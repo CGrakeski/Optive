@@ -1,0 +1,157 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Optive",
+  "scopeName": "source.tive",
+  "fileTypes": ["tive"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#identifiers" },
+    { "include": "#punctuation" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.tive",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.tive",
+          "begin": "/\\*",
+          "end": "\\*/",
+          "patterns": [{ "include": "#comments" }]
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.triple.tive",
+          "begin": "(r|f)?\"\"\"",
+          "end": "\"\"\"",
+          "beginCaptures": {
+            "1": { "name": "punctuation.definition.string.begin.tive" }
+          }
+        },
+        {
+          "comment": "f-string 插值：f\"...{expr}...\"",
+          "name": "string.quoted.double.tive",
+          "begin": "f\"",
+          "end": "\"|$",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.string.begin.tive" }
+          },
+          "patterns": [
+            {
+              "name": "meta.interpolation.tive",
+              "begin": "\\{",
+              "end": "\\}",
+              "patterns": [{ "include": "$self" }]
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.double.tive",
+          "begin": "r\"",
+          "end": "\"|$",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.string.begin.tive" }
+          }
+        },
+        {
+          "name": "string.quoted.double.tive",
+          "begin": "(?<![rRfF])\"",
+          "end": "\"|$",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.string.begin.tive" }
+          },
+          "patterns": [
+            {
+              "name": "meta.interpolation.tive",
+              "match": "\\{[^}]*\\}"
+            }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.integer.hex.tive",
+          "match": "\\b0[xX][0-9a-fA-F_]+\\b"
+        },
+        {
+          "name": "constant.numeric.integer.binary.tive",
+          "match": "\\b0[bB][01_]+\\b"
+        },
+        {
+          "name": "constant.numeric.float.tive",
+          "match": "\\b[0-9][0-9_]*\\.[0-9][0-9_]*([eE][+-]?[0-9]+)?\\b"
+        },
+        {
+          "name": "constant.numeric.integer.tive",
+          "match": "\\b[0-9][0-9_]*\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.tive",
+          "match": "\\b(if|elif|else|then|loop|while|for|in|break|continue|return|match|case|do|handle|try|catch|throw|outside)\\b"
+        },
+        {
+          "name": "keyword.operator.logical.tive",
+          "match": "\\b(and|or|not|is)\\b"
+        },
+        {
+          "name": "keyword.declaration.tive",
+          "match": "\\b(let|var|const|func|friend|struct|enum|variant|protocol|macro|quote|typed|overload|import|use|as|intern|export|with|make|del)\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "comment": "基本类型名（与 type_registry::names 对齐）",
+          "name": "support.type.tive",
+          "match": "\\b(num|text|bool|list|dict|set|tuple|bytes|iterator|type|nonetype|ptr|i8|u8|i16|u16|i32|u32|i64|u64|isize|usize|f32|f64)\\b"
+        }
+      ]
+    },
+    "identifiers": {
+      "patterns": [
+        {
+          "comment": "大写开头：类型 / 结构体 / 枚举名",
+          "name": "entity.name.type.tive",
+          "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+        },
+        {
+          "comment": "全大写常量",
+          "name": "constant.other.tive",
+          "match": "\\b[A-Z][A-Z0-9_]*\\b"
+        },
+        {
+          "name": "variable.other.tive",
+          "match": "\\b[a-z_][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "punctuation": {
+      "patterns": [
+        {
+          "name": "punctuation.accessor.tive",
+          "match": "\\."
+        },
+        {
+          "name": "keyword.operator.tive",
+          "match": "(==|!=|<=|>=|->|=>|\\+\\+|--|\\+=|-=|\\*=|/=|::|\\+|-|\\*|/|=|<|>|%|&|\\||\\^|!)"
+        }
+      ]
+    }
+  }
+}

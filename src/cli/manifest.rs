@@ -1,0 +1,447 @@
+//! `Optive.toml` 项目清单。
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+const MANIFEST_NAMES: &[&str] = &["Optive.toml", "optive.toml"];
+
+/// 依赖修订声明种类（决定是否可被 `update` 追 tip）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevSpec {
+    /// 钉死 commit sha
+    Commit(String),
+    /// 钉死 tag（当快照）
+    Tag(String),
+    /// 可追 branch
+    Branch(String),
+    /// 裸 URL：可追默认 tip
+    None,
+}
+
+impl RevSpec {
+    pub fn branch_name(&self) -> Option<&str> {
+        match self {
+            RevSpec::Branch(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Manifest {
+    pub package: Package,
+    #[serde(default)]
+    pub track_latest: bool,
+    #[serde(default)]
+    pub dependencies: BTreeMap<String, Dependency>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Package {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// 入口脚本；默认依次尝试 `src/main.tive`、`main.tive`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dependency {
+    pub git: String,
+    pub rev: RevSpec,
+}
+
+impl Dependency {
+    pub fn pinned_commit(git: impl Into<String>, sha: impl Into<String>) -> Self {
+        Self {
+            git: git.into(),
+            rev: RevSpec::Commit(sha.into()),
+        }
+    }
+
+    pub fn with_branch(git: impl Into<String>, branch: impl Into<String>) -> Self {
+        Self {
+            git: git.into(),
+            rev: RevSpec::Branch(branch.into()),
+        }
+    }
+
+    pub fn with_tag(git: impl Into<String>, tag: impl Into<String>) -> Self {
+        Self {
+            git: git.into(),
+            rev: RevSpec::Tag(tag.into()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Dependency {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Url(String),
+            Table {
+                git: String,
+                #[serde(default)]
+                rev: Option<String>,
+                #[serde(default)]
+                branch: Option<String>,
+                #[serde(default)]
+                tag: Option<String>,
+                #[serde(default)]
+                version: Option<String>,
+            },
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Url(git) => Ok(Dependency {
+                git,
+                rev: RevSpec::None,
+            }),
+            Raw::Table {
+                git,
+                rev,
+                branch,
+                tag,
+                version,
+            } => {
+                let set = [
+                    rev.is_some(),
+                    branch.is_some(),
+                    tag.is_some(),
+                    version.is_some(),
+                ]
+                .into_iter()
+                .filter(|b| *b)
+                .count();
+                if set > 1 {
+                    return Err(serde::de::Error::custom(
+                        "dependency may set only one of rev / branch / tag / version",
+                    ));
+                }
+                let rev = if let Some(r) = rev {
+                    RevSpec::Commit(r)
+                } else if let Some(b) = branch {
+                    RevSpec::Branch(b)
+                } else if let Some(t) = tag {
+                    RevSpec::Tag(t)
+                } else if let Some(v) = version {
+                    // legacy alias → treat as tag/commit pin
+                    RevSpec::Commit(v)
+                } else {
+                    RevSpec::None
+                };
+                Ok(Dependency { git, rev })
+            }
+        }
+    }
+}
+
+impl Serialize for Dependency {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        match &self.rev {
+            RevSpec::None => serializer.serialize_str(&self.git),
+            RevSpec::Commit(r) => {
+                let mut m = serializer.serialize_map(Some(2))?;
+                m.serialize_entry("git", &self.git)?;
+                m.serialize_entry("rev", r)?;
+                m.end()
+            }
+            RevSpec::Tag(t) => {
+                let mut m = serializer.serialize_map(Some(2))?;
+                m.serialize_entry("git", &self.git)?;
+                m.serialize_entry("tag", t)?;
+                m.end()
+            }
+            RevSpec::Branch(b) => {
+                let mut m = serializer.serialize_map(Some(2))?;
+                m.serialize_entry("git", &self.git)?;
+                m.serialize_entry("branch", b)?;
+                m.end()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Project {
+    pub root: PathBuf,
+    pub manifest_path: PathBuf,
+    pub manifest: Manifest,
+}
+
+impl Project {
+    /// 解析入口 `.tive` 文件的绝对路径。
+    pub fn entry_path(&self) -> Result<PathBuf, String> {
+        if let Some(entry) = &self.manifest.package.entry {
+            let p = self.root.join(entry);
+            if p.is_file() {
+                return Ok(p);
+            }
+            return Err(format!(
+                "entry not found: {} (from {})",
+                p.display(),
+                self.manifest_path.display()
+            ));
+        }
+        for candidate in ["src/main.tive", "main.tive"] {
+            let p = self.root.join(candidate);
+            if p.is_file() {
+                return Ok(p);
+            }
+        }
+        Err(format!(
+            "no entry script: set [package].entry or add src/main.tive (project {})",
+            self.root.display()
+        ))
+    }
+
+    pub fn deps_dir(&self) -> PathBuf {
+        if let Ok(custom) = std::env::var("OPTIVE_DEPS") {
+            PathBuf::from(custom)
+        } else {
+            self.root.join("deps")
+        }
+    }
+
+    pub fn lock_path(&self) -> PathBuf {
+        self.root.join("optive.lock")
+    }
+
+    pub fn cache_path(&self) -> PathBuf {
+        self.root.join("Optive.cache")
+    }
+}
+
+/// 无清单或不存在 → 空依赖表，不报错。
+pub fn read_deps_if_exists(package_root: &Path) -> BTreeMap<String, Dependency> {
+    for name in MANIFEST_NAMES {
+        let p = package_root.join(name);
+        if p.is_file() {
+            if let Ok(text) = fs::read_to_string(&p) {
+                if let Ok(m) = toml::from_str::<Manifest>(&text) {
+                    return m.dependencies;
+                }
+            }
+            return BTreeMap::new();
+        }
+    }
+    BTreeMap::new()
+}
+
+/// 用 toml_edit 增量写入单个依赖（尽量保留其它注释/格式）。
+pub fn upsert_dependency(
+    manifest_path: &Path,
+    name: &str,
+    dep: &Dependency,
+) -> Result<(), String> {
+    let text = fs::read_to_string(manifest_path).map_err(|e| {
+        format!("cannot read {}: {e}", manifest_path.display())
+    })?;
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| {
+        format!("invalid {}: {e}", manifest_path.display())
+    })?;
+    if doc.get("dependencies").is_none() {
+        doc["dependencies"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let deps = doc["dependencies"]
+        .as_table_mut()
+        .ok_or_else(|| format!("{}: [dependencies] is not a table", manifest_path.display()))?;
+    deps.insert(name, dependency_to_item(dep));
+    fs::write(manifest_path, doc.to_string()).map_err(|e| {
+        format!("cannot write {}: {e}", manifest_path.display())
+    })?;
+    Ok(())
+}
+
+pub fn remove_dependency(manifest_path: &Path, name: &str) -> Result<bool, String> {
+    let text = fs::read_to_string(manifest_path).map_err(|e| {
+        format!("cannot read {}: {e}", manifest_path.display())
+    })?;
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| {
+        format!("invalid {}: {e}", manifest_path.display())
+    })?;
+    let Some(deps) = doc.get_mut("dependencies").and_then(|i| i.as_table_mut()) else {
+        return Ok(false);
+    };
+    let removed = deps.remove(name).is_some();
+    fs::write(manifest_path, doc.to_string()).map_err(|e| {
+        format!("cannot write {}: {e}", manifest_path.display())
+    })?;
+    Ok(removed)
+}
+
+pub fn set_track_latest(manifest_path: &Path, value: bool) -> Result<(), String> {
+    let text = fs::read_to_string(manifest_path).map_err(|e| {
+        format!("cannot read {}: {e}", manifest_path.display())
+    })?;
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| {
+        format!("invalid {}: {e}", manifest_path.display())
+    })?;
+    doc["track_latest"] = toml_edit::value(value);
+    fs::write(manifest_path, doc.to_string()).map_err(|e| {
+        format!("cannot write {}: {e}", manifest_path.display())
+    })?;
+    Ok(())
+}
+
+fn dependency_to_item(dep: &Dependency) -> toml_edit::Item {
+    match &dep.rev {
+        RevSpec::None => toml_edit::value(dep.git.as_str()),
+        RevSpec::Commit(r) => {
+            let mut t = toml_edit::InlineTable::new();
+            t.insert("git", dep.git.as_str().into());
+            t.insert("rev", r.as_str().into());
+            toml_edit::Item::Value(toml_edit::Value::InlineTable(t))
+        }
+        RevSpec::Tag(t) => {
+            let mut table = toml_edit::InlineTable::new();
+            table.insert("git", dep.git.as_str().into());
+            table.insert("tag", t.as_str().into());
+            toml_edit::Item::Value(toml_edit::Value::InlineTable(table))
+        }
+        RevSpec::Branch(b) => {
+            let mut table = toml_edit::InlineTable::new();
+            table.insert("git", dep.git.as_str().into());
+            table.insert("branch", b.as_str().into());
+            toml_edit::Item::Value(toml_edit::Value::InlineTable(table))
+        }
+    }
+}
+
+/// 从路径定位项目：目录、清单文件，或向上查找。
+pub fn find_project(start: Option<&Path>) -> Result<Project, String> {
+    let start = match start {
+        Some(p) => {
+            if p.is_file() {
+                let name = p
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                if MANIFEST_NAMES.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+                    return load_project(p);
+                }
+                return Err(format!(
+                    "expected a project directory or Optive.toml, got file {}",
+                    p.display()
+                ));
+            }
+            p.to_path_buf()
+        }
+        None => std::env::current_dir().map_err(|e| e.to_string())?,
+    };
+
+    let mut dir = start.canonicalize().unwrap_or(start);
+    loop {
+        for name in MANIFEST_NAMES {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return load_project(&candidate);
+            }
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    Err("Optive.toml not found (searched current and parent directories)".into())
+}
+
+pub fn load_project(manifest_path: &Path) -> Result<Project, String> {
+    let text = fs::read_to_string(manifest_path).map_err(|e| {
+        format!("cannot read {}: {e}", manifest_path.display())
+    })?;
+    let manifest: Manifest = toml::from_str(&text).map_err(|e| {
+        format!("invalid {}: {e}", manifest_path.display())
+    })?;
+    if manifest.package.name.trim().is_empty() {
+        return Err(format!(
+            "{}: [package].name must not be empty",
+            manifest_path.display()
+        ));
+    }
+    let root = manifest_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let root = root.canonicalize().unwrap_or(root);
+    let root = strip_windows_verbatim(root);
+    Ok(Project {
+        root,
+        manifest_path: strip_windows_verbatim(manifest_path.to_path_buf()),
+        manifest,
+    })
+}
+
+/// Windows `canonicalize` 会得到 `\\?\D:\...`；用户可见路径去掉此前缀。
+fn strip_windows_verbatim(path: PathBuf) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        if let Some(unc) = rest.strip_prefix("UNC\\") {
+            return PathBuf::from(format!(r"\\{unc}"));
+        }
+        return PathBuf::from(rest);
+    }
+    path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_url_and_table_deps() {
+        let src = r#"
+[package]
+name = "demo"
+version = "0.1.0"
+entry = "src/main.tive"
+
+[dependencies]
+helper = "https://github.com/example/helper.git"
+other = { git = "https://github.com/example/other", rev = "abc123" }
+branched = { git = "https://github.com/example/b", branch = "main" }
+tagged = { git = "https://github.com/example/t", tag = "v1" }
+"#;
+        let m: Manifest = toml::from_str(src).unwrap();
+        assert_eq!(m.package.name, "demo");
+        assert_eq!(m.package.entry.as_deref(), Some("src/main.tive"));
+        assert_eq!(
+            m.dependencies["helper"].git,
+            "https://github.com/example/helper.git"
+        );
+        assert!(matches!(m.dependencies["helper"].rev, RevSpec::None));
+        assert!(matches!(
+            m.dependencies["other"].rev,
+            RevSpec::Commit(ref s) if s == "abc123"
+        ));
+        assert!(matches!(
+            m.dependencies["branched"].rev,
+            RevSpec::Branch(ref s) if s == "main"
+        ));
+        assert!(matches!(
+            m.dependencies["tagged"].rev,
+            RevSpec::Tag(ref s) if s == "v1"
+        ));
+    }
+
+    #[test]
+    fn read_deps_missing_is_empty() {
+        let dir = std::env::temp_dir().join(format!("optive_no_toml_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        assert!(read_deps_if_exists(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

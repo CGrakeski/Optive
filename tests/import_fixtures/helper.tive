@@ -1,0 +1,2 @@
+export let value = 10
+export func add(a, b) { return a + b }

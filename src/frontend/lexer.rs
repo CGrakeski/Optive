@@ -1,0 +1,692 @@
+use crate::error::LexError;
+use crate::token::{keyword_or_ident, Token, TokenKind};
+
+pub struct Lexer {
+    source: String,
+    pos: usize,
+    line: usize,
+    column: usize,
+    last_kind: Option<TokenKind>,
+    /// 块注释未闭合时置位，由 `tokenize` 报错。
+    unclosed_block_comment: bool,
+}
+
+impl Lexer {
+    pub fn new(source: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            pos: 0,
+            line: 1,
+            column: 1,
+            last_kind: None,
+            unclosed_block_comment: false,
+        }
+    }
+
+    pub fn tokenize(mut self) -> Result<Vec<Token>, LexError> {
+        let mut tokens = Vec::new();
+        self.skip_bom();
+        while !self.is_at_end() {
+            if self.skip_comment() {
+                if self.unclosed_block_comment {
+                    return Err(LexError::Message {
+                        line: self.line,
+                        column: self.column,
+                        message: "unterminated block comment".into(),
+                    });
+                }
+                continue;
+            }
+            if self.skip_whitespace() {
+                continue;
+            }
+            let start_line = self.line;
+            let start_col = self.column;
+            let tok = self.next_token();
+            if tok.kind == TokenKind::Mismatch {
+                let message = if tok.value.starts_with("unterminated")
+                    || tok.value.starts_with("non-ASCII")
+                    || tok.value.contains(' ')
+                {
+                    tok.value.clone()
+                } else if tok.value.is_empty() {
+                    format!("unexpected character {:?}", self.peek_char())
+                } else {
+                    format!(
+                        "unexpected character {:?}",
+                        tok.value.chars().next().unwrap_or('?')
+                    )
+                };
+                return Err(LexError::Message {
+                    line: start_line,
+                    column: start_col,
+                    message,
+                });
+            }
+            self.last_kind = Some(tok.kind);
+            tokens.push(tok);
+        }
+        tokens.push(Token::new(TokenKind::End, "", self.line, self.column));
+        Ok(tokens)
+    }
+
+    fn skip_bom(&mut self) {
+        if self.source.starts_with('\u{feff}') {
+            self.pos += '\u{feff}'.len_utf8();
+        }
+    }
+
+    fn is_at_end(&self) -> bool {
+        self.pos >= self.source.len()
+    }
+
+    fn peek_char(&self) -> Option<char> {
+        self.source[self.pos..].chars().next()
+    }
+
+    fn consume_char(&mut self) -> Option<char> {
+        let ch = self.peek_char()?;
+        self.pos += ch.len_utf8();
+        if ch == '\n' {
+            self.line += 1;
+            self.column = 1;
+        } else {
+            self.column += 1;
+        }
+        Some(ch)
+    }
+
+    fn skip_whitespace(&mut self) -> bool {
+        let mut skipped = false;
+        while matches!(self.peek_char(), Some(' ' | '\t' | '\r')) {
+            self.consume_char();
+            skipped = true;
+        }
+        skipped
+    }
+
+    fn skip_comment(&mut self) -> bool {
+        if self.source[self.pos..].starts_with("//") {
+            while let Some(ch) = self.peek_char() {
+                if ch == '\n' {
+                    break;
+                }
+                self.consume_char();
+            }
+            return true;
+        }
+        if self.source[self.pos..].starts_with("/*") {
+            self.consume_char(); // '/'
+            self.consume_char(); // '*'
+            let mut closed = false;
+            while !self.is_at_end() {
+                if self.source[self.pos..].starts_with("*/") {
+                    self.consume_char();
+                    self.consume_char();
+                    closed = true;
+                    break;
+                }
+                self.consume_char();
+            }
+            if !closed {
+                self.unclosed_block_comment = true;
+            }
+            return true;
+        }
+        false
+    }
+
+    fn next_token(&mut self) -> Token {
+        let line = self.line;
+        let col = self.column;
+        let ch = match self.peek_char() {
+            Some(c) => c,
+            None => return Token::new(TokenKind::End, "", line, col),
+        };
+
+        if ch == '\n' {
+            self.consume_char();
+            return Token::new(TokenKind::Newline, "\\n", line, col);
+        }
+
+        if self.source[self.pos..].starts_with("f\"\"\"") {
+            return self.read_fstring_triple(line, col);
+        }
+        if self.source[self.pos..].starts_with("f\"") {
+            return self.read_fstring(line, col);
+        }
+
+        if self.source[self.pos..].starts_with("b\"") {
+            return self.read_bytes_string(line, col);
+        }
+
+        // 原始字符串：`r"..."` / `r"""..."""`（`r` 后必须是引号，否则走标识符）
+        if ch == 'r' {
+            let rest = &self.source[self.pos + 'r'.len_utf8()..];
+            if rest.starts_with("\"\"\"") {
+                return self.read_raw_triple(line, col);
+            }
+            if rest.starts_with('"') {
+                return self.read_raw_string(line, col);
+            }
+        }
+
+        if self.source[self.pos..].starts_with("\"\"\"") {
+            return self.read_string_triple(line, col);
+        }
+        if ch == '"' {
+            return self.read_string(line, col);
+        }
+
+        if ch == '_' && !self.identifier_continues_at(1) {
+            self.consume_char();
+            return Token::new(TokenKind::Placeholder, "_", line, col);
+        }
+
+        if ch.is_ascii_digit() || (ch == '.' && self.peek_next_is_digit()) {
+            return self.read_number(line, col);
+        }
+
+        if ch == '-'
+            && self.peek_next_is_number_start()
+            && !self.minus_follows_complete_expr()
+        {
+            return self.read_number(line, col);
+        }
+
+        if is_ident_start(ch) {
+            return self.read_ident(line, col);
+        }
+
+        // 三点省略号：空块（≡ `{}`）、catch 通配 / 类型省略
+        if self.source[self.pos..].starts_with("...") {
+            self.pos += 3;
+            self.column += 3;
+            return Token::new(TokenKind::Ellipsis, "...", line, col);
+        }
+
+        // 双字符运算符
+        let two = &self.source[self.pos..];
+        let (kind, len, text) = if two.starts_with("==") {
+            (TokenKind::EqEq, 2, "==")
+        } else if two.starts_with("!=") {
+            (TokenKind::Ne, 2, "!=")
+        } else if two.starts_with("<=") {
+            (TokenKind::Le, 2, "<=")
+        } else if two.starts_with(">=") {
+            (TokenKind::Ge, 2, ">=")
+        } else if two.starts_with("->") {
+            (TokenKind::Arrow, 2, "->")
+        } else if two.starts_with("=>") {
+            (TokenKind::FatArrow, 2, "=>")
+        } else if two.starts_with("|>") {
+            (TokenKind::Pipe, 2, "|>")
+        } else if two.starts_with("**") {
+            (TokenKind::StarStar, 2, "**")
+        } else if two.starts_with("::") {
+            (TokenKind::ColonColon, 2, "::")
+        } else if two.starts_with(":=") {
+            (TokenKind::ColonEq, 2, ":=")
+        } else {
+            (TokenKind::Mismatch, 0, "")
+        };
+        if len > 0 {
+            self.pos += len;
+            self.column += len;
+            return Token::new(kind, text, line, col);
+        }
+
+        let kind = match ch {
+            '+' => TokenKind::Plus,
+            '-' => TokenKind::Minus,
+            '*' => TokenKind::Star,
+            '/' => TokenKind::Slash,
+            '!' => TokenKind::Bang,
+            '<' => TokenKind::Lt,
+            '>' => TokenKind::Gt,
+            '=' => TokenKind::Assign,
+            ',' => TokenKind::Comma,
+            '.' => TokenKind::Dot,
+            ':' => TokenKind::Colon,
+            '|' => TokenKind::Bar,
+            '(' => TokenKind::LParen,
+            ')' => TokenKind::RParen,
+            '{' => TokenKind::LBrace,
+            '}' => TokenKind::RBrace,
+            '[' => TokenKind::LBracket,
+            ']' => TokenKind::RBracket,
+            _ => TokenKind::Mismatch,
+        };
+        if kind == TokenKind::Mismatch {
+            return Token::new(kind, ch.to_string(), line, col);
+        }
+        self.consume_char();
+        Token::new(kind, ch.to_string(), line, col)
+    }
+
+    fn peek_next_is_digit(&self) -> bool {
+        let rest = self.source[self.pos + '.'.len_utf8()..].chars().next();
+        rest.map(|c| c.is_ascii_digit()).unwrap_or(false)
+    }
+
+    /// 在已完成的主表达式/后缀后，`-` 开启二元减法，而非负数字面量。
+    fn minus_follows_complete_expr(&self) -> bool {
+        matches!(
+            self.last_kind,
+            Some(
+                TokenKind::Identifier
+                    | TokenKind::NumLiteral
+                    | TokenKind::StringLiteral
+                    | TokenKind::FStringLiteral
+                    | TokenKind::BytesLiteral
+                    | TokenKind::RParen
+                    | TokenKind::RBracket
+                    | TokenKind::RBrace
+                    | TokenKind::Placeholder
+            )
+        )
+    }
+
+    fn peek_next_is_number_start(&self) -> bool {
+        let mut iter = self.source[self.pos + '-'.len_utf8()..].chars();
+        match iter.next() {
+            Some(c) if c.is_ascii_digit() => true,
+            Some('.') => iter.next().map(|c| c.is_ascii_digit()).unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    fn read_string(&mut self, line: usize, col: usize) -> Token {
+        self.consume_char(); // 起始引号
+        match self.read_string_body(false, false) {
+            Ok(out) => Token::new(TokenKind::StringLiteral, out, line, col),
+            Err(msg) => Token::new(TokenKind::Mismatch, msg, line, col),
+        }
+    }
+
+    /// 多行字符串 `"""..."""`（支持转义与换行）。
+    fn read_string_triple(&mut self, line: usize, col: usize) -> Token {
+        self.pos += 3;
+        self.column += 3;
+        match self.read_string_body(true, false) {
+            Ok(out) => Token::new(TokenKind::StringLiteral, out, line, col),
+            Err(msg) => Token::new(TokenKind::Mismatch, msg, line, col),
+        }
+    }
+
+    /// 原始字符串 `r"..."`（不处理转义；不可跨行）。
+    fn read_raw_string(&mut self, line: usize, col: usize) -> Token {
+        self.pos += 'r'.len_utf8();
+        self.column += 1;
+        self.consume_char(); // 起始引号
+        match self.read_string_body(false, true) {
+            Ok(out) => Token::new(TokenKind::StringLiteral, out, line, col),
+            Err(msg) => Token::new(TokenKind::Mismatch, msg, line, col),
+        }
+    }
+
+    /// 原始多行字符串 `r"""..."""`。
+    fn read_raw_triple(&mut self, line: usize, col: usize) -> Token {
+        self.pos += 'r'.len_utf8();
+        self.column += 1;
+        self.pos += 3;
+        self.column += 3;
+        match self.read_string_body(true, true) {
+            Ok(out) => Token::new(TokenKind::StringLiteral, out, line, col),
+            Err(msg) => Token::new(TokenKind::Mismatch, msg, line, col),
+        }
+    }
+
+    /// `triple`：以 `"""` 结束并可含换行；`raw`：反斜杠原样保留。
+    fn read_string_body(&mut self, triple: bool, raw: bool) -> Result<String, String> {
+        let mut out = String::new();
+        while let Some(ch) = self.peek_char() {
+            if triple {
+                if self.source[self.pos..].starts_with("\"\"\"") {
+                    self.pos += 3;
+                    self.column += 3;
+                    return Ok(out);
+                }
+            } else if ch == '"' {
+                self.consume_char();
+                return Ok(out);
+            } else if ch == '\n' {
+                return Err("unterminated string".into());
+            }
+            if !raw && ch == '\\' {
+                self.consume_char();
+                match self.consume_char() {
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some('r') => out.push('\r'),
+                    Some('"') => out.push('"'),
+                    Some('\\') => out.push('\\'),
+                    Some(c) => {
+                        out.push('\\');
+                        out.push(c);
+                    }
+                    None => return Err("unterminated escape".into()),
+                }
+                continue;
+            }
+            out.push(ch);
+            self.consume_char();
+        }
+        Err(if triple {
+            "unterminated triple-quoted string".into()
+        } else {
+            "unterminated string".into()
+        })
+    }
+
+    /// 字节字面量 `b"..."` — token 值为 Latin-1（每字节一个 char）。
+    fn read_bytes_string(&mut self, line: usize, col: usize) -> Token {
+        self.pos += 'b'.len_utf8();
+        self.column += 1;
+        self.consume_char(); // 起始引号
+        let mut bytes: Vec<u8> = Vec::new();
+        while let Some(ch) = self.peek_char() {
+            if ch == '"' {
+                self.consume_char();
+                let encoded: String = bytes
+                    .iter()
+                    .map(|&b| {
+                        char::from_u32(b as u32)
+                            .expect("byte value 0-255 is always a valid char (theoretically unreachable)")
+                    })
+                    .collect();
+                return Token::new(TokenKind::BytesLiteral, encoded, line, col);
+            }
+            if ch == '\n' {
+                return Token::new(TokenKind::Mismatch, "unterminated bytes literal", line, col);
+            }
+            if ch == '\\' {
+                self.consume_char();
+                match self.consume_char() {
+                    Some('n') => bytes.push(b'\n'),
+                    Some('t') => bytes.push(b'\t'),
+                    Some('r') => bytes.push(b'\r'),
+                    Some('"') => bytes.push(b'"'),
+                    Some('\\') => bytes.push(b'\\'),
+                    Some('x') => {
+                        let hi = self.consume_char();
+                        let lo = self.consume_char();
+                        match (hi, lo) {
+                            (Some(h), Some(l)) => {
+                                let hx = h.to_digit(16);
+                                let lx = l.to_digit(16);
+                                match (hx, lx) {
+                                    (Some(hh), Some(ll)) => {
+                                        bytes.push(((hh << 4) | ll) as u8);
+                                    }
+                                    _ => {
+                                        return Token::new(
+                                            TokenKind::Mismatch,
+                                            "invalid \\x escape in bytes",
+                                            line,
+                                            col,
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {
+                                return Token::new(
+                                    TokenKind::Mismatch,
+                                    "unterminated \\x escape",
+                                    line,
+                                    col,
+                                );
+                            }
+                        }
+                    }
+                    Some(c) if c.is_ascii() => bytes.push(c as u8),
+                    Some(_) => {
+                        return Token::new(
+                            TokenKind::Mismatch,
+                            "non-ASCII escape in bytes literal",
+                            line,
+                            col,
+                        );
+                    }
+                    None => {
+                        return Token::new(TokenKind::Mismatch, "unterminated escape", line, col);
+                    }
+                }
+                continue;
+            }
+            if !ch.is_ascii() {
+                return Token::new(
+                    TokenKind::Mismatch,
+                    "non-ASCII byte in bytes literal (use \\xHH)",
+                    line,
+                    col,
+                );
+            }
+            bytes.push(ch as u8);
+            self.consume_char();
+        }
+        Token::new(TokenKind::Mismatch, "unterminated bytes literal", line, col)
+    }
+
+    fn read_fstring(&mut self, line: usize, col: usize) -> Token {
+        self.pos += 'f'.len_utf8();
+        self.column += 1;
+        self.consume_char(); // 起始引号
+        match self.read_fstring_body(false) {
+            Ok(out) => Token::new(TokenKind::FStringLiteral, out, line, col),
+            Err(msg) => Token::new(TokenKind::Mismatch, msg, line, col),
+        }
+    }
+
+    fn read_fstring_triple(&mut self, line: usize, col: usize) -> Token {
+        self.pos += 'f'.len_utf8();
+        self.column += 1;
+        self.pos += 3;
+        self.column += 3;
+        match self.read_fstring_body(true) {
+            Ok(out) => Token::new(TokenKind::FStringLiteral, out, line, col),
+            Err(msg) => Token::new(TokenKind::Mismatch, msg, line, col),
+        }
+    }
+
+    fn read_fstring_body(&mut self, triple: bool) -> Result<String, String> {
+        let mut out = String::new();
+        while let Some(ch) = self.peek_char() {
+            if triple {
+                if self.source[self.pos..].starts_with("\"\"\"") {
+                    self.pos += 3;
+                    self.column += 3;
+                    return Ok(out);
+                }
+            } else if ch == '"' {
+                self.consume_char();
+                return Ok(out);
+            } else if ch == '\n' {
+                return Err("unterminated f-string".into());
+            }
+            if ch == '\\' {
+                self.consume_char();
+                match self.consume_char() {
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some('r') => out.push('\r'),
+                    Some('"') => out.push('"'),
+                    Some('\\') => out.push('\\'),
+                    Some('{') => out.push('{'),
+                    Some('}') => out.push('}'),
+                    Some(c) => {
+                        out.push('\\');
+                        out.push(c);
+                    }
+                    None => return Err("unterminated escape".into()),
+                }
+                continue;
+            }
+            out.push(ch);
+            self.consume_char();
+        }
+        Err(if triple {
+            "unterminated triple-quoted f-string".into()
+        } else {
+            "unterminated f-string".into()
+        })
+    }
+
+    fn read_number(&mut self, line: usize, col: usize) -> Token {
+        let start = self.pos;
+        if self.peek_char() == Some('-') || self.peek_char() == Some('+') {
+            self.consume_char();
+        }
+        while matches!(self.peek_char(), Some(c) if c.is_ascii_digit()) {
+            self.consume_char();
+        }
+        let mut is_rational = false;
+        if self.peek_char() == Some('.') {
+            is_rational = true;
+            self.consume_char();
+            while matches!(self.peek_char(), Some(c) if c.is_ascii_digit()) {
+                self.consume_char();
+            }
+        }
+        if matches!(self.peek_char(), Some('e' | 'E')) {
+            is_rational = true;
+            self.consume_char();
+            if matches!(self.peek_char(), Some('+' | '-')) {
+                self.consume_char();
+            }
+            while matches!(self.peek_char(), Some(c) if c.is_ascii_digit()) {
+                self.consume_char();
+            }
+        }
+        let text = self.source[start..self.pos].to_string();
+        let _ = is_rational;
+        // 定宽后缀：`1i32`、`3.14f64`（较长优先）
+        let saved = self.pos;
+        let saved_col = self.column;
+        if let Some(ch) = self.peek_char() {
+            if ch.is_ascii_alphabetic() {
+                let suf_start = self.pos;
+                while matches!(self.peek_char(), Some(c) if c.is_ascii_alphanumeric()) {
+                    self.consume_char();
+                }
+                let suf = &self.source[suf_start..self.pos];
+                if crate::sized::LITERAL_SUFFIXES.contains(&suf) {
+                    let full = self.source[start..self.pos].to_string();
+                    return Token::new(TokenKind::NumLiteral, full, line, col);
+                }
+                self.pos = saved;
+                self.column = saved_col;
+            }
+        }
+        Token::new(TokenKind::NumLiteral, text, line, col)
+    }
+
+    fn read_ident(&mut self, line: usize, col: usize) -> Token {
+        let start = self.pos;
+        self.consume_char();
+        while self.identifier_continues_here() {
+            self.consume_char();
+        }
+        let text = &self.source[start..self.pos];
+        let kind = keyword_or_ident(text);
+        Token::new(kind, text.to_string(), line, col)
+    }
+
+    fn identifier_continues_at(&self, offset: usize) -> bool {
+        let idx = self.pos + offset;
+        if idx >= self.source.len() {
+            return false;
+        }
+        self.source[idx..]
+            .chars()
+            .next()
+            .map(is_ident_continue)
+            .unwrap_or(false)
+    }
+
+    fn identifier_continues_here(&self) -> bool {
+        self.peek_char()
+            .map(is_ident_continue)
+            .unwrap_or(false)
+    }
+}
+
+fn is_ident_start(ch: char) -> bool {
+    ch == '_' || ch.is_alphabetic()
+}
+
+fn is_ident_continue(ch: char) -> bool {
+    ch == '_' || ch.is_alphanumeric()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::token::TokenKind;
+
+    #[test]
+    fn lex_basic() {
+        let tokens = Lexer::new("let x = 42\n").tokenize().unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::KwLet);
+        assert_eq!(tokens[1].value, "x");
+        assert_eq!(tokens[2].kind, TokenKind::Assign);
+        assert_eq!(tokens[3].value, "42");
+    }
+
+    #[test]
+    fn lex_string_and_ops() {
+        let tokens = Lexer::new(r#""hi" == "hi""#).tokenize().unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::StringLiteral);
+        assert_eq!(tokens[1].kind, TokenKind::EqEq);
+    }
+
+    #[test]
+    fn lex_subtraction_not_negative_literal() {
+        let kinds: Vec<_> = Lexer::new("fib(n-1)")
+            .tokenize()
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.kind != TokenKind::End)
+            .map(|t| t.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Identifier,
+                TokenKind::LParen,
+                TokenKind::Identifier,
+                TokenKind::Minus,
+                TokenKind::NumLiteral,
+                TokenKind::RParen,
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_unary_minus_still_works() {
+        let kinds: Vec<_> = Lexer::new("x = -1")
+            .tokenize()
+            .unwrap()
+            .into_iter()
+            .filter(|t| !matches!(t.kind, TokenKind::End | TokenKind::Newline))
+            .map(|t| t.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Identifier,
+                TokenKind::Assign,
+                TokenKind::NumLiteral,
+            ]
+        );
+        assert_eq!(
+            Lexer::new("-1")
+                .tokenize()
+                .unwrap()
+                .first()
+                .unwrap()
+                .value,
+            "-1"
+        );
+    }
+}

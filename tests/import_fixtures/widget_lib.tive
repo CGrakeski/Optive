@@ -1,0 +1,17 @@
+intern struct Widget {
+    var count
+
+    func bump(self) {
+        print("bump")
+        self.count = self.count + 1
+    }
+}
+
+export func make_widget() {
+    return Widget(0)
+}
+
+export func bump_twice(w) {
+    w.bump()
+    w.bump()
+}

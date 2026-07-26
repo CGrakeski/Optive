@@ -1,0 +1,617 @@
+// 图书管理核心库 — 可被 import "book-system/lib/library.tive" 引用
+
+intern struct Book {
+    var id
+    var title
+    var author
+    var isbn
+    var category
+    var year
+    var shelf
+    var total
+    var available
+    var borrow_count
+}
+
+intern struct Loan {
+    var id
+    var book_id
+    var book_title
+    var reader
+}
+
+intern func text_contains(s, sub) {
+    let n = len(sub)
+    if (n == 0) { return true }
+    let m = len(s)
+    if (n > m) { return false }
+    let i = 0
+    while (i + n <= m) {
+        if (s[i:i + n] == sub) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+intern func text_lower(s) {
+    return s.lower()
+}
+
+intern func book_matches(b, keyword) {
+    if (keyword == "") { return true }
+    let k = text_lower(keyword)
+    if (text_contains(text_lower(b.title), k)) { return true }
+    if (text_contains(text_lower(b.author), k)) { return true }
+    if (text_contains(text_lower(b.isbn), k)) { return true }
+    if (text_contains(text_lower(b.category), k)) { return true }
+    if (text_contains(text_lower(b.shelf), k)) { return true }
+    return false
+}
+
+intern func category_matches(b, category) {
+    if (category == "") { return true }
+    return text_lower(b.category) == text_lower(category)
+}
+
+intern func swap_books(books, i, j) {
+    let tmp = books[i]
+    books[i] = books[j]
+    books[j] = tmp
+}
+
+intern func sort_books_by_title(books) {
+    let n = len(books)
+    let i = 0
+    while (i < n) {
+        let j = i + 1
+        while (j < n) {
+            if (books[i].title > books[j].title) {
+                swap_books(books, i, j)
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return books
+}
+
+intern func normalize_category(c) {
+    if (c == "") { return "(未分类)" }
+    return c
+}
+
+intern struct Library {
+    var books
+    var next_id
+    var active_loans
+    var next_loan_id
+
+    func find_by_id(self, id) {
+        for (b in self.books) {
+            if (b.id == id) { return b }
+        }
+        return none
+    }
+
+    func find_by_isbn(self, isbn) {
+        if (isbn == "") { return none }
+        for (b in self.books) {
+            if (b.isbn == isbn) { return b }
+        }
+        return none
+    }
+
+    func has_active_loans_for(self, book_id) {
+        for (loan in self.active_loans) {
+            if (loan.book_id == book_id) { return true }
+        }
+        return false
+    }
+
+    func format_book_line(self, b) {
+        print(
+            b.id,
+            "|",
+            b.title,
+            "|",
+            b.author,
+            "|",
+            b.category,
+            "|",
+            b.shelf,
+            "|",
+            b.available,
+            "/",
+            b.total
+        )
+    }
+
+    func add_book(self, title, author, isbn, copies, category, year, shelf) {
+        if (title == "") {
+            print("错误：书名不能为空")
+            return false
+        }
+        if (author == "") {
+            print("错误：作者不能为空")
+            return false
+        }
+        if (copies <= 0) {
+            print("错误：册数必须大于 0")
+            return false
+        }
+        if (isbn != "") {
+            let existing = self.find_by_isbn(isbn)
+            if (existing) {
+                print("错误：ISBN 已存在 — #", existing.id, existing.title)
+                return false
+            }
+        }
+        let b = Book(
+            self.next_id,
+            title,
+            author,
+            isbn,
+            category,
+            year,
+            shelf,
+            copies,
+            copies,
+            0
+        )
+        self.books.append(b)
+        self.next_id = self.next_id + 1
+        print("已添加图书 #", b.id, ":", title, "[", category, "]")
+        return true
+    }
+
+    func show_book(self, id) {
+        let b = self.find_by_id(id)
+        if (not b) {
+            print("错误：图书不存在")
+            return false
+        }
+        print("-------- 图书详情 --------")
+        print("ID:", b.id)
+        print("书名:", b.title)
+        print("作者:", b.author)
+        print("ISBN:", b.isbn)
+        print("分类:", b.category)
+        print("出版年:", b.year)
+        print("书架:", b.shelf)
+        print("册数:", b.available, "/", b.total)
+        print("累计借阅:", b.borrow_count, "次")
+        print("-------------------------")
+        return true
+    }
+
+    func list_books(self) {
+        if (len(self.books) == 0) {
+            print("(暂无图书)")
+            return
+        }
+        print("ID | 书名 | 作者 | 分类 | 书架 | 可借/总量")
+        print("---")
+        for (b in self.books) {
+            self.format_book_line(b)
+        }
+    }
+
+    func list_books_sorted(self) {
+        if (len(self.books) == 0) {
+            print("(暂无图书)")
+            return
+        }
+        let sorted = sort_books_by_title(self.copy_books())
+        print("ID | 书名 | 作者 | 分类 | 书架 | 可借/总量  (按书名排序)")
+        print("---")
+        let i = 0
+        while (i < len(sorted)) {
+            self.format_book_line(sorted[i])
+            i = i + 1
+        }
+    }
+
+    func copy_books(self) {
+        let out = []
+        let i = 0
+        while (i < len(self.books)) {
+            out.append(self.books[i])
+            i = i + 1
+        }
+        return out
+    }
+
+    func search_books(self, keyword) {
+        let hits = []
+        let i = 0
+        while (i < len(self.books)) {
+            if (book_matches(self.books[i], keyword)) {
+                hits.append(self.books[i])
+            }
+            i = i + 1
+        }
+        if (len(hits) == 0) {
+            print("未找到匹配的图书")
+            return
+        }
+        print("找到", len(hits), "本图书：")
+        let j = 0
+        while (j < len(hits)) {
+            let b = hits[j]
+            print(
+                "#",
+                b.id,
+                b.title,
+                "-",
+                b.author,
+                "[",
+                b.category,
+                "]",
+                "(可借",
+                b.available,
+                "/",
+                b.total,
+                ")"
+            )
+            j = j + 1
+        }
+    }
+
+    func list_by_category(self, category) {
+        let hits = []
+        let i = 0
+        while (i < len(self.books)) {
+            if (category_matches(self.books[i], category)) {
+                hits.append(self.books[i])
+            }
+            i = i + 1
+        }
+        if (len(hits) == 0) {
+            print("该分类下暂无图书")
+            return
+        }
+        print("分类 [", category, "] 共", len(hits), "种：")
+        let j = 0
+        while (j < len(hits)) {
+            let b = hits[j]
+            print("#", b.id, b.title, "-", b.author)
+            j = j + 1
+        }
+    }
+
+    func list_available(self) {
+        let hits = []
+        let i = 0
+        while (i < len(self.books)) {
+            if (self.books[i].available > 0) {
+                hits.append(self.books[i])
+            }
+            i = i + 1
+        }
+        if (len(hits) == 0) {
+            print("当前没有可借图书")
+            return
+        }
+        print("可借图书 (", len(hits), "种)：")
+        let j = 0
+        while (j < len(hits)) {
+            let b = hits[j]
+            print("#", b.id, b.title, "— 可借", b.available, "册")
+            j = j + 1
+        }
+    }
+
+    func list_unavailable(self) {
+        let hits = []
+        let i = 0
+        while (i < len(self.books)) {
+            if (self.books[i].available == 0) {
+                hits.append(self.books[i])
+            }
+            i = i + 1
+        }
+        if (len(hits) == 0) {
+            print("没有已全部借出的图书")
+            return
+        }
+        print("已全部借出 (", len(hits), "种)：")
+        let j = 0
+        while (j < len(hits)) {
+            let b = hits[j]
+            print("#", b.id, b.title)
+            j = j + 1
+        }
+    }
+
+    func popular_books(self, limit) {
+        if (len(self.books) == 0) {
+            print("(暂无图书)")
+            return
+        }
+        let ranked = self.copy_books()
+        let n = len(ranked)
+        let i = 0
+        while (i < n) {
+            let j = i + 1
+            while (j < n) {
+                if (ranked[i].borrow_count < ranked[j].borrow_count) {
+                    swap_books(ranked, i, j)
+                }
+                j = j + 1
+            }
+            i = i + 1
+        }
+        let show = limit
+        if (show > n) { show = n }
+        if (show <= 0) { show = n }
+        print("热门借阅 TOP", show, "：")
+        let k = 0
+        while (k < show) {
+            let b = ranked[k]
+            print("#", k + 1, "—", b.title, "(", b.borrow_count, "次)")
+            k = k + 1
+        }
+    }
+
+    func borrow_book(self, id, reader) {
+        if (reader == "") {
+            print("错误：请填写读者姓名")
+            return false
+        }
+        let b = self.find_by_id(id)
+        if (not b) {
+            print("错误：图书不存在")
+            return false
+        }
+        if (b.available <= 0) {
+            print("错误：《", b.title, "》已全部借出")
+            return false
+        }
+        b.available = b.available - 1
+        b.borrow_count = b.borrow_count + 1
+        let loan = Loan(self.next_loan_id, b.id, b.title, reader)
+        self.active_loans.append(loan)
+        self.next_loan_id = self.next_loan_id + 1
+        print("借出成功：《", b.title, "》→", reader, "，剩余可借", b.available)
+        return true
+    }
+
+    func return_book(self, id, reader) {
+        let b = self.find_by_id(id)
+        if (not b) {
+            print("错误：图书不存在")
+            return false
+        }
+        if (b.available >= b.total) {
+            print("错误：《", b.title, "》没有借出记录可归还")
+            return false
+        }
+        let found = none
+        let new_loans = []
+        let i = 0
+        while (i < len(self.active_loans)) {
+            let loan = self.active_loans[i]
+            if (not found and loan.book_id == id) {
+                if (reader == "" or loan.reader == reader) {
+                    found = loan
+                } else {
+                    new_loans.append(loan)
+                }
+            } else {
+                new_loans.append(loan)
+            }
+            i = i + 1
+        }
+        if (not found) {
+            print("错误：未找到该书的在借记录")
+            return false
+        }
+        self.active_loans = new_loans
+        let book = self.find_by_id(id)
+        book.available = book.available + 1
+        print("归还成功：《", book.title, "》←", found.reader)
+        return true
+    }
+
+    func list_active_loans(self) {
+        if (len(self.active_loans) == 0) {
+            print("(当前无在借记录)")
+            return
+        }
+        print("在借记录 (", len(self.active_loans), "条)：")
+        print("借阅ID | 图书ID | 书名 | 读者")
+        print("---")
+        for (loan in self.active_loans) {
+            print(loan.id, "|", loan.book_id, "|", loan.book_title, "|", loan.reader)
+        }
+    }
+
+    func add_copies(self, id, extra) {
+        if (extra <= 0) {
+            print("错误：增加册数必须大于 0")
+            return false
+        }
+        let b = self.find_by_id(id)
+        if (not b) {
+            print("错误：图书不存在")
+            return false
+        }
+        b.total = b.total + extra
+        b.available = b.available + extra
+        print("已为 #", id, "《", b.title, "》增加", extra, "册，现", b.available, "/", b.total)
+        return true
+    }
+
+    func update_book(self, id, title, author, isbn, category, year, shelf) {
+        let b = self.find_by_id(id)
+        if (not b) {
+            print("错误：图书不存在")
+            return false
+        }
+        if (title != "") { b.title = title }
+        if (author != "") { b.author = author }
+        if (isbn != "") {
+            let other = self.find_by_isbn(isbn)
+            if (other and other.id != id) {
+                print("错误：ISBN 已被 #", other.id, "使用")
+                return false
+            }
+            b.isbn = isbn
+        }
+        if (category != "") { b.category = category }
+        if (year != 0) { b.year = year }
+        if (shelf != "") { b.shelf = shelf }
+        print("已更新图书 #", id)
+        return true
+    }
+
+    func remove_book(self, id) {
+        let b = self.find_by_id(id)
+        if (not b) {
+            print("错误：图书不存在")
+            return false
+        }
+        if (b.available < b.total) {
+            print("错误：《", b.title, "》仍有册在外借阅，无法删除")
+            return false
+        }
+        if (self.has_active_loans_for(id)) {
+            print("错误：存在在借记录，无法删除")
+            return false
+        }
+        self.books = self.filter_books_except(id)
+        print("已删除图书 #", id, "《", b.title, "》")
+        return true
+    }
+
+    func filter_books_except(self, id) {
+        let kept = []
+        let i = 0
+        while (i < len(self.books)) {
+            if (self.books[i].id != id) {
+                kept.append(self.books[i])
+            }
+            i = i + 1
+        }
+        return kept
+    }
+
+    func stats(self) {
+        let total_copies = 0
+        let available_copies = 0
+        let total_borrows = 0
+        let i = 0
+        while (i < len(self.books)) {
+            let bk = self.books[i]
+            total_copies = total_copies + bk.total
+            available_copies = available_copies + bk.available
+            total_borrows = total_borrows + bk.borrow_count
+            i = i + 1
+        }
+        print("======== 馆藏统计 ========")
+        print("馆藏品种:", len(self.books))
+        print("总册数:", total_copies)
+        print("可借册数:", available_copies)
+        print("已借出册数:", total_copies - available_copies)
+        print("累计借阅次数:", total_borrows)
+        print("当前在借笔数:", len(self.active_loans))
+    }
+
+    func stats_by_category(self) {
+        if (len(self.books) == 0) {
+            print("(暂无图书)")
+            return
+        }
+        print("======== 分类统计 ========")
+        let cats = []
+        let i = 0
+        while (i < len(self.books)) {
+            let key = normalize_category(self.books[i].category)
+            if (not (key in cats)) {
+                cats.append(key)
+            }
+            i = i + 1
+        }
+        let ci = 0
+        while (ci < len(cats)) {
+            let c = cats[ci]
+            let hits = []
+            let hi = 0
+            while (hi < len(self.books)) {
+                if (normalize_category(self.books[hi].category) == c) {
+                    hits.append(self.books[hi])
+                }
+                hi = hi + 1
+            }
+            let copies = 0
+            let hj = 0
+            while (hj < len(hits)) {
+                copies = copies + hits[hj].total
+                hj = hj + 1
+            }
+            print(c, ":", len(hits), "种,", copies, "册")
+            ci = ci + 1
+        }
+    }
+}
+
+export func create_library() {
+    return Library([], 1, [], 1)
+}
+
+export func load_sample_books(library) {
+    library.add_book(
+        "深入理解计算机系统",
+        "Randal E. Bryant",
+        "9787111544937",
+        3,
+        "计算机",
+        2016,
+        "A-01"
+    )
+    library.add_book(
+        "代码大全",
+        "Steve McConnell",
+        "9787121022982",
+        2,
+        "软件工程",
+        2006,
+        "A-02"
+    )
+    library.add_book(
+        "Rust 程序设计",
+        "Jim Blandy",
+        "9787115548644",
+        1,
+        "编程语言",
+        2021,
+        "B-01"
+    )
+    library.add_book(
+        "算法导论",
+        "Thomas H. Cormen",
+        "9787111407010",
+        2,
+        "计算机",
+        2013,
+        "A-03"
+    )
+    library.add_book(
+        "三体",
+        "刘慈欣",
+        "9787536692930",
+        4,
+        "科幻",
+        2008,
+        "C-01"
+    )
+    library.add_book(
+        "人类简史",
+        "Yuval Harari",
+        "9787508647357",
+        2,
+        "历史",
+        2014,
+        "D-01"
+    )
+}

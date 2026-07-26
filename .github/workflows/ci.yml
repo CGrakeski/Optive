@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE"
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+# 取消同分支上被取代的旧运行，节省 CI 分钟。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # 单独的 fmt / clippy 门禁：快，且不依赖完整编译产物。
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt check
+        run: cargo fmt --all -- --check
+      - name: clippy (all targets, deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+  # 三平台构建 + 测试。集成测试会 spawn 已构建的 `Optive` 二进制，
+  # `cargo test` 默认会先编译 bin，故无需额外步骤。
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --bin Optive
+      - name: Test (default — 跳过被 ignore 的慢基准)
+        run: cargo test
+      - name: Test (ignored 基准，仅作冒烟)
+        # 慢的 fib(30) 等；CI 上只验证能跑通，不读性能数据。
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test -- --ignored
+
+  # release 构建冒烟：确保 release profile（LTO + overflow-checks）也能编译通过并运行。
+  build-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (release)
+        run: cargo build --release --bin Optive
+      - name: Smoke run
+        run: ./target/release/Optive -V
+
+  # 依赖漏洞扫描（RustSec advisory DB）。
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: cargo audit
+        run: cargo audit

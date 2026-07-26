@@ -1,0 +1,7 @@
+struct Stuffed {
+    func sth1() { return 101 }
+    func sth2() { return 202 }
+}
+
+export let sth0 = Stuffed()
+export let value = 42

@@ -1,0 +1,12 @@
+# Example Optive project manifest.
+# Copy to a project root as `Optive.toml`.
+
+[package]
+name = "hello"
+version = "0.1.0"
+# entry = "src/main.tive"   # default: src/main.tive then main.tive
+
+[dependencies]
+# Installs into deps/<name>/ when you `Optive run` (skipped if already present).
+# helper = "https://github.com/example/helper.git"
+# other = { git = "https://github.com/example/other", rev = "main" }

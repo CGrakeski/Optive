@@ -1,0 +1,3 @@
+export let answer = 42
+intern let hidden = 99
+export func double(x) { return x * 2 }

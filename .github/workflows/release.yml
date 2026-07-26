@@ -1,0 +1,97 @@
+name: Release
+
+# 打 tag `v*` 时：三平台构建 release 二进制，附到 GitHub Release。
+# 这是「CD」部分；CI 由 ci.yml 负责。
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  # 产物剥离符号，减小体积。
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+
+# 同 tag 重复推送时不取消进行中的发布。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: Optive
+            archive: optive-${{ github.ref_name }}-x86_64-linux.tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: Optive
+            archive: optive-${{ github.ref_name }}-aarch64-macos.tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: Optive
+            archive: optive-${{ github.ref_name }}-x86_64-macos.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: Optive.exe
+            archive: optive-${{ github.ref_name }}-x86_64-windows.zip
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }} --bin Optive
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -eux
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../${{ matrix.archive }} ${{ matrix.artifact }}
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        run: |
+          Compress-Archive -Path target/${{ matrix.target }}/release/${{ matrix.artifact }} -DestinationPath ${{ matrix.archive }}
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+          retention-days: 30
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate SHA256 checksums
+        run: |
+          set -eux
+          cd dist
+          sha256sum optive-* > SHA256SUMS
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/optive-*
+            dist/SHA256SUMS
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
