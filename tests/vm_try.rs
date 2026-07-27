@@ -171,6 +171,46 @@ fn handle_host_errors() {
     assert_bool(r#"handle {"a":1}[2] is none"#, true);
 }
 
+/// break 越过 handle 时必须 PopTry，否则后续异常会跳进已废弃的 catch PC。
+#[test]
+fn handle_break_clears_try_frame() {
+    assert_num(
+        r#"
+let n = 0
+loop {
+    let _ = handle (1 / 0)
+    n = n + 1
+    if (n == 1) { break }
+}
+try {
+    1 / 0
+} catch (e: ZeroDivisionError) {
+    n + 10
+}
+"#,
+        "11",
+    );
+}
+
+/// break 从 handle 操作数内的 match 块跳出时也要 PopTry。
+#[test]
+fn handle_break_inside_match_operand() {
+    assert_num(
+        r#"
+let n = 0
+loop {
+    n = n + 1
+    let _ = handle (match (n) {
+        case (1) { break }
+    } else { 0 })
+    n = n + 100
+}
+n
+"#,
+        "1",
+    );
+}
+
 #[test]
 fn catch_lookup_error_base_for_index() {
     assert_num(

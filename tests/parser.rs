@@ -199,6 +199,13 @@ fn parse_do_expr() {
 }
 
 #[test]
+fn parse_do_block_iife_sugar() {
+    parse_ok("do { return 1 }");
+    parse_ok("go do { return 2 }");
+    parse_ok("await do { return 3 }");
+}
+
+#[test]
 fn parse_if_stmt() {
     parse_ok("if (true) { let x = 1 }");
 }
@@ -322,6 +329,12 @@ fn parse_multiline_in_parens() {
 #[test]
 fn parse_multiline_list() {
     parse_ok("[1,\n2,\n3]");
+}
+
+/// `{ foo(\n x\n) }` 内换行在 () 里，不应被当成多语句块。
+#[test]
+fn parse_brace_call_with_newline_inside_parens() {
+    parse_ok("let s = { abs(\n  -1\n) }");
 }
 
 #[test]

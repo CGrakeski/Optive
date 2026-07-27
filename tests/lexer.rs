@@ -86,7 +86,12 @@ fn lex_do_macro_quote() {
 
 #[test]
 fn lex_operators_arithmetic() {
-    assert_kinds!("+ - * /", Plus, Minus, Star, Slash);
+    assert_kinds!("+ - * / %", Plus, Minus, Star, Slash, Percent);
+}
+
+#[test]
+fn lex_operators_bitwise() {
+    assert_kinds!("& | ^ ~ << >>", Ampersand, Bar, Caret, Tilde, LtLt, GtGt);
 }
 
 #[test]

@@ -57,18 +57,6 @@ fn main() {
                 println!("Optive {VERSION}");
                 return;
             }
-            "get" => {
-                // 兼容旧命令：转发为 add
-                if args.len() != 3 {
-                    color::eprint_error("usage: Optive get <url>  (prefer: Optive add <url>)");
-                    process::exit(2);
-                }
-                if let Err(e) = cmd_add(&["add".into(), args[2].clone()]) {
-                    color::eprint_error(format!("Error: {e}"));
-                    process::exit(1);
-                }
-                return;
-            }
             "add" => {
                 if let Err(e) = cmd_add(&args[1..]) {
                     color::eprint_error(format!("Error: {e}"));
@@ -467,7 +455,6 @@ fn print_help() {
     println!("  Optive deps doctor [-v]        Diagnose deps / lock / orphans");
     println!("  Optive env                     Print OPTIVE_HOME and paths");
     println!("  Optive change track_latest=…   Toggle tip-following (warns)");
-    println!("  Optive get <url>               Deprecated alias for add");
     println!("  Optive -h, --help              Show this help");
     println!("  Optive -V, --version           Show version");
     println!();

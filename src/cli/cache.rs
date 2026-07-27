@@ -6,6 +6,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use super::store;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectCache {
     #[serde(default)]
@@ -27,32 +29,56 @@ impl ProjectCache {
         if !path.is_file() {
             return Self::default();
         }
-        fs::read_to_string(path)
-            .ok()
-            .and_then(|t| toml::from_str(&t).ok())
-            .unwrap_or_default()
+        match fs::read_to_string(path) {
+            Ok(t) => match toml::from_str(&t) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "warning: ignoring corrupt {}: {e}",
+                        path.display()
+                    );
+                    Self::default()
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "warning: cannot read {}: {e}",
+                    path.display()
+                );
+                Self::default()
+            }
+        }
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let text = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
-        fs::write(path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        let tmp = path.with_extension("cache.tmp");
+        fs::write(&tmp, &text).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        fs::rename(&tmp, path).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            format!("cannot rename {} → {}: {e}", tmp.display(), path.display())
+        })?;
         Ok(())
     }
 
     fn key(git: &str, branch: Option<&str>) -> String {
+        let git = store::normalize_git_url(git);
         match branch {
             Some(b) => format!("{git}@{b}"),
-            None => git.to_string(),
+            None => git,
         }
     }
 
     pub fn get_commit(&self, git: &str, branch: Option<&str>) -> Option<&str> {
+        let norm = store::normalize_git_url(git);
         let k = Self::key(git, branch);
         self.entries.get(&k).map(|e| e.commit.as_str()).or_else(|| {
-            // 宽松：仅按 git 匹配
+            // 宽松：规范化后按 git + branch 匹配（兼容旧缓存里未规范化的键）
             self.entries
                 .values()
-                .find(|e| e.git == git && e.branch.as_deref() == branch)
+                .find(|e| {
+                    store::normalize_git_url(&e.git) == norm && e.branch.as_deref() == branch
+                })
                 .map(|e| e.commit.as_str())
         })
     }
@@ -64,15 +90,31 @@ impl ProjectCache {
         commit: &str,
         id: Option<&str>,
     ) {
+        let norm = store::normalize_git_url(git);
         let k = Self::key(git, branch);
         self.entries.insert(
             k,
             CacheEntry {
-                git: git.to_string(),
+                git: norm,
                 branch: branch.map(|s| s.to_string()),
                 commit: commit.to_string(),
                 id: id.map(|s| s.to_string()),
             },
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tip_cache_key_normalizes_git_url() {
+        let mut c = ProjectCache::default();
+        c.put("https://GitHub.com/Foo/Bar.git", None, "abc", Some("id1"));
+        assert_eq!(
+            c.get_commit("https://github.com/foo/bar", None),
+            Some("abc")
         );
     }
 }

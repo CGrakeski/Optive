@@ -41,6 +41,11 @@ pub fn normalize_git_url(url: &str) -> String {
     if u.ends_with(".git") {
         u.truncate(u.len() - 4);
     }
+    // file://：保留路径大小写（大小写敏感盘上 `/Home/Dep` ≠ `/home/Dep`）。
+    if u.starts_with("file:") {
+        return u;
+    }
+    // 网络 / scp-like：整段小写，保证 GitHub.com/Foo 与 github.com/foo 同一 CAS id。
     u.to_ascii_lowercase()
 }
 
@@ -55,7 +60,8 @@ impl Store {
         fs::create_dir_all(home.join("pack"))?;
         let db_path = home.join("index.db");
         let conn = Connection::open(&db_path)?;
-        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        conn.busy_timeout(std::time::Duration::from_secs(30))?;
+        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")?;
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS packs (
@@ -180,7 +186,9 @@ impl Store {
     pub fn delete_pack(&mut self, id: &str) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(rec) = self.lookup(id)? {
             if rec.path.exists() {
-                let _ = fs::remove_dir_all(&rec.path);
+                fs::remove_dir_all(&rec.path).map_err(|e| {
+                    format!("cannot remove pack {}: {e}", rec.path.display())
+                })?;
             }
         }
         self.conn
@@ -199,11 +207,8 @@ pub fn ensure_pack(
     if let Some(rec) = store.lookup(&id)? {
         if rec.path.is_dir() {
             store.touch_access(&id)?;
-            // 仍对齐 rev（tag/commit）
-            if let Err(e) = git_ops::checkout_rev(&rec.path, effective_rev) {
-                // tip-only 裸 sha 应对齐；失败则继续使用现有树
-                eprintln!("warning: checkout {effective_rev} in {}: {e}", rec.path.display());
-            }
+            // checkout 失败必须硬失败，否则会跑错版本。
+            git_ops::checkout_rev(&rec.path, effective_rev)?;
             return Ok((id, rec.path, false));
         }
         // index 有、pack 无 → 重装
@@ -213,14 +218,32 @@ pub fn ensure_pack(
     if target.exists() {
         fs::remove_dir_all(&target)?;
     }
-    // 克隆到临时目录再改名，避免半成品
-    let tmp = store.home.join("pack").join(format!(".tmp-{id}"));
+    // 唯一临时目录，避免并发 ensure 互删共享 `.tmp-{id}`。
+    let tmp = store.home.join("pack").join(format!(
+        ".tmp-{id}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
     if tmp.exists() {
         fs::remove_dir_all(&tmp)?;
     }
     fs::create_dir_all(tmp.parent().expect("tempfile path always has a parent"))?;
     git_ops::clone_into(git_url, &tmp)?;
     git_ops::checkout_rev(&tmp, effective_rev)?;
+    // 并发下另一进程可能已装好：丢弃本进程临时目录并复用。
+    if target.exists() {
+        let _ = fs::remove_dir_all(&tmp);
+        if let Some(rec) = store.lookup(&id)? {
+            if rec.path.is_dir() {
+                git_ops::checkout_rev(&rec.path, effective_rev)?;
+                store.touch_access(&id)?;
+                return Ok((id, rec.path, false));
+            }
+        }
+    }
     fs::rename(&tmp, &target)?;
     let rel = PathBuf::from("pack").join(&id);
     store.upsert_pack(&id, git_url, effective_rev, &rel)?;
@@ -238,12 +261,37 @@ pub fn ensure_local_pack(
     git_ops::validate_dep_dir_name_pub(name)?;
     fs::create_dir_all(project_deps)?;
     let target = project_deps.join(name);
+    let marker = target.join(".optive-id");
     if target.is_dir() {
-        git_ops::checkout_rev(&target, effective_rev).ok();
-        return Ok((id, target, false));
+        let ok = fs::read_to_string(&marker)
+            .ok()
+            .map(|s| s.trim() == id)
+            .unwrap_or(false);
+        if ok {
+            // 有匹配标记：尽量对齐 rev；无 .git 的 fixture 目录跳过 checkout。
+            if target.join(".git").is_dir() {
+                git_ops::checkout_rev(&target, effective_rev)?;
+            }
+            return Ok((id, target, false));
+        }
+        if target.join(".git").is_dir() {
+            // 真 git 仓库但身份不符 → 重装，避免静默用错远程。
+            fs::remove_dir_all(&target)?;
+        } else if marker.is_file() {
+            // 无 .git 却已有错误 marker：勿盲盖章复用，避免把错 fixture 当成目标 rev。
+            return Err(format!(
+                "deps/{name} exists with mismatched .optive-id (want {id}); remove the directory or fix the marker"
+            )
+            .into());
+        } else {
+            // 无 .git、无 marker 的本地 fixture（测试/手摆 deps/）：盖章后复用。
+            fs::write(&marker, &id)?;
+            return Ok((id, target, false));
+        }
     }
     git_ops::clone_into(git_url, &target)?;
     git_ops::checkout_rev(&target, effective_rev)?;
+    fs::write(&marker, &id)?;
     Ok((id, target, true))
 }
 

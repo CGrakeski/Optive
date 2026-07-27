@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -14,7 +14,7 @@ use crate::type_registry;
 use crate::types::{self, type_expr_display};
 use crate::ast::TypeExpr;
 use crate::opcode::{CompiledProgram, FunctionObject, Instruction, MacroObject, ModuleGlobalEnv};
-use crate::value::{BuiltinFn, DictMap, DispatchTable, IteratorKind, IteratorState, ModuleObject, Num, Value, ValueKey, values_identical};
+use crate::value::{BuiltinFn, ChannelInner, DictMap, DispatchTable, IteratorKind, IteratorState, ModuleObject, MutexInner, Num, TaskInner, TaskState, Value, ValueKey, values_identical};
 use crate::Result;
 
 /// 运行时可见的已安装依赖包。
@@ -110,6 +110,18 @@ fn max_call_depth() -> usize {
 
 /// 加载期一次性校验热字节码结构。畸形字节码在此干净报错，
 /// 让主循环的安全索引（`ops[pc]` 等）有了显式边界保证。
+fn validate_function_hot(func: &crate::opcode::FunctionObject) -> Result<()> {
+    if func.body.len() != func.hot.ops.len() {
+        return Err(RuntimeError::msg(format!(
+            "internal: function `{}` code/hot length mismatch ({} != {})",
+            func.name,
+            func.body.len(),
+            func.hot.ops.len()
+        )));
+    }
+    validate_hot_bytecode(&func.hot)
+}
+
 fn validate_hot_bytecode(hot: &crate::hot_code::HotCode) -> Result<()> {
     use crate::hot_code::*;
     let n = hot.ops.len();
@@ -124,10 +136,7 @@ fn validate_hot_bytecode(hot: &crate::hot_code::HotCode) -> Result<()> {
         let op = hot.ops[pc];
         let arg = hot.args[pc];
         // 跳转类指令的目标必须落在 [0, n)。
-        let is_jump = matches!(
-            op,
-            H_GOTO | H_GOTO_IF | H_GOTO_IF_NOT
-        );
+        let is_jump = matches!(op, H_GOTO | H_GOTO_IF | H_GOTO_IF_NOT);
         if is_jump {
             let target = arg;
             if target < 0 || (target as usize) >= n {
@@ -136,6 +145,17 @@ fn validate_hot_bytecode(hot: &crate::hot_code::HotCode) -> Result<()> {
                     pc, target, n
                 )));
             }
+        }
+        // 槽位 / 参数计数字段不得为负（否则 as usize 会变成巨大偏移）。
+        let is_slot_or_argc = matches!(
+            op,
+            H_LOAD_FAST | H_STORE_FAST | H_RET_FAST | H_CALL_SELF
+        );
+        if is_slot_or_argc && arg < 0 {
+            return Err(RuntimeError::msg(format!(
+                "internal: hot bytecode op at pc={} has negative arg {}",
+                pc, arg
+            )));
         }
     }
     Ok(())
@@ -284,6 +304,8 @@ pub struct Vm {
     pub(crate) set_element_contracts: FxHashMap<usize, crate::ast::TypeExpr>,
     /// 已编译程序中的协议定义（供运行时 `is_a` / `:: Protocol`）。
     pub(crate) protocols: FxHashMap<String, Rc<crate::protocol::ProtocolDef>>,
+    /// M:1 协作调度就绪队列。
+    pub(crate) ready_tasks: VecDeque<Rc<RefCell<TaskInner>>>,
 }
 
 #[derive(Clone)]
@@ -315,8 +337,15 @@ enum StepAction {
     Sub,
     Mul,
     Div,
+    Mod,
     Pow,
+    BitAnd,
+    BitOr,
+    BitXor,
+    LShift,
+    RShift,
     Neg,
+    Invert,
     Not,
     TruthyNot,
     And,
@@ -360,7 +389,7 @@ enum StepAction {
     DictSet,
     SetAdd,
     Ret,
-    RetFast,
+    RetFast(usize),
     RetLeave,
     VecNew(usize),
     DictNew(usize),
@@ -400,6 +429,15 @@ enum StepAction {
     TypeCheck(TypeExpr),
     FindMod(String),
     RegisterExport(String),
+    GoCall { argc: usize },
+    GoValue,
+    Await,
+    Yield,
+    SelectTryRecv,
+    SelectTrySend,
+    SelectPollTask,
+    MakeDeadline,
+    SelectPollDeadline,
 }
 
 pub struct ModuleInitSnapshot {
@@ -407,6 +445,7 @@ pub struct ModuleInitSnapshot {
     pub(crate) functions: FxHashMap<String, Rc<FunctionObject>>,
     pub(crate) macros: FxHashMap<String, Rc<MacroObject>>,
     pub(crate) struct_defs: FxHashMap<String, Rc<crate::value::StructDef>>,
+    pub(crate) overload_tables: FxHashMap<String, Vec<Rc<FunctionObject>>>,
     pub(crate) const_names: FxHashSet<String>,
     pub(crate) module_init_exports: Option<Rc<RefCell<HashMap<String, Value>>>>,
     pub(crate) code: Rc<Vec<Instruction>>,
@@ -479,6 +518,7 @@ impl Vm {
             dict_contracts: FxHashMap::default(),
             set_element_contracts: FxHashMap::default(),
             protocols: FxHashMap::default(),
+            ready_tasks: VecDeque::new(),
         };
         builtins::install_globals(&mut vm);
         type_registry::install_core_types(&mut vm);
@@ -646,6 +686,7 @@ impl Vm {
             functions: self.functions.clone(),
             macros: self.macros.clone(),
             struct_defs: self.struct_defs.clone(),
+            overload_tables: self.overload_tables.clone(),
             const_names: self.const_names.clone(),
             module_init_exports: self.module_init_exports.clone(),
             code: self.code.clone(),
@@ -687,6 +728,7 @@ impl Vm {
         self.functions = snap.functions.clone();
         self.macros = snap.macros.clone();
         self.struct_defs = snap.struct_defs.clone();
+        self.overload_tables = snap.overload_tables.clone();
         exports
     }
 
@@ -696,11 +738,13 @@ impl Vm {
         new_functions: HashMap<String, Rc<FunctionObject>>,
         new_macros: HashMap<String, Rc<MacroObject>>,
         new_struct_defs: HashMap<String, Rc<crate::value::StructDef>>,
+        new_overloads: FxHashMap<String, Vec<Rc<FunctionObject>>>,
     ) {
         self.globals = snap.globals;
         self.functions = snap.functions;
         self.macros = snap.macros;
         self.struct_defs = snap.struct_defs;
+        self.overload_tables = snap.overload_tables;
         self.const_names = snap.const_names;
         self.module_init_exports = snap.module_init_exports;
         self.code = snap.code;
@@ -721,6 +765,7 @@ impl Vm {
         self.functions.extend(new_functions);
         self.macros.extend(new_macros);
         self.struct_defs.extend(new_struct_defs);
+        self.overload_tables.extend(new_overloads);
         self.script_global_names = snap.script_global_names;
         self.script_globals = snap.script_globals;
     }
@@ -728,7 +773,22 @@ impl Vm {
     pub fn load_program(&mut self, program: CompiledProgram) -> Result<()> {
         // 先做一次性结构校验：畸形字节码在进入主循环前就干净报错，
         // 让热路径的安全索引有了显式保证（纵深防御）。
+        if program.code.len() != program.hot.ops.len() {
+            return Err(RuntimeError::msg(format!(
+                "internal: program code/hot length mismatch ({} != {})",
+                program.code.len(),
+                program.hot.ops.len()
+            )));
+        }
         validate_hot_bytecode(&program.hot)?;
+        for f in program.functions.values() {
+            validate_function_hot(f)?;
+        }
+        for overloads in program.overload_tables.values() {
+            for f in overloads {
+                validate_function_hot(f)?;
+            }
+        }
         // 每个代码块使用全新操作数栈与调用状态——REPL 复用同一 Vm，
         // 不得把先前表达式的结果残留到后续语句之下。
         self.op_clear();
@@ -801,11 +861,12 @@ impl Vm {
     pub(crate) fn snapshot_module_global_env(&self) -> ModuleGlobalEnv {
         ModuleGlobalEnv {
             global_names: self.script_global_names.clone(),
-            globals: self
-                .globals
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
+            globals: std::cell::RefCell::new(
+                self.globals
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ),
         }
     }
 
@@ -823,15 +884,16 @@ impl Vm {
             .collect();
     }
 
-    fn sync_script_global(&mut self, idx: usize, val: Value) {
-        if idx < self.script_globals.len() {
-            self.script_globals[idx] = val.clone();
-            if let Some(name) = self.script_global_names.get(idx) {
-                if let Some(Value::Cell(cell)) = self.globals.get(name.as_str()) {
-                    *cell.borrow_mut() = val;
-                } else {
-                    self.globals.insert(name.clone(), val);
-                }
+    /// 按名字写入全局；若该名在 script 表中则同步槽位。
+    fn store_global_by_name(&mut self, name: &str, val: Value) {
+        if let Some(Value::Cell(cell)) = self.globals.get(name) {
+            *cell.borrow_mut() = val.clone();
+        } else {
+            self.globals.insert(name.to_string(), val.clone());
+        }
+        if let Some(script_idx) = self.script_global_names.iter().position(|n| n == name) {
+            if script_idx < self.script_globals.len() {
+                self.script_globals[script_idx] = val;
             }
         }
     }
@@ -851,10 +913,15 @@ impl Vm {
                     env.global_names.len()
                 )));
             };
+            if name.is_empty() {
+                return Err(RuntimeError::msg(format!(
+                    "internal: LoadGlobal({idx}) resolves to empty global name"
+                )));
+            }
             // 优先用模块快照；否则回退到活动 globals，以便 REPL 前向引用
             //（先定义 `a` 再定义 `b`）仍能解析，并使 LoadGlobal 下标绑定到
             // 函数编译期的名字，即使后来 `load_program` 替换了 `script_global_names`。
-            if let Some(v) = env.globals.get(name.as_str()) {
+            if let Some(v) = env.globals.borrow().get(name.as_str()) {
                 return Ok(match v {
                     Value::Cell(c) => c.borrow().clone(),
                     other => other.clone(),
@@ -872,6 +939,11 @@ impl Vm {
                 self.script_global_names.len()
             )));
         };
+        if name.is_empty() {
+            return Err(RuntimeError::msg(format!(
+                "internal: LoadGlobal({idx}) resolves to empty global name"
+            )));
+        }
         match self.globals.get(name.as_str()) {
             Some(Value::Cell(c)) => Ok(c.borrow().clone()),
             Some(v) => Ok(v.clone()),
@@ -1818,6 +1890,23 @@ impl Vm {
                     break 'hot;
                 }
                 match self.dispatch_hot_u8(ops, args, pc) {
+                    HotFlow::Cont if self.hot_failed => {
+                        // 部分热路径在 set_hot_error 后仍返回 Cont（如 CallSelf 递归超限、
+                        // pop_hot 下溢）；统一在此升级为失败，避免静默继续执行。
+                        self.hot_failed = false;
+                        let e = self
+                            .hot_error
+                            .take()
+                            .unwrap_or_else(|| RuntimeError::msg("hot path error"));
+                        match self.handle_or_promote_error(&e)? {
+                            true => continue 'outer,
+                            false => {
+                                self.record_error_stack();
+                                self.unwind_user_calls_on_error()?;
+                                return Err(self.finalize_runtime_error(e));
+                            }
+                        }
+                    }
                     HotFlow::Cont => continue 'hot,
                     HotFlow::Fail => {
                         self.hot_failed = false;
@@ -1970,8 +2059,15 @@ impl Vm {
             I::Sub | I::SubNumNum => StepAction::Sub,
             I::Mul | I::MulNumNum => StepAction::Mul,
             I::Div | I::DivNumNum => StepAction::Div,
+            I::Mod => StepAction::Mod,
             I::Pow | I::PowNumNum => StepAction::Pow,
+            I::BitAnd => StepAction::BitAnd,
+            I::BitOr => StepAction::BitOr,
+            I::BitXor => StepAction::BitXor,
+            I::LShift => StepAction::LShift,
+            I::RShift => StepAction::RShift,
             I::Neg => StepAction::Neg,
+            I::Invert => StepAction::Invert,
             I::Not => StepAction::Not,
             I::TruthyNot => StepAction::TruthyNot,
             I::And => StepAction::And,
@@ -2022,7 +2118,7 @@ impl Vm {
             I::DictSet => StepAction::DictSet,
             I::SetAdd => StepAction::SetAdd,
             I::Ret => StepAction::Ret,
-            I::RetFast(_) => StepAction::RetFast,
+            I::RetFast(slot) => StepAction::RetFast(*slot),
             I::RetLeave => StepAction::RetLeave,
             I::VecNew(n) => StepAction::VecNew(*n),
             I::DictNew(n) => StepAction::DictNew(*n),
@@ -2072,11 +2168,26 @@ impl Vm {
             I::TypeCheck(ty) => StepAction::TypeCheck(ty.clone()),
             I::FindMod(name) => StepAction::FindMod(name.clone()),
             I::RegisterExport(name) => StepAction::RegisterExport(name.clone()),
+            I::GoCall(argc) => StepAction::GoCall { argc: *argc },
+            I::GoValue => StepAction::GoValue,
+            I::Await => StepAction::Await,
+            I::Yield => StepAction::Yield,
+            I::SelectTryRecv => StepAction::SelectTryRecv,
+            I::SelectTrySend => StepAction::SelectTrySend,
+            I::SelectPollTask => StepAction::SelectPollTask,
+            I::MakeDeadline => StepAction::MakeDeadline,
+            I::SelectPollDeadline => StepAction::SelectPollDeadline,
         }
     }
 
     fn step(&mut self) -> Result<()> {
         let pc = self.pc;
+        if pc >= self.code.len() {
+            return Err(RuntimeError::msg(format!(
+                "internal: pc {pc} out of range (code len {})",
+                self.code.len()
+            )));
+        }
         self.pc += 1;
         let action = Self::decode_step_action(&self.code[pc]);
         self.run_step_action(action)
@@ -2167,9 +2278,86 @@ impl Vm {
                 };
                 self.push_value(result);
             }
+            StepAction::Mod => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                let result = if matches!((&a, &b), (Value::Num(_), Value::Num(_))) {
+                    a.rem(&b)?
+                } else {
+                    self.dispatch_binary_arith(&a, &b, "__mod__", "__rmod__", |x, y| {
+                        x.rem(y)
+                    })?
+                };
+                self.push_value(result);
+            }
+            StepAction::BitAnd => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                let result = if matches!((&a, &b), (Value::Num(_), Value::Num(_))) {
+                    a.bitand(&b)?
+                } else {
+                    self.dispatch_binary_arith(&a, &b, "__and__", "__rand__", |x, y| {
+                        x.bitand(y)
+                    })?
+                };
+                self.push_value(result);
+            }
+            StepAction::BitOr => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                let result = if matches!((&a, &b), (Value::Num(_), Value::Num(_))) {
+                    a.bitor(&b)?
+                } else {
+                    self.dispatch_binary_arith(&a, &b, "__or__", "__ror__", |x, y| {
+                        x.bitor(y)
+                    })?
+                };
+                self.push_value(result);
+            }
+            StepAction::BitXor => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                let result = if matches!((&a, &b), (Value::Num(_), Value::Num(_))) {
+                    a.bitxor(&b)?
+                } else {
+                    self.dispatch_binary_arith(&a, &b, "__xor__", "__rxor__", |x, y| {
+                        x.bitxor(y)
+                    })?
+                };
+                self.push_value(result);
+            }
+            StepAction::LShift => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                let result = if matches!((&a, &b), (Value::Num(_), Value::Num(_))) {
+                    a.lshift(&b)?
+                } else {
+                    self.dispatch_binary_arith(&a, &b, "__lshift__", "__rlshift__", |x, y| {
+                        x.lshift(y)
+                    })?
+                };
+                self.push_value(result);
+            }
+            StepAction::RShift => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                let result = if matches!((&a, &b), (Value::Num(_), Value::Num(_))) {
+                    a.rshift(&b)?
+                } else {
+                    self.dispatch_binary_arith(&a, &b, "__rshift__", "__rrshift__", |x, y| {
+                        x.rshift(y)
+                    })?
+                };
+                self.push_value(result);
+            }
             StepAction::Neg => {
                 let a = self.pop()?;
                 let result = self.dispatch_neg(&a)?;
+                self.push_value(result);
+            }
+            StepAction::Invert => {
+                let a = self.pop()?;
+                let result = self.dispatch_invert(&a)?;
                 self.push_value(result);
             }
             StepAction::Not => {
@@ -2334,15 +2522,59 @@ impl Vm {
             }
             StepAction::StoreGlobal(idx) => {
                 let val = self.pop()?;
-                if let Some(name) = self.script_global_names.get(idx) {
-                    if self.const_names.contains(name) {
-                        return Err(RuntimeError::msg(format!(
-                            "cannot assign to const binding: {name}"
-                        )));
-                    }
+                // 与 LoadGlobal 一致：有活动函数时按该函数 module_env 的名字解析下标，
+                // 避免 REPL/二次 load_program 替换 script_global_names 后写错槽。
+                let name = if let Some(env) = self.active_module_global_env() {
+                    env.global_names.get(idx).cloned().ok_or_else(|| {
+                        RuntimeError::msg(format!(
+                            "internal: StoreGlobal({idx}) out of range for function global table (len {})",
+                            env.global_names.len()
+                        ))
+                    })?
+                } else {
+                    self.script_global_names.get(idx).cloned().ok_or_else(|| {
+                        RuntimeError::msg(format!(
+                            "internal: StoreGlobal({idx}) out of range for script global table (len {})",
+                            self.script_global_names.len()
+                        ))
+                    })?
+                };
+                if name.is_empty() {
+                    return Err(RuntimeError::msg(format!(
+                        "internal: StoreGlobal({idx}) resolves to empty global name"
+                    )));
                 }
-                self.sync_script_global(idx, val);
-                if let Some(name) = self.script_global_names.get(idx).cloned() {
+                if self.const_names.contains(name.as_str()) {
+                    return Err(RuntimeError::msg(format!(
+                        "cannot assign to const binding: {name}"
+                    )));
+                }
+                // 克隆 Rc，避免与 `finalize_const_init` 的 &mut self 借权冲突。
+                let module_env = self
+                    .user_call_frames
+                    .iter()
+                    .rev()
+                    .find_map(|frame| frame.func.module_env.clone());
+                if let Some(env) = module_env {
+                    // 写入模块快照，使导入后模块函数的赋值留在模块内。
+                    {
+                        let mut g = env.globals.borrow_mut();
+                        if let Some(Value::Cell(cell)) = g.get(name.as_str()) {
+                            *cell.borrow_mut() = val.clone();
+                        } else {
+                            g.insert(name.clone(), val.clone());
+                        }
+                    }
+                    // 主脚本/REPL：名字在 live globals 或 script 表里时必须同步，
+                    // 否则函数内 StoreGlobal 只改快照，顶层读到旧值。
+                    if self.globals.contains_key(name.as_str())
+                        || self.script_global_names.iter().any(|n| n == &name)
+                    {
+                        self.store_global_by_name(&name, val);
+                    }
+                    self.finalize_const_init(&name);
+                } else {
+                    self.store_global_by_name(&name, val);
                     self.finalize_const_init(&name);
                 }
             }
@@ -2531,7 +2763,9 @@ impl Vm {
                 }
                 self.pc = self.code.len();
             }
-            StepAction::RetFast => {
+            StepAction::RetFast(slot) => {
+                let result_sv = self.load_fast_sv(slot);
+                self.op_push(result_sv);
                 self.pc = self.code.len();
             }
             StepAction::RetLeave => {
@@ -2710,9 +2944,11 @@ impl Vm {
                 });
             }
             StepAction::EndTry => {
+                // 成功离开 try：先弹出帧，再跳到 else / end。
+                // 这样 else 与成功清理不再被同一 handler 覆盖。
                 let frame = self
                     .try_stack
-                    .last()
+                    .pop()
                     .ok_or_else(|| RuntimeError::msg("END_TRY without ENTER_TRY"))?;
                 let target = if frame.else_pc != 0 {
                     frame.else_pc
@@ -2830,13 +3066,110 @@ impl Vm {
             }
             StepAction::RegisterExport(name) => {
                 if let Some(ref exports) = self.module_init_exports {
-                    let val = if let Some(v) = self.load_script_global_by_name(&name) {
+                    let mut val = if let Some(v) = self.load_script_global_by_name(&name) {
                         v
                     } else {
                         self.load_name(&name)?
                     };
+                    // NewVar 初值为 none；若 StoreGlobal 曾写错槽，script 槽可能仍是 none。
+                    // 回退到 globals / load_name，避免静默导出 none。
+                    if matches!(val, Value::None) {
+                        if let Ok(v) = self.load_name(&name) {
+                            if !matches!(v, Value::None) {
+                                val = v;
+                            }
+                        }
+                    }
                     exports.borrow_mut().insert(name.clone(), val);
                 }
+            }
+            StepAction::GoCall { argc } => {
+                let callee = self.pop()?;
+                let mut args = Vec::with_capacity(argc);
+                for _ in 0..argc {
+                    args.push(self.pop()?);
+                }
+                args.reverse();
+                let task = self.spawn_task(callee, args);
+                self.push_value(task);
+            }
+            StepAction::GoValue => {
+                let v = self.pop()?;
+                let task = self.task_from_value(v);
+                self.push_value(task);
+            }
+            StepAction::Await => {
+                let v = self.pop()?;
+                let result = self.await_value(v)?;
+                self.push_value(result);
+            }
+            StepAction::Yield => {
+                self.scheduler_yield()?;
+            }
+            StepAction::SelectTryRecv => {
+                let ch = self.pop()?;
+                let Value::Channel(inner) = ch else {
+                    return Err(RuntimeError::type_err("select recv expects Channel"));
+                };
+                let outcome = inner.borrow_mut().try_recv();
+                match outcome {
+                    Some(Some(v)) => {
+                        self.push_value(v);
+                        self.push_value(Value::Bool(true));
+                    }
+                    Some(None) => {
+                        self.push_value(Value::None);
+                        self.push_value(Value::Bool(true));
+                    }
+                    None => {
+                        self.push_value(Value::Bool(false));
+                    }
+                }
+            }
+            StepAction::SelectTrySend => {
+                let val = self.pop()?;
+                let ch = self.pop()?;
+                let Value::Channel(inner) = ch else {
+                    return Err(RuntimeError::type_err("select send expects Channel"));
+                };
+                let outcome = inner.borrow_mut().try_send(val);
+                match outcome {
+                    Some(Ok(())) => self.push_value(Value::Bool(true)),
+                    Some(Err(())) => self.push_value(Value::Bool(false)),
+                    None => self.push_value(Value::Bool(false)),
+                }
+            }
+            StepAction::SelectPollTask => {
+                let v = self.pop()?;
+                let Value::Task(task) = v else {
+                    // 非 Task：视为已完成
+                    self.push_value(v);
+                    self.push_value(Value::Bool(true));
+                    return Ok(());
+                };
+                let state = task.borrow().state.clone();
+                match state {
+                    TaskState::Done(r) => {
+                        self.push_value(r);
+                        self.push_value(Value::Bool(true));
+                    }
+                    TaskState::Failed(e) => {
+                        self.throw_value(e)?;
+                    }
+                    _ => {
+                        self.push_value(Value::Bool(false));
+                    }
+                }
+            }
+            StepAction::MakeDeadline => {
+                let secs = self.pop()?;
+                let dl = crate::concurrency::deadline_from_secs(&secs)?;
+                self.push_value(dl);
+            }
+            StepAction::SelectPollDeadline => {
+                let dl = self.pop()?;
+                let ready = crate::concurrency::poll_deadline_ready(&dl)?;
+                self.push_value(Value::Bool(ready));
             }
         }
         Ok(())
@@ -3086,6 +3419,13 @@ impl Vm {
         a.neg()
     }
 
+    fn dispatch_invert(&mut self, a: &Value) -> Result<Value> {
+        if let Some(r) = self.try_call_magic(a, "__invert__", vec![]) {
+            return r;
+        }
+        a.invert()
+    }
+
     fn dispatch_eq(&mut self, a: &Value, b: &Value) -> Result<bool> {
         if let Some(r) = self.try_call_magic(a, "__eq__", vec![b.clone()]) {
             return Self::magic_to_bool(r);
@@ -3134,10 +3474,10 @@ impl Vm {
     }
 
     pub(crate) fn call_method(&mut self, obj: &Value, method: &str, args: Vec<Value>) -> Result<Value> {
+        // `get_attr` 对实例方法返回已绑定 self 的闭包（与字节码 GetAttr+Call 一致），
+        // 不可再前置 self，否则会变成「5 个参数」。
         let method_val = get_attr(self, obj, method)?;
-        let mut call_args = vec![obj.clone()];
-        call_args.extend(args);
-        self.call_value(method_val, call_args)
+        self.call_value(method_val, args)
     }
 
     pub(crate) fn call_value(&mut self, callee: Value, args: Vec<Value>) -> Result<Value> {
@@ -4003,6 +4343,7 @@ impl Vm {
             pushed_func_stack: !reenter,
         });
         self.code = func.body.clone();
+        validate_function_hot(&func)?;
         self.hot_ops = func.hot.ops.clone();
         self.hot_args = func.hot.args.clone();
         self.active_line_map = func.line_map.clone();
@@ -4026,6 +4367,17 @@ impl Vm {
         leave_scope: bool,
         result: Value,
     ) -> Result<Option<Value>> {
+        // 防御：清掉当前调用帧内未走 EndTry 的 try 帧（codegen 应已清理 with；此处防泄漏）。
+        let depth = self.user_call_frames.len();
+        while self
+            .try_stack
+            .last()
+            .map(|f| f.user_call_depth >= depth)
+            .unwrap_or(false)
+        {
+            self.try_stack.pop();
+        }
+
         if leave_scope {
             self.leave_scope();
         }
@@ -4285,6 +4637,209 @@ impl Vm {
                     *index = (i + 1) % items.len();
                     return Ok(Some(items[i].clone()));
                 }
+                IteratorKind::Channel { channel } => {
+                    let ch = channel.clone();
+                    let v = self.channel_recv(&ch)?;
+                    // 关闭后 recv 返回 none → 迭代结束（与 docs 一致；无法与合法 none 载荷区分）。
+                    if matches!(v, Value::None) && ch.borrow().closed {
+                        return Ok(None);
+                    }
+                    return Ok(Some(v));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn spawn_task(&mut self, callable: Value, args: Vec<Value>) -> Value {
+        let task = Rc::new(RefCell::new(TaskInner::pending(callable, args)));
+        self.ready_tasks.push_back(task.clone());
+        Value::Task(task)
+    }
+
+    pub(crate) fn task_from_value(&mut self, value: Value) -> Value {
+        if matches!(value, Value::Task(_)) {
+            return value;
+        }
+        Value::Task(Rc::new(RefCell::new(TaskInner::done(value))))
+    }
+
+    pub(crate) fn scheduler_run_one(&mut self) -> Result<bool> {
+        let Some(task) = self.ready_tasks.pop_front() else {
+            return Ok(false);
+        };
+        let pending = {
+            let mut inner = task.borrow_mut();
+            match std::mem::replace(&mut inner.state, TaskState::Running) {
+                TaskState::Pending { callable, args } => Some((callable, args)),
+                other => {
+                    inner.state = other;
+                    None
+                }
+            }
+        };
+        let Some((callable, args)) = pending else {
+            return Ok(true);
+        };
+        match self.call_value_to_completion(callable, args) {
+            Ok(v) => {
+                task.borrow_mut().state = TaskState::Done(v);
+            }
+            Err(e) => {
+                let msg = e.message();
+                let exc = match exceptions::make_exception_kind(self, e.kind(), msg) {
+                    Ok(v) => v,
+                    Err(_) => Value::Text(e.message().to_string()),
+                };
+                task.borrow_mut().state = TaskState::Failed(exc);
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn scheduler_yield(&mut self) -> Result<()> {
+        let n = self.ready_tasks.len();
+        for _ in 0..n {
+            if !self.scheduler_run_one()? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn await_value(&mut self, value: Value) -> Result<Value> {
+        let Value::Task(task) = value else {
+            return Ok(value);
+        };
+        loop {
+            let state = task.borrow().state.clone();
+            match state {
+                TaskState::Done(v) => return Ok(v),
+                TaskState::Failed(e) => {
+                    self.throw_value(e)?;
+                    return Ok(Value::None);
+                }
+                TaskState::Pending { .. } => {
+                    if !self.ready_tasks.iter().any(|t| Rc::ptr_eq(t, &task)) {
+                        self.ready_tasks.push_back(task.clone());
+                    }
+                    if !self.scheduler_run_one()? {
+                        return Err(RuntimeError::msg(
+                            "DeadlockError: no runnable tasks while awaiting",
+                        ));
+                    }
+                }
+                TaskState::Running => {
+                    if !self.scheduler_run_one()? {
+                        return Err(RuntimeError::msg(
+                            "DeadlockError: no runnable tasks while awaiting",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn call_value_to_completion(
+        &mut self,
+        callee: Value,
+        args: Vec<Value>,
+    ) -> Result<Value> {
+        match callee {
+            Value::Function(f) => self.call_user_function(f, args),
+            Value::Builtin(f) => f(self, &args),
+            other => {
+                let stop = self.user_call_frames.len();
+                let result = self.call_value(other, args)?;
+                if self.user_call_deferred {
+                    Ok(self
+                        .run_interpreter(Some(stop))?
+                        .unwrap_or(Value::None))
+                } else {
+                    Ok(result)
+                }
+            }
+        }
+    }
+
+    pub(crate) fn channel_send(
+        &mut self,
+        ch: &Rc<RefCell<ChannelInner>>,
+        value: Value,
+    ) -> Result<()> {
+        loop {
+            let outcome = {
+                let mut inner = ch.borrow_mut();
+                inner.try_send(value.clone())
+            };
+            match outcome {
+                Some(Ok(())) => {
+                    if ch.borrow().capacity == Some(0) {
+                        loop {
+                            if ch.borrow().queue.is_empty() {
+                                return Ok(());
+                            }
+                            if !self.scheduler_run_one()? {
+                                if ch.borrow().queue.is_empty() {
+                                    return Ok(());
+                                }
+                                return Err(RuntimeError::msg(
+                                    "DeadlockError: channel send blocked",
+                                ));
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+                Some(Err(())) => {
+                    return Err(RuntimeError::msg(
+                        "ChannelClosed: cannot send on closed channel",
+                    ));
+                }
+                None => {
+                    if !self.scheduler_run_one()? {
+                        return Err(RuntimeError::msg(
+                            "DeadlockError: channel send blocked",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn channel_recv(
+        &mut self,
+        ch: &Rc<RefCell<ChannelInner>>,
+    ) -> Result<Value> {
+        loop {
+            let outcome = {
+                let mut inner = ch.borrow_mut();
+                inner.try_recv()
+            };
+            match outcome {
+                Some(Some(v)) => return Ok(v),
+                Some(None) => return Ok(Value::None),
+                None => {
+                    if !self.scheduler_run_one()? {
+                        return Err(RuntimeError::msg(
+                            "DeadlockError: channel recv blocked",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn mutex_lock(&mut self, m: &Rc<RefCell<MutexInner>>) -> Result<Value> {
+        loop {
+            {
+                let mut inner = m.borrow_mut();
+                if !inner.locked {
+                    inner.locked = true;
+                    return Ok(Value::MutexGuard(m.clone()));
+                }
+            }
+            if !self.scheduler_run_one()? {
+                return Err(RuntimeError::msg("DeadlockError: mutex lock blocked"));
             }
         }
     }
@@ -4803,6 +5358,9 @@ fn get_attr(vm: &mut Vm, obj: &Value, field: &str) -> Result<Value> {
         Value::Set(set) => type_registry::get_set_method(set, field),
         Value::Tuple(tuple) => type_registry::get_tuple_method(tuple, field),
         Value::Bytes(bytes) => type_registry::get_bytes_method(bytes, field),
+        Value::Channel(ch) => crate::concurrency::get_channel_method(ch, field),
+        Value::Mutex(m) => crate::concurrency::get_mutex_method(m, field),
+        Value::MutexGuard(m) => crate::concurrency::get_mutex_guard_method(m, field),
         Value::Struct(s) => {
             if let Some(idx) = s.def.fields.iter().position(|f| f == field) {
                 return Ok(s.slots.borrow()[idx].clone());

@@ -297,5 +297,6 @@ fn mark_iterator_children(state: &IteratorState, worklist: &mut Vec<Value>) {
                 worklist.push(v.clone());
             }
         }
+        IteratorKind::Channel { .. } => {}
     }
 }

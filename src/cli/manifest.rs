@@ -183,18 +183,46 @@ pub struct Project {
 }
 
 impl Project {
-    /// 解析入口 `.tive` 文件的绝对路径。
+    /// 解析入口 `.tive` 文件的绝对路径（相对 root join，便于显示时 strip_prefix）。
     pub fn entry_path(&self) -> Result<PathBuf, String> {
         if let Some(entry) = &self.manifest.package.entry {
-            let p = self.root.join(entry);
-            if p.is_file() {
-                return Ok(p);
+            use std::path::{Component, Path};
+            let entry_path = Path::new(entry);
+            if entry_path.is_absolute() {
+                return Err(format!(
+                    "entry must be relative to package root, got absolute: {entry} (from {})",
+                    self.manifest_path.display()
+                ));
             }
-            return Err(format!(
-                "entry not found: {} (from {})",
-                p.display(),
-                self.manifest_path.display()
-            ));
+            if entry_path
+                .components()
+                .any(|c| matches!(c, Component::ParentDir))
+            {
+                return Err(format!(
+                    "entry must not contain '..': {entry} (from {})",
+                    self.manifest_path.display()
+                ));
+            }
+            let p = self.root.join(entry);
+            if !p.is_file() {
+                return Err(format!(
+                    "entry not found: {} (from {})",
+                    p.display(),
+                    self.manifest_path.display()
+                ));
+            }
+            // 纵深防御：能 canonicalize 时再确认未逃出包根（返回值仍用 join 路径，便于相对显示）。
+            if let (Ok(canon_root), Ok(canon)) =
+                (self.root.canonicalize(), p.canonicalize())
+            {
+                if !canon.starts_with(&canon_root) {
+                    return Err(format!(
+                        "entry escapes package root: {entry} (from {})",
+                        self.manifest_path.display()
+                    ));
+                }
+            }
+            return Ok(p);
         }
         for candidate in ["src/main.tive", "main.tive"] {
             let p = self.root.join(candidate);
@@ -225,20 +253,23 @@ impl Project {
     }
 }
 
-/// 无清单或不存在 → 空依赖表，不报错。
-pub fn read_deps_if_exists(package_root: &Path) -> BTreeMap<String, Dependency> {
+/// 读取包内依赖表。清单不存在 → 空表；存在但无法解析 → 硬错误。
+pub fn read_deps_if_exists(
+    package_root: &Path,
+) -> Result<BTreeMap<String, Dependency>, String> {
     for name in MANIFEST_NAMES {
         let p = package_root.join(name);
         if p.is_file() {
-            if let Ok(text) = fs::read_to_string(&p) {
-                if let Ok(m) = toml::from_str::<Manifest>(&text) {
-                    return m.dependencies;
-                }
-            }
-            return BTreeMap::new();
+            let text = fs::read_to_string(&p).map_err(|e| {
+                format!("cannot read {}: {e}", p.display())
+            })?;
+            let m: Manifest = toml::from_str(&text).map_err(|e| {
+                format!("invalid {}: {e}", p.display())
+            })?;
+            return Ok(m.dependencies);
         }
     }
-    BTreeMap::new()
+    Ok(BTreeMap::new())
 }
 
 /// 用 toml_edit 增量写入单个依赖（尽量保留其它注释/格式）。
@@ -441,7 +472,7 @@ tagged = { git = "https://github.com/example/t", tag = "v1" }
         let dir = std::env::temp_dir().join(format!("optive_no_toml_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        assert!(read_deps_if_exists(&dir).is_empty());
+        assert!(read_deps_if_exists(&dir).unwrap().is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -346,8 +346,13 @@ pub fn normalize_clone_source(url: &str) -> Result<String, Box<dyn std::error::E
 /// Windows `canonicalize` 会得到 `\\?\C:\...`，gix 会误当成 SCP URL；去掉此前缀。
 fn path_for_gix_local(path: &std::path::Path) -> String {
     let mut s = path.to_string_lossy().into_owned();
-    if let Some(stripped) = s.strip_prefix(r"\\?\") {
-        s = stripped.to_string();
+    // `\\?\UNC\server\share\...` → `\\server\share\...`；普通 `\\?\C:\...` → `C:\...`
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        if let Some(unc) = rest.strip_prefix("UNC\\") {
+            s = format!(r"\\{unc}");
+        } else {
+            s = rest.to_string();
+        }
     }
     // 给 gix 用正斜杠的本地路径更稳（仍是本地 clone，不是 file URL）
     if cfg!(windows) {
@@ -418,6 +423,35 @@ pub fn resolve_remote_tip(
         if let Some(b) = branch {
             checkout_rev(&tmp_root, b)?;
         }
+        let repo = gix::open(&tmp_root)?;
+        let id = repo.head_id()?;
+        Ok(id.to_string())
+    })();
+    let _ = fs::remove_dir_all(&tmp_root);
+    outcome
+}
+
+/// 将 tag 剥皮为 commit SHA（用于 lock / CAS 不可变快照）。
+pub fn resolve_tag_commit(
+    url: &str,
+    tag: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    validate_git_url(url)?;
+    let tmp_root = std::env::temp_dir().join(format!(
+        "optive_tag_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    if let Some(parent) = tmp_root.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let outcome = (|| -> Result<String, Box<dyn std::error::Error>> {
+        clone_into(url, &tmp_root)?;
+        checkout_rev(&tmp_root, tag)?;
         let repo = gix::open(&tmp_root)?;
         let id = repo.head_id()?;
         Ok(id.to_string())

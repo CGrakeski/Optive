@@ -157,3 +157,20 @@ f(b)
         "1",
     );
 }
+
+/// 嵌套函数对捕获的外层 local 赋值必须走 Cell/Store，不能 StoreGlobal。
+#[test]
+fn nested_func_mutates_outer_local() {
+    assert_num(
+        r#"
+func outer() {
+    let x = 1
+    func inc() { x = x + 1 }
+    inc()
+    return x
+}
+outer()
+"#,
+        "2",
+    );
+}

@@ -12,8 +12,8 @@ pub use compiler::{
 };
 pub use frontend::{ast, diagnostics, error, lexer, parser, token};
 pub use runtime::{
-    builtins, c_types, enum_variant, exceptions, ffi, gc, module, runtime_ast, sized, traceback,
-    type_registry, types, value, vm,
+    builtins, concurrency, c_types, enum_variant, exceptions, ffi, gc, module, runtime_ast, sized,
+    traceback, type_registry, types, value, vm,
 };
 pub use stdlib as std_modules;
 

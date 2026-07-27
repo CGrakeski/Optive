@@ -22,8 +22,18 @@ pub struct LockEdge {
     pub parent: String,
     pub name: String,
     pub git: String,
+    /// 钉死的 object id（commit SHA）；tag 在解析时已剥皮。
     pub rev: String,
     pub id: String,
+    /// 意图：toml 声明的 branch（可追 tip）；与 `tag` 互斥。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// 意图：toml 声明的 tag 名；`rev` 为其剥皮后的 commit。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    /// toml 声明了 `rev = "..."`（commit pin）。与 tip（`None`）区分：二者都无 branch/tag。
+    /// 必须显式写出；缺省即格式错误（不做旧 lock 兼容）。
+    pub pinned: bool,
 }
 
 impl LockFile {
@@ -41,12 +51,25 @@ impl LockFile {
         let lock: LockFile = toml::from_str(&text).map_err(|e| {
             format!("invalid {}: {e}", path.display())
         })?;
+        if lock.version != 1 {
+            return Err(format!(
+                "unsupported {}: version {} (expected 1)",
+                path.display(),
+                lock.version
+            ));
+        }
         Ok(Some(lock))
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let text = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
-        fs::write(path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        // 原子写：先写临时文件再 rename，避免崩溃截断锁文件。
+        let tmp = path.with_extension("lock.tmp");
+        fs::write(&tmp, &text).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        fs::rename(&tmp, path).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            format!("cannot rename {} → {}: {e}", tmp.display(), path.display())
+        })?;
         Ok(())
     }
 
@@ -82,33 +105,31 @@ fn intent_matches_edge(dep: &Dependency, edge: &LockEdge) -> bool {
         return false;
     }
     match &dep.rev {
-        RevSpec::Commit(r) => r == &edge.rev,
-        RevSpec::Tag(t) => {
-            // tag 钉死：lock 中可能存 tag 名或已解析 sha；要求声明 tag 仍写在意图里且 git 一致，
-            // 且 lock 的 id 对应同一内容——这里用：edge.rev == tag 或至少 git 一致且名字在 lock。
-            // 严格：若 toml 写 tag，lock.rev 应为解析后的 object 或 tag 名。
-            t == &edge.rev || true_if_same_git_only_tag(dep, edge)
+        RevSpec::Commit(r) => {
+            // 钉死 commit：必须标记 pinned，且 rev 一致。
+            edge.pinned && r == &edge.rev && edge.branch.is_none() && edge.tag.is_none()
         }
-        RevSpec::Branch(_) | RevSpec::None => {
-            // 可追边：意图一致只要名字+git 在 lock 根边出现（rev 由 lock 钉死）
-            true
+        RevSpec::Tag(t) => {
+            edge.tag.as_deref() == Some(t.as_str())
+                && edge.branch.is_none()
+                && !edge.pinned
+        }
+        RevSpec::Branch(b) => {
+            edge.branch.as_deref() == Some(b.as_str()) && edge.tag.is_none() && !edge.pinned
+        }
+        RevSpec::None => {
+            // tip：无 branch/tag，且非 commit pin。
+            !edge.pinned && edge.branch.is_none() && edge.tag.is_none()
         }
     }
 }
 
-fn true_if_same_git_only_tag(dep: &Dependency, edge: &LockEdge) -> bool {
-    // tag 名可能已解析为 sha；接受 git 相同即可（名字已匹配）
-    let _ = (dep, edge);
-    true
+/// 公开：供 `update <name>` 物化其它根前校验意图。
+pub fn dependency_matches_lock_edge(dep: &Dependency, edge: &LockEdge) -> bool {
+    intent_matches_edge(dep, edge)
 }
 
 fn normalize_cmp(url: &str) -> String {
-    let mut u = url.trim().to_ascii_lowercase();
-    if u.ends_with('/') {
-        u.pop();
-    }
-    if u.ends_with(".git") {
-        u.truncate(u.len() - 4);
-    }
-    u
+    // 与 CAS 使用同一套规范化（file:// 保大小写，网络 URL 整段小写）。
+    super::store::normalize_git_url(url)
 }

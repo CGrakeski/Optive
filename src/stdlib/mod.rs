@@ -156,6 +156,7 @@ pub fn build_std_module() -> Rc<RefCell<ModuleObject>> {
     std_children.insert("functional".into(), build_functional_module());
     std_children.insert("collections".into(), build_collections_module());
     std_children.insert("time".into(), build_time_module());
+    std_children.insert("sync".into(), build_sync_module());
     std_children.insert("text".into(), build_text_module());
     std_children.insert("path".into(), build_path_module());
     std_children.insert("fs".into(), build_fs_module());
@@ -1377,6 +1378,16 @@ fn build_time_module() -> Rc<RefCell<ModuleObject>> {
             ("monotonic", builtin(time_monotonic)),
             ("sleep", builtin(time_sleep)),
             ("sleep_ms", builtin(time_sleep_ms)),],
+    )
+}
+
+fn build_sync_module() -> Rc<RefCell<ModuleObject>> {
+    submodule(
+        "sync",
+        &[
+            ("Channel", Value::type_ref("Channel")),
+            ("Mutex", Value::type_ref("Mutex")),
+        ],
     )
 }
 

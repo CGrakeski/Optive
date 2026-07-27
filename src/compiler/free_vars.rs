@@ -64,12 +64,29 @@ fn collect_stmt_scoped(stmt: &Stmt, locals: &mut HashMap<String, ()>, free: &mut
             bind_destruct_pattern(pattern, locals);
         }
         Stmt::ProtocolDecl { .. } => {}
-        Stmt::FuncDecl { body, .. } | Stmt::MacroDecl { body, .. } => {
-            collect_block(body, locals, free);
+        Stmt::FuncDecl { params, body, .. } => {
+            let mut scoped = locals.clone();
+            for p in params {
+                scoped.insert(p.name.clone(), ());
+            }
+            collect_block(body, &mut scoped, free);
         }
-        Stmt::FriendFuncDecl { body, .. } => {
+        Stmt::MacroDecl { params, body, .. } => {
+            let mut scoped = locals.clone();
+            for p in params {
+                scoped.insert(p.name.clone(), ());
+            }
+            collect_block(body, &mut scoped, free);
+        }
+        Stmt::FriendFuncDecl { params, body, .. } => {
             if let Some(b) = body {
-                collect_block(b, locals, free);
+                let mut scoped = locals.clone();
+                if let Some(params) = params {
+                    for p in params {
+                        scoped.insert(p.name.clone(), ());
+                    }
+                }
+                collect_block(b, &mut scoped, free);
             }
         }
         Stmt::Return(e) => {
@@ -319,8 +336,11 @@ fn collect_expr(expr: &Expr, locals: &HashMap<String, ()>, free: &mut HashSet<St
             }
         }
         ExprKind::Bytes(_) => {}
-        ExprKind::DoFunc { body, .. } => {
+        ExprKind::DoFunc { params, body, .. } => {
             let mut scoped = locals.clone();
+            for p in params {
+                scoped.insert(p.name.clone(), ());
+            }
             collect_block(body, &mut scoped, free);
         }
         ExprKind::Pipeline {
@@ -394,6 +414,24 @@ fn collect_expr(expr: &Expr, locals: &HashMap<String, ()>, free: &mut HashSet<St
             collect_expr(else_expr, locals, free);
         }
         ExprKind::Handle { operand } => collect_expr(operand, locals, free),
+        ExprKind::Go { operand } | ExprKind::Await { operand } => {
+            collect_expr(operand, locals, free)
+        }
+        ExprKind::Yield => {}
+        ExprKind::Select { cases, else_block } => {
+            for case in cases {
+                collect_expr(&case.event, locals, free);
+                let mut scoped = locals.clone();
+                if let Some(name) = &case.bind {
+                    scoped.insert(name.clone(), ());
+                }
+                collect_block(&case.body, &mut scoped, free);
+            }
+            if let Some(b) = else_block {
+                let mut scoped = locals.clone();
+                collect_block(b, &mut scoped, free);
+            }
+        }
         ExprKind::NamedAssign { name, value } => {
             let mut scoped = locals.clone();
             scoped.insert(name.clone(), ());

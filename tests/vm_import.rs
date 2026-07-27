@@ -160,3 +160,41 @@ len(library.books)
         "6",
     );
 }
+
+/// Regression: export func with struct ctor + `len(param)` must not export as `none`.
+#[test]
+fn export_func_struct_ctor_and_len_param() {
+    assert_num(
+        r#"
+import "tests/import_fixtures/struct_len_export.tive" as m
+m.make_tokens("abcde")
+"#,
+        "5",
+    );
+}
+
+/// `friend` handler that uses module globals / builtins after import.
+#[test]
+fn export_friend_with_struct_and_len() {
+    assert_num(
+        r#"
+import "tests/import_fixtures/struct_len_export.tive" as m
+let t = m.Token("ab", "cd")
+m.describe(t)
+"#,
+        "4",
+    );
+}
+
+/// 导入后模块函数对模块全局的赋值必须留在 module_env，不能污染调用方。
+#[test]
+fn imported_module_mutates_own_global() {
+    assert_num(
+        r#"
+import "tests/import_fixtures/mutable_counter.tive" as c
+c.bump()
+c.bump()
+"#,
+        "2",
+    );
+}

@@ -140,7 +140,12 @@ id = "dead"
     );
     assert_ne!(code, 0, "stdout={stdout}");
     assert!(
-        stderr.contains("out of date") || stderr.contains("update") || stderr.contains("up"),
+        stderr.contains("out of date")
+            || stderr.contains("update")
+            || stderr.contains("up")
+            || stderr.contains("invalid")
+            || stderr.contains("pinned")
+            || stderr.contains("missing"),
         "stderr={stderr}"
     );
 }

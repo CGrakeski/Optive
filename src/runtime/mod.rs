@@ -2,6 +2,7 @@
 
 pub mod builtins;
 pub mod c_types;
+pub mod concurrency;
 pub mod enum_variant;
 pub mod exceptions;
 pub mod ffi;

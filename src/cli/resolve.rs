@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use super::cache::ProjectCache;
 use super::git_ops;
 use super::home;
-use super::lock::{LockEdge, LockFile, ROOT_PARENT};
+use super::lock::{self, LockEdge, LockFile, ROOT_PARENT};
 use super::manifest::{
     read_deps_if_exists, Dependency, Project, RevSpec,
 };
@@ -22,6 +22,12 @@ pub struct ResolvedEdge {
     pub git: String,
     pub effective_rev: String,
     pub id: String,
+    /// toml 意图：branch 名（可追 tip）
+    pub branch: Option<String>,
+    /// toml 意图：tag 名（effective_rev 为剥皮 SHA）
+    pub tag: Option<String>,
+    /// toml 意图：`rev =` commit pin
+    pub pinned: bool,
 }
 
 #[derive(Debug, Default)]
@@ -103,10 +109,19 @@ pub fn ensure_graph(
     let mut dep_map: DepMap = HashMap::new();
     let mut queue: VecDeque<(String, String, Dependency)> = VecDeque::new();
 
+    let dry = opts.mode == ResolveMode::DryRun;
+    let mut store = if dry || home::use_local_deps() {
+        None
+    } else {
+        Some(Store::open()?)
+    };
+    // LOCAL_DEPS：检测同名不同 id
+    let mut local_name_ids: HashMap<String, String> = HashMap::new();
+
     for (name, dep) in &project.manifest.dependencies {
         if let Some(ref only) = opts.only_root_dep {
             if name != only {
-                // update <name>：其它根边若有 lock 则沿用，否则仍按 toml 解析
+                // update <name>：其它根依赖整棵子树按 lock 原样物化，不 tip-fetch。
                 if opts.mode == ResolveMode::Update {
                     if let Some(ref lock) = existing_lock {
                         if let Some(edge) = lock
@@ -114,28 +129,33 @@ pub fn ensure_graph(
                             .iter()
                             .find(|e| e.parent == ROOT_PARENT && e.name == *name)
                         {
-                            queue_lock_subtree(lock, edge, &mut queue, &mut binding)?;
+                            if !lock::dependency_matches_lock_edge(dep, edge) {
+                                return Err(format!(
+                                    "optive.lock is out of date for dependency `{name}` (intent changed); run `Optive update` without a name filter, or `Optive up`"
+                                )
+                                .into());
+                            }
+                            materialize_lock_subtree(
+                                project,
+                                lock,
+                                edge,
+                                dry,
+                                &mut store,
+                                &mut cache,
+                                &mut binding,
+                                &mut dep_map,
+                                &mut report,
+                                &mut local_name_ids,
+                            )?;
                             continue;
                         }
                     }
+                    // 有 only 过滤器但无 lock / 无该边：仍按 toml 解析该根（进 queue）。
                 }
             }
         }
         queue.push_back((ROOT_PARENT.to_string(), name.clone(), dep.clone()));
     }
-
-    // update <name>：把该子树可追边标为强制 tip（整图 force_fetch 已开时无需）
-    let _ = &opts.only_root_dep;
-
-    let dry = opts.mode == ResolveMode::DryRun;
-    let mut store = if dry || home::use_local_deps() {
-        None
-    } else {
-        Some(Store::open()?)
-    };
-
-    // LOCAL_DEPS：检测同名不同 id
-    let mut local_name_ids: HashMap<String, String> = HashMap::new();
 
     while let Some((parent, name, dep)) = queue.pop_front() {
         let effective_rev = resolve_effective_rev(
@@ -199,12 +219,15 @@ pub fn ensure_graph(
         };
 
         if !dry {
-            cache.put(
-                &dep.git,
-                dep.rev.branch_name(),
-                &effective_rev,
-                Some(&id),
-            );
+            // 仅 tip/branch 写入 tip 缓存；tag/commit pin 不得污染 tip 槽。
+            if matches!(dep.rev, RevSpec::Branch(_) | RevSpec::None) {
+                cache.put(
+                    &dep.git,
+                    dep.rev.branch_name(),
+                    &effective_rev,
+                    Some(&id),
+                );
+            }
         }
 
         dep_map.insert(
@@ -220,14 +243,21 @@ pub fn ensure_graph(
             git: dep.git.clone(),
             effective_rev: effective_rev.clone(),
             id: id.clone(),
+            branch: match &dep.rev {
+                RevSpec::Branch(b) => Some(b.clone()),
+                _ => None,
+            },
+            tag: match &dep.rev {
+                RevSpec::Tag(t) => Some(t.clone()),
+                _ => None,
+            },
+            pinned: matches!(dep.rev, RevSpec::Commit(_)),
         });
 
-        // 子依赖
-        if !dry {
-            let children = read_deps_if_exists(&path);
-            for (cname, cdep) in children {
-                queue.push_back((id.clone(), cname, cdep));
-            }
+        // 子依赖：dry-run 也展开（读已有 pack 上的清单），以便 -v 能预览传递边；不落盘。
+        let children = read_deps_if_exists(&path)?;
+        for (cname, cdep) in children {
+            queue.push_back((id.clone(), cname, cdep));
         }
     }
 
@@ -244,6 +274,9 @@ pub fn ensure_graph(
                     git: e.git.clone(),
                     rev: e.effective_rev.clone(),
                     id: e.id.clone(),
+                    branch: e.branch.clone(),
+                    tag: e.tag.clone(),
+                    pinned: e.pinned,
                 })
                 .collect(),
         );
@@ -292,6 +325,14 @@ fn ensure_from_lock(
     let mut local_name_ids: HashMap<String, String> = HashMap::new();
 
     for edge in &lock.edges {
+        let computed = store::content_id(&edge.git, &edge.rev);
+        if computed != edge.id {
+            return Err(format!(
+                "corrupt optive.lock: edge {} id {} != content_id({})",
+                edge.name, edge.id, computed
+            )
+            .into());
+        }
         let path = if home::use_local_deps() {
             if let Some(prev) = local_name_ids.get(&edge.name) {
                 if prev != &edge.id {
@@ -335,6 +376,9 @@ fn ensure_from_lock(
             git: edge.git.clone(),
             effective_rev: edge.rev.clone(),
             id: edge.id.clone(),
+            branch: edge.branch.clone(),
+            tag: edge.tag.clone(),
+            pinned: edge.pinned,
         });
     }
 
@@ -351,17 +395,111 @@ fn ensure_from_lock(
     })
 }
 
-fn queue_lock_subtree(
+/// 将 lock 中以 `root_edge` 为根的整棵子树按钉死 rev 物化，不 tip-fetch、不重读 pack toml。
+fn materialize_lock_subtree(
+    project: &Project,
     lock: &LockFile,
     root_edge: &LockEdge,
-    queue: &mut VecDeque<(String, String, Dependency)>,
+    dry: bool,
+    store: &mut Option<Store>,
+    cache: &mut ProjectCache,
     binding: &mut HashMap<(String, String), String>,
+    dep_map: &mut DepMap,
+    report: &mut ResolveReport,
+    local_name_ids: &mut HashMap<String, String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // 将 lock 中从该根边可达的边预先记入 binding，并作为已解析跳过重算——
-    // 简化：把整条根边当钉死 Dependency 入队，子树仍从 pack toml 展开。
-    let dep = Dependency::pinned_commit(&root_edge.git, &root_edge.rev);
-    queue.push_back((ROOT_PARENT.to_string(), root_edge.name.clone(), dep));
-    let _ = (lock, binding);
+    let mut q: VecDeque<&LockEdge> = VecDeque::new();
+    q.push_back(root_edge);
+    // 按 (parent, name) 去重，保留菱形依赖的多条入边。
+    let mut seen_keys: HashSet<(String, String)> = HashSet::new();
+
+    while let Some(edge) = q.pop_front() {
+        let key = (edge.parent.clone(), edge.name.clone());
+        if !seen_keys.insert(key.clone()) {
+            continue;
+        }
+        let computed = store::content_id(&edge.git, &edge.rev);
+        if computed != edge.id {
+            return Err(format!(
+                "corrupt optive.lock: edge {} id {} != content_id({})",
+                edge.name, edge.id, computed
+            )
+            .into());
+        }
+        if let Some(prev) = binding.get(&key) {
+            if prev != &edge.id {
+                return Err(format!(
+                    "dependency conflict: ({}, {}) maps to both {prev} and {}",
+                    edge.parent, edge.name, edge.id
+                )
+                .into());
+            }
+        } else {
+            binding.insert(key.clone(), edge.id.clone());
+        }
+
+        let path = if dry {
+            home::pack_dir().join(&edge.id)
+        } else if home::use_local_deps() {
+            if let Some(prev) = local_name_ids.get(&edge.name) {
+                if prev != &edge.id {
+                    return Err(
+                        "OPTIVE_USE_LOCAL_DEPS cannot express two versions; unset env".into(),
+                    );
+                }
+            }
+            local_name_ids.insert(edge.name.clone(), edge.id.clone());
+            let (_, path, fresh) =
+                store::ensure_local_pack(&project.deps_dir(), &edge.name, &edge.git, &edge.rev)?;
+            if fresh {
+                report.installed.push(edge.name.clone());
+            } else {
+                report.reused.push(edge.name.clone());
+            }
+            path
+        } else {
+            let st = store
+                .as_mut()
+                .expect("store initialized unless dry-run (theoretically unreachable)");
+            let (_, path, fresh) = store::ensure_pack(st, &edge.git, &edge.rev)?;
+            if fresh {
+                report.installed.push(format!("{}@{}", edge.name, edge.rev));
+            } else {
+                report.reused.push(edge.name.clone());
+            }
+            path
+        };
+
+        if !dry && !edge.pinned && edge.tag.is_none() {
+            cache.put(
+                &edge.git,
+                edge.branch.as_deref(),
+                &edge.rev,
+                Some(&edge.id),
+            );
+        }
+        dep_map.insert(
+            (edge.parent.clone(), edge.name.clone()),
+            DepBinding {
+                path,
+                id: edge.id.clone(),
+            },
+        );
+        report.edges.push(ResolvedEdge {
+            parent: edge.parent.clone(),
+            name: edge.name.clone(),
+            git: edge.git.clone(),
+            effective_rev: edge.rev.clone(),
+            id: edge.id.clone(),
+            branch: edge.branch.clone(),
+            tag: edge.tag.clone(),
+            pinned: edge.pinned,
+        });
+
+        for child in lock.edges.iter().filter(|e| e.parent == edge.id) {
+            q.push_back(child);
+        }
+    }
     Ok(())
 }
 
@@ -373,7 +511,8 @@ fn resolve_effective_rev(
 ) -> Result<String, Box<dyn std::error::Error>> {
     match &dep.rev {
         RevSpec::Commit(r) => Ok(r.clone()),
-        RevSpec::Tag(t) => Ok(t.clone()),
+        // tag → 剥皮为 commit SHA，保证 CAS id / lock 可复现。
+        RevSpec::Tag(t) => git_ops::resolve_tag_commit(&dep.git, t),
         RevSpec::Branch(b) => {
             if force_fetch_tips || mode == ResolveMode::DryRun {
                 git_ops::resolve_remote_tip(&dep.git, Some(b))

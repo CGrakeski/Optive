@@ -180,13 +180,26 @@ const PROTOCOL_METHODS: &[(&str, &str)] = &[
     ("num", "__sub__"),
     ("num", "__mul__"),
     ("num", "__div__"),
+    ("num", "__mod__"),
     ("num", "__pow__"),
+    ("num", "__and__"),
+    ("num", "__or__"),
+    ("num", "__xor__"),
+    ("num", "__lshift__"),
+    ("num", "__rshift__"),
     ("num", "__radd__"),
     ("num", "__rsub__"),
     ("num", "__rmul__"),
     ("num", "__rdiv__"),
+    ("num", "__rmod__"),
     ("num", "__rpow__"),
+    ("num", "__rand__"),
+    ("num", "__ror__"),
+    ("num", "__rxor__"),
+    ("num", "__rlshift__"),
+    ("num", "__rrshift__"),
     ("num", "__neg__"),
+    ("num", "__invert__"),
     ("text", "__add__"),
     ("text", "__mul__"),
     ("text", "__rmul__"),
@@ -757,6 +770,8 @@ pub fn call_primitive_ctor(_vm: &mut Vm, type_name: &str, args: Vec<Value>) -> O
             "expects 1 argument",
             0,
         ))),
+        "Channel" | "channel" => Some(crate::concurrency::construct_channel(&args)),
+        "Mutex" | "mutex" => Some(crate::concurrency::construct_mutex(&args)),
         "type" if args.len() == 1 => Some(Ok(Value::type_ref(args[0].type_name()))),
         "type" => Some(Err(type_ctor_arity_error(
             "type",
@@ -1137,8 +1152,26 @@ fn value_mul(a: &Value, b: &Value) -> Result<Value> {
 fn value_div(a: &Value, b: &Value) -> Result<Value> {
     a.div(b)
 }
+fn value_mod(a: &Value, b: &Value) -> Result<Value> {
+    a.rem(b)
+}
 fn value_pow(a: &Value, b: &Value) -> Result<Value> {
     a.pow(b)
+}
+fn value_bitand(a: &Value, b: &Value) -> Result<Value> {
+    a.bitand(b)
+}
+fn value_bitor(a: &Value, b: &Value) -> Result<Value> {
+    a.bitor(b)
+}
+fn value_bitxor(a: &Value, b: &Value) -> Result<Value> {
+    a.bitxor(b)
+}
+fn value_lshift(a: &Value, b: &Value) -> Result<Value> {
+    a.lshift(b)
+}
+fn value_rshift(a: &Value, b: &Value) -> Result<Value> {
+    a.rshift(b)
 }
 
 fn install_primitive_methods(vm: &mut Vm) {
@@ -1170,8 +1203,20 @@ fn install_primitive_methods(vm: &mut Vm) {
     num_methods.insert("__rmul__".into(), bin_magic("__rmul__", true, value_mul));
     num_methods.insert("__div__".into(), bin_magic("__div__", false, value_div));
     num_methods.insert("__rdiv__".into(), bin_magic("__rdiv__", true, value_div));
+    num_methods.insert("__mod__".into(), bin_magic("__mod__", false, value_mod));
+    num_methods.insert("__rmod__".into(), bin_magic("__rmod__", true, value_mod));
     num_methods.insert("__pow__".into(), bin_magic("__pow__", false, value_pow));
     num_methods.insert("__rpow__".into(), bin_magic("__rpow__", true, value_pow));
+    num_methods.insert("__and__".into(), bin_magic("__and__", false, value_bitand));
+    num_methods.insert("__rand__".into(), bin_magic("__rand__", true, value_bitand));
+    num_methods.insert("__or__".into(), bin_magic("__or__", false, value_bitor));
+    num_methods.insert("__ror__".into(), bin_magic("__ror__", true, value_bitor));
+    num_methods.insert("__xor__".into(), bin_magic("__xor__", false, value_bitxor));
+    num_methods.insert("__rxor__".into(), bin_magic("__rxor__", true, value_bitxor));
+    num_methods.insert("__lshift__".into(), bin_magic("__lshift__", false, value_lshift));
+    num_methods.insert("__rlshift__".into(), bin_magic("__rlshift__", true, value_lshift));
+    num_methods.insert("__rshift__".into(), bin_magic("__rshift__", false, value_rshift));
+    num_methods.insert("__rrshift__".into(), bin_magic("__rrshift__", true, value_rshift));
     num_methods.insert(
         "__neg__".into(),
         Rc::new(|_vm, args| {
@@ -1179,6 +1224,15 @@ fn install_primitive_methods(vm: &mut Vm) {
                 return Err(RuntimeError::type_err("__neg__ requires 1 argument"));
             }
             args[0].neg()
+        }),
+    );
+    num_methods.insert(
+        "__invert__".into(),
+        Rc::new(|_vm, args| {
+            if args.len() != 1 {
+                return Err(RuntimeError::type_err("__invert__ requires 1 argument"));
+            }
+            args[0].invert()
         }),
     );
 
@@ -1535,7 +1589,7 @@ fn install_primitive_type_globals(vm: &mut Vm) {
     for ty in [
         "text", "num", "bool", "list", "dict", "set", "tuple", "bytes", "iterator", "nonetype",
         "type", "AST", "Frame", "Traceback", "ptr", "i8", "u8", "i16", "u16", "i32", "u32", "i64",
-        "u64", "isize", "usize", "f32", "f64",
+        "u64", "isize", "usize", "f32", "f64", "Channel", "Mutex",
     ] {
         vm.globals
             .entry(ty.into())
@@ -1543,6 +1597,8 @@ fn install_primitive_type_globals(vm: &mut Vm) {
     }
     // 优先使用元类型句柄，覆盖同名的旧式内建函数。
     vm.globals.insert("type".into(), Value::type_ref("type"));
+    vm.globals.insert("Channel".into(), Value::type_ref("Channel"));
+    vm.globals.insert("Mutex".into(), Value::type_ref("Mutex"));
 }
 
 fn primitive_convert_handler(type_name: &'static str) -> BuiltinFn {

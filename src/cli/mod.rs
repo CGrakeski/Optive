@@ -1,4 +1,4 @@
-//! 命令行辅助（`get` / `run` / `new` / 清单 / 包管理）。
+//! 命令行辅助（`run` / `new` / 清单 / 包管理）。
 
 pub mod cache;
 pub mod color;

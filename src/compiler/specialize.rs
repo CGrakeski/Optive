@@ -93,9 +93,11 @@ pub(crate) fn specialize_with_entry(code: &mut [Instruction], entry_env: &[Optio
             | Instruction::NewVarOrLoad(_) => {
                 stack.push(None);
             }
-            Instruction::Store(_) | Instruction::StoreGlobal(_) | Instruction::NewVar { .. } => {
+            Instruction::Store(_) | Instruction::StoreGlobal(_) => {
                 let _ = stack.pop();
             }
+            // NewVar 不弹栈（与 VM 一致）；误弹会让标签栈与真实栈失衡。
+            Instruction::NewVar { .. } => {}
             Instruction::Call { argc }
             | Instruction::CallSelf { argc }
             | Instruction::MacroCall { argc } => {
@@ -162,10 +164,22 @@ pub(crate) fn specialize_with_entry(code: &mut [Instruction], entry_env: &[Optio
                 let _ = stack.pop(); // 字典
                 stack.push(Some(Tag::Dict));
             }
-            Instruction::Neg => {
+            Instruction::Neg | Instruction::Invert => {
                 let t = stack.pop().unwrap_or(None);
                 stack.push(match t {
                     Some(Tag::Num) => Some(Tag::Num),
+                    _ => None,
+                });
+            }
+            Instruction::Mod
+            | Instruction::BitAnd
+            | Instruction::BitOr
+            | Instruction::BitXor
+            | Instruction::LShift
+            | Instruction::RShift => {
+                let (rb, ra) = pop2(&mut stack);
+                stack.push(match (ra, rb) {
+                    (Some(Tag::Num), Some(Tag::Num)) => Some(Tag::Num),
                     _ => None,
                 });
             }
@@ -325,6 +339,37 @@ pub(crate) fn specialize_with_entry(code: &mut [Instruction], entry_env: &[Optio
                 stack.push(None);
             }
             Instruction::RegisterExport(_) => {}
+            Instruction::GoCall(argc) => {
+                for _ in 0..*argc {
+                    let _ = stack.pop();
+                }
+                let _ = stack.pop(); // callee
+                stack.push(None); // Task
+            }
+            Instruction::GoValue | Instruction::Await => {
+                let _ = stack.pop();
+                stack.push(None);
+            }
+            Instruction::Yield => {}
+            Instruction::SelectTryRecv | Instruction::SelectPollTask => {
+                let _ = stack.pop();
+                // value? + bool 或仅 bool — 保守清空后压未知
+                stack.push(None);
+                stack.push(Some(Tag::Bool));
+            }
+            Instruction::SelectTrySend => {
+                let _ = stack.pop();
+                let _ = stack.pop();
+                stack.push(Some(Tag::Bool));
+            }
+            Instruction::MakeDeadline => {
+                let _ = stack.pop();
+                stack.push(Some(Tag::Num));
+            }
+            Instruction::SelectPollDeadline => {
+                let _ = stack.pop();
+                stack.push(Some(Tag::Bool));
+            }
             Instruction::DelIndex => {
                 let _ = stack.pop();
                 let _ = stack.pop();

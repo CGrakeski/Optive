@@ -20,11 +20,22 @@ enum CompKind {
     Dict,
 }
 
+/// 编译期打开的 try/with，供 return/break/continue 补发清理。
+#[derive(Clone)]
+enum OpenHandler {
+    Try,
+    With { ctx: String },
+}
+
 pub struct Generator {
     cg: Codegen,
     program: CompiledProgram,
     loop_break_labels: Vec<usize>,
     loop_continue_labels: Vec<usize>,
+    /// 进入循环时 `handler_stack.len()`，break/continue 只清到该深度。
+    loop_handler_depths: Vec<usize>,
+    /// 当前词法位置仍打开的 try/with（innermost last）。
+    handler_stack: Vec<OpenHandler>,
     type_env: Vec<HashMap<String, (TypeExpr, bool)>>,
     macro_depth: usize,
     match_expr_ends: Vec<usize>,
@@ -52,6 +63,8 @@ impl Generator {
             program: CompiledProgram::new(),
             loop_break_labels: Vec::new(),
             loop_continue_labels: Vec::new(),
+            loop_handler_depths: Vec::new(),
+            handler_stack: Vec::new(),
             type_env: vec![HashMap::new()],
             macro_depth: 0,
             match_expr_ends: Vec::new(),
@@ -85,8 +98,14 @@ impl Generator {
         if slot >= self.program.global_names.len() {
             self.program.global_names.resize(slot + 1, String::new());
         }
-        if self.program.global_names[slot].is_empty() {
+        let existing = &self.program.global_names[slot];
+        if existing.is_empty() {
             self.program.global_names[slot] = name.to_string();
+        } else if existing != name {
+            // 不变量：同一槽只能有一个名字。静默保留旧名会导致 Store/Load 绑错导出。
+            panic!(
+                "internal: global slot {slot} claimed by both `{existing}` and `{name}`"
+            );
         }
     }
 
@@ -288,6 +307,11 @@ impl Generator {
                 self.cg.emit(Instruction::StoreFast(slot));
                 return;
             }
+            // 与 emit_load_name 对称：捕获变量走名字 Store（Cell），勿写成 StoreGlobal。
+            if self.captured_names.contains(name) {
+                self.cg.emit(Instruction::Store(name.to_string()));
+                return;
+            }
             let slot = self.global_slot(name);
             self.cg.emit(Instruction::StoreGlobal(slot));
             return;
@@ -354,7 +378,7 @@ impl Generator {
     fn attach_compile_global_envs(&mut self) {
         let env = Rc::new(crate::opcode::ModuleGlobalEnv {
             global_names: self.program.global_names.clone(),
-            globals: HashMap::new(),
+            globals: std::cell::RefCell::new(HashMap::new()),
         });
         let updated: HashMap<String, Rc<FunctionObject>> = self
             .program
@@ -752,11 +776,13 @@ impl Generator {
                 let jmp = self.cg.emit(Instruction::GotoIfNot(end));
                 self.loop_break_labels.push(end);
                 self.loop_continue_labels.push(start);
+                self.loop_handler_depths.push(self.handler_stack.len());
                 for s in body {
                     self.gen_stmt(s, false)?;
                 }
                 self.loop_break_labels.pop();
                 self.loop_continue_labels.pop();
+                self.loop_handler_depths.pop();
                 self.cg.emit(Instruction::Goto(start));
                 self.cg.mark_label(end);
                 let _ = jmp;
@@ -786,21 +812,27 @@ impl Generator {
                     self.emit_store_temp(counter);
                     self.loop_break_labels.push(end);
                     self.loop_continue_labels.push(start);
+                    self.loop_handler_depths.push(self.handler_stack.len());
                     for s in body {
                         self.gen_stmt(s, false)?;
                     }
                     self.loop_break_labels.pop();
                     self.loop_continue_labels.pop();
+                    self.loop_handler_depths.pop();
                     self.cg.emit(Instruction::Goto(start));
                     self.cg.mark_label(done);
+                    // break 跳向 `end`；与 `done` 同 PC，否则 patch_labels 报 undefined label。
+                    self.cg.mark_label(end);
                 } else {
                     self.loop_break_labels.push(end);
                     self.loop_continue_labels.push(start);
+                    self.loop_handler_depths.push(self.handler_stack.len());
                     for s in body {
                         self.gen_stmt(s, false)?;
                     }
                     self.loop_break_labels.pop();
                     self.loop_continue_labels.pop();
+                    self.loop_handler_depths.pop();
                     self.cg.emit(Instruction::Goto(start));
                     self.cg.mark_label(end);
                 }
@@ -813,6 +845,11 @@ impl Generator {
                     .loop_break_labels
                     .last()
                     .ok_or_else(|| RuntimeError::msg("break outside loop"))?;
+                let depth = *self
+                    .loop_handler_depths
+                    .last()
+                    .ok_or_else(|| RuntimeError::msg("break outside loop"))?;
+                self.emit_handler_exit_cleanups(depth);
                 self.cg.emit(Instruction::Goto(lbl));
             }
             Stmt::Continue => {
@@ -820,6 +857,11 @@ impl Generator {
                     .loop_continue_labels
                     .last()
                     .ok_or_else(|| RuntimeError::msg("continue outside loop"))?;
+                let depth = *self
+                    .loop_handler_depths
+                    .last()
+                    .ok_or_else(|| RuntimeError::msg("continue outside loop"))?;
+                self.emit_handler_exit_cleanups(depth);
                 self.cg.emit(Instruction::Goto(lbl));
             }
             Stmt::Block(stmts) => {
@@ -1052,15 +1094,22 @@ impl Generator {
         }
 
         let catch_dispatch = self.cg.fresh_label();
+        let success_cleanup = self.cg.fresh_label();
         let try_end = self.cg.fresh_label();
+        // else_label → 成功清理；EndTry 会 PopTry 后再跳过来。
         self.cg.emit(Instruction::EnterTry {
             catch_label: catch_dispatch,
-            else_label: 0,
+            else_label: success_cleanup,
             end_label: try_end,
+        });
+        self.handler_stack.push(OpenHandler::With {
+            ctx: ctx.clone(),
         });
         self.gen_block(body, as_value)?;
         self.cg.emit(Instruction::EndTry);
+        self.handler_stack.pop();
 
+        self.cg.mark_label(success_cleanup);
         self.emit_load_temp(&ctx);
         self.cg.emit(Instruction::Push(Value::None));
         self.cg
@@ -1072,6 +1121,8 @@ impl Generator {
         self.cg.mark_label(catch_dispatch);
         self.cg.emit(Instruction::PushExc);
         self.emit_store_temp(&exc);
+        // 先弹出本层 try，再调 __exit__ / 重抛，避免重抛再次落入同一 catch 死循环。
+        self.cg.emit(Instruction::PopTry);
         self.emit_load_temp(&ctx);
         self.emit_load_temp(&exc);
         self.cg
@@ -1137,8 +1188,11 @@ impl Generator {
             else_label,
             end_label: try_end,
         });
+        self.handler_stack.push(OpenHandler::Try);
         self.gen_block(body, false)?;
         self.cg.emit(Instruction::EndTry);
+        // EndTry 已在运行时弹帧；catch 会在 body 前 PopTry。编译期栈在此收起。
+        self.handler_stack.pop();
 
         self.cg.mark_label(catch_dispatch);
 
@@ -1178,19 +1232,21 @@ impl Generator {
                 self.cg.emit(Instruction::PushExc);
                 self.emit_bind_name(name);
             }
+            // 先弹出本层 try，再跑 catch 体，避免 catch 内再抛落入同一 handler 死循环。
+            self.cg.emit(Instruction::PopTry);
             self.gen_block(&clause.body, as_value)?;
             self.cg.emit(Instruction::Goto(try_end));
         }
 
         if else_label != 0 {
             self.cg.mark_label(else_label);
+            // EndTry 已 PopTry，else 不再被本层 handler 覆盖。
             if let Some(else_b) = else_block {
                 self.gen_block(else_b, as_value)?;
             }
         }
 
         self.cg.mark_label(try_end);
-        self.cg.emit(Instruction::PopTry);
         Ok(())
     }
 
@@ -1845,6 +1901,8 @@ impl Generator {
             program: self.fresh_subprogram(),
             loop_break_labels: Vec::new(),
             loop_continue_labels: Vec::new(),
+            loop_handler_depths: Vec::new(),
+            handler_stack: Vec::new(),
             type_env: vec![HashMap::new()],
             macro_depth: self.macro_depth,
             match_expr_ends: Vec::new(),
@@ -1878,11 +1936,19 @@ impl Generator {
             })
             .collect();
         crate::specialize::specialize_with_entry(&mut body, &entry_env);
+        // 子编译器的 `global_names` 可能含空洞：struct/原始类型经 `Push(type_ref)`
+        // 不写入名字表，而 `len` 等仍占后续 `LoadGlobal` 下标 → `["", "len", …]`。
+        // 不可对空串调用 `global_slot`（会偷占槽位），也不可把 `next_global_sym`
+        // 回退到子编译器值（会与已合并槽冲突），否则随后的函数名
+        // `StoreGlobal` 写到错误槽，`RegisterExport` 读到仍为 `none` 的绑定。
         let func_global_names = sub.program.global_names.clone();
         for name in &func_global_names {
+            if name.is_empty() {
+                continue;
+            }
             self.global_slot(name);
         }
-        self.next_global_sym = sub.next_global_sym;
+        self.next_global_sym = self.next_global_sym.max(sub.next_global_sym);
         let uses_name_map = crate::opcode::function_uses_name_map(&body);
         let track_frames = return_strong || crate::opcode::function_uses_try(&body);
         let flexible_params = params.iter().any(|p| {
@@ -1913,7 +1979,7 @@ impl Generator {
         } else {
             Some(Rc::new(crate::opcode::ModuleGlobalEnv {
                 global_names: func_global_names,
-                globals: HashMap::new(),
+                globals: std::cell::RefCell::new(HashMap::new()),
             }))
         };
         Ok(FunctionObject {
@@ -1944,14 +2010,37 @@ impl Generator {
         })
     }
 
+    /// 非局部退出前补发打开的 try/with 清理（`down_to..` 段，自内向外）。
+    fn emit_handler_exit_cleanups(&mut self, down_to: usize) {
+        let handlers: Vec<OpenHandler> = self.handler_stack[down_to..].to_vec();
+        for h in handlers.into_iter().rev() {
+            match h {
+                OpenHandler::Try => {
+                    self.cg.emit(Instruction::PopTry);
+                }
+                OpenHandler::With { ctx } => {
+                    self.cg.emit(Instruction::PopTry);
+                    self.emit_load_temp(&ctx);
+                    self.cg.emit(Instruction::Push(Value::None));
+                    self.cg
+                        .emit(Instruction::Load("__with_exit__".into()));
+                    self.cg.emit(Instruction::Call { argc: 2 });
+                    self.cg.emit(Instruction::Pop);
+                }
+            }
+        }
+    }
+
     fn gen_return_expr(&mut self, expr: Option<&Expr>) -> Result<()> {
         if let (Some(e), Some(slots)) = (expr, self.local_slots.as_ref()) {
             if let ExprKind::Var(name) = &e.kind {
             if self.current_return_wrapper.is_none() {
                 if let Some(&slot) = slots.get(name.as_str()) {
                     if let Some(end) = self.match_expr_ends.last().copied() {
+                        self.emit_handler_exit_cleanups(0);
                         self.cg.emit(Instruction::Goto(end));
                     } else {
+                        self.emit_handler_exit_cleanups(0);
                         self.cg.emit(Instruction::RetFast(slot));
                     }
                     return Ok(());
@@ -1971,8 +2060,10 @@ impl Generator {
             self.gen_expr(&wrapper)?;
         }
         if let Some(end) = self.match_expr_ends.last().copied() {
+            self.emit_handler_exit_cleanups(0);
             self.cg.emit(Instruction::Goto(end));
         } else {
+            self.emit_handler_exit_cleanups(0);
             self.cg.emit(Instruction::Ret);
         }
         Ok(())
@@ -1989,6 +2080,8 @@ impl Generator {
             program: self.fresh_subprogram(),
             loop_break_labels: Vec::new(),
             loop_continue_labels: Vec::new(),
+            loop_handler_depths: Vec::new(),
+            handler_stack: Vec::new(),
             type_env: vec![HashMap::new()],
             macro_depth: self.macro_depth + 1,
             match_expr_ends: Vec::new(),
@@ -2148,6 +2241,9 @@ impl Generator {
                     UnaryOp::TruthyNot => {
                         self.cg.emit(Instruction::TruthyNot);
                     }
+                    UnaryOp::Invert => {
+                        self.cg.emit(Instruction::Invert);
+                    }
                 }
             }
             ExprKind::Binary { op, left, right } => {
@@ -2188,7 +2284,13 @@ impl Generator {
                             BinaryOp::Sub => Instruction::Sub,
                             BinaryOp::Mul => Instruction::Mul,
                             BinaryOp::Div => Instruction::Div,
+                            BinaryOp::Mod => Instruction::Mod,
                             BinaryOp::Pow => Instruction::Pow,
+                            BinaryOp::BitAnd => Instruction::BitAnd,
+                            BinaryOp::BitOr => Instruction::BitOr,
+                            BinaryOp::BitXor => Instruction::BitXor,
+                            BinaryOp::LShift => Instruction::LShift,
+                            BinaryOp::RShift => Instruction::RShift,
                             BinaryOp::Eq => Instruction::Eq,
                             BinaryOp::Ne => Instruction::Ne,
                             BinaryOp::Lt => Instruction::Lt,
@@ -2451,12 +2553,49 @@ impl Generator {
                     else_label: 0,
                     end_label,
                 });
+                // 与 try 一样入栈，使 loop 内 break/continue 能补发 PopTry。
+                self.handler_stack.push(OpenHandler::Try);
                 self.gen_expr(operand)?;
                 self.cg.emit(Instruction::Goto(end_label));
                 self.cg.mark_label(catch_label);
                 self.cg.emit(Instruction::Push(Value::None));
                 self.cg.mark_label(end_label);
+                self.handler_stack.pop();
                 self.cg.emit(Instruction::PopTry);
+            }
+            ExprKind::Go { operand } => {
+                self.gen_go_operand(operand)?;
+            }
+            ExprKind::Await { operand } => {
+                if matches!(operand.kind, ExprKind::Yield) {
+                    self.cg.emit(Instruction::Yield);
+                } else if let ExprKind::Call { callee, args } = &operand.kind {
+                    let has_named = args.iter().any(|a| a.name.is_some());
+                    let has_kwsplat = args.iter().any(|a| a.is_kwsplat);
+                    let has_splat = args.iter().any(|a| a.is_splat);
+                    if !has_named && !has_kwsplat && !has_splat {
+                        for a in args {
+                            self.gen_expr(&a.value)?;
+                        }
+                        self.gen_expr(callee)?;
+                        self.cg.emit(Instruction::GoCall(args.len()));
+                        self.cg.emit(Instruction::Await);
+                    } else {
+                        self.gen_expr(operand)?;
+                        self.cg.emit(Instruction::Await);
+                    }
+                } else {
+                    self.gen_expr(operand)?;
+                    self.cg.emit(Instruction::Await);
+                }
+            }
+            ExprKind::Yield => {
+                return Err(RuntimeError::msg(
+                    "'yield' is only valid as 'await yield'",
+                ));
+            }
+            ExprKind::Select { cases, else_block } => {
+                self.gen_select(cases, else_block.as_ref())?;
             }
             ExprKind::NamedAssign { name, value } => {
                 self.gen_expr(value)?;
@@ -2476,6 +2615,155 @@ impl Generator {
             }
         }
         Ok(())
+    }
+
+    fn gen_go_operand(&mut self, operand: &Expr) -> Result<()> {
+        if let ExprKind::Call { callee, args } = &operand.kind {
+            let has_named = args.iter().any(|a| a.name.is_some());
+            let has_kwsplat = args.iter().any(|a| a.is_kwsplat);
+            let has_splat = args.iter().any(|a| a.is_splat);
+            if !has_named && !has_kwsplat && !has_splat {
+                for a in args {
+                    self.gen_expr(&a.value)?;
+                }
+                self.gen_expr(callee)?;
+                self.cg.emit(Instruction::GoCall(args.len()));
+                return Ok(());
+            }
+        }
+        // 非调用：求值后包装为已完成 Task。
+        self.gen_expr(operand)?;
+        self.cg.emit(Instruction::GoValue);
+        Ok(())
+    }
+
+    fn gen_select(&mut self, cases: &[SelectCase], else_block: Option<&Block>) -> Result<()> {
+        let end = self.cg.fresh_label();
+        let start = self.cg.fresh_label();
+
+        // 预处理 sleep 截止时间。
+        let mut sleep_temps: Vec<Option<String>> = Vec::with_capacity(cases.len());
+        for case in cases {
+            if let Some(secs) = select_sleep_seconds_expr(&case.event) {
+                let tmp = self.cg.fresh_temp("__sel_deadline");
+                self.gen_expr(secs)?;
+                self.cg.emit(Instruction::MakeDeadline);
+                self.emit_store_temp(&tmp);
+                sleep_temps.push(Some(tmp));
+            } else {
+                sleep_temps.push(None);
+            }
+        }
+
+        self.cg.mark_label(start);
+        for (i, case) in cases.iter().enumerate() {
+            let next = self.cg.fresh_label();
+            self.gen_select_poll(&case.event, sleep_temps[i].as_deref())?;
+            self.cg.emit(Instruction::GotoIfNot(next));
+            // ready：栈顶为事件结果值
+            if let Some(name) = &case.bind {
+                if name != "_" {
+                    self.emit_bind_name(name);
+                } else {
+                    self.cg.emit(Instruction::Pop);
+                }
+            } else {
+                self.cg.emit(Instruction::Pop);
+            }
+            self.gen_block(&case.body, true)?;
+            self.cg.emit(Instruction::Goto(end));
+            self.cg.mark_label(next);
+        }
+
+        if let Some(else_b) = else_block {
+            // 粗略：若没有任何 case 就绪，先让步再重试；多次空转后走 else。
+            // 用一次 Yield 后若仍全不就绪则 else（简化：直接检查通道全关由 SelectTryRecv 的 closed 处理）。
+            // 此处：跑一次调度，再若仍无进展则 else。
+            self.cg.emit(Instruction::Yield);
+            // 再 poll 一轮；若仍无则 else
+            let else_lbl = self.cg.fresh_label();
+            for (i, case) in cases.iter().enumerate() {
+                let next = self.cg.fresh_label();
+                self.gen_select_poll(&case.event, sleep_temps[i].as_deref())?;
+                self.cg.emit(Instruction::GotoIfNot(next));
+                if let Some(name) = &case.bind {
+                    if name != "_" {
+                        self.emit_bind_name(name);
+                    } else {
+                        self.cg.emit(Instruction::Pop);
+                    }
+                } else {
+                    self.cg.emit(Instruction::Pop);
+                }
+                self.gen_block(&case.body, true)?;
+                self.cg.emit(Instruction::Goto(end));
+                self.cg.mark_label(next);
+            }
+            self.cg.mark_label(else_lbl);
+            self.gen_block(else_b, true)?;
+            self.cg.emit(Instruction::Goto(end));
+        } else {
+            self.cg.emit(Instruction::Yield);
+            self.cg.emit(Instruction::Goto(start));
+        }
+        self.cg.mark_label(end);
+        Ok(())
+    }
+
+    fn gen_select_poll(&mut self, event: &Expr, sleep_tmp: Option<&str>) -> Result<()> {
+        if let Some(tmp) = sleep_tmp {
+            self.emit_load_temp(tmp);
+            self.cg.emit(Instruction::SelectPollDeadline);
+            // ready 时补一个 none 作为绑定值
+            let not_ready = self.cg.fresh_label();
+            let done = self.cg.fresh_label();
+            self.cg.emit(Instruction::GotoIfNot(not_ready));
+            self.cg.emit(Instruction::Push(Value::None));
+            self.cg.emit(Instruction::Push(Value::Bool(true)));
+            self.cg.emit(Instruction::Goto(done));
+            self.cg.mark_label(not_ready);
+            self.cg.emit(Instruction::Push(Value::Bool(false)));
+            self.cg.mark_label(done);
+            return Ok(());
+        }
+        match &event.kind {
+            ExprKind::Await { operand } => {
+                self.gen_expr(operand)?;
+                self.cg.emit(Instruction::SelectPollTask);
+                Ok(())
+            }
+            ExprKind::Call { callee, args } => {
+                if let ExprKind::Member { object, field } = &callee.kind {
+                    if field == "recv" && args.is_empty() {
+                        self.gen_expr(object)?;
+                        self.cg.emit(Instruction::SelectTryRecv);
+                        return Ok(());
+                    }
+                    if field == "send" && args.len() == 1 {
+                        self.gen_expr(object)?;
+                        self.gen_expr(&args[0].value)?;
+                        self.cg.emit(Instruction::SelectTrySend);
+                        // send ready → 绑定值用 none
+                        let not_ready = self.cg.fresh_label();
+                        let done = self.cg.fresh_label();
+                        self.cg.emit(Instruction::GotoIfNot(not_ready));
+                        self.cg.emit(Instruction::Push(Value::None));
+                        self.cg.emit(Instruction::Push(Value::Bool(true)));
+                        self.cg.emit(Instruction::Goto(done));
+                        self.cg.mark_label(not_ready);
+                        self.cg.emit(Instruction::Push(Value::Bool(false)));
+                        self.cg.mark_label(done);
+                        return Ok(());
+                    }
+                }
+                Err(RuntimeError::msg(
+                    "select case event must be ch.recv(), ch.send(v), await t, or sleep(...)",
+                ))
+            }
+            _ => Err(RuntimeError::msg(
+                "select case event must be ch.recv(), ch.send(v), await t, or sleep(...)",
+            )),
+        }
     }
 
     fn gen_list_comp(
@@ -2697,11 +2985,13 @@ impl Generator {
         self.gen_for_iter_bind(items)?;
         self.loop_break_labels.push(end);
         self.loop_continue_labels.push(start);
+        self.loop_handler_depths.push(self.handler_stack.len());
         for s in body {
             self.gen_stmt(s, false)?;
         }
         self.loop_break_labels.pop();
         self.loop_continue_labels.pop();
+        self.loop_handler_depths.pop();
         self.cg.emit(Instruction::Goto(start));
         self.cg.mark_label(end);
         self.cg.emit(Instruction::IterEnd);
@@ -2892,6 +3182,29 @@ fn const_default_value(expr: &Expr) -> Option<Value> {
         ExprKind::String(s) => Some(Value::Text(s.clone())),
         ExprKind::Number(s) => Num::from_literal(s).ok().map(Value::Num),
         _ => None,
+    }
+}
+
+/// 识别 `sleep(secs)` / `std.time.sleep(secs)` 等单参数 sleep 调用，返回秒数表达式。
+fn select_sleep_seconds_expr(event: &Expr) -> Option<&Expr> {
+    let ExprKind::Call { callee, args } = &event.kind else {
+        return None;
+    };
+    if args.len() != 1 || args[0].name.is_some() || args[0].is_splat || args[0].is_kwsplat {
+        return None;
+    }
+    if call_ends_with_sleep(callee) {
+        Some(&args[0].value)
+    } else {
+        None
+    }
+}
+
+fn call_ends_with_sleep(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Var(name) => name == "sleep",
+        ExprKind::Member { field, .. } => field == "sleep",
+        _ => false,
     }
 }
 

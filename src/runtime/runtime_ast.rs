@@ -300,6 +300,10 @@ pub fn ast_from_expr(expr: &Expr) -> RuntimeAstNode {
         | ExprKind::Match { .. }
         | ExprKind::IfThenElse { .. }
         | ExprKind::Handle { .. }
+        | ExprKind::Go { .. }
+        | ExprKind::Await { .. }
+        | ExprKind::Yield
+        | ExprKind::Select { .. }
         | ExprKind::NamedAssign { .. }
         | ExprKind::Set(_)
         | ExprKind::Tuple(_)
@@ -617,6 +621,7 @@ fn unary_op_text(op: UnaryOp) -> &'static str {
         UnaryOp::Neg => "-",
         UnaryOp::Not => "not",
         UnaryOp::TruthyNot => "!",
+        UnaryOp::Invert => "~",
     }
 }
 
@@ -626,7 +631,13 @@ fn binary_op_text(op: BinaryOp) -> &'static str {
         BinaryOp::Sub => "-",
         BinaryOp::Mul => "*",
         BinaryOp::Div => "/",
+        BinaryOp::Mod => "%",
         BinaryOp::Pow => "**",
+        BinaryOp::BitAnd => "&",
+        BinaryOp::BitOr => "|",
+        BinaryOp::BitXor => "^",
+        BinaryOp::LShift => "<<",
+        BinaryOp::RShift => ">>",
         BinaryOp::Eq => "==",
         BinaryOp::Ne => "!=",
         BinaryOp::Lt => "<",
@@ -1270,6 +1281,7 @@ fn parse_unary_op(text: &str) -> Result<UnaryOp> {
         "-" => Ok(UnaryOp::Neg),
         "not" => Ok(UnaryOp::Not),
         "!" => Ok(UnaryOp::TruthyNot),
+        "~" => Ok(UnaryOp::Invert),
         _ => Err(RuntimeError::msg(format!("unknown unary op: {text}"))),
     }
 }
@@ -1280,7 +1292,13 @@ fn parse_binary_op(text: &str) -> Result<BinaryOp> {
         "-" => Ok(BinaryOp::Sub),
         "*" => Ok(BinaryOp::Mul),
         "/" => Ok(BinaryOp::Div),
+        "%" => Ok(BinaryOp::Mod),
         "**" => Ok(BinaryOp::Pow),
+        "&" => Ok(BinaryOp::BitAnd),
+        "|" => Ok(BinaryOp::BitOr),
+        "^" => Ok(BinaryOp::BitXor),
+        "<<" => Ok(BinaryOp::LShift),
+        ">>" => Ok(BinaryOp::RShift),
         "==" => Ok(BinaryOp::Eq),
         "!=" => Ok(BinaryOp::Ne),
         "<" => Ok(BinaryOp::Lt),

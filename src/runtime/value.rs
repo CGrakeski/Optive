@@ -3,7 +3,7 @@ use num_rational::BigRational;
 use num_traits::{One, Signed, ToPrimitive, Zero};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::rc::Rc;
 
@@ -99,6 +99,17 @@ impl Num {
             Num::Int(n) => n.to_i64(),
             Num::Rat(r) if r.denom() == &One::one() => r.numer().to_i64(),
             _ => None,
+        }
+    }
+
+    /// 转为整数 `BigInt`；有理数报错（按位/取模仅支持整数）。
+    pub fn to_bigint(&self) -> Result<BigInt> {
+        match self {
+            Num::Small(n) => Ok(BigInt::from(*n)),
+            Num::Int(n) => Ok(n.as_ref().clone()),
+            Num::Rat(_) => Err(RuntimeError::type_err(
+                "bitwise/modulo operators require integers, got rational",
+            )),
         }
     }
 
@@ -305,6 +316,10 @@ pub enum IteratorKind {
         items: Vec<Value>,
         index: usize,
     },
+    /// `for (v in ch)`：阻塞 recv，关闭后结束。
+    Channel {
+        channel: Rc<RefCell<ChannelInner>>,
+    },
 }
 
 #[derive(Clone)]
@@ -430,6 +445,108 @@ impl DictMap {
 }
 
 #[derive(Clone)]
+pub enum TaskState {
+    Pending {
+        callable: Value,
+        args: Vec<Value>,
+    },
+    Running,
+    Done(Value),
+    Failed(Value),
+}
+
+#[derive(Clone)]
+pub struct TaskInner {
+    pub state: TaskState,
+}
+
+impl TaskInner {
+    pub fn pending(callable: Value, args: Vec<Value>) -> Self {
+        Self {
+            state: TaskState::Pending { callable, args },
+        }
+    }
+
+    pub fn done(value: Value) -> Self {
+        Self {
+            state: TaskState::Done(value),
+        }
+    }
+}
+
+/// `capacity`: `None` = 无界；`Some(0)` = rendezvous；`Some(n)` = 有界 n。
+#[derive(Clone)]
+pub struct ChannelInner {
+    pub queue: VecDeque<Value>,
+    pub capacity: Option<usize>,
+    pub closed: bool,
+}
+
+impl ChannelInner {
+    pub fn new(capacity: Option<usize>) -> Self {
+        Self {
+            queue: VecDeque::new(),
+            capacity,
+            closed: false,
+        }
+    }
+
+    pub fn try_recv(&mut self) -> Option<Option<Value>> {
+        if let Some(v) = self.queue.pop_front() {
+            return Some(Some(v));
+        }
+        if self.closed {
+            return Some(None);
+        }
+        None
+    }
+
+    /// `Some(Ok(()))` 已发送；`Some(Err(()))` 已关闭；`None` 会阻塞。
+    pub fn try_send(&mut self, value: Value) -> Option<std::result::Result<(), ()>> {
+        if self.closed {
+            return Some(Err(()));
+        }
+        match self.capacity {
+            None => {
+                self.queue.push_back(value);
+                Some(Ok(()))
+            }
+            Some(0) => {
+                if self.queue.is_empty() {
+                    self.queue.push_back(value);
+                    Some(Ok(()))
+                } else {
+                    None
+                }
+            }
+            Some(n) => {
+                if self.queue.len() < n {
+                    self.queue.push_back(value);
+                    Some(Ok(()))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct MutexInner {
+    pub value: Value,
+    pub locked: bool,
+}
+
+impl MutexInner {
+    pub fn new(value: Value) -> Self {
+        Self {
+            value,
+            locked: false,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub enum Value {
     None,
     Bool(bool),
@@ -467,6 +584,14 @@ pub enum Value {
     EnumMember(Rc<EnumMemberData>),
     /// 外层 variant 包装（双层包装）。
     Variant(Rc<VariantInstance>),
+    /// 协作式任务句柄（`go` / `await`）。
+    Task(Rc<RefCell<TaskInner>>),
+    /// 通道（`Channel()` / `Channel(n)`）。
+    Channel(Rc<RefCell<ChannelInner>>),
+    /// 互斥锁（`Mutex(v)`）。
+    Mutex(Rc<RefCell<MutexInner>>),
+    /// `Mutex.lock()` 得到的守卫，可用于 `with`。
+    MutexGuard(Rc<RefCell<MutexInner>>),
 }
 
 /// [`Value::TypeSpec`] 的堆载荷 — 移出 `Value` 枚举以保持栈表示紧凑。
@@ -622,6 +747,10 @@ impl Value {
             Value::TypeSpec(_) => "type",
             Value::EnumMember(m) => &m.type_name,
             Value::Variant(v) => &v.inst_name,
+            Value::Task(_) => "Task",
+            Value::Channel(_) => "Channel",
+            Value::Mutex(_) => "Mutex",
+            Value::MutexGuard(_) => "MutexGuard",
         }
     }
 
@@ -749,6 +878,10 @@ impl Value {
                 v.inst_name,
                 v.payload.display_string()
             ),
+            Value::Task(_) => "<Task>".to_string(),
+            Value::Channel(_) => "<Channel>".to_string(),
+            Value::Mutex(_) => "<Mutex>".to_string(),
+            Value::MutexGuard(_) => "<MutexGuard>".to_string(),
         }
     }
 
@@ -828,10 +961,59 @@ impl Value {
         }
     }
 
+    pub fn rem(&self, other: &Value) -> Result<Value> {
+        match (self, other) {
+            (Value::Num(a), Value::Num(b)) => Ok(Value::Num(rem_num(a, b)?)),
+            _ => Err(RuntimeError::unsupported("unsupported % operation")),
+        }
+    }
+
+    pub fn bitand(&self, other: &Value) -> Result<Value> {
+        match (self, other) {
+            (Value::Num(a), Value::Num(b)) => Ok(Value::Num(bitand_num(a, b)?)),
+            _ => Err(RuntimeError::unsupported("unsupported & operation")),
+        }
+    }
+
+    pub fn bitor(&self, other: &Value) -> Result<Value> {
+        match (self, other) {
+            (Value::Num(a), Value::Num(b)) => Ok(Value::Num(bitor_num(a, b)?)),
+            _ => Err(RuntimeError::unsupported("unsupported | operation")),
+        }
+    }
+
+    pub fn bitxor(&self, other: &Value) -> Result<Value> {
+        match (self, other) {
+            (Value::Num(a), Value::Num(b)) => Ok(Value::Num(bitxor_num(a, b)?)),
+            _ => Err(RuntimeError::unsupported("unsupported ^ operation")),
+        }
+    }
+
+    pub fn lshift(&self, other: &Value) -> Result<Value> {
+        match (self, other) {
+            (Value::Num(a), Value::Num(b)) => Ok(Value::Num(lshift_num(a, b)?)),
+            _ => Err(RuntimeError::unsupported("unsupported << operation")),
+        }
+    }
+
+    pub fn rshift(&self, other: &Value) -> Result<Value> {
+        match (self, other) {
+            (Value::Num(a), Value::Num(b)) => Ok(Value::Num(rshift_num(a, b)?)),
+            _ => Err(RuntimeError::unsupported("unsupported >> operation")),
+        }
+    }
+
     pub fn neg(&self) -> Result<Value> {
         match self {
             Value::Num(n) => Ok(Value::Num(neg_num(n))),
             _ => Err(RuntimeError::unsupported("unsupported unary -")),
+        }
+    }
+
+    pub fn invert(&self) -> Result<Value> {
+        match self {
+            Value::Num(n) => Ok(Value::Num(invert_num(n)?)),
+            _ => Err(RuntimeError::unsupported("unsupported unary ~")),
         }
     }
 
@@ -905,6 +1087,10 @@ impl Value {
             (Value::Dispatch(a), Value::Dispatch(b)) => Ok(Rc::ptr_eq(a, b)),
             (Value::Macro(a), Value::Macro(b)) => Ok(Rc::ptr_eq(a, b)),
             (Value::Cell(a), Value::Cell(b)) => Ok(Rc::ptr_eq(a, b)),
+            (Value::Task(a), Value::Task(b)) => Ok(Rc::ptr_eq(a, b)),
+            (Value::Channel(a), Value::Channel(b)) => Ok(Rc::ptr_eq(a, b)),
+            (Value::Mutex(a), Value::Mutex(b)) => Ok(Rc::ptr_eq(a, b)),
+            (Value::MutexGuard(a), Value::MutexGuard(b)) => Ok(Rc::ptr_eq(a, b)),
             (Value::TypeSpec(a), Value::TypeSpec(b)) => {
                 Ok(a.name == b.name && a.args == b.args)
             }
@@ -943,6 +1129,10 @@ pub fn values_identical(a: &Value, b: &Value) -> bool {
         (Value::Dispatch(x), Value::Dispatch(y)) => Rc::ptr_eq(x, y),
         (Value::Macro(x), Value::Macro(y)) => Rc::ptr_eq(x, y),
         (Value::Cell(x), Value::Cell(y)) => Rc::ptr_eq(x, y),
+        (Value::Task(x), Value::Task(y)) => Rc::ptr_eq(x, y),
+        (Value::Channel(x), Value::Channel(y)) => Rc::ptr_eq(x, y),
+        (Value::Mutex(x), Value::Mutex(y)) => Rc::ptr_eq(x, y),
+        (Value::MutexGuard(x), Value::MutexGuard(y)) => Rc::ptr_eq(x, y),
         (Value::Function(x), Value::Function(y)) => Rc::ptr_eq(x, y),
         (Value::GenericFunction(x), Value::GenericFunction(y)) => Rc::ptr_eq(x, y),
         (Value::Builtin(x), Value::Builtin(y)) => std::ptr::eq(x, y),
@@ -1054,6 +1244,55 @@ fn neg_num(n: &Num) -> Num {
         Num::Int(i) => Num::from_bigint(-i.as_ref()),
         Num::Rat(r) => Num::from_rational(-r.as_ref()),
     }
+}
+
+fn rem_num(a: &Num, b: &Num) -> Result<Num> {
+    let ai = a.to_bigint()?;
+    let bi = b.to_bigint()?;
+    if bi.is_zero() {
+        return Err(RuntimeError::zero_div("division by zero"));
+    }
+    // Python-style：余数符号跟随除数
+    let mut r = &ai % &bi;
+    if (r.is_negative() && bi.is_positive()) || (r.is_positive() && bi.is_negative()) {
+        r += &bi;
+    }
+    Ok(Num::from_bigint(r))
+}
+
+fn bitand_num(a: &Num, b: &Num) -> Result<Num> {
+    Ok(Num::from_bigint(a.to_bigint()? & b.to_bigint()?))
+}
+
+fn bitor_num(a: &Num, b: &Num) -> Result<Num> {
+    Ok(Num::from_bigint(a.to_bigint()? | b.to_bigint()?))
+}
+
+fn bitxor_num(a: &Num, b: &Num) -> Result<Num> {
+    Ok(Num::from_bigint(a.to_bigint()? ^ b.to_bigint()?))
+}
+
+fn shift_amount(n: &Num) -> Result<u32> {
+    let bi = n.to_bigint()?;
+    if bi.is_negative() {
+        return Err(RuntimeError::value_err("negative shift count"));
+    }
+    bi.to_u32()
+        .ok_or_else(|| RuntimeError::value_err("shift count too large"))
+}
+
+fn lshift_num(a: &Num, b: &Num) -> Result<Num> {
+    let amount = shift_amount(b)?;
+    Ok(Num::from_bigint(a.to_bigint()? << amount))
+}
+
+fn rshift_num(a: &Num, b: &Num) -> Result<Num> {
+    let amount = shift_amount(b)?;
+    Ok(Num::from_bigint(a.to_bigint()? >> amount))
+}
+
+fn invert_num(n: &Num) -> Result<Num> {
+    Ok(Num::from_bigint(!n.to_bigint()?))
 }
 
 fn parse_decimal_literal(text: &str) -> Result<BigRational> {
@@ -1236,6 +1475,15 @@ impl IteratorState {
                 *index = (i + 1) % items.len();
                 Ok(Some(items[i].clone()))
             }
+            IteratorKind::Channel { channel } => {
+                let ch = channel.clone();
+                let v = vm.channel_recv(&ch)?;
+                if matches!(v, Value::None) && ch.borrow().closed {
+                    Ok(None)
+                } else {
+                    Ok(Some(v))
+                }
+            }
         }
     }
 }
@@ -1287,6 +1535,11 @@ pub fn value_to_iterable(v: &Value) -> crate::Result<IteratorState> {
         Value::Text(s) => Ok(IteratorState::from_list(
             s.chars().map(|c| Value::Text(c.to_string())).collect(),
         )),
+        Value::Channel(ch) => Ok(IteratorState {
+            kind: IteratorKind::Channel {
+                channel: ch.clone(),
+            },
+        }),
         Value::Dict(d) => {
             let items: Vec<Value> = d
                 .borrow()

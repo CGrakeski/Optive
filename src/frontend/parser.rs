@@ -172,18 +172,29 @@ impl Parser {
             | TokenKind::KwDel => return false,
             _ => {}
         }
-        let mut depth = 1;
+        let mut brace_depth: usize = 1;
+        let mut paren_depth: usize = 0;
+        let mut bracket_depth: usize = 0;
         let mut j = i;
         let mut saw_collection_marker = false;
         let mut saw_stmt_break = false;
-        while j < self.tokens.len() && depth > 0 {
+        while j < self.tokens.len() && brace_depth > 0 {
             match self.tokens[j].kind {
-                TokenKind::LBrace => depth += 1,
-                TokenKind::RBrace => depth -= 1,
-                TokenKind::Colon | TokenKind::Comma if depth == 1 => {
+                TokenKind::LBrace => brace_depth += 1,
+                TokenKind::RBrace => brace_depth -= 1,
+                TokenKind::LParen => paren_depth += 1,
+                TokenKind::RParen => paren_depth = paren_depth.saturating_sub(1),
+                TokenKind::LBracket => bracket_depth += 1,
+                TokenKind::RBracket => bracket_depth = bracket_depth.saturating_sub(1),
+                // 只把花括号顶层、且不在 ()/[] 内的 `,`/`:` 当作集合/字典标记。
+                TokenKind::Colon | TokenKind::Comma
+                    if brace_depth == 1 && paren_depth == 0 && bracket_depth == 0 =>
+                {
                     saw_collection_marker = true;
                 }
-                TokenKind::Newline if depth == 1 => {
+                TokenKind::Newline
+                    if brace_depth == 1 && paren_depth == 0 && bracket_depth == 0 =>
+                {
                     let mut k = j + 1;
                     while k < self.tokens.len() && self.tokens[k].kind == TokenKind::Newline {
                         k += 1;
@@ -191,6 +202,7 @@ impl Parser {
                     if k < self.tokens.len() && self.tokens[k].kind != TokenKind::RBrace {
                         // 深度 1 上换行后又有内容：多语句块（`{ a \n b }`），
                         // 除非已见 `,`/`:`（多行集合/字典字面量）。
+                        // 在 () / [] 内的换行（如 `{ foo(\n  x\n) }`）不算语句分隔。
                         if !saw_collection_marker {
                             saw_stmt_break = true;
                         }
@@ -245,11 +257,21 @@ impl Parser {
             return self.parse_func_decl(vis, decorators);
         }
 
+        if is_const {
+            // `const` 只能修饰 let/var；否则静默落到赋值会得到错误语义。
+            if self.match_kind(TokenKind::KwLet) {
+                return self.parse_var_or_destruct_decl(vis, true, false);
+            }
+            if self.match_kind(TokenKind::KwVar) {
+                return self.parse_var_or_destruct_decl(vis, true, true);
+            }
+            return Err(self.error("expected 'let' or 'var' after 'const'"));
+        }
         if self.match_kind(TokenKind::KwLet) {
-            return self.parse_var_or_destruct_decl(vis, is_const, false);
+            return self.parse_var_or_destruct_decl(vis, false, false);
         }
         if self.match_kind(TokenKind::KwVar) {
-            return self.parse_var_or_destruct_decl(vis, is_const, true);
+            return self.parse_var_or_destruct_decl(vis, false, true);
         }
         if !decorators.is_empty() {
             if self.check(TokenKind::KwDo) {
@@ -791,7 +813,28 @@ impl Parser {
     }
 
     fn parse_do_func_expr(&mut self, loc: SourceLoc) -> Result<Expr, ParseError> {
-        self.expect(TokenKind::LParen, "expected '(' after do")?;
+        // `do { ... }` ≈ `do() { ... } ()` — 无参 IIFE 糖。
+        if self.check(TokenKind::LBrace) {
+            let body = self.parse_block()?;
+            let do_func = Expr::new(
+                loc,
+                ExprKind::DoFunc {
+                    params: Vec::new(),
+                    return_type: None,
+                    return_strong: false,
+                    return_wrapper: None,
+                    body,
+                },
+            );
+            return Ok(Expr::new(
+                loc,
+                ExprKind::Call {
+                    callee: Box::new(do_func),
+                    args: Vec::new(),
+                },
+            ));
+        }
+        self.expect(TokenKind::LParen, "expected '(' or '{' after do")?;
         let params = self.parse_param_list()?;
         self.skip_newlines();
         self.expect(TokenKind::RParen, "expected ')'")?;
@@ -1841,7 +1884,10 @@ impl Parser {
                 | TokenKind::Bang
                 | TokenKind::KwNot
                 | TokenKind::KwMatch
+                | TokenKind::KwSelect
                 | TokenKind::KwHandle
+                | TokenKind::KwGo
+                | TokenKind::KwAwait
                 | TokenKind::KwIf
                 | TokenKind::Placeholder
         )
@@ -2000,7 +2046,7 @@ impl Parser {
     }
 
     fn parse_comparison_ex(&mut self, allow_macro: bool) -> Result<Expr, ParseError> {
-        let mut expr = self.parse_additive_ex(allow_macro)?;
+        let mut expr = self.parse_bitor_ex(allow_macro)?;
         loop {
             let op = match self.current().kind {
                 TokenKind::EqEq => BinaryOp::Eq,
@@ -2012,6 +2058,81 @@ impl Parser {
                 _ => break,
             };
             self.advance();
+            { let __loc = expr.loc; expr = Expr::new(__loc, ExprKind::Binary {
+                op,
+                left: Box::new(expr),
+                right: Box::new(self.parse_bitor_ex(allow_macro)?),
+            }); }
+        }
+        Ok(expr)
+    }
+
+    /// `|` 按位或（表达式中复用 `TokenKind::Bar`；模式解析不走此层）。
+    fn parse_bitor_ex(&mut self, allow_macro: bool) -> Result<Expr, ParseError> {
+        let mut expr = self.parse_bitxor_ex(allow_macro)?;
+        loop {
+            self.skip_newlines();
+            if !self.check(TokenKind::Bar) {
+                break;
+            }
+            self.advance();
+            self.skip_newlines();
+            { let __loc = expr.loc; expr = Expr::new(__loc, ExprKind::Binary {
+                op: BinaryOp::BitOr,
+                left: Box::new(expr),
+                right: Box::new(self.parse_bitxor_ex(allow_macro)?),
+            }); }
+        }
+        Ok(expr)
+    }
+
+    fn parse_bitxor_ex(&mut self, allow_macro: bool) -> Result<Expr, ParseError> {
+        let mut expr = self.parse_bitand_ex(allow_macro)?;
+        loop {
+            self.skip_newlines();
+            if !self.check(TokenKind::Caret) {
+                break;
+            }
+            self.advance();
+            self.skip_newlines();
+            { let __loc = expr.loc; expr = Expr::new(__loc, ExprKind::Binary {
+                op: BinaryOp::BitXor,
+                left: Box::new(expr),
+                right: Box::new(self.parse_bitand_ex(allow_macro)?),
+            }); }
+        }
+        Ok(expr)
+    }
+
+    fn parse_bitand_ex(&mut self, allow_macro: bool) -> Result<Expr, ParseError> {
+        let mut expr = self.parse_shift_ex(allow_macro)?;
+        loop {
+            self.skip_newlines();
+            if !self.check(TokenKind::Ampersand) {
+                break;
+            }
+            self.advance();
+            self.skip_newlines();
+            { let __loc = expr.loc; expr = Expr::new(__loc, ExprKind::Binary {
+                op: BinaryOp::BitAnd,
+                left: Box::new(expr),
+                right: Box::new(self.parse_shift_ex(allow_macro)?),
+            }); }
+        }
+        Ok(expr)
+    }
+
+    fn parse_shift_ex(&mut self, allow_macro: bool) -> Result<Expr, ParseError> {
+        let mut expr = self.parse_additive_ex(allow_macro)?;
+        loop {
+            self.skip_newlines();
+            let op = match self.current().kind {
+                TokenKind::LtLt => BinaryOp::LShift,
+                TokenKind::GtGt => BinaryOp::RShift,
+                _ => break,
+            };
+            self.advance();
+            self.skip_newlines();
             { let __loc = expr.loc; expr = Expr::new(__loc, ExprKind::Binary {
                 op,
                 left: Box::new(expr),
@@ -2048,6 +2169,7 @@ impl Parser {
             let op = match self.current().kind {
                 TokenKind::Star => BinaryOp::Mul,
                 TokenKind::Slash => BinaryOp::Div,
+                TokenKind::Percent => BinaryOp::Mod,
                 _ => break,
             };
             self.advance();
@@ -2072,6 +2194,28 @@ impl Parser {
             let operand = self.parse_comparison_ex(allow_macro)?;
             return Ok(Expr::new(loc, ExprKind::Handle { operand: Box::new(operand) }));
         }
+        if self.check(TokenKind::KwGo) {
+            let loc = self.loc_here();
+            self.advance();
+            let operand = self.parse_comparison_ex(allow_macro)?;
+            return Ok(Expr::new(loc, ExprKind::Go { operand: Box::new(operand) }));
+        }
+        if self.check(TokenKind::KwAwait) {
+            let loc = self.loc_here();
+            self.advance();
+            self.skip_newlines();
+            if self.check(TokenKind::KwYield) {
+                self.advance();
+                return Ok(Expr::new(
+                    loc,
+                    ExprKind::Await {
+                        operand: Box::new(Expr::new(loc, ExprKind::Yield)),
+                    },
+                ));
+            }
+            let operand = self.parse_comparison_ex(allow_macro)?;
+            return Ok(Expr::new(loc, ExprKind::Await { operand: Box::new(operand) }));
+        }
         if self.check(TokenKind::Minus) {
             let loc = self.loc_here();
             self.advance();
@@ -2090,6 +2234,17 @@ impl Parser {
                 loc,
                 ExprKind::Unary {
                     op: UnaryOp::Not,
+                    operand: Box::new(self.parse_unary_ex(allow_macro)?),
+                },
+            ));
+        }
+        if self.check(TokenKind::Tilde) {
+            let loc = self.loc_here();
+            self.advance();
+            return Ok(Expr::new(
+                loc,
+                ExprKind::Unary {
+                    op: UnaryOp::Invert,
                     operand: Box::new(self.parse_unary_ex(allow_macro)?),
                 },
             ));
@@ -2387,6 +2542,7 @@ impl Parser {
             }
             TokenKind::KwQuote => self.parse_quote_expr(),
             TokenKind::KwMatch => self.parse_match_expr(),
+            TokenKind::KwSelect => self.parse_select_expr(),
             TokenKind::LParen => {
                 let loc = self.loc_here();
                 self.paren_depth += 1;
@@ -2595,6 +2751,48 @@ impl Parser {
             loc,
             ExprKind::Match {
                 subject: Box::new(subject),
+                cases,
+                else_block,
+            },
+        ))
+    }
+
+    fn parse_select_expr(&mut self) -> Result<Expr, ParseError> {
+        let loc = self.loc_here();
+        self.advance(); // select
+        self.expect(TokenKind::LBrace, "expected '{' after select")?;
+        let mut cases = Vec::new();
+        self.skip_newlines();
+        let mut else_block = None;
+        while !self.check(TokenKind::RBrace) && !self.is_at_end() {
+            if self.match_kind(TokenKind::KwCase) {
+                let event = self.parse_expr()?;
+                self.skip_newlines();
+                let bind = if self.match_kind(TokenKind::KwAs) {
+                    let name = self
+                        .expect(TokenKind::Identifier, "expected name after 'as'")?
+                        .value;
+                    Some(name)
+                } else {
+                    None
+                };
+                let body = self.parse_block()?;
+                cases.push(SelectCase { event, bind, body });
+                self.skip_newlines();
+            } else if self.match_kind(TokenKind::KwElse) {
+                else_block = Some(self.parse_block()?);
+                self.skip_newlines();
+            } else {
+                return Err(self.error("expected 'case' or 'else' in select"));
+            }
+        }
+        self.expect(TokenKind::RBrace, "expected '}' after select cases")?;
+        if else_block.is_none() && self.match_kind(TokenKind::KwElse) {
+            else_block = Some(self.parse_block()?);
+        }
+        Ok(Expr::new(
+            loc,
+            ExprKind::Select {
                 cases,
                 else_block,
             },

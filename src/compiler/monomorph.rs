@@ -414,6 +414,26 @@ pub fn substitute_expr(expr: &Expr, type_names: &HashMap<String, String>) -> Exp
         ExprKind::Handle { operand } => ExprKind::Handle {
             operand: Box::new(substitute_expr(operand, type_names)),
         },
+        ExprKind::Go { operand } => ExprKind::Go {
+            operand: Box::new(substitute_expr(operand, type_names)),
+        },
+        ExprKind::Await { operand } => ExprKind::Await {
+            operand: Box::new(substitute_expr(operand, type_names)),
+        },
+        ExprKind::Yield => ExprKind::Yield,
+        ExprKind::Select { cases, else_block } => ExprKind::Select {
+            cases: cases
+                .iter()
+                .map(|c| SelectCase {
+                    event: substitute_expr(&c.event, type_names),
+                    bind: c.bind.clone(),
+                    body: substitute_block(&c.body, type_names),
+                })
+                .collect(),
+            else_block: else_block
+                .as_ref()
+                .map(|b| substitute_block(b, type_names)),
+        },
         ExprKind::NamedAssign { name, value } => ExprKind::NamedAssign {
             name: name.clone(),
             value: Box::new(substitute_expr(value, type_names)),

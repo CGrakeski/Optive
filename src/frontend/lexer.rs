@@ -205,7 +205,7 @@ impl Lexer {
             return Token::new(TokenKind::Ellipsis, "...", line, col);
         }
 
-        // 双字符运算符
+        // 双字符运算符（`<<`/`>>` 须先于 `<`/`>`）
         let two = &self.source[self.pos..];
         let (kind, len, text) = if two.starts_with("==") {
             (TokenKind::EqEq, 2, "==")
@@ -215,6 +215,10 @@ impl Lexer {
             (TokenKind::Le, 2, "<=")
         } else if two.starts_with(">=") {
             (TokenKind::Ge, 2, ">=")
+        } else if two.starts_with("<<") {
+            (TokenKind::LtLt, 2, "<<")
+        } else if two.starts_with(">>") {
+            (TokenKind::GtGt, 2, ">>")
         } else if two.starts_with("->") {
             (TokenKind::Arrow, 2, "->")
         } else if two.starts_with("=>") {
@@ -241,6 +245,10 @@ impl Lexer {
             '-' => TokenKind::Minus,
             '*' => TokenKind::Star,
             '/' => TokenKind::Slash,
+            '%' => TokenKind::Percent,
+            '&' => TokenKind::Ampersand,
+            '^' => TokenKind::Caret,
+            '~' => TokenKind::Tilde,
             '!' => TokenKind::Bang,
             '<' => TokenKind::Lt,
             '>' => TokenKind::Gt,

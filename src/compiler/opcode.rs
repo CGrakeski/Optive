@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -26,10 +27,17 @@ pub enum Instruction {
     Div,
     /// 已证两侧为 `Num` 的除法。
     DivNumNum,
+    Mod,
     Pow,
     /// 已证两侧为 `Num` 的幂运算。
     PowNumNum,
+    BitAnd,
+    BitOr,
+    BitXor,
+    LShift,
+    RShift,
     Neg,
+    Invert,
     Not,
     TruthyNot,
     And,
@@ -126,6 +134,24 @@ pub enum Instruction {
     TypeCheck(TypeExpr),
     FindMod(String),
     RegisterExport(String),
+    /// `go f(args)`：栈为 args… + callee → Task。
+    GoCall(usize),
+    /// 将栈顶值包装为已完成的 Task。
+    GoValue,
+    /// 若为 Task 则 join；否则原样留下。
+    Await,
+    /// 协作式让步。
+    Yield,
+    /// 非阻塞试收：Channel → (value?, ready:bool)。ready 时栈顶为 bool，其下为值（关闭则为 none）。
+    SelectTryRecv,
+    /// 非阻塞试发：Channel, value → ready:bool。
+    SelectTrySend,
+    /// 轮询 Task：Task → (value?, ready:bool)。Failed 时抛出。
+    SelectPollTask,
+    /// 秒数 → 截止时间戳（毫秒）。
+    MakeDeadline,
+    /// 截止时间戳 → ready:bool。
+    SelectPollDeadline,
 }
 
 /// 将跳转指令中的标签 id 就地解析为绝对 PC。
@@ -194,11 +220,12 @@ impl MacroObject {
     }
 }
 
-/// 模块全局名表与绑定的快照；挂到该模块内编译的函数上，使导入后 `LoadGlobal` 仍可用。
+/// 模块全局名表与绑定的快照；挂到该模块内编译的函数上，使导入后 `LoadGlobal`/`StoreGlobal` 仍可用。
+/// `globals` 用 `RefCell`：导入后模块函数写入模块自己的绑定，而非污染调用方 globals。
 #[derive(Clone)]
 pub struct ModuleGlobalEnv {
     pub global_names: Vec<String>,
-    pub globals: HashMap<String, Value>,
+    pub globals: RefCell<HashMap<String, Value>>,
 }
 
 #[derive(Clone)]

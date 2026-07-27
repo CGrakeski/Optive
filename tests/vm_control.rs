@@ -96,6 +96,21 @@ n
 }
 
 #[test]
+fn loop_counted_break() {
+    assert_num(
+        r#"
+let n = 0
+loop (10) {
+    n = n + 1
+    if (n == 3) { break }
+}
+n
+"#,
+        "3",
+    );
+}
+
+#[test]
 fn loop_continue() {
     assert_num(
         r#"

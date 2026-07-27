@@ -1,16 +1,58 @@
 use crate::codegen::Generator;
 use crate::error::RuntimeError;
-use crate::opcode::FunctionObject;
+use crate::hot_code;
+use crate::opcode::{FunctionObject, Instruction, ModuleGlobalEnv};
 use crate::parser::Parser;
 use crate::std_modules;
 use crate::value::{ModuleObject, Value};
 use crate::vm::{DepPackage, Vm};
 use crate::Result;
+use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+
+/// 把模块快照挂到函数（含体内嵌套 `Push(Function)`），使 LoadGlobal/StoreGlobal 解析模块绑定。
+fn function_with_module_env(
+    func: &FunctionObject,
+    env: &Rc<ModuleGlobalEnv>,
+) -> Rc<FunctionObject> {
+    let mut f = func.clone();
+    f.module_env = Some(env.clone());
+    let mut body = (*f.body).clone();
+    let mut changed = false;
+    for ins in body.iter_mut() {
+        if let Instruction::Push(Value::Function(inner)) = ins {
+            *ins = Instruction::Push(Value::Function(function_with_module_env(inner, env)));
+            changed = true;
+        }
+    }
+    if changed {
+        f.body = Rc::new(body);
+        f.hot = hot_code::HotCode::encode(&f.body);
+    }
+    Rc::new(f)
+}
+
+fn rebind_export_value(val: &Value, env: &Rc<ModuleGlobalEnv>) -> Value {
+    match val {
+        Value::Function(f) => Value::Function(function_with_module_env(f, env)),
+        Value::Dispatch(table) => {
+            let handlers = table.borrow().handlers.clone();
+            let mut hs = handlers.borrow_mut();
+            for h in hs.iter_mut() {
+                if let Value::Function(f) = h {
+                    *h = Value::Function(function_with_module_env(f, env));
+                }
+            }
+            drop(hs);
+            Value::Dispatch(table.clone())
+        }
+        other => other.clone(),
+    }
+}
 
 pub fn install_std(vm: &mut Vm) {
     let std_mod = std_modules::build_std_module();
@@ -68,6 +110,7 @@ fn run_module_source(
     vm.import_base = import_base;
     vm.current_package_id = package_id;
     vm.package_root = package_root;
+    let module_overload_keys: Vec<String> = compiled.overload_tables.keys().cloned().collect();
     vm.load_program(compiled)?;
     let run_result = vm.run();
     vm.import_base = prev_base;
@@ -79,22 +122,38 @@ fn run_module_source(
         .functions
         .iter()
         .filter(|(k, _)| !snap.functions.contains_key(*k))
-        .map(|(k, v)| {
-            let mut func = (**v).clone();
-            func.module_env = Some(module_env.clone());
-            (k.clone(), Rc::new(func))
-        })
+        .map(|(k, v)| (k.clone(), function_with_module_env(v, &module_env)))
         .collect();
     for (k, v) in &new_functions {
         vm.functions.insert(k.clone(), v.clone());
     }
+
+    let mut new_overloads: FxHashMap<String, Vec<Rc<FunctionObject>>> = FxHashMap::default();
+    for name in module_overload_keys {
+        if let Some(overloads) = vm.overload_tables.get(&name) {
+            let patched: Vec<Rc<FunctionObject>> = overloads
+                .iter()
+                .map(|f| function_with_module_env(f, &module_env))
+                .collect();
+            new_overloads.insert(name, patched);
+        }
+    }
+
     let mut export_map = exports.borrow().clone();
     for (name, val) in export_map.iter_mut() {
+        if matches!(val, Value::None) {
+            if let Some(f) = new_functions.get(name.as_str()) {
+                *val = Value::Function(f.clone());
+                continue;
+            }
+        }
         if let Value::Function(_) = val {
             if let Some(f) = new_functions.get(name.as_str()) {
                 *val = Value::Function(f.clone());
+                continue;
             }
         }
+        *val = rebind_export_value(val, &module_env);
     }
     let new_macros: HashMap<_, _> = vm
         .macros
@@ -108,7 +167,13 @@ fn run_module_source(
         .filter(|(k, _)| !snap.struct_defs.contains_key(*k))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    vm.finish_module_init(snap, new_functions, new_macros, new_struct_defs);
+    vm.finish_module_init(
+        snap,
+        new_functions,
+        new_macros,
+        new_struct_defs,
+        new_overloads,
+    );
     Ok(export_map)
 }
 
@@ -181,7 +246,7 @@ fn load_from_package(
 ) -> Result<Value> {
     let logical = path_components[0];
     let file_path = if path_components.len() == 1 {
-        resolve_package_entry_file(&binding.path, logical).ok_or_else(|| {
+        resolve_package_entry_file(&binding.path, logical)?.ok_or_else(|| {
             RuntimeError::msg(format!(
                 "package `{logical}` has no entry (tried [package].entry, main.tive, {logical}.tive)"
             ))
@@ -244,36 +309,48 @@ fn load_file_as_module(
     }
 }
 
-fn resolve_package_entry_file(package_root: &Path, logical_name: &str) -> Option<PathBuf> {
+fn resolve_package_entry_file(
+    package_root: &Path,
+    logical_name: &str,
+) -> Result<Option<PathBuf>> {
     for name in ["Optive.toml", "optive.toml"] {
         let p = package_root.join(name);
-        if p.is_file() {
-            if let Ok(text) = fs::read_to_string(&p) {
-                if let Ok(val) = text.parse::<toml::Value>() {
-                    if let Some(entry) = val
-                        .get("package")
-                        .and_then(|p| p.get("entry"))
-                        .and_then(|e| e.as_str())
-                    {
-                        let ep = package_root.join(entry);
-                        if ep.is_file() {
-                            return Some(ep);
-                        }
-                    }
-                }
-            }
-            break;
+        if !p.is_file() {
+            continue;
         }
+        let text = fs::read_to_string(&p).map_err(|e| {
+            RuntimeError::msg(format!("cannot read {}: {e}", p.display()))
+        })?;
+        let val: toml::Value = text.parse().map_err(|e| {
+            RuntimeError::msg(format!("invalid {}: {e}", p.display()))
+        })?;
+        if let Some(entry) = val
+            .get("package")
+            .and_then(|pkg| pkg.get("entry"))
+            .and_then(|e| e.as_str())
+        {
+            let ep = package_root.join(entry);
+            if ep.is_file() {
+                return Ok(Some(ep));
+            }
+            return Err(RuntimeError::msg(format!(
+                "{} declares entry `{}` but file is missing: {}",
+                p.display(),
+                entry,
+                ep.display()
+            )));
+        }
+        break;
     }
     let main = package_root.join("main.tive");
     if main.is_file() {
-        return Some(main);
+        return Ok(Some(main));
     }
     let named = package_root.join(format!("{logical_name}.tive"));
     if named.is_file() {
-        return Some(named);
+        return Ok(Some(named));
     }
-    None
+    Ok(None)
 }
 
 fn locate_under_root(root: &Path, path_components: &[&str]) -> Option<PathBuf> {

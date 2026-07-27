@@ -114,6 +114,13 @@ pub struct MatchCase {
 }
 
 #[derive(Debug, Clone)]
+pub struct SelectCase {
+    pub event: Expr,
+    pub bind: Option<String>,
+    pub body: Block,
+}
+
+#[derive(Debug, Clone)]
 pub struct ForItem {
     pub name: String,
     pub iterable: Expr,
@@ -424,6 +431,17 @@ pub enum ExprKind {
         else_expr: Box<Expr>,
     },
     Handle { operand: Box<Expr> },
+    /// `go expr` — 启动任务，立即返回 Task。
+    Go { operand: Box<Expr> },
+    /// `await expr` — 启动并等待；`await yield` 的 operand 为 [`ExprKind::Yield`]。
+    Await { operand: Box<Expr> },
+    /// `yield` 哨兵（仅作 `await yield` 的操作数）。
+    Yield,
+    /// `select { case ev as x { } } else { }`
+    Select {
+        cases: Vec<SelectCase>,
+        else_block: Option<Block>,
+    },
     NamedAssign { name: String, value: Box<Expr> },
     DoFunc {
         params: Vec<FuncParam>,
@@ -455,6 +473,7 @@ pub enum UnaryOp {
     Neg,
     Not,
     TruthyNot,
+    Invert,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -463,7 +482,13 @@ pub enum BinaryOp {
     Sub,
     Mul,
     Div,
+    Mod,
     Pow,
+    BitAnd,
+    BitOr,
+    BitXor,
+    LShift,
+    RShift,
     Eq,
     Ne,
     Lt,
@@ -679,6 +704,32 @@ pub fn fill_placeholders(expr: &Expr, repl: &Expr) -> Expr {
                 operand: Box::new(fill_placeholders(operand, repl)),
             },
         ),
+        ExprKind::Go { operand } => Expr::new(
+            expr.loc,
+            ExprKind::Go {
+                operand: Box::new(fill_placeholders(operand, repl)),
+            },
+        ),
+        ExprKind::Await { operand } => Expr::new(
+            expr.loc,
+            ExprKind::Await {
+                operand: Box::new(fill_placeholders(operand, repl)),
+            },
+        ),
+        ExprKind::Select { cases, else_block } => Expr::new(
+            expr.loc,
+            ExprKind::Select {
+                cases: cases
+                    .iter()
+                    .map(|c| SelectCase {
+                        event: fill_placeholders(&c.event, repl),
+                        bind: c.bind.clone(),
+                        body: c.body.clone(),
+                    })
+                    .collect(),
+                else_block: else_block.clone(),
+            },
+        ),
         ExprKind::NamedAssign { name, value } => Expr::new(
             expr.loc,
             ExprKind::NamedAssign {
@@ -715,7 +766,8 @@ pub fn fill_placeholders(expr: &Expr, repl: &Expr) -> Expr {
         | ExprKind::Bool(_)
         | ExprKind::None
         | ExprKind::Var(_)
-        | ExprKind::Bytes(_) => expr.clone(),
+        | ExprKind::Bytes(_)
+        | ExprKind::Yield => expr.clone(),
     }
 }
 
