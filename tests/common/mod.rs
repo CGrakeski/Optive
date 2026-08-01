@@ -11,7 +11,15 @@ pub fn tokens(source: &str) -> Vec<optive::Token> {
 pub fn kinds(source: &str) -> Vec<TokenKind> {
     tokens(source)
         .into_iter()
-        .filter(|t| t.kind != TokenKind::End && t.kind != TokenKind::Newline)
+        .filter(|t| {
+            !matches!(
+                t.kind,
+                TokenKind::End
+                    | TokenKind::Newline
+                    | TokenKind::LineComment
+                    | TokenKind::BlockComment
+            )
+        })
         .map(|t| t.kind)
         .collect()
 }
@@ -42,6 +50,30 @@ pub fn parse_err(source: &str) {
 
 pub fn run_err(source: &str) {
     assert!(run_source(source).is_err(), "expected runtime error for: {source}");
+}
+
+/// 用给定能力集跑源码（沙箱测试用）。
+pub fn run_with_caps(
+    source: &str,
+    caps: optive::caps::Capabilities,
+) -> Result<Value, optive::RuntimeError> {
+    let mut vm = optive::vm::Vm::new();
+    vm.caps = caps;
+    optive::run_source_in_vm(&mut vm, source, "<test>")
+}
+
+/// 断言给定源码在指定能力集下抛错，且消息包含 `needle`。
+pub fn assert_caps_err(source: &str, caps: optive::caps::Capabilities, needle: &str) {
+    match run_with_caps(source, caps) {
+        Ok(v) => panic!("expected error containing '{needle}', got ok value: {}", v.display_string()),
+        Err(e) => {
+            let msg = e.message();
+            assert!(
+                msg.contains(needle),
+                "expected error containing '{needle}', got: {msg}"
+            );
+        }
+    }
 }
 
 pub fn assert_num(source: &str, expected: &str) {

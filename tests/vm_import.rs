@@ -186,6 +186,39 @@ m.describe(t)
     );
 }
 
+/// 导入后模块内非 export 函数仍须能读本模块级 `let`（LoadGlobal 走 module_env）。
+#[test]
+fn imported_module_internal_func_sees_module_let() {
+    assert_num(
+        r#"
+import "tests/import_fixtures/module_internal_global.tive" as m
+let ok = if m.TOP == "ab" then 1 else 0
+let r = if m.test_let() then 1 else 0
+ok + r
+"#,
+        "2",
+    );
+}
+
+/// `use` 引入的函数必须保留定义模块的 globals，不能被调用方 module_env 换绑。
+#[test]
+fn use_imported_func_keeps_defining_module_globals() {
+    assert_text(
+        r#"
+import "tests/import_fixtures/use_caller_with_struct.tive" as cu
+cu.via_use("x")
+"#,
+        "Identifier",
+    );
+    assert_text(
+        r#"
+import "tests/import_fixtures/use_caller_with_struct.tive" as cu
+cu.via_use("let")
+"#,
+        "KwLet",
+    );
+}
+
 /// 导入后模块函数对模块全局的赋值必须留在 module_env，不能污染调用方。
 #[test]
 fn imported_module_mutates_own_global() {

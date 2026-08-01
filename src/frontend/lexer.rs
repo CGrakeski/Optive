@@ -27,21 +27,23 @@ impl Lexer {
         let mut tokens = Vec::new();
         self.skip_bom();
         while !self.is_at_end() {
-            if self.skip_comment() {
-                if self.unclosed_block_comment {
-                    return Err(LexError::Message {
-                        line: self.line,
-                        column: self.column,
-                        message: "unterminated block comment".into(),
-                    });
-                }
-                continue;
-            }
             if self.skip_whitespace() {
                 continue;
             }
             let start_line = self.line;
             let start_col = self.column;
+            if let Some(tok) = self.lex_comment(start_line, start_col) {
+                if self.unclosed_block_comment {
+                    return Err(LexError::Message {
+                        line: start_line,
+                        column: start_col,
+                        message: "unterminated block comment".into(),
+                    });
+                }
+                self.last_kind = Some(tok.kind);
+                tokens.push(tok);
+                continue;
+            }
             let tok = self.next_token();
             if tok.kind == TokenKind::Mismatch {
                 let message = if tok.value.starts_with("unterminated")
@@ -105,19 +107,25 @@ impl Lexer {
         skipped
     }
 
-    fn skip_comment(&mut self) -> bool {
+    /// 识别 `//` / `/* */`；非注释返回 `None`（不消耗输入）。
+    fn lex_comment(&mut self, line: usize, column: usize) -> Option<Token> {
         if self.source[self.pos..].starts_with("//") {
+            self.consume_char();
+            self.consume_char();
+            let mut text = String::new();
             while let Some(ch) = self.peek_char() {
                 if ch == '\n' {
                     break;
                 }
+                text.push(ch);
                 self.consume_char();
             }
-            return true;
+            return Some(Token::new(TokenKind::LineComment, text, line, column));
         }
         if self.source[self.pos..].starts_with("/*") {
             self.consume_char(); // '/'
             self.consume_char(); // '*'
+            let mut text = String::new();
             let mut closed = false;
             while !self.is_at_end() {
                 if self.source[self.pos..].starts_with("*/") {
@@ -126,14 +134,16 @@ impl Lexer {
                     closed = true;
                     break;
                 }
-                self.consume_char();
+                if let Some(ch) = self.consume_char() {
+                    text.push(ch);
+                }
             }
             if !closed {
                 self.unclosed_block_comment = true;
             }
-            return true;
+            return Some(Token::new(TokenKind::BlockComment, text, line, column));
         }
-        false
+        None
     }
 
     fn next_token(&mut self) -> Token {
@@ -369,6 +379,10 @@ impl Lexer {
                     Some('r') => out.push('\r'),
                     Some('"') => out.push('"'),
                     Some('\\') => out.push('\\'),
+                    Some('x') => {
+                        let b = self.read_hex_byte_escape()?;
+                        out.push(char::from(b));
+                    }
                     Some(c) => {
                         out.push('\\');
                         out.push(c);
@@ -385,6 +399,19 @@ impl Lexer {
         } else {
             "unterminated string".into()
         })
+    }
+
+    /// `\xHH`：两位十六进制 → 一字节（0..=255）。
+    fn read_hex_byte_escape(&mut self) -> Result<u8, String> {
+        let hi = self.consume_char();
+        let lo = self.consume_char();
+        match (hi, lo) {
+            (Some(h), Some(l)) => match (h.to_digit(16), l.to_digit(16)) {
+                (Some(hh), Some(ll)) => Ok(((hh << 4) | ll) as u8),
+                _ => Err("invalid \\x escape".into()),
+            },
+            _ => Err("unterminated \\x escape".into()),
+        }
     }
 
     /// 字节字面量 `b"..."` — token 值为 Latin-1（每字节一个 char）。
@@ -416,37 +443,12 @@ impl Lexer {
                     Some('r') => bytes.push(b'\r'),
                     Some('"') => bytes.push(b'"'),
                     Some('\\') => bytes.push(b'\\'),
-                    Some('x') => {
-                        let hi = self.consume_char();
-                        let lo = self.consume_char();
-                        match (hi, lo) {
-                            (Some(h), Some(l)) => {
-                                let hx = h.to_digit(16);
-                                let lx = l.to_digit(16);
-                                match (hx, lx) {
-                                    (Some(hh), Some(ll)) => {
-                                        bytes.push(((hh << 4) | ll) as u8);
-                                    }
-                                    _ => {
-                                        return Token::new(
-                                            TokenKind::Mismatch,
-                                            "invalid \\x escape in bytes",
-                                            line,
-                                            col,
-                                        );
-                                    }
-                                }
-                            }
-                            _ => {
-                                return Token::new(
-                                    TokenKind::Mismatch,
-                                    "unterminated \\x escape",
-                                    line,
-                                    col,
-                                );
-                            }
+                    Some('x') => match self.read_hex_byte_escape() {
+                        Ok(b) => bytes.push(b),
+                        Err(msg) => {
+                            return Token::new(TokenKind::Mismatch, msg, line, col);
                         }
-                    }
+                    },
                     Some(c) if c.is_ascii() => bytes.push(c as u8),
                     Some(_) => {
                         return Token::new(
@@ -522,6 +524,10 @@ impl Lexer {
                     Some('\\') => out.push('\\'),
                     Some('{') => out.push('{'),
                     Some('}') => out.push('}'),
+                    Some('x') => {
+                        let b = self.read_hex_byte_escape()?;
+                        out.push(char::from(b));
+                    }
                     Some(c) => {
                         out.push('\\');
                         out.push(c);

@@ -3,6 +3,7 @@
 use std::rc::Rc;
 
 use crate::opcode::Instruction;
+use crate::value::{Num, Value};
 
 pub const H_PUSH_SMALL: u8 = 0;
 pub const H_LOAD_FAST: u8 = 1;
@@ -27,6 +28,9 @@ pub const H_LABEL: u8 = 19;
 pub const H_ADD_TEXT: u8 = 20;
 pub const H_ADD_LIST: u8 = 21;
 pub const H_STORE_FAST: u8 = 22;
+pub const H_LOOP_COUNTDOWN: u8 = 23;
+pub const H_LOAD_FAST_SUB_IMM: u8 = 24;
+pub const H_LOAD_FAST_LE_IMM: u8 = 25;
 pub const H_COLD: u8 = 255;
 
 #[derive(Clone, Default)]
@@ -51,6 +55,12 @@ impl HotCode {
                 Instruction::PushSmall(n) => (H_PUSH_SMALL, *n),
                 Instruction::LoadFast(s) => (H_LOAD_FAST, *s as i64),
                 Instruction::StoreFast(s) => (H_STORE_FAST, *s as i64),
+                Instruction::LoadFastSubImm { slot, imm } => {
+                    (H_LOAD_FAST_SUB_IMM, encode_slot_imm(*slot, *imm))
+                }
+                Instruction::LoadFastLeImm { slot, imm } => {
+                    (H_LOAD_FAST_LE_IMM, encode_slot_imm(*slot, *imm))
+                }
                 Instruction::Add | Instruction::AddNumNum => (H_ADD_NUM, 0),
                 Instruction::Sub | Instruction::SubNumNum => (H_SUB_NUM, 0),
                 Instruction::MulNumNum => (H_MUL_NUM, 0),
@@ -64,6 +74,7 @@ impl HotCode {
                 Instruction::Goto(t) => (H_GOTO, *t as i64),
                 Instruction::GotoIf(t) => (H_GOTO_IF, *t as i64),
                 Instruction::GotoIfNot(t) => (H_GOTO_IF_NOT, *t as i64),
+                Instruction::LoopCountdown(t) => (H_LOOP_COUNTDOWN, *t as i64),
                 Instruction::CallSelf { argc } => (H_CALL_SELF, *argc as i64),
                 Instruction::Ret => (H_RET, 0),
                 Instruction::RetLeave => (H_RET_LEAVE, 0),
@@ -71,6 +82,8 @@ impl HotCode {
                 Instruction::Label(_) => (H_LABEL, 0),
                 Instruction::AddTextText => (H_ADD_TEXT, 0),
                 Instruction::AddListList => (H_ADD_LIST, 0),
+                // 兜底：完整 Push(Small) 仍走热路径，避免漏改 codegen 再掉进冷分发。
+                Instruction::Push(Value::Num(Num::Small(n))) => (H_PUSH_SMALL, *n),
                 _ => (H_COLD, 0),
             };
             ops.push(op);
@@ -81,4 +94,19 @@ impl HotCode {
             args: Rc::from(args),
         }
     }
+}
+
+/// 将 `(slot, imm)` 打包为单个 `i64` 热操作数。slot 占低 32 位，imm 占高 32 位。
+/// 调用方需保证 `slot < 2^32` 且 `imm` 落在 `i32` 范围内。
+#[inline(always)]
+pub fn encode_slot_imm(slot: usize, imm: i64) -> i64 {
+    (slot as u32 as i64) | ((imm as i32 as i64) << 32)
+}
+
+/// 解包 `encode_slot_imm` 的结果。
+#[inline(always)]
+pub fn decode_slot_imm(arg: i64) -> (usize, i64) {
+    let slot = (arg & 0xFFFF_FFFF) as u32 as usize;
+    let imm = (arg >> 32) as i32 as i64;
+    (slot, imm)
 }

@@ -157,3 +157,54 @@ f(2)
         "7",
     );
 }
+
+/// 回归：函数体内的字段/下标赋值不得往操作数栈压 `none`，
+/// 否则会污染外层调用已压好的实参（嵌套调用作实参时静默算错）。
+#[test]
+fn nested_call_arg_survives_callee_field_assign() {
+    assert_text(
+        r#"
+struct Box {
+    let tokens
+    var pos
+}
+
+struct Lit {
+    let value
+}
+
+func next_lit(p) {
+    let t = p.tokens[p.pos]
+    p.pos = p.pos + 1
+    return Lit(num(t))
+}
+
+func take3(a, b, c) {
+    return [a, b, c]
+}
+
+str(take3("+", Lit(1), next_lit(Box(["9"], 0))))
+"#,
+        "[\"+\", Lit(value: 1), Lit(value: 9)]",
+    );
+}
+
+#[test]
+fn nested_call_arg_survives_callee_index_assign() {
+    assert_text(
+        r#"
+func bump(xs) {
+    xs[0] = xs[0] + 1
+    return xs[0]
+}
+
+func take2(a, b) {
+    return [a, b]
+}
+
+str(take2("keep", bump([8])))
+"#,
+        "[\"keep\", 9]",
+    );
+}
+

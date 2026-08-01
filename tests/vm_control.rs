@@ -128,6 +128,38 @@ sum
 }
 
 #[test]
+fn loop_return_inside_counted() {
+    assert_num(
+        r#"
+func f() {
+    loop (10) {
+        return 7
+    }
+    return 0
+}
+f()
+"#,
+        "7",
+    );
+}
+
+#[test]
+fn nested_counted_loops() {
+    assert_num(
+        r#"
+let n = 0
+loop (3) {
+    loop (4) {
+        n = n + 1
+    }
+}
+n
+"#,
+        "12",
+    );
+}
+
+#[test]
 fn for_in_list() {
     assert_num(
         r#"

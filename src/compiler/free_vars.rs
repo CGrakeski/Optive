@@ -89,11 +89,12 @@ fn collect_stmt_scoped(stmt: &Stmt, locals: &mut HashMap<String, ()>, free: &mut
                 collect_block(b, &mut scoped, free);
             }
         }
-        Stmt::Return(e) => {
+        Stmt::Return(e) | Stmt::Yield(e) => {
             if let Some(e) = e {
                 collect_expr(e, locals, free);
             }
         }
+        Stmt::YieldFrom(e) => collect_expr(e, locals, free),
         Stmt::Throw(e) => collect_expr(e, locals, free),
         Stmt::Expr(e) => collect_expr(e, locals, free),
         Stmt::If {
@@ -133,6 +134,7 @@ fn collect_stmt_scoped(stmt: &Stmt, locals: &mut HashMap<String, ()>, free: &mut
             }
         }
         Stmt::Break | Stmt::Continue => {}
+        Stmt::Comment { .. } => {}
         Stmt::Try {
             body,
             catches,
@@ -417,7 +419,7 @@ fn collect_expr(expr: &Expr, locals: &HashMap<String, ()>, free: &mut HashSet<St
         ExprKind::Go { operand } | ExprKind::Await { operand } => {
             collect_expr(operand, locals, free)
         }
-        ExprKind::Yield => {}
+        ExprKind::Suspend => {}
         ExprKind::Select { cases, else_block } => {
             for case in cases {
                 collect_expr(&case.event, locals, free);

@@ -176,6 +176,20 @@ fn lex_string_with_escapes() {
 }
 
 #[test]
+fn lex_string_hex_escape() {
+    let t = common::tokens(r#""\x41\x42\x00""#);
+    assert_eq!(t[0].kind, TokenKind::StringLiteral);
+    assert_eq!(t[0].value, "AB\0");
+}
+
+#[test]
+fn lex_string_hex_escape_invalid() {
+    let err = optive::tokenize(r#""\xGG""#).expect_err("expected lex error");
+    let msg = err.to_string();
+    assert!(msg.contains("\\x") || msg.contains("invalid"), "msg={msg}");
+}
+
+#[test]
 fn lex_string_concat_ops() {
     assert_kinds!(r###""hi" + "!""###, StringLiteral, Plus, StringLiteral);
 }

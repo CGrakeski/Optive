@@ -2,7 +2,9 @@
 
 pub mod builtins;
 pub mod c_types;
+pub mod caps;
 pub mod concurrency;
+pub mod debug;
 pub mod enum_variant;
 pub mod exceptions;
 pub mod ffi;

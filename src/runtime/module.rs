@@ -14,12 +14,22 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+/// 已挂到其它已加载模块的函数（`use` 引入）不得换绑到当前模块。
+fn module_env_already_finalized(func: &FunctionObject) -> bool {
+    func.module_env
+        .as_ref()
+        .is_some_and(|env| env.finalized)
+}
+
 /// 把模块快照挂到函数（含体内嵌套 `Push(Function)`），使 LoadGlobal/StoreGlobal 解析模块绑定。
 fn function_with_module_env(
-    func: &FunctionObject,
+    func: &Rc<FunctionObject>,
     env: &Rc<ModuleGlobalEnv>,
 ) -> Rc<FunctionObject> {
-    let mut f = func.clone();
+    if module_env_already_finalized(func) {
+        return func.clone();
+    }
+    let mut f = (**func).clone();
     f.module_env = Some(env.clone());
     let mut body = (*f.body).clone();
     let mut changed = false;
@@ -126,6 +136,30 @@ fn run_module_source(
         .collect();
     for (k, v) in &new_functions {
         vm.functions.insert(k.clone(), v.clone());
+    }
+
+    // 快照里的 Function 仍是「空 globals 的 module_env」。导出函数会被
+    // function_with_module_env 换掉，但模块内非 export 函数（如 via_let）
+    // 仍通过 LoadGlobal 从 module_env.globals 取出旧对象 → 函数体看不到
+    // 本模块 let/use。此处把快照内的函数（及 Dispatch）换成已挂 env 的版本。
+    {
+        let mut g = module_env.globals.borrow_mut();
+        let keys: Vec<String> = g.keys().cloned().collect();
+        for name in keys {
+            let Some(val) = g.get(&name).cloned() else {
+                continue;
+            };
+            if let Some(f) = new_functions.get(name.as_str()) {
+                g.insert(name, Value::Function(f.clone()));
+                continue;
+            }
+            match &val {
+                Value::Function(_) | Value::Dispatch(_) => {
+                    g.insert(name, rebind_export_value(&val, &module_env));
+                }
+                _ => {}
+            }
+        }
     }
 
     let mut new_overloads: FxHashMap<String, Vec<Rc<FunctionObject>>> = FxHashMap::default();

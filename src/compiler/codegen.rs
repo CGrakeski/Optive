@@ -34,6 +34,8 @@ pub struct Generator {
     loop_continue_labels: Vec<usize>,
     /// 进入循环时 `handler_stack.len()`，break/continue 只清到该深度。
     loop_handler_depths: Vec<usize>,
+    /// 与 break/continue 标签对齐：计数 `loop` 在栈上压了倒计时器。
+    loop_owns_stack_counter: Vec<bool>,
     /// 当前词法位置仍打开的 try/with（innermost last）。
     handler_stack: Vec<OpenHandler>,
     type_env: Vec<HashMap<String, (TypeExpr, bool)>>,
@@ -41,12 +43,16 @@ pub struct Generator {
     match_expr_ends: Vec<usize>,
     local_slots: Option<HashMap<String, usize>>,
     next_local_slot: usize,
+    /// 顶层已 `NewVar` 过的临时名，避免每次 `emit_store_temp` 重复建名。
+    declared_temps: HashSet<String>,
     global_index: FxHashMap<String, usize>,
     next_global_sym: usize,
     current_func: Option<String>,
     block_depth: usize,
     captured_names: HashSet<String>,
     current_return_wrapper: Option<Expr>,
+    /// 正在编译生成器函数体（`yield` / `return expr` 语义不同）。
+    compiling_generator: bool,
 }
 
 struct CompileFnExtras<'a> {
@@ -54,6 +60,7 @@ struct CompileFnExtras<'a> {
     return_strong: bool,
     return_wrapper: Option<Expr>,
     captured_names: HashSet<String>,
+    is_generator: bool,
 }
 
 impl Generator {
@@ -64,19 +71,72 @@ impl Generator {
             loop_break_labels: Vec::new(),
             loop_continue_labels: Vec::new(),
             loop_handler_depths: Vec::new(),
+            loop_owns_stack_counter: Vec::new(),
             handler_stack: Vec::new(),
             type_env: vec![HashMap::new()],
             macro_depth: 0,
             match_expr_ends: Vec::new(),
             local_slots: None,
             next_local_slot: 0,
+            declared_temps: HashSet::new(),
             global_index: FxHashMap::default(),
             next_global_sym: 0,
             current_func: None,
             block_depth: 0,
             captured_names: HashSet::new(),
             current_return_wrapper: None,
+            compiling_generator: false,
         }
+    }
+
+    /// 块内是否含本层 `yield`/`yield from`（不进入嵌套 `func`/`do` 体）。
+    fn block_has_yield(body: &Block) -> bool {
+        fn stmt_has(stmt: &Stmt) -> bool {
+            match stmt {
+                Stmt::Yield(_) | Stmt::YieldFrom(_) => true,
+                Stmt::If {
+                    then_block,
+                    elifs,
+                    else_block,
+                    ..
+                } => {
+                    Generator::block_has_yield(then_block)
+                        || elifs.iter().any(|(_, b)| Generator::block_has_yield(b))
+                        || else_block
+                            .as_ref()
+                            .is_some_and(Generator::block_has_yield)
+                }
+                Stmt::While { body, .. }
+                | Stmt::Loop { body, .. }
+                | Stmt::For { body, .. }
+                | Stmt::With { body, .. }
+                | Stmt::Block(body) => Generator::block_has_yield(body),
+                Stmt::Try {
+                    body,
+                    catches,
+                    else_block,
+                } => {
+                    Generator::block_has_yield(body)
+                        || catches.iter().any(|c| Generator::block_has_yield(&c.body))
+                        || else_block
+                            .as_ref()
+                            .is_some_and(Generator::block_has_yield)
+                }
+                Stmt::Match {
+                    cases,
+                    else_block,
+                    ..
+                } => {
+                    cases.iter().any(|c| Generator::block_has_yield(&c.body))
+                        || else_block
+                            .as_ref()
+                            .is_some_and(Generator::block_has_yield)
+                }
+                // 嵌套 FuncDecl 的 yield 只属于内层；do 在表达式里单独编译。
+                _ => false,
+            }
+        }
+        body.iter().any(|s| stmt_has(&s.stmt))
     }
 
     fn global_slot(&mut self, name: &str) -> usize {
@@ -248,10 +308,12 @@ impl Generator {
             let slot = self.ensure_local_slot(name);
             self.cg.emit(Instruction::StoreFast(slot));
         } else {
-            self.cg.emit(Instruction::NewVar {
-                name: name.to_string(),
-                is_const: false,
-            });
+            if self.declared_temps.insert(name.to_string()) {
+                self.cg.emit(Instruction::NewVar {
+                    name: name.to_string(),
+                    is_const: false,
+                });
+            }
             self.cg.emit(Instruction::Store(name.to_string()));
         }
     }
@@ -365,10 +427,15 @@ impl Generator {
             .patch_labels()
             .map_err(RuntimeError::msg)?;
         crate::specialize::specialize_instructions(&mut self.cg.code);
+        let (compacted, remap) = crate::opcode::compact_bytecode(std::mem::take(&mut self.cg.code));
+        let (fused, remap2) = crate::opcode::peephole_fuse(compacted);
+        self.cg.code = fused;
         self.program.code = std::mem::take(&mut self.cg.code);
         self.program.hot = crate::hot_code::HotCode::encode(&self.program.code);
-        self.program.line_map = std::mem::take(&mut self.cg.line_map);
-        self.program.column_map = std::mem::take(&mut self.cg.column_map);
+        let lm = crate::opcode::compact_parallel(&self.cg.line_map, &remap);
+        self.program.line_map = crate::opcode::compact_parallel(&lm, &remap2);
+        let cm = crate::opcode::compact_parallel(&self.cg.column_map, &remap);
+        self.program.column_map = crate::opcode::compact_parallel(&cm, &remap2);
         self.attach_compile_global_envs();
         Ok(self.program)
     }
@@ -379,6 +446,7 @@ impl Generator {
         let env = Rc::new(crate::opcode::ModuleGlobalEnv {
             global_names: self.program.global_names.clone(),
             globals: std::cell::RefCell::new(HashMap::new()),
+            finalized: false,
         });
         let updated: HashMap<String, Rc<FunctionObject>> = self
             .program
@@ -492,7 +560,8 @@ impl Generator {
     }
 
     fn maybe_register_export(&mut self, visibility: Visibility, name: &str, top_level: bool) {
-        if top_level && visibility == Visibility::Exported {
+        // 历史语义：无修饰符与 `export` 均注册为导出；仅 `intern` 不导出。
+        if top_level && visibility != Visibility::Internal {
             self.cg
                 .emit(Instruction::RegisterExport(name.to_string()));
         }
@@ -612,7 +681,9 @@ impl Generator {
                 return_wrapper,
                 visibility,
                 decorators,
+                is_generator,
             } => {
+                let is_gen = *is_generator;
                 if type_params.is_empty() {
                     let param_names: HashSet<String> =
                         params.iter().map(|p| p.name.clone()).collect();
@@ -631,6 +702,7 @@ impl Generator {
                             return_strong: *return_strong,
                             return_wrapper: return_wrapper.clone(),
                             captured_names: captured,
+                            is_generator: is_gen,
                         },
                     )?;
                     self.program.functions.insert(name.clone(), Rc::new(func.clone()));
@@ -655,6 +727,7 @@ impl Generator {
                         return_type: return_type.clone(),
                         return_strong: *return_strong,
                         return_wrapper: return_wrapper.clone(),
+                        is_generator: is_gen,
                         source: None,
                         source_file: "<script>".into(),
                     });
@@ -732,6 +805,7 @@ impl Generator {
                             return_strong: *return_strong,
                             return_wrapper: return_wrapper.clone(),
                             captured_names: HashSet::new(),
+                            is_generator: false,
                         },
                     )?;
                     self.cg
@@ -750,7 +824,39 @@ impl Generator {
                 self.maybe_register_export(*visibility, name, top_level);
             }
             Stmt::Return(expr) => {
-                self.gen_return_expr(expr.as_ref())?;
+                if self.compiling_generator {
+                    // 8B：`return expr` ≡ 再 yield 一次后结束；裸 return 直接结束。
+                    if let Some(e) = expr {
+                        self.gen_expr(e)?;
+                        self.cg.emit(Instruction::Yield);
+                    }
+                    self.cg.emit(Instruction::Push(Value::None));
+                    self.gen_return_from_tos()?;
+                } else {
+                    self.gen_return_expr(expr.as_ref())?;
+                }
+            }
+            Stmt::Yield(expr) => {
+                if !self.compiling_generator {
+                    return Err(RuntimeError::msg(
+                        "`yield` is only valid inside a generator function or do",
+                    ));
+                }
+                if let Some(e) = expr {
+                    self.gen_expr(e)?;
+                } else {
+                    self.cg.emit(Instruction::Push(Value::None));
+                }
+                self.cg.emit(Instruction::Yield);
+            }
+            Stmt::YieldFrom(expr) => {
+                if !self.compiling_generator {
+                    return Err(RuntimeError::msg(
+                        "`yield from` is only valid inside a generator function or do",
+                    ));
+                }
+                self.gen_expr(expr)?;
+                self.cg.emit(Instruction::YieldFrom);
             }
             Stmt::Expr(e) => {
                 self.gen_expr(e)?;
@@ -777,12 +883,14 @@ impl Generator {
                 self.loop_break_labels.push(end);
                 self.loop_continue_labels.push(start);
                 self.loop_handler_depths.push(self.handler_stack.len());
+                self.loop_owns_stack_counter.push(false);
                 for s in body {
                     self.gen_stmt(s, false)?;
                 }
                 self.loop_break_labels.pop();
                 self.loop_continue_labels.pop();
                 self.loop_handler_depths.pop();
+                self.loop_owns_stack_counter.pop();
                 self.cg.emit(Instruction::Goto(start));
                 self.cg.mark_label(end);
                 let _ = jmp;
@@ -790,35 +898,25 @@ impl Generator {
             Stmt::Loop { count, body } => {
                 let start = self.cg.fresh_label();
                 let end = self.cg.fresh_label();
-                let counter = if count.is_some() {
-                    Some(self.cg.fresh_temp("__loop_i"))
-                } else {
-                    None
-                };
-                if let (Some(c), Some(counter)) = (count, counter.as_ref()) {
+                let owns_counter = count.is_some();
+                if let Some(c) = count {
                     self.gen_expr(c)?;
-                    self.emit_store_temp(counter);
                 }
                 self.cg.mark_label(start);
-                if let Some(counter) = counter.as_ref() {
-                    self.emit_load_temp(counter);
+                if owns_counter {
                     let done = self.cg.fresh_label();
-                    self.cg.emit(Instruction::Push(Value::Num(Num::Small(0))));
-                    self.cg.emit(Instruction::Le);
-                    self.cg.emit(Instruction::GotoIf(done));
-                    self.emit_load_temp(counter);
-                    self.cg.emit(Instruction::Push(Value::Num(Num::Small(1))));
-                    self.cg.emit(Instruction::Sub);
-                    self.emit_store_temp(counter);
+                    self.cg.emit(Instruction::LoopCountdown(done));
                     self.loop_break_labels.push(end);
                     self.loop_continue_labels.push(start);
                     self.loop_handler_depths.push(self.handler_stack.len());
+                    self.loop_owns_stack_counter.push(true);
                     for s in body {
                         self.gen_stmt(s, false)?;
                     }
                     self.loop_break_labels.pop();
                     self.loop_continue_labels.pop();
                     self.loop_handler_depths.pop();
+                    self.loop_owns_stack_counter.pop();
                     self.cg.emit(Instruction::Goto(start));
                     self.cg.mark_label(done);
                     // break 跳向 `end`；与 `done` 同 PC，否则 patch_labels 报 undefined label。
@@ -827,12 +925,14 @@ impl Generator {
                     self.loop_break_labels.push(end);
                     self.loop_continue_labels.push(start);
                     self.loop_handler_depths.push(self.handler_stack.len());
+                    self.loop_owns_stack_counter.push(false);
                     for s in body {
                         self.gen_stmt(s, false)?;
                     }
                     self.loop_break_labels.pop();
                     self.loop_continue_labels.pop();
                     self.loop_handler_depths.pop();
+                    self.loop_owns_stack_counter.pop();
                     self.cg.emit(Instruction::Goto(start));
                     self.cg.mark_label(end);
                 }
@@ -849,7 +949,14 @@ impl Generator {
                     .loop_handler_depths
                     .last()
                     .ok_or_else(|| RuntimeError::msg("break outside loop"))?;
+                let owns_counter = *self
+                    .loop_owns_stack_counter
+                    .last()
+                    .ok_or_else(|| RuntimeError::msg("break outside loop"))?;
                 self.emit_handler_exit_cleanups(depth);
+                if owns_counter {
+                    self.cg.emit(Instruction::Pop);
+                }
                 self.cg.emit(Instruction::Goto(lbl));
             }
             Stmt::Continue => {
@@ -867,11 +974,7 @@ impl Generator {
             Stmt::Block(stmts) => {
                 self.cg.emit(Instruction::EnterScope);
                 self.block_depth += 1;
-                self.push_type_scope();
-                for s in stmts {
-                    self.gen_stmt(s, false)?;
-                }
-                self.pop_type_scope();
+                self.gen_block(stmts, top_level)?;
                 self.block_depth -= 1;
                 self.cg.emit(Instruction::LeaveScope);
             }
@@ -935,6 +1038,7 @@ impl Generator {
                             return_strong,
                             return_wrapper: m.return_wrapper.clone(),
                             captured_names: HashSet::new(),
+                            is_generator: false,
                         },
                     )?;
                     let func_rc = Rc::new(func);
@@ -1060,6 +1164,9 @@ impl Generator {
                 body,
             } => {
                 self.gen_with(context, alias.as_deref(), body, top_level)?;
+            }
+            Stmt::Comment { .. } => {
+                // 注释不生成任何指令。
             }
         }
         Ok(())
@@ -1341,7 +1448,7 @@ impl Generator {
                 self.emit_load_match_at(temp, path)?;
                 self.cg.emit(Instruction::ListLen);
                 self.cg
-                    .emit(Instruction::Push(Value::Num(Num::Small(elems.len() as i64))));
+                    .emit(Instruction::PushSmall(elems.len() as i64));
                 self.cg.emit(Instruction::Eq);
                 self.cg.emit(Instruction::GotoIfNot(fail_label));
                 for (i, elem) in elems.iter().enumerate() {
@@ -1529,6 +1636,7 @@ impl Generator {
                     return_strong: false,
                     return_wrapper: None,
                     captured_names: HashSet::new(),
+                    is_generator: false,
                 },
             )?;
             if method.name == "__generate__" {
@@ -1678,7 +1786,7 @@ impl Generator {
         self.emit_load_temp(temp);
         for &idx in path {
             self.cg
-                .emit(Instruction::Push(Value::Num(Num::Small(idx as i64))));
+                .emit(Instruction::PushSmall(idx as i64));
             self.cg.emit(Instruction::Index);
         }
         Ok(())
@@ -1686,12 +1794,36 @@ impl Generator {
 
     fn gen_block(&mut self, block: &Block, keep_last_value: bool) -> Result<()> {
         self.push_type_scope();
-        for (i, located) in block.iter().enumerate() {
-            let keep = keep_last_value && i + 1 == block.len();
-            self.gen_stmt(located, keep)?;
+        let last_value_idx = block.iter().rposition(|s| !matches!(s.stmt, Stmt::Comment { .. }));
+        if keep_last_value
+            && (last_value_idx.is_none()
+                || !Self::stmt_yields_value(&block[last_value_idx.expect("checked")].stmt))
+        {
+            for located in block {
+                self.gen_stmt(located, false)?;
+            }
+            self.cg.emit(Instruction::Push(Value::None));
+        } else {
+            for (i, located) in block.iter().enumerate() {
+                let keep = keep_last_value && Some(i) == last_value_idx;
+                self.gen_stmt(located, keep)?;
+            }
         }
         self.pop_type_scope();
         Ok(())
+    }
+
+    /// 作为「块的值」时，这些语句能把结果留在操作数栈顶。
+    fn stmt_yields_value(stmt: &Stmt) -> bool {
+        matches!(
+            stmt,
+            Stmt::Expr(_)
+                | Stmt::If { .. }
+                | Stmt::Match { .. }
+                | Stmt::Try { .. }
+                | Stmt::Block(_)
+                | Stmt::With { .. }
+        )
     }
 
     fn fresh_subprogram(&self) -> CompiledProgram {
@@ -1784,6 +1916,7 @@ impl Generator {
                 return_strong: template.return_strong,
                 return_wrapper,
                 captured_names: HashSet::new(),
+                is_generator: template.is_generator,
             },
         )?;
         let mut func = func;
@@ -1890,10 +2023,21 @@ impl Generator {
             return_strong,
             return_wrapper,
             captured_names,
+            is_generator,
         } = extras;
         let mut local_slots = HashMap::new();
         for (i, p) in params.iter().enumerate() {
             local_slots.insert(p.name.clone(), i);
+        }
+        // 为闭包捕获预留局部槽，避免 `let`/`BindFast` 覆盖捕获的 Cell。
+        let mut captured_ordered: Vec<String> = captured_names.iter().cloned().collect();
+        captured_ordered.sort();
+        let mut next_local_slot = params.len();
+        for name in &captured_ordered {
+            if !local_slots.contains_key(name) {
+                local_slots.insert(name.clone(), next_local_slot);
+                next_local_slot += 1;
+            }
         }
         let wrapper_for_func = return_wrapper.clone();
         let mut sub = Generator {
@@ -1902,28 +2046,57 @@ impl Generator {
             loop_break_labels: Vec::new(),
             loop_continue_labels: Vec::new(),
             loop_handler_depths: Vec::new(),
+            loop_owns_stack_counter: Vec::new(),
             handler_stack: Vec::new(),
             type_env: vec![HashMap::new()],
             macro_depth: self.macro_depth,
             match_expr_ends: Vec::new(),
             local_slots: Some(local_slots),
-            next_local_slot: params.len(),
+            next_local_slot,
+            declared_temps: HashSet::new(),
             global_index: self.global_index.clone(),
             next_global_sym: self.next_global_sym,
             current_func: Some(name.to_string()),
             block_depth: 0,
             captured_names,
             current_return_wrapper: return_wrapper,
+            compiling_generator: is_generator,
         };
         for p in params {
             if let (Some(ty), true) = (&p.type_expr, p.type_strong) {
                 sub.bind_type(&p.name, ty.clone(), true);
             }
         }
-        for s in body {
-            sub.gen_stmt(s, false)?;
+        // 隐式返回：块末尾产生值的语句（表达式 / if / match / …）留在栈上并 Ret；
+        // 显式 `return` / `return expr` 仍走 Return；空 `return` → none。
+        if body.is_empty() {
+            sub.gen_return_expr(None)?;
+        } else {
+            let last = body.len() - 1;
+            for (i, s) in body.iter().enumerate() {
+                if i != last {
+                    sub.gen_stmt(s, false)?;
+                    continue;
+                }
+                match &s.stmt {
+                    Stmt::Return(_) => {
+                        sub.gen_stmt(s, false)?;
+                    }
+                    Stmt::Yield(_) | Stmt::YieldFrom(_) => {
+                        sub.gen_stmt(s, false)?;
+                        sub.gen_return_expr(None)?;
+                    }
+                    other if Self::stmt_yields_value(other) => {
+                        sub.gen_stmt(s, true)?;
+                        sub.gen_return_from_tos()?;
+                    }
+                    _ => {
+                        sub.gen_stmt(s, false)?;
+                        sub.gen_return_expr(None)?;
+                    }
+                }
+            }
         }
-        sub.gen_return_expr(None)?;
         sub.cg
             .patch_labels()
             .map_err(RuntimeError::msg)?;
@@ -1936,6 +2109,13 @@ impl Generator {
             })
             .collect();
         crate::specialize::specialize_with_entry(&mut body, &entry_env);
+        let (compacted_body, body_remap) = crate::opcode::compact_bytecode(body);
+        let (fused_body, body_remap2) = crate::opcode::peephole_fuse(compacted_body);
+        body = fused_body;
+        let lm = crate::opcode::compact_parallel(&sub.cg.line_map, &body_remap);
+        let func_line_map = crate::opcode::compact_parallel(&lm, &body_remap2);
+        let cm = crate::opcode::compact_parallel(&sub.cg.column_map, &body_remap);
+        let func_column_map = crate::opcode::compact_parallel(&cm, &body_remap2);
         // 子编译器的 `global_names` 可能含空洞：struct/原始类型经 `Push(type_ref)`
         // 不写入名字表，而 `len` 等仍占后续 `LoadGlobal` 下标 → `["", "len", …]`。
         // 不可对空串调用 `global_slot`（会偷占槽位），也不可把 `next_global_sym`
@@ -1980,6 +2160,7 @@ impl Generator {
             Some(Rc::new(crate::opcode::ModuleGlobalEnv {
                 global_names: func_global_names,
                 globals: std::cell::RefCell::new(HashMap::new()),
+                finalized: false,
             }))
         };
         Ok(FunctionObject {
@@ -1987,8 +2168,8 @@ impl Generator {
             params: params.to_vec(),
             body: Rc::new(body),
             hot,
-            line_map: Rc::new(std::mem::take(&mut sub.cg.line_map)),
-            column_map: Rc::new(std::mem::take(&mut sub.cg.column_map)),
+            line_map: Rc::new(func_line_map),
+            column_map: Rc::new(func_column_map),
             entry_label: 0,
             fast_locals: sub.next_local_slot,
             is_builtin_body: false,
@@ -2003,7 +2184,8 @@ impl Generator {
             uses_name_map,
             track_frames,
             entry_pc: 0,
-            lightweight,
+            lightweight: lightweight && !is_generator,
+            is_generator,
             module_env,
             source: None,
             source_file: "<script>".into(),
@@ -2031,6 +2213,31 @@ impl Generator {
         }
     }
 
+    /// `return` 前丢掉仍压在栈上的计数循环计数器。
+    /// `keep_tos`：栈顶已是返回值，需先挪开再弹计数器。
+    fn emit_discard_loop_stack_counters(&mut self, keep_tos: bool) {
+        let n = self
+            .loop_owns_stack_counter
+            .iter()
+            .filter(|&&owns| owns)
+            .count();
+        if n == 0 {
+            return;
+        }
+        if keep_tos {
+            let tmp = self.cg.fresh_temp("__ret_keep");
+            self.emit_store_temp(&tmp);
+            for _ in 0..n {
+                self.cg.emit(Instruction::Pop);
+            }
+            self.emit_load_temp(&tmp);
+        } else {
+            for _ in 0..n {
+                self.cg.emit(Instruction::Pop);
+            }
+        }
+    }
+
     fn gen_return_expr(&mut self, expr: Option<&Expr>) -> Result<()> {
         if let (Some(e), Some(slots)) = (expr, self.local_slots.as_ref()) {
             if let ExprKind::Var(name) = &e.kind {
@@ -2038,9 +2245,11 @@ impl Generator {
                 if let Some(&slot) = slots.get(name.as_str()) {
                     if let Some(end) = self.match_expr_ends.last().copied() {
                         self.emit_handler_exit_cleanups(0);
+                        self.emit_discard_loop_stack_counters(false);
                         self.cg.emit(Instruction::Goto(end));
                     } else {
                         self.emit_handler_exit_cleanups(0);
+                        self.emit_discard_loop_stack_counters(false);
                         self.cg.emit(Instruction::RetFast(slot));
                     }
                     return Ok(());
@@ -2053,6 +2262,11 @@ impl Generator {
         } else {
             self.cg.emit(Instruction::Push(Value::None));
         }
+        self.gen_return_from_tos()
+    }
+
+    /// 操作数栈顶已是返回值（隐式末尾表达式 / 已求值的 return 表达式）。
+    fn gen_return_from_tos(&mut self) -> Result<()> {
         if let Some(wrapper) = self.current_return_wrapper.clone() {
             // 解析期已将包装器中的 `_` 替换为 `__ret_wrapper_val`。
             let slot = self.ensure_local_slot(RET_WRAPPER_VAL);
@@ -2061,9 +2275,11 @@ impl Generator {
         }
         if let Some(end) = self.match_expr_ends.last().copied() {
             self.emit_handler_exit_cleanups(0);
+            self.emit_discard_loop_stack_counters(true);
             self.cg.emit(Instruction::Goto(end));
         } else {
             self.emit_handler_exit_cleanups(0);
+            self.emit_discard_loop_stack_counters(true);
             self.cg.emit(Instruction::Ret);
         }
         Ok(())
@@ -2081,18 +2297,21 @@ impl Generator {
             loop_break_labels: Vec::new(),
             loop_continue_labels: Vec::new(),
             loop_handler_depths: Vec::new(),
+            loop_owns_stack_counter: Vec::new(),
             handler_stack: Vec::new(),
             type_env: vec![HashMap::new()],
             macro_depth: self.macro_depth + 1,
             match_expr_ends: Vec::new(),
             local_slots: None,
             next_local_slot: 0,
+            declared_temps: HashSet::new(),
             global_index: self.global_index.clone(),
             next_global_sym: self.next_global_sym,
             current_func: None,
             block_depth: 0,
             captured_names: HashSet::new(),
             current_return_wrapper: None,
+            compiling_generator: false,
         };
         for s in body {
             sub.gen_stmt(s, false)?;
@@ -2426,6 +2645,7 @@ impl Generator {
                     params.iter().map(|p| p.name.clone()).collect();
                 let free = free_vars::free_vars_in_block(body, &param_names);
                 let captured: HashSet<String> = free.iter().cloned().collect();
+                let is_generator = Self::block_has_yield(body);
                 let func = self.compile_function(
                     "<do>",
                     params,
@@ -2435,6 +2655,7 @@ impl Generator {
                         return_strong: *return_strong,
                         return_wrapper: return_wrapper.as_ref().map(|b| *b.clone()),
                         captured_names: captured,
+                        is_generator,
                     },
                 )?;
                 self.emit_function_value_with_defaults(params, func)?;
@@ -2567,9 +2788,7 @@ impl Generator {
                 self.gen_go_operand(operand)?;
             }
             ExprKind::Await { operand } => {
-                if matches!(operand.kind, ExprKind::Yield) {
-                    self.cg.emit(Instruction::Yield);
-                } else if let ExprKind::Call { callee, args } = &operand.kind {
+                if let ExprKind::Call { callee, args } = &operand.kind {
                     let has_named = args.iter().any(|a| a.name.is_some());
                     let has_kwsplat = args.iter().any(|a| a.is_kwsplat);
                     let has_splat = args.iter().any(|a| a.is_splat);
@@ -2589,10 +2808,8 @@ impl Generator {
                     self.cg.emit(Instruction::Await);
                 }
             }
-            ExprKind::Yield => {
-                return Err(RuntimeError::msg(
-                    "'yield' is only valid as 'await yield'",
-                ));
+            ExprKind::Suspend => {
+                self.cg.emit(Instruction::Suspend);
             }
             ExprKind::Select { cases, else_block } => {
                 self.gen_select(cases, else_block.as_ref())?;
@@ -2679,7 +2896,7 @@ impl Generator {
             // 粗略：若没有任何 case 就绪，先让步再重试；多次空转后走 else。
             // 用一次 Yield 后若仍全不就绪则 else（简化：直接检查通道全关由 SelectTryRecv 的 closed 处理）。
             // 此处：跑一次调度，再若仍无进展则 else。
-            self.cg.emit(Instruction::Yield);
+            self.cg.emit(Instruction::Suspend);
             // 再 poll 一轮；若仍无则 else
             let else_lbl = self.cg.fresh_label();
             for (i, case) in cases.iter().enumerate() {
@@ -2703,7 +2920,7 @@ impl Generator {
             self.gen_block(else_b, true)?;
             self.cg.emit(Instruction::Goto(end));
         } else {
-            self.cg.emit(Instruction::Yield);
+            self.cg.emit(Instruction::Suspend);
             self.cg.emit(Instruction::Goto(start));
         }
         self.cg.mark_label(end);
@@ -2919,6 +3136,7 @@ impl Generator {
                 return_strong: false,
                 return_wrapper: None,
                 captured_names: elem_free.iter().cloned().collect(),
+                is_generator: false,
             },
         )?;
         self.cg
@@ -2948,6 +3166,7 @@ impl Generator {
                     return_strong: false,
                     return_wrapper: None,
                     captured_names: g_free.iter().cloned().collect(),
+                    is_generator: false,
                 },
             )?;
             self.cg
@@ -2986,12 +3205,14 @@ impl Generator {
         self.loop_break_labels.push(end);
         self.loop_continue_labels.push(start);
         self.loop_handler_depths.push(self.handler_stack.len());
+        self.loop_owns_stack_counter.push(false);
         for s in body {
             self.gen_stmt(s, false)?;
         }
         self.loop_break_labels.pop();
         self.loop_continue_labels.pop();
         self.loop_handler_depths.pop();
+        self.loop_owns_stack_counter.pop();
         self.cg.emit(Instruction::Goto(start));
         self.cg.mark_label(end);
         self.cg.emit(Instruction::IterEnd);
@@ -3026,7 +3247,7 @@ impl Generator {
         for (i, item) in items.iter().enumerate() {
             self.emit_load_temp(&tuple_name);
             self.cg
-                .emit(Instruction::Push(Value::Num(Num::Small(i as i64))));
+                .emit(Instruction::PushSmall(i as i64));
             self.cg.emit(Instruction::Index);
             self.emit_bind_name(&item.name);
         }

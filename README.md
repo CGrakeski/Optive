@@ -91,6 +91,7 @@ Optive up                                 # update + run（跟随 tip）
 | `Optive cache gc [--dry-run]` | 回收未被引用的孤儿 pack |
 | `Optive env` | 打印 `OPTIVE_HOME` 与各路径 |
 | `Optive change track_latest=true\|false` | 切换某依赖是否跟随 tip（会告警） |
+| `Optive fmt <file> [-o\|--out]` | 格式化 `.tive` 源文件（默认写回；`-o` 只打印） |
 | `Optive -V` / `--version` | 版本 |
 | `Optive -h` / `--help` | 帮助 |
 
@@ -110,8 +111,8 @@ Optive up                                 # update + run（跟随 tip）
 src/
 ├── main.rs              CLI 入口 + REPL
 ├── lib.rs               库入口（run_source / run_source_in_vm）
-├── frontend/            词法 + 语法 + 诊断
-│   ├── lexer.rs  parser.rs  ast.rs  token.rs  error.rs  diagnostics.rs
+├── frontend/            词法 + 语法 + 诊断 + 格式化
+│   ├── lexer.rs  parser.rs  ast.rs  token.rs  fmt.rs  error.rs  diagnostics.rs
 ├── compiler/            AST → 字节码
 │   ├── codegen.rs  hot_code.rs  opcode.rs  monomorph.rs  specialize.rs
 │   ├── protocol.rs  free_vars.rs
@@ -131,11 +132,12 @@ src/
 ## 文档
 
 - [`docs/getting-started.md`](docs/getting-started.md) — 入门教程（手把手建项目、加依赖、跑）
-- [`docs/language.md`](docs/language.md) — 语言参考（语法、类型、控制流、泛型、宏）
-- [`docs/stdlib.md`](docs/stdlib.md) — 标准库 API
+- [`docs/language.md`](docs/language.md) — 语言参考（语法、类型、控制流、泛型、宏；§1.1 含 CLI / `Optive fmt`）
+- [`docs/stdlib.md`](docs/stdlib.md) — 标准库 API（含 `std.http` 等）
 - [`docs/ffi-c.md`](docs/ffi-c.md) — C 互操作
 - [`docs/deps-strategy.md`](docs/deps-strategy.md) — 依赖管理设计
 - [`docs/deps-tutorial.md`](docs/deps-tutorial.md) — 依赖管理实操
+- [`docs/concurrency_like_go.md`](docs/concurrency_like_go.md) — 并发模型（`go` / channel / `select`）
 
 > 文档与实现冲突时，以源码与测试为准。
 

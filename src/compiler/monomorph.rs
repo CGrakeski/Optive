@@ -116,6 +116,8 @@ fn substitute_stmt(stmt: &LocatedStmt, type_names: &HashMap<String, String>) -> 
 fn substitute_stmt_body(stmt: &Stmt, type_names: &HashMap<String, String>) -> Stmt {
     match stmt {
         Stmt::Return(e) => Stmt::Return(e.as_ref().map(|x| substitute_expr(x, type_names))),
+        Stmt::Yield(e) => Stmt::Yield(e.as_ref().map(|x| substitute_expr(x, type_names))),
+        Stmt::YieldFrom(e) => Stmt::YieldFrom(substitute_expr(e, type_names)),
         Stmt::Throw(e) => Stmt::Throw(substitute_expr(e, type_names)),
         Stmt::Assign { target, value } => Stmt::Assign {
             target: substitute_lvalue(target, type_names),
@@ -420,7 +422,7 @@ pub fn substitute_expr(expr: &Expr, type_names: &HashMap<String, String>) -> Exp
         ExprKind::Await { operand } => ExprKind::Await {
             operand: Box::new(substitute_expr(operand, type_names)),
         },
-        ExprKind::Yield => ExprKind::Yield,
+        ExprKind::Suspend => ExprKind::Suspend,
         ExprKind::Select { cases, else_block } => ExprKind::Select {
             cases: cases
                 .iter()

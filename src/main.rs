@@ -57,6 +57,22 @@ fn main() {
                 println!("Optive {VERSION}");
                 return;
             }
+            "-c" | "--code" => {
+                if args.len() < 3 {
+                    color::eprint_error("usage: Optive -c <code>");
+                    process::exit(2);
+                }
+                let (caps, _rest) = match cli::caps::parse_caps(&args[3..]) {
+                    Ok(v) => v,
+                    Err(e) => { color::eprint_error(format!("Error: {e}")); process::exit(2); }
+                };
+                // 允许多行：整段作为下一个参数（shell 引号内可含换行）。
+                if let Err(e) = run_inline_source(&args[2], caps) {
+                    color::eprint_error(e.to_string());
+                    process::exit(1);
+                }
+                return;
+            }
             "add" => {
                 if let Err(e) = cmd_add(&args[1..]) {
                     color::eprint_error(format!("Error: {e}"));
@@ -83,15 +99,24 @@ fn main() {
                 return;
             }
             "up" => {
-                if let Err(e) = cmd_up(args.get(2).map(Path::new)) {
+                let (caps, rest) = match cli::caps::parse_caps(&args[2..]) {
+                    Ok(v) => v,
+                    Err(e) => { color::eprint_error(format!("Error: {e}")); process::exit(2); }
+                };
+                let path = rest.first().map(Path::new);
+                if let Err(e) = cmd_up(path, caps) {
                     color::eprint_error(format!("Error: {e}"));
                     process::exit(1);
                 }
                 return;
             }
             "run" => {
-                let path = args.get(2).map(Path::new);
-                if let Err(e) = cmd_run(path) {
+                let (caps, rest) = match cli::caps::parse_caps(&args[2..]) {
+                    Ok(v) => v,
+                    Err(e) => { color::eprint_error(format!("Error: {e}")); process::exit(2); }
+                };
+                let path = rest.first().map(Path::new);
+                if let Err(e) = cmd_run(path, caps) {
                     color::eprint_error(format!("Error: {e}"));
                     process::exit(1);
                 }
@@ -133,9 +158,27 @@ fn main() {
                 }
                 return;
             }
+            "fmt" => {
+                if let Err(e) = cmd_fmt(&args[2..]) {
+                    color::eprint_error(format!("Error: {e}"));
+                    process::exit(1);
+                }
+                return;
+            }
+            "debug" => {
+                if let Err(e) = cli::debug_cmd::cmd_debug(&args[2..]) {
+                    color::eprint_error(format!("Error: {e}"));
+                    process::exit(1);
+                }
+                return;
+            }
             path => {
                 if path.ends_with(".tive") || Path::new(path).is_file() {
-                    run_script_file(path);
+                    let (caps, _rest) = match cli::caps::parse_caps(&args[2..]) {
+                        Ok(v) => v,
+                        Err(e) => { color::eprint_error(format!("Error: {e}")); process::exit(2); }
+                    };
+                    run_script_file(path, caps);
                     return;
                 }
                 color::eprint_error(format!("unknown command or file: {path}"));
@@ -162,7 +205,46 @@ fn cmd_new(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn cmd_run(path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+/// `Optive fmt <file> [-o|--out]`：默认写回；`-o` / `--out` 只打印到 stdout。
+fn cmd_fmt(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut out_only = false;
+    let mut file: Option<&str> = None;
+    for a in args {
+        match a.as_str() {
+            "-o" | "--out" => out_only = true,
+            "-h" | "--help" => {
+                println!("usage: Optive fmt <filename> [-o|--out]");
+                println!("  default: write formatted source back to <filename>");
+                println!("  -o, --out: print formatted source to stdout only");
+                return Ok(());
+            }
+            s if s.starts_with('-') => {
+                return Err(format!("unknown fmt flag: {s}").into());
+            }
+            s => {
+                if file.is_some() {
+                    return Err("usage: Optive fmt <filename> [-o|--out]".into());
+                }
+                file = Some(s);
+            }
+        }
+    }
+    let Some(path) = file else {
+        return Err("usage: Optive fmt <filename> [-o|--out]".into());
+    };
+    let source = fs::read_to_string(path)?;
+    let formatted = optive::fmt::format_source(&source).map_err(|e| {
+        optive::diagnostics::format_parse_error(&source, path, &e)
+    })?;
+    if out_only {
+        print!("{formatted}");
+    } else {
+        fs::write(path, formatted)?;
+    }
+    Ok(())
+}
+
+fn cmd_run(path: Option<&Path>, caps: optive::caps::Capabilities) -> Result<(), Box<dyn std::error::Error>> {
     let project = cli::manifest::find_project(path)?;
     print_project_header(&project);
     let ensured = cli::deps::ensure_for_run(&project)?;
@@ -175,11 +257,11 @@ fn cmd_run(path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
         .display()
         .to_string();
     color::status_line(&format!("Running {entry_display}"));
-    run_script_path_with_deps(&entry, &project.root, &ensured)?;
+    run_script_path_with_deps(&entry, &project.root, &ensured, caps)?;
     Ok(())
 }
 
-fn cmd_up(path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_up(path: Option<&Path>, caps: optive::caps::Capabilities) -> Result<(), Box<dyn std::error::Error>> {
     let project = cli::manifest::find_project(path)?;
     print_project_header(&project);
     color::status_line("Updating dependencies…");
@@ -193,7 +275,7 @@ fn cmd_up(path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
         .display()
         .to_string();
     color::status_line(&format!("Running {entry_display}"));
-    run_script_path_with_deps(&entry, &project.root, &ensured)?;
+    run_script_path_with_deps(&entry, &project.root, &ensured, caps)?;
     Ok(())
 }
 
@@ -398,11 +480,13 @@ fn run_script_path_with_deps(
     path: &Path,
     project_root: &Path,
     ensured: &EnsureResult,
+    caps: optive::caps::Capabilities,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let source = fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let file = path.to_string_lossy().to_string();
     let mut vm = Vm::new();
+    vm.caps = caps;
     inject_dep_map(&mut vm, ensured, project_root);
     match run_source_in_vm(&mut vm, &source, &file) {
         Ok(v) => {
@@ -415,19 +499,34 @@ fn run_script_path_with_deps(
     }
 }
 
-fn run_script_file(path: &str) {
-    if let Err(e) = run_script_path(Path::new(path)) {
+fn run_script_file(path: &str, caps: optive::caps::Capabilities) {
+    if let Err(e) = run_script_path(Path::new(path), caps) {
         color::eprint_error(e.to_string());
         process::exit(1);
     }
 }
 
-fn run_script_path(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn run_script_path(path: &Path, caps: optive::caps::Capabilities) -> Result<(), Box<dyn std::error::Error>> {
     let source = fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let file = path.to_string_lossy().to_string();
     let mut vm = Vm::new();
+    vm.caps = caps;
     match run_source_in_vm(&mut vm, &source, &file) {
+        Ok(v) => {
+            if !matches!(v, optive::value::Value::None) {
+                println!("{}", v.display_string());
+            }
+            Ok(())
+        }
+        Err(e) => Err(e.to_string().into()),
+    }
+}
+
+fn run_inline_source(source: &str, caps: optive::caps::Capabilities) -> Result<(), Box<dyn std::error::Error>> {
+    let mut vm = Vm::new();
+    vm.caps = caps;
+    match run_source_in_vm(&mut vm, source, "<string>") {
         Ok(v) => {
             if !matches!(v, optive::value::Value::None) {
                 println!("{}", v.display_string());
@@ -444,6 +543,7 @@ fn print_help() {
     println!("Usage:");
     println!("  Optive                         Start interactive REPL");
     println!("  Optive <script.tive>           Run a script");
+    println!("  Optive -c <code>               Run code from argument (multi-line OK)");
     println!("  Optive new <ProjectName>       Create a new project");
     println!("  Optive run [path]              Ensure deps (strict lock) + run entry");
     println!("  Optive up [path]               update + run");
@@ -455,6 +555,13 @@ fn print_help() {
     println!("  Optive deps doctor [-v]        Diagnose deps / lock / orphans");
     println!("  Optive env                     Print OPTIVE_HOME and paths");
     println!("  Optive change track_latest=…   Toggle tip-following (warns)");
+    println!("  Optive fmt <file> [-o|--out]   Format a .tive file (default: write back)");
+    println!("  Optive debug [file|path]       Debug a script or project entry");
+    println!();
+    println!("Runtime capability flags (apply to run / up / debug / <script> / -c):");
+    println!("  --sandbox[=DIR]          No network, no env mutation, fs limited to DIR (default: cwd)");
+    println!("  --no-network            Disable std.http");
+    println!("  --allow-path DIR         Allow fs access under DIR (repeatable; combines with --sandbox)");
     println!("  Optive -h, --help              Show this help");
     println!("  Optive -V, --version           Show version");
     println!();

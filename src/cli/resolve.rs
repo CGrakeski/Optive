@@ -396,6 +396,7 @@ fn ensure_from_lock(
 }
 
 /// 将 lock 中以 `root_edge` 为根的整棵子树按钉死 rev 物化，不 tip-fetch、不重读 pack toml。
+#[allow(clippy::too_many_arguments)]
 fn materialize_lock_subtree(
     project: &Project,
     lock: &LockFile,

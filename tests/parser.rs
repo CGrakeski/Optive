@@ -307,6 +307,18 @@ fn parse_struct_decl() {
 }
 
 #[test]
+fn parse_variant_plain_struct_cases() {
+    parse_ok(
+        r#"
+variant Expr {
+    Lit = struct { let value }
+    Bin = struct { let op let left let right }
+}
+"#,
+    );
+}
+
+#[test]
 fn parse_typed_struct() {
     parse_ok("typed struct P { let x: num }");
 }

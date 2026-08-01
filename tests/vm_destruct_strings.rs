@@ -27,6 +27,18 @@ fn multiline_string_escapes() {
 }
 
 #[test]
+fn string_hex_escape() {
+    assert_text(r#""\x41\x42""#, "AB");
+    assert_text(r#""hi\x20there""#, "hi there");
+    assert_num(r#""\x00".len()"#, "1");
+}
+
+#[test]
+fn fstring_hex_escape() {
+    assert_text(r#"f"\x41={1+1}""#, "A=2");
+}
+
+#[test]
 fn raw_string_no_escape() {
     assert_text(r#"r"\n\t\\""#, r"\n\t\\");
 }

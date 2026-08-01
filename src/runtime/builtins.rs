@@ -37,6 +37,7 @@ pub fn install_globals(vm: &mut Vm) {
         ("__make_closure__", builtin_make_closure),
         ("__with_exit__", builtin_with_exit),
         ("is_a", builtin_is_a),
+        ("isinstanceof", builtin_is_a),
         ("hash", builtin_hash),
         ("copy", builtin_copy),
         ("deepcopy", builtin_deepcopy),
@@ -329,14 +330,7 @@ fn builtin_is_a(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let ok = match &args[1] {
         Value::TypeRef(s) | Value::Text(s) => types::instance_is_a(vm, &args[0], s),
         Value::TypeSpec(spec) => {
-            let ty = if spec.args.is_empty() {
-                crate::ast::TypeExpr::Name(spec.name.clone())
-            } else {
-                crate::ast::TypeExpr::Generic {
-                    name: spec.name.clone(),
-                    params: spec.args.clone(),
-                }
-            };
+            let ty = types::type_spec_to_type_expr(spec);
             types::type_accepts(vm, &args[0], &ty)
         }
         _ => {

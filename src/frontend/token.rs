@@ -13,6 +13,7 @@ pub enum TokenKind {
     KwVar,
     KwConst,
     KwFunc,
+    KwGen,
     KwFriend,
     KwDo,
     KwReturn,
@@ -42,6 +43,7 @@ pub enum TokenKind {
     KwAwait,
     KwSelect,
     KwYield,
+    KwSuspend,
     KwVariant,
     KwEnum,
     KwStruct,
@@ -99,6 +101,10 @@ pub enum TokenKind {
     LBracket,
     RBracket,
     Newline,
+    /// `// ...` 行注释（`value` 为 `//` 之后的文本，不含换行）。
+    LineComment,
+    /// `/* ... */` 块注释（`value` 为 `/*` 与 `*/` 之间的文本）。
+    BlockComment,
     Mismatch,
 }
 
@@ -133,6 +139,7 @@ pub fn keyword_or_ident(text: &str) -> TokenKind {
         "var" => TokenKind::KwVar,
         "const" => TokenKind::KwConst,
         "func" => TokenKind::KwFunc,
+        "gen" => TokenKind::KwGen,
         "friend" => TokenKind::KwFriend,
         "do" => TokenKind::KwDo,
         "return" => TokenKind::KwReturn,
@@ -162,6 +169,7 @@ pub fn keyword_or_ident(text: &str) -> TokenKind {
         "await" => TokenKind::KwAwait,
         "select" => TokenKind::KwSelect,
         "yield" => TokenKind::KwYield,
+        "suspend" => TokenKind::KwSuspend,
         "variant" => TokenKind::KwVariant,
         "enum" => TokenKind::KwEnum,
         "struct" => TokenKind::KwStruct,

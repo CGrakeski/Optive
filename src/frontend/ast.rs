@@ -2,6 +2,8 @@ use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Visibility {
+    /// 无 `export` / `intern` 修饰符。
+    Default,
     Exported,
     Internal,
 }
@@ -180,6 +182,7 @@ pub enum Stmt {
         return_strong: bool,
         return_wrapper: Option<Expr>,
         body: Block,
+        is_generator: bool,
     },
     ProtocolDecl {
         visibility: Visibility,
@@ -187,6 +190,10 @@ pub enum Stmt {
         members: Vec<ProtocolMember>,
     },
     Return(Option<Expr>),
+    /// `yield` / `yield expr` —— 生成器产出（仅出现在含 yield 的 func/do 中）。
+    Yield(Option<Expr>),
+    /// `yield from expr` —— 委托迭代。
+    YieldFrom(Expr),
     Throw(Expr),
     If {
         cond: Expr,
@@ -262,6 +269,12 @@ pub enum Stmt {
     },
     Expr(Expr),
     Block(Block),
+    /// 语句级注释（codegen 忽略；供 `fmt` 保留）。
+    Comment {
+        /// `true` = `/* ... */`，`false` = `// ...`
+        is_block: bool,
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -433,10 +446,10 @@ pub enum ExprKind {
     Handle { operand: Box<Expr> },
     /// `go expr` — 启动任务，立即返回 Task。
     Go { operand: Box<Expr> },
-    /// `await expr` — 启动并等待；`await yield` 的 operand 为 [`ExprKind::Yield`]。
+    /// `await expr` — 启动并等待。
     Await { operand: Box<Expr> },
-    /// `yield` 哨兵（仅作 `await yield` 的操作数）。
-    Yield,
+    /// `suspend` — 协作式让出 CPU（调度器预算用尽时也会隐式挂起）。
+    Suspend,
     /// `select { case ev as x { } } else { }`
     Select {
         cases: Vec<SelectCase>,
@@ -767,7 +780,7 @@ pub fn fill_placeholders(expr: &Expr, repl: &Expr) -> Expr {
         | ExprKind::None
         | ExprKind::Var(_)
         | ExprKind::Bytes(_)
-        | ExprKind::Yield => expr.clone(),
+        | ExprKind::Suspend => expr.clone(),
     }
 }
 

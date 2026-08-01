@@ -135,3 +135,74 @@ counter
         "2",
     );
 }
+
+#[test]
+fn function_implicit_last_expr_return() {
+    assert_num(
+        r#"
+func a() {
+    1 + 1
+}
+a()
+"#,
+        "2",
+    );
+}
+
+#[test]
+fn function_empty_return_is_none() {
+    let v = common::value(
+        r#"
+func b() {
+    42
+    return
+}
+b()
+"#,
+    );
+    assert!(
+        matches!(v, optive::value::Value::None),
+        "expected none, got {}",
+        v.display_string()
+    );
+}
+
+#[test]
+fn do_block_implicit_last_expr() {
+    assert_num(
+        r#"
+let result = do {
+    let x = 10
+    x * 2
+}
+result
+"#,
+        "20",
+    );
+}
+
+#[test]
+fn function_implicit_if_value() {
+    assert_num(
+        r#"
+func pick(x) {
+    if (x) { 10 } else { 20 }
+}
+pick(false)
+"#,
+        "20",
+    );
+}
+
+#[test]
+fn bare_block_is_not_expression() {
+    common::parse_err(
+        r#"
+let result = {
+    let x = 10
+    x * 2
+}
+"#,
+    );
+}
+

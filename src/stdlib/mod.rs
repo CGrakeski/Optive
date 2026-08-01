@@ -17,7 +17,14 @@ pub fn build_std_module() -> Rc<RefCell<ModuleObject>> {
             ("sin", builtin(math_sin)),
             ("cos", builtin(math_cos)),
             ("tan", builtin(math_tan)),
+            ("asin", builtin(math_asin)),
+            ("acos", builtin(math_acos)),
+            ("atan", builtin(math_atan)),
+            ("sinh", builtin(math_sinh)),
+            ("cosh", builtin(math_cosh)),
+            ("tanh", builtin(math_tanh)),
             ("sqrt", builtin(math_sqrt)),
+            ("cbrt", builtin(math_cbrt)),
             ("abs", builtin(math_abs)),
             ("floor", builtin(math_floor)),
             ("ceil", builtin(math_ceil)),
@@ -25,6 +32,7 @@ pub fn build_std_module() -> Rc<RefCell<ModuleObject>> {
             ("trunc", builtin(math_trunc)),
             ("pow", builtin(math_pow)),
             ("log", builtin(math_log)),
+            ("log2", builtin(math_log2)),
             ("log10", builtin(math_log10)),
             ("exp", builtin(math_exp)),
             ("min", builtin(math_min)),
@@ -39,8 +47,15 @@ pub fn build_std_module() -> Rc<RefCell<ModuleObject>> {
             ("is_integer", builtin(math_is_integer)),
             ("is_rational", builtin(math_is_rational)),
             ("range", builtin(math_range)),
+            ("atan2", builtin(math_atan2)),
+            ("hypot", builtin(math_hypot)),
+            ("divmod", builtin(math_divmod)),
             ("pi", math_const_pi()),
             ("e", math_const_e()),
+            ("tau", math_const_tau()),
+            ("inf", math_const_inf()),
+            ("-inf", math_const_neg_inf()),
+            ("nan", math_const_nan()),
         ],
     );
 
@@ -169,6 +184,12 @@ pub fn build_std_module() -> Rc<RefCell<ModuleObject>> {
     std_children.insert("hash".into(), build_hash_module());
     std_children.insert("exceptions".into(), build_exceptions_module());
     std_children.insert("language".into(), crate::ffi::build_language_module());
+    std_children.insert("http".into(), build_http_module());
+    std_children.insert("encoding".into(), build_encoding_module());
+    std_children.insert("csv".into(), build_csv_module());
+    std_children.insert("toml".into(), build_toml_module());
+    std_children.insert("yaml".into(), build_yaml_module());
+    std_children.insert("xml".into(), build_xml_module());
 
     Rc::new(RefCell::new(ModuleObject {
         name: "std".into(),
@@ -286,6 +307,61 @@ math_f1!(math_tan, "tan", f64::tan);
 math_f1!(math_exp, "exp", f64::exp);
 math_f1!(math_degrees, "degrees", f64::to_degrees);
 math_f1!(math_radians, "radians", f64::to_radians);
+math_f1!(math_asin, "asin", f64::asin);
+math_f1!(math_acos, "acos", f64::acos);
+math_f1!(math_atan, "atan", f64::atan);
+math_f1!(math_sinh, "sinh", f64::sinh);
+math_f1!(math_cosh, "cosh", f64::cosh);
+math_f1!(math_tanh, "tanh", f64::tanh);
+math_f1!(math_log2, "log2", f64::log2);
+math_f1!(math_cbrt, "cbrt", f64::cbrt);
+
+fn math_atan2(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    expect_arity("atan2", args, 2)?;
+    let y = expect_num_f64("atan2", args, 0)?;
+    let x = expect_num_f64("atan2", args, 1)?;
+    Ok(Value::Num(float_from_f64(y.atan2(x))?))
+}
+
+fn math_hypot(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    expect_arity("hypot", args, 2)?;
+    let a = expect_num_f64("hypot", args, 0)?;
+    let b = expect_num_f64("hypot", args, 1)?;
+    Ok(Value::Num(float_from_f64(a.hypot(b))?))
+}
+
+/// `divmod(a, b)` → `[a / b, a % b]`（整数商与余数，遵循有理数取模同号语义）。
+fn math_divmod(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    expect_arity("divmod", args, 2)?;
+    let (Value::Num(_a), Value::Num(b)) = (&args[0], &args[1]) else {
+        return Err(crate::error::RuntimeError::type_err("divmod requires nums"));
+    };
+    if b.is_zero() {
+        return Err(crate::error::RuntimeError::value_err("divmod by zero"));
+    }
+    let q = args[0].div(&args[1])?;
+    let r = args[0].rem(&args[1])?;
+    Ok(Value::List(Rc::new(RefCell::new(vec![q, r]))))
+}
+
+fn math_const_inf() -> Value {
+    Value::Num(float_from_f64(f64::INFINITY).unwrap_or(Num::Small(0)))
+}
+
+fn math_const_neg_inf() -> Value {
+    Value::Num(float_from_f64(f64::NEG_INFINITY).unwrap_or(Num::Small(0)))
+}
+
+fn math_const_nan() -> Value {
+    Value::Num(float_from_f64(f64::NAN).unwrap_or(Num::Small(0)))
+}
+
+fn math_const_tau() -> Value {
+    Value::Num(Num::from_rational(num_rational::BigRational::new(
+        BigInt::parse_bytes(b"62831853071795864769", 10).expect("tau numerator digits"),
+        BigInt::parse_bytes(b"10000000000000000000", 10).expect("tau denominator digits"),
+    )))
+}
 
 fn std_concat(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let mut out = String::new();
@@ -550,34 +626,38 @@ fn math_range(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     Ok(IteratorState::from_range(start, stop, step).as_value())
 }
 
-fn io_read_file(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn io_read_file(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(crate::error::RuntimeError::type_err(
             "read_file requires 1 argument",
         ));
     }
     let path = expect_text("read_file", args, 0)?;
+    vm.caps.check_fs("read_file", &path)?;
     let content = std::fs::read_to_string(&path).map_err(|e| {
         crate::error::RuntimeError::io_err(format!("read_file failed: {e}"))
     })?;
+    vm.request_cooperative_yield();
     Ok(Value::Text(content))
 }
 
-fn io_write_file(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn io_write_file(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
         return Err(crate::error::RuntimeError::type_err(
             "write_file requires 2 arguments",
         ));
     }
     let path = expect_text("write_file", args, 0)?;
+    vm.caps.check_fs("write_file", &path)?;
     let content = args[1].print_string();
     std::fs::write(&path, content).map_err(|e| {
         crate::error::RuntimeError::io_err(format!("write_file failed: {e}"))
     })?;
+    vm.request_cooperative_yield();
     Ok(Value::None)
 }
 
-fn io_append_file(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn io_append_file(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
         return Err(crate::error::RuntimeError::type_err(
             "append_file requires 2 arguments",
@@ -585,6 +665,7 @@ fn io_append_file(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
     use std::io::Write;
     let path = expect_text("append_file", args, 0)?;
+    vm.caps.check_fs("append_file", &path)?;
     let content = args[1].print_string();
     let mut f = std::fs::OpenOptions::new()
         .create(true)
@@ -593,28 +674,32 @@ fn io_append_file(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         .map_err(|e| crate::error::RuntimeError::io_err(format!("append_file failed: {e}")))?;
     f.write_all(content.as_bytes())
         .map_err(|e| crate::error::RuntimeError::io_err(format!("append_file failed: {e}")))?;
+    vm.request_cooperative_yield();
     Ok(Value::None)
 }
 
-fn io_read_bytes(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn io_read_bytes(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(crate::error::RuntimeError::type_err(
             "read_bytes requires 1 argument",
         ));
     }
     let path = expect_text("read_bytes", args, 0)?;
+    vm.caps.check_fs("read_bytes", &path)?;
     let bytes = std::fs::read(&path)
         .map_err(|e| crate::error::RuntimeError::io_err(format!("read_bytes failed: {e}")))?;
+    vm.request_cooperative_yield();
     Ok(Value::Bytes(Rc::new(bytes)))
 }
 
-fn io_write_bytes(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn io_write_bytes(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
         return Err(crate::error::RuntimeError::type_err(
             "write_bytes requires 2 arguments",
         ));
     }
     let path = expect_text("write_bytes", args, 0)?;
+    vm.caps.check_fs("write_bytes", &path)?;
     let bytes = match &args[1] {
         Value::Bytes(b) => b.as_ref().clone(),
         Value::Text(s) => s.as_bytes().to_vec(),
@@ -626,6 +711,7 @@ fn io_write_bytes(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     };
     std::fs::write(&path, bytes)
         .map_err(|e| crate::error::RuntimeError::io_err(format!("write_bytes failed: {e}")))?;
+    vm.request_cooperative_yield();
     Ok(Value::None)
 }
 
@@ -1291,8 +1377,15 @@ fn decos_memoize(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 fn build_typing_module() -> Rc<RefCell<ModuleObject>> {
     fn type_ctor(name: &str) -> Value {
         let name = name.to_string();
+        let is_form = crate::type_registry::is_type_form(&name);
         Value::Builtin(Rc::new(move |_vm, args| {
             if args.is_empty() {
+                if is_form {
+                    return Ok(Value::TypeSpec(crate::value::TypeSpecData::new(
+                        name.clone(),
+                        vec![],
+                    )));
+                }
                 return Ok(Value::type_ref(name.clone()));
             }
             let params: Vec<crate::ast::TypeExpr> = args
@@ -1326,12 +1419,106 @@ fn build_typing_module() -> Rc<RefCell<ModuleObject>> {
         "typing",
         &[("Union", type_ctor("Union")),
             ("Maybe", type_ctor("Maybe")),
+            ("Optional", type_ctor("Maybe")),
+            ("Tuple", type_ctor("Tuple")),
+            ("Callable", type_ctor("Callable")),
             ("Covariant", type_ctor("Covariant")),
             ("Contravariant", type_ctor("Contravariant")),
             ("Invariant", type_ctor("Invariant")),
             ("Never", Value::type_ref("Never")),
-            ("Literal", type_ctor_literal()),],
+            ("Literal", type_ctor_literal()),
+            ("fields_of", builtin(typing_fields_of)),
+            ("protocol_of", builtin(typing_protocol_of)),
+            ("isinstanceof", builtin(typing_isinstanceof)),],
     )
+}
+
+/// `std.typing.fields_of(value | "TypeName")` → 字段名 text 列表（含基类字段）。
+fn typing_fields_of(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(crate::error::RuntimeError::type_err(
+            "fields_of requires 1 argument",
+        ));
+    }
+    let def = match &args[0] {
+        Value::Struct(s) => Some(s.def.clone()),
+        Value::TypeRef(n) | Value::Text(n) => _vm.struct_defs.get(n).cloned(),
+        _ => None,
+    };
+    let Some(def) = def else {
+        return Err(crate::error::RuntimeError::type_err(
+            "fields_of expects a struct value or struct type name",
+        ));
+    };
+    Ok(Value::List(Rc::new(RefCell::new(
+        def.fields.iter().map(|f| Value::Text(f.clone())).collect(),
+    ))))
+}
+
+/// `std.typing.protocol_of("Name")` → `{name, methods, fields}` 或 none（非协议）。
+fn typing_protocol_of(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(crate::error::RuntimeError::type_err(
+            "protocol_of requires 1 argument",
+        ));
+    }
+    let name = match &args[0] {
+        Value::Text(s) => s.clone(),
+        Value::TypeRef(s) => s.clone(),
+        _ => {
+            return Err(crate::error::RuntimeError::type_err(
+                "protocol_of expects a protocol name (text)",
+            ));
+        }
+    };
+    let Some(pd) = _vm.protocols.get(&name).cloned() else {
+        return Ok(Value::None);
+    };
+    let mut out = DictMap::new();
+    out.insert(ValueKey::Text("name".into()), Value::Text(pd.name.clone()));
+    out.insert(
+        ValueKey::Text("methods".into()),
+        Value::List(Rc::new(RefCell::new(
+            pd.methods.iter().map(|m| Value::Text(m.clone())).collect(),
+        ))),
+    );
+    out.insert(
+        ValueKey::Text("fields".into()),
+        Value::List(Rc::new(RefCell::new(
+            pd.fields
+                .iter()
+                .map(|(f, m)| {
+                    let mut d = DictMap::new();
+                    d.insert(ValueKey::Text("name".into()), Value::Text(f.clone()));
+                    d.insert(ValueKey::Text("mutable".into()), Value::Bool(*m));
+                    Value::Dict(Rc::new(RefCell::new(d)))
+                })
+                .collect(),
+        ))),
+    );
+    Ok(Value::Dict(Rc::new(RefCell::new(out))))
+}
+
+/// `std.typing.isinstanceof(value, type)` —— 运行时实例检查，替代 `is_a`。
+fn typing_isinstanceof(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(crate::error::RuntimeError::type_err(
+            "isinstanceof requires 2 arguments",
+        ));
+    }
+    let ok = match &args[1] {
+        Value::TypeRef(s) | Value::Text(s) => crate::types::instance_is_a(vm, &args[0], s),
+        Value::TypeSpec(spec) => {
+            let ty = crate::types::type_spec_to_type_expr(spec);
+            crate::types::type_accepts(vm, &args[0], &ty)
+        }
+        _ => {
+            return Err(crate::error::RuntimeError::type_err(
+                "isinstanceof expects a type handle or TypeSpec",
+            ));
+        }
+    };
+    Ok(Value::Bool(ok))
 }
 
 fn build_functional_module() -> Rc<RefCell<ModuleObject>> {
@@ -1387,8 +1574,24 @@ fn build_sync_module() -> Rc<RefCell<ModuleObject>> {
         &[
             ("Channel", Value::type_ref("Channel")),
             ("Mutex", Value::type_ref("Mutex")),
+            ("RWMutex", Value::type_ref("RWMutex")),
+            ("WaitGroup", Value::type_ref("WaitGroup")),
+            ("Semaphore", Value::type_ref("Semaphore")),
+            ("Once", Value::type_ref("Once")),
+            ("Barrier", Value::type_ref("Barrier")),
+            ("Cond", Value::type_ref("Cond")),
+            ("yield", builtin(sync_yield)),
         ],
     )
+}
+
+/// `std.sync.yield()`：主动让出当前 fiber，给其它就绪 fiber 一个运行机会。
+fn sync_yield(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if !args.is_empty() {
+        return Err(crate::error::RuntimeError::type_err("yield requires 0 arguments"));
+    }
+    vm.request_cooperative_yield();
+    Ok(Value::None)
 }
 
 fn build_text_module() -> Rc<RefCell<ModuleObject>> {
@@ -1486,11 +1689,14 @@ fn build_test_module() -> Rc<RefCell<ModuleObject>> {
 fn build_debug_module() -> Rc<RefCell<ModuleObject>> {
     submodule(
         "debug",
-        &[("traceback", builtin(debug_traceback)),
+        &[
+            ("traceback", builtin(debug_traceback)),
             ("format_tb", builtin(debug_format_tb)),
             ("print_tb", builtin(debug_print_tb)),
             ("format_exception", builtin(debug_format_exception)),
-            ("type_name", builtin(debug_type_name)),],
+            ("type_name", builtin(debug_type_name)),
+            ("breakpoint", builtin(debug_breakpoint)),
+        ],
     )
 }
 
@@ -2212,15 +2418,18 @@ fn path_stem(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 }
 
 fn path_is_absolute(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    path_bool_query("is_absolute", args, |p| p.is_absolute())
+    // 纯词法判断，不触盘，不受沙箱限制。
+    path_bool_query(&crate::caps::Capabilities::full(), "is_absolute", args, |p| p.is_absolute())
 }
 
 fn path_bool_query(
+    caps: &crate::caps::Capabilities,
     name: &str,
     args: &[Value],
     query: impl FnOnce(&std::path::Path) -> bool,
 ) -> Result<Value> {
     let p = expect_text(name, args, 0)?;
+    caps.check_fs(name, &p)?;
     Ok(Value::Bool(query(std::path::Path::new(&p))))
 }
 
@@ -2276,20 +2485,21 @@ fn path_splitext(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     ]))))
 }
 
-fn fs_exists(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    path_bool_query("exists", args, |p| p.exists())
+fn fs_exists(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    path_bool_query(&vm.caps, "exists", args, |p| p.exists())
 }
 
-fn fs_is_file(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    path_bool_query("is_file", args, |p| p.is_file())
+fn fs_is_file(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    path_bool_query(&vm.caps, "is_file", args, |p| p.is_file())
 }
 
-fn fs_is_dir(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    path_bool_query("is_dir", args, |p| p.is_dir())
+fn fs_is_dir(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    path_bool_query(&vm.caps, "is_dir", args, |p| p.is_dir())
 }
 
-fn fs_list_dir(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn fs_list_dir(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let p = expect_text("list_dir", args, 0)?;
+    vm.caps.check_fs("list_dir", &p)?;
     let mut names = Vec::new();
     for entry in std::fs::read_dir(&p)
         .map_err(|e| crate::error::RuntimeError::io_err(format!("list_dir failed: {e}")))?
@@ -2301,54 +2511,63 @@ fn fs_list_dir(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         ));
     }
     names.sort_by_key(|a| a.print_string());
+    vm.request_cooperative_yield();
     Ok(Value::List(Rc::new(RefCell::new(names))))
 }
 
-fn fs_mkdir(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn fs_mkdir(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let p = expect_text("mkdir", args, 0)?;
+    vm.caps.check_fs("mkdir", &p)?;
     std::fs::create_dir(&p)
         .map_err(|e| crate::error::RuntimeError::io_err(format!("mkdir failed: {e}")))?;
     Ok(Value::None)
 }
 
-fn fs_mkdir_all(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn fs_mkdir_all(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let p = expect_text("mkdir_all", args, 0)?;
+    vm.caps.check_fs("mkdir_all", &p)?;
     std::fs::create_dir_all(&p)
         .map_err(|e| crate::error::RuntimeError::io_err(format!("mkdir_all failed: {e}")))?;
     Ok(Value::None)
 }
 
-fn fs_remove(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn fs_remove(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let p = expect_text("remove", args, 0)?;
+    vm.caps.check_fs("remove", &p)?;
     std::fs::remove_file(&p)
         .map_err(|e| crate::error::RuntimeError::io_err(format!("remove failed: {e}")))?;
     Ok(Value::None)
 }
 
-fn fs_remove_dir(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn fs_remove_dir(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let p = expect_text("remove_dir", args, 0)?;
+    vm.caps.check_fs("remove_dir", &p)?;
     std::fs::remove_dir_all(&p)
         .map_err(|e| crate::error::RuntimeError::io_err(format!("remove_dir failed: {e}")))?;
     Ok(Value::None)
 }
 
-fn fs_rename(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn fs_rename(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
         return Err(crate::error::RuntimeError::type_err("rename requires 2 arguments"));
     }
     let from = expect_text("rename", args, 0)?;
     let to = expect_text("rename", args, 1)?;
+    vm.caps.check_fs("rename", &from)?;
+    vm.caps.check_fs("rename", &to)?;
     std::fs::rename(&from, &to)
         .map_err(|e| crate::error::RuntimeError::io_err(format!("rename failed: {e}")))?;
     Ok(Value::None)
 }
 
-fn fs_copy(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn fs_copy(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
         return Err(crate::error::RuntimeError::type_err("copy requires 2 arguments"));
     }
     let from = expect_text("copy", args, 0)?;
     let to = expect_text("copy", args, 1)?;
+    vm.caps.check_fs("copy", &from)?;
+    vm.caps.check_fs("copy", &to)?;
     std::fs::copy(&from, &to)
         .map_err(|e| crate::error::RuntimeError::io_err(format!("copy failed: {e}")))?;
     Ok(Value::None)
@@ -2361,10 +2580,11 @@ fn os_getenv(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         .unwrap_or(Value::None))
 }
 
-fn os_setenv(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn os_setenv(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
         return Err(crate::error::RuntimeError::type_err("setenv requires 2 arguments"));
     }
+    vm.caps.check_env("setenv")?;
     let key = expect_text("setenv", args, 0)?;
     let val = args[1].print_string();
     std::env::set_var(key, val);
@@ -2387,8 +2607,9 @@ fn os_cwd(_vm: &mut Vm, _args: &[Value]) -> Result<Value> {
     Ok(Value::Text(cwd.to_string_lossy().to_string()))
 }
 
-fn os_chdir(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn os_chdir(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let p = expect_text("chdir", args, 0)?;
+    vm.caps.check_env("chdir")?;
     std::env::set_current_dir(&p)
         .map_err(|e| crate::error::RuntimeError::io_err(format!("chdir failed: {e}")))?;
     Ok(Value::None)
@@ -2849,6 +3070,14 @@ fn debug_type_name(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     Ok(Value::Text(args[0].type_name_string()))
 }
 
+fn debug_breakpoint(vm: &mut Vm, _args: &[Value]) -> Result<Value> {
+    if let Some(dbg) = &vm.debug {
+        dbg.borrow_mut()
+            .request_break(crate::debug::StopReason::Explicit);
+    }
+    Ok(Value::None)
+}
+
 thread_local! {
     static RNG_CELL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
@@ -3235,4 +3464,687 @@ fn exc_tree(_vm: &mut Vm, _args: &[Value]) -> Result<Value> {
         );
     }
     Ok(Value::Dict(Rc::new(RefCell::new(out))))
+}
+
+// ── std.http ──────────────────────────────────────────────────────────
+
+fn build_http_module() -> Rc<RefCell<ModuleObject>> {
+    submodule(
+        "http",
+        &[
+            ("get", builtin(http_get)),
+            ("post", builtin(http_post)),
+            ("put", builtin(http_put)),
+            ("delete", builtin(http_delete)),
+            ("patch", builtin(http_patch)),
+            ("head", builtin(http_head)),
+            ("request", builtin(http_request)),
+        ],
+    )
+}
+
+fn extract_headers(name: &str, opts: &Value) -> Result<reqwest::header::HeaderMap> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    // 只读 opts.headers 子表；避免 timeout/proxy/body 等控制字段被误当作请求头。
+    let hdrs = match opts {
+        Value::Dict(d) => d.borrow().get(&ValueKey::Text("headers".into())).cloned(),
+        _ => None,
+    };
+    if let Some(Value::Dict(d)) = hdrs {
+        for (k, v) in d.borrow().iter() {
+            let key_str = match k {
+                ValueKey::Text(s) => s.as_str(),
+                _ => continue,
+            };
+            let val_str = match v {
+                Value::Text(s) => s.as_str(),
+                Value::Num(n) => &n.to_string(),
+                Value::Bool(b) => &b.to_string(),
+                _ => continue,
+            };
+            let hn = reqwest::header::HeaderName::try_from(key_str)
+                .map_err(|e| crate::error::RuntimeError::value_err(format!("{name}: invalid header name '{key_str}': {e}")))?;
+            let hv = reqwest::header::HeaderValue::try_from(val_str)
+                .map_err(|e| crate::error::RuntimeError::value_err(format!("{name}: invalid header value: {e}")))?;
+            headers.insert(hn, hv);
+        }
+    }
+    Ok(headers)
+}
+
+fn opt_str(opts: &Value, key: &str) -> Option<String> {
+    if let Value::Dict(d) = opts {
+        if let Some(Value::Text(s)) = d.borrow().get(&ValueKey::Text(key.into())) {
+            return Some(s.clone());
+        }
+    }
+    None
+}
+
+fn opt_bool(opts: &Value, key: &str) -> Option<bool> {
+    if let Value::Dict(d) = opts {
+        if let Some(Value::Bool(b)) = d.borrow().get(&ValueKey::Text(key.into())) {
+            return Some(*b);
+        }
+    }
+    None
+}
+
+fn opt_num(opts: &Value, key: &str) -> Option<i64> {
+    if let Value::Dict(d) = opts {
+        if let Some(Value::Num(n)) = d.borrow().get(&ValueKey::Text(key.into())) {
+            return n.to_i64();
+        }
+    }
+    None
+}
+
+fn extract_timeout(opts: &Value) -> Option<std::time::Duration> {
+    if let Value::Dict(d) = opts {
+        if let Some(Value::Num(n)) = d.borrow().get(&ValueKey::Text("timeout".into())) {
+            if let Some(secs) = n.to_i64() {
+                return Some(std::time::Duration::from_secs(secs.max(0) as u64));
+            }
+        }
+    }
+    None
+}
+
+fn response_to_dict(resp: reqwest::blocking::Response) -> Result<Value> {
+    let status = resp.status().as_u16();
+    let url = resp.url().to_string();
+    let mut header_map = DictMap::new();
+    for (k, v) in resp.headers().iter() {
+        let val = v.to_str().unwrap_or("");
+        header_map.insert(
+            ValueKey::Text(k.as_str().to_string()),
+            Value::Text(val.to_string()),
+        );
+    }
+    let body = resp
+        .text()
+        .map_err(|e| crate::error::RuntimeError::io_err(format!("http: failed to read body: {e}")))?;
+    let mut out = DictMap::new();
+    out.insert(ValueKey::Text("status".into()), Value::Num(Num::Small(status as i64)));
+    out.insert(ValueKey::Text("body".into()), Value::Text(body));
+    out.insert(ValueKey::Text("headers".into()), Value::Dict(Rc::new(RefCell::new(header_map))));
+    out.insert(
+        ValueKey::Text("ok".into()),
+        Value::Bool((200..300).contains(&status)),
+    );
+    out.insert(ValueKey::Text("url".into()), Value::Text(url));
+    Ok(Value::Dict(Rc::new(RefCell::new(out))))
+}
+
+fn build_client(opts: &Value) -> Result<reqwest::blocking::Client> {
+    let mut builder = reqwest::blocking::Client::builder();
+    if let Some(dur) = extract_timeout(opts) {
+        builder = builder.timeout(dur);
+    }
+    // 代理：opts.proxy = "http://host:port" 或 socks5
+    if let Some(p) = opt_str(opts, "proxy") {
+        let proxy = reqwest::Proxy::all(&p).map_err(|e| {
+            crate::error::RuntimeError::value_err(format!("http: invalid proxy '{p}': {e}"))
+        })?;
+        builder = builder.proxy(proxy);
+    }
+    // User-Agent
+    if let Some(ua) = opt_str(opts, "user_agent") {
+        builder = builder.user_agent(ua);
+    }
+    // 跟随重定向：bool（开/关）或 num（最大次数）
+    if let Some(follow) = opt_bool(opts, "follow_redirects") {
+        builder = builder.redirect(if follow {
+            reqwest::redirect::Policy::default()
+        } else {
+            reqwest::redirect::Policy::none()
+        });
+    } else if let Some(n) = opt_num(opts, "follow_redirects") {
+        builder = builder.redirect(reqwest::redirect::Policy::limited(n.max(0) as usize));
+    }
+    builder
+        .build()
+        .map_err(|e| crate::error::RuntimeError::io_err(format!("http: failed to build client: {e}")))
+}
+
+/// 从 opts.auth（"user:pass" 或 {user,pass}）解析基本认证，按请求应用。
+fn apply_auth(
+    mut req: reqwest::blocking::RequestBuilder,
+    opts: &Value,
+) -> reqwest::blocking::RequestBuilder {
+    if let Some(auth) = opt_str(opts, "auth") {
+        if let Some(idx) = auth.find(':') {
+            let (u, p) = auth.split_at(idx);
+            req = req.basic_auth(u, Some(&p[1..]));
+        }
+    } else if let Value::Dict(d) = opts {
+        let auth_val = d.borrow().get(&ValueKey::Text("auth".into())).cloned();
+        if let Some(Value::Dict(ad)) = auth_val {
+            let user = match ad.borrow().get(&ValueKey::Text("user".into())) {
+                Some(Value::Text(s)) => s.clone(),
+                _ => String::new(),
+            };
+            let pass = match ad.borrow().get(&ValueKey::Text("pass".into())) {
+                Some(Value::Text(s)) => Some(s.clone()),
+                _ => None,
+            };
+            req = req.basic_auth(user, pass);
+        }
+    }
+    req
+}
+
+fn http_get(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    vm.caps.check_network("http.get")?;
+    let url = expect_text("http.get", args, 0)?;
+    let opts = args.get(1).cloned().unwrap_or(Value::None);
+    let client = build_client(&opts)?;
+    let mut req = client.get(url.as_str());
+    if let Value::Dict(_) = &opts {
+        req = req.headers(extract_headers("http.get", &opts)?);
+    }
+    req = apply_auth(req, &opts);
+    let resp = req
+        .send()
+        .map_err(|e| crate::error::RuntimeError::io_err(format!("http.get '{url}' failed: {e}")))?;
+    let r = response_to_dict(resp);
+    if r.is_ok() {
+        vm.request_cooperative_yield();
+    }
+    r
+}
+
+fn http_post(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    vm.caps.check_network("http.post")?;
+    let url = expect_text("http.post", args, 0)?;
+    let body = expect_text("http.post", args, 1)?;
+    let opts = args.get(2).cloned().unwrap_or(Value::None);
+    let client = build_client(&opts)?;
+    let mut req = client.post(url.as_str()).body(body);
+    if let Value::Dict(_) = &opts {
+        req = req.headers(extract_headers("http.post", &opts)?);
+    }
+    req = apply_auth(req, &opts);
+    let resp = req
+        .send()
+        .map_err(|e| crate::error::RuntimeError::io_err(format!("http.post '{url}' failed: {e}")))?;
+    let r = response_to_dict(resp);
+    if r.is_ok() {
+        vm.request_cooperative_yield();
+    }
+    r
+}
+
+fn http_put(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    vm.caps.check_network("http.put")?;
+    let url = expect_text("http.put", args, 0)?;
+    let body = expect_text("http.put", args, 1)?;
+    let opts = args.get(2).cloned().unwrap_or(Value::None);
+    let client = build_client(&opts)?;
+    let mut req = client.put(url.as_str()).body(body);
+    if let Value::Dict(_) = &opts {
+        req = req.headers(extract_headers("http.put", &opts)?);
+    }
+    req = apply_auth(req, &opts);
+    let resp = req
+        .send()
+        .map_err(|e| crate::error::RuntimeError::io_err(format!("http.put '{url}' failed: {e}")))?;
+    let r = response_to_dict(resp);
+    if r.is_ok() {
+        vm.request_cooperative_yield();
+    }
+    r
+}
+
+fn http_delete(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    vm.caps.check_network("http.delete")?;
+    let url = expect_text("http.delete", args, 0)?;
+    let opts = args.get(1).cloned().unwrap_or(Value::None);
+    let client = build_client(&opts)?;
+    let mut req = client.delete(url.as_str());
+    if let Value::Dict(_) = &opts {
+        req = req.headers(extract_headers("http.delete", &opts)?);
+    }
+    req = apply_auth(req, &opts);
+    let resp = req
+        .send()
+        .map_err(|e| crate::error::RuntimeError::io_err(format!("http.delete '{url}' failed: {e}")))?;
+    let r = response_to_dict(resp);
+    if r.is_ok() {
+        vm.request_cooperative_yield();
+    }
+    r
+}
+
+fn http_patch(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    vm.caps.check_network("http.patch")?;
+    let url = expect_text("http.patch", args, 0)?;
+    let body = expect_text("http.patch", args, 1)?;
+    let opts = args.get(2).cloned().unwrap_or(Value::None);
+    let client = build_client(&opts)?;
+    let mut req = client.patch(url.as_str()).body(body);
+    if let Value::Dict(_) = &opts {
+        req = req.headers(extract_headers("http.patch", &opts)?);
+    }
+    req = apply_auth(req, &opts);
+    let resp = req
+        .send()
+        .map_err(|e| crate::error::RuntimeError::io_err(format!("http.patch '{url}' failed: {e}")))?;
+    let r = response_to_dict(resp);
+    if r.is_ok() {
+        vm.request_cooperative_yield();
+    }
+    r
+}
+
+fn http_head(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    vm.caps.check_network("http.head")?;
+    let url = expect_text("http.head", args, 0)?;
+    let opts = args.get(1).cloned().unwrap_or(Value::None);
+    let client = build_client(&opts)?;
+    let mut req = client.head(url.as_str());
+    if let Value::Dict(_) = &opts {
+        req = req.headers(extract_headers("http.head", &opts)?);
+    }
+    req = apply_auth(req, &opts);
+    let resp = req
+        .send()
+        .map_err(|e| crate::error::RuntimeError::io_err(format!("http.head '{url}' failed: {e}")))?;
+    let r = response_to_dict(resp);
+    if r.is_ok() {
+        vm.request_cooperative_yield();
+    }
+    r
+}
+
+fn http_request(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    vm.caps.check_network("http.request")?;
+    let method = expect_text("http.request", args, 0)?;
+    let url = expect_text("http.request", args, 1)?;
+    let opts = args.get(2).cloned().unwrap_or(Value::None);
+    let client = build_client(&opts)?;
+    let m = method.to_uppercase();
+    let mut req_builder = match m.as_str() {
+        "GET" => client.get(url.as_str()),
+        "POST" => client.post(url.as_str()),
+        "PUT" => client.put(url.as_str()),
+        "DELETE" => client.delete(url.as_str()),
+        "PATCH" => client.patch(url.as_str()),
+        "HEAD" => client.head(url.as_str()),
+        other => {
+            return Err(crate::error::RuntimeError::type_err(format!(
+                "http.request: unsupported method '{other}'"
+            )));
+        }
+    };
+    if let Value::Dict(_) = &opts {
+        req_builder = req_builder.headers(extract_headers("http.request", &opts)?);
+        if let Value::Dict(d) = &opts {
+            if let Some(Value::Text(s)) = d.borrow().get(&ValueKey::Text("body".into())) {
+                req_builder = req_builder.body(s.clone());
+            }
+        }
+    }
+    let req_builder = apply_auth(req_builder, &opts);
+    let resp = req_builder
+        .send()
+        .map_err(|e| crate::error::RuntimeError::io_err(format!("http.request '{m} {url}' failed: {e}")))?;
+    let r = response_to_dict(resp);
+    if r.is_ok() {
+        vm.request_cooperative_yield();
+    }
+    r
+}
+
+// ---------------------------------------------------------------------------
+// std.encoding —— base64 / hex / url / gzip 编解码
+// ---------------------------------------------------------------------------
+
+fn enc_input_bytes(v: &Value) -> Result<Vec<u8>> {
+    match v {
+        Value::Text(s) => Ok(s.as_bytes().to_vec()),
+        Value::Bytes(b) => Ok(b.as_ref().clone()),
+        _ => Err(crate::error::RuntimeError::type_err(
+            "expected text or bytes",
+        )),
+    }
+}
+
+fn enc_base64_encode(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    expect_arity("base64_encode", args, 1)?;
+    let data = enc_input_bytes(&args[0])?;
+    use base64::Engine;
+    Ok(Value::Text(
+        base64::engine::general_purpose::STANDARD.encode(&data),
+    ))
+}
+
+fn enc_base64_decode(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    expect_arity("base64_decode", args, 1)?;
+    let s = expect_text("base64_decode", args, 0)?;
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(s.as_bytes())
+        .map_err(|e| crate::error::RuntimeError::value_err(format!("base64_decode: {e}")))?;
+    Ok(Value::Bytes(Rc::new(bytes)))
+}
+
+fn enc_hex_encode(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    expect_arity("hex_encode", args, 1)?;
+    let data = enc_input_bytes(&args[0])?;
+    Ok(Value::Text(hex::encode(&data)))
+}
+
+fn enc_hex_decode(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    expect_arity("hex_decode", args, 1)?;
+    let s = expect_text("hex_decode", args, 0)?;
+    let bytes = hex::decode(s)
+        .map_err(|e| crate::error::RuntimeError::value_err(format!("hex_decode: {e}")))?;
+    Ok(Value::Bytes(Rc::new(bytes)))
+}
+
+/// URL 百分号编码：保留 unreserved 字符（A-Za-z0-9-._~），其余 %XX。
+fn enc_url_encode(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    expect_arity("url_encode", args, 1)?;
+    let s = expect_text("url_encode", args, 0)?;
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    Ok(Value::Text(out))
+}
+
+fn enc_url_decode(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    expect_arity("url_decode", args, 1)?;
+    let s = expect_text("url_decode", args, 0)?;
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'%' {
+            if i + 2 >= bytes.len() {
+                return Err(crate::error::RuntimeError::value_err(
+                    "url_decode: incomplete %XX escape",
+                ));
+            }
+            let hi = hex_val(bytes[i + 1])?;
+            let lo = hex_val(bytes[i + 2])?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else if b == b'+' {
+            out.push(b' ');
+            i += 1;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    Ok(Value::Text(
+        String::from_utf8(out)
+            .map_err(|e| crate::error::RuntimeError::value_err(format!("url_decode: {e}")))?,
+    ))
+}
+
+fn hex_val(b: u8) -> Result<u8> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(crate::error::RuntimeError::value_err(format!(
+            "url_decode: invalid hex digit '{}'",
+            b as char
+        ))),
+    }
+}
+
+fn enc_gzip_encode(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    expect_arity("gzip_encode", args, 1)?;
+    let data = enc_input_bytes(&args[0])?;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(&data)
+        .map_err(|e| crate::error::RuntimeError::io_err(format!("gzip_encode: {e}")))?;
+    let out = encoder
+        .finish()
+        .map_err(|e| crate::error::RuntimeError::io_err(format!("gzip_encode: {e}")))?;
+    Ok(Value::Bytes(Rc::new(out)))
+}
+
+fn enc_gzip_decode(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    expect_arity("gzip_decode", args, 1)?;
+    let data = enc_input_bytes(&args[0])?;
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    let mut dec = GzDecoder::new(&data[..]);
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out)
+        .map_err(|e| crate::error::RuntimeError::io_err(format!("gzip_decode: {e}")))?;
+    Ok(Value::Bytes(Rc::new(out)))
+}
+
+fn build_encoding_module() -> Rc<RefCell<ModuleObject>> {
+    submodule(
+        "encoding",
+        &[
+            ("base64_encode", builtin(enc_base64_encode)),
+            ("base64_decode", builtin(enc_base64_decode)),
+            ("hex_encode", builtin(enc_hex_encode)),
+            ("hex_decode", builtin(enc_hex_decode)),
+            ("url_encode", builtin(enc_url_encode)),
+            ("url_decode", builtin(enc_url_decode)),
+            ("gzip_encode", builtin(enc_gzip_encode)),
+            ("gzip_decode", builtin(enc_gzip_decode)),
+        ],
+    )
+}
+
+// ---------------------------------------------------------------------------
+// 数据格式解析标准库 —— csv / toml / yaml / xml
+// ---------------------------------------------------------------------------
+
+/// `serde_json::Value` → Optive `Value`（供 toml/yaml 经 serde 中转后复用）。
+fn serde_json_to_optive(v: &serde_json::Value) -> Result<Value> {
+    use serde_json::Value as J;
+    Ok(match v {
+        J::Null => Value::None,
+        J::Bool(b) => Value::Bool(*b),
+        J::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Value::Num(Num::Small(i))
+            } else if let Some(u) = n.as_u64() {
+                if let Ok(i) = i64::try_from(u) {
+                    Value::Num(Num::Small(i))
+                } else {
+                    Value::Num(Num::from_bigint(num_bigint::BigInt::from(u)))
+                }
+            } else if let Some(f) = n.as_f64() {
+                Value::Num(float_from_f64(f)?)
+            } else {
+                Value::None
+            }
+        }
+        J::String(s) => Value::Text(s.clone()),
+        J::Array(a) => {
+            let items: Result<Vec<_>> = a.iter().map(serde_json_to_optive).collect();
+            Value::List(Rc::new(RefCell::new(items?)))
+        }
+        J::Object(o) => {
+            let mut d = DictMap::new();
+            for (k, val) in o.iter() {
+                d.insert(ValueKey::Text(k.clone()), serde_json_to_optive(val)?);
+            }
+            Value::Dict(Rc::new(RefCell::new(d)))
+        }
+    })
+}
+
+// --- std.toml ---
+
+fn toml_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    expect_arity("parse", args, 1)?;
+    let s = expect_text("parse", args, 0)?;
+    let toml_val: toml::Value = toml::from_str(&s)
+        .map_err(|e| crate::error::RuntimeError::value_err(format!("toml parse: {e}")))?;
+    let jv = serde_json::to_value(&toml_val)
+        .map_err(|e| crate::error::RuntimeError::value_err(format!("toml convert: {e}")))?;
+    serde_json_to_optive(&jv)
+}
+
+fn build_toml_module() -> Rc<RefCell<ModuleObject>> {
+    submodule("toml", &[("parse", builtin(toml_parse))])
+}
+
+// --- std.yaml ---
+
+fn yaml_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    expect_arity("parse", args, 1)?;
+    let s = expect_text("parse", args, 0)?;
+    let yaml_val: serde_yaml::Value = serde_yaml::from_str(&s)
+        .map_err(|e| crate::error::RuntimeError::value_err(format!("yaml parse: {e}")))?;
+    let jv = serde_json::to_value(&yaml_val)
+        .map_err(|e| crate::error::RuntimeError::value_err(format!("yaml convert: {e}")))?;
+    serde_json_to_optive(&jv)
+}
+
+fn build_yaml_module() -> Rc<RefCell<ModuleObject>> {
+    submodule("yaml", &[("parse", builtin(yaml_parse))])
+}
+
+// --- std.csv ---
+
+/// `parse(text, opts?)`：`opts.header`（默认 true）控制首行是否为字段名。
+/// 有表头 → 返回 dict 列表；无表头 → 返回 list 列表。
+fn csv_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if args.is_empty() {
+        return Err(crate::error::RuntimeError::type_err(
+            "csv.parse requires at least 1 argument",
+        ));
+    }
+    let text = expect_text("csv.parse", args, 0)?;
+    // 默认 header=true；仅当 opts.header 显式为 false 时关闭。
+    let header = match args.get(1) {
+        Some(Value::Dict(d)) => !matches!(
+            d.borrow().get(&ValueKey::Text("header".into())),
+            Some(Value::Bool(false))
+        ),
+        _ => true,
+    };
+
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(header)
+        .flexible(true)
+        .from_reader(text.as_bytes());
+    let rows: Vec<Vec<String>> = rdr
+        .records()
+        .map(|r| {
+            r.map_err(|e| crate::error::RuntimeError::value_err(format!("csv parse: {e}")))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .map(|r| r.iter().map(|s| s.to_string()).collect())
+        .collect();
+
+    if header {
+        let headers = rdr
+            .headers()
+            .map_err(|e| crate::error::RuntimeError::value_err(format!("csv headers: {e}")))?
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        let out: Vec<Value> = rows
+            .iter()
+            .map(|row| {
+                let mut d = DictMap::new();
+                for (i, h) in headers.iter().enumerate() {
+                    let v = row.get(i).map(|s| s.as_str()).unwrap_or("");
+                    d.insert(ValueKey::Text(h.clone()), Value::Text(v.to_string()));
+                }
+                Value::Dict(Rc::new(RefCell::new(d)))
+            })
+            .collect();
+        Ok(Value::List(Rc::new(RefCell::new(out))))
+    } else {
+        let out: Vec<Value> = rows
+            .iter()
+            .map(|row| {
+                Value::List(Rc::new(RefCell::new(
+                    row.iter()
+                        .map(|s| Value::Text(s.clone()))
+                        .collect(),
+                )))
+            })
+            .collect();
+        Ok(Value::List(Rc::new(RefCell::new(out))))
+    }
+}
+
+fn build_csv_module() -> Rc<RefCell<ModuleObject>> {
+    submodule("csv", &[("parse", builtin(csv_parse))])
+}
+
+// --- std.xml ---
+
+/// XML 元素 → dict：`{tag, attrs, text, children}`。
+/// `text` 为直接文本内容（trimmed）；`children` 为子元素 dict 列表。
+fn xml_element_to_value(node: roxmltree::Node) -> Value {
+    let mut d = DictMap::new();
+    d.insert(
+        ValueKey::Text("tag".into()),
+        Value::Text(node.tag_name().name().to_string()),
+    );
+    // 属性
+    let mut attrs = DictMap::new();
+    for a in node.attributes() {
+        attrs.insert(
+            ValueKey::Text(a.name().to_string()),
+            Value::Text(a.value().to_string()),
+        );
+    }
+    d.insert(
+        ValueKey::Text("attrs".into()),
+        Value::Dict(Rc::new(RefCell::new(attrs))),
+    );
+    // 直接文本 + 子元素
+    let mut text = String::new();
+    let mut children = Vec::new();
+    for child in node.children() {
+        if child.is_element() {
+            children.push(xml_element_to_value(child));
+        } else if child.is_text() {
+            text.push_str(child.text().unwrap_or(""));
+        }
+    }
+    let trimmed = text.trim().to_string();
+    d.insert(
+        ValueKey::Text("text".into()),
+        if trimmed.is_empty() {
+            Value::None
+        } else {
+            Value::Text(trimmed)
+        },
+    );
+    d.insert(
+        ValueKey::Text("children".into()),
+        Value::List(Rc::new(RefCell::new(children))),
+    );
+    Value::Dict(Rc::new(RefCell::new(d)))
+}
+
+fn xml_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    expect_arity("parse", args, 1)?;
+    let s = expect_text("parse", args, 0)?;
+    let doc = roxmltree::Document::parse(&s)
+        .map_err(|e| crate::error::RuntimeError::value_err(format!("xml parse: {e}")))?;
+    Ok(xml_element_to_value(doc.root_element()))
+}
+
+fn build_xml_module() -> Rc<RefCell<ModuleObject>> {
+    submodule("xml", &[("parse", builtin(xml_parse))])
 }

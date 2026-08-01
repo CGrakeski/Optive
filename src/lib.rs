@@ -10,10 +10,10 @@ pub mod stdlib;
 pub use compiler::{
     codegen, free_vars, hot_code, monomorph, opcode, protocol, specialize,
 };
-pub use frontend::{ast, diagnostics, error, lexer, parser, token};
+pub use frontend::{ast, diagnostics, error, fmt, lexer, parser, token};
 pub use runtime::{
-    builtins, concurrency, c_types, enum_variant, exceptions, ffi, gc, module, runtime_ast, sized,
-    traceback, type_registry, types, value, vm,
+    builtins, caps, concurrency, c_types, debug, enum_variant, exceptions, ffi, gc, module, runtime_ast,
+    sized, traceback, type_registry, types, value, vm,
 };
 pub use stdlib as std_modules;
 

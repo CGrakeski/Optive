@@ -298,5 +298,17 @@ fn mark_iterator_children(state: &IteratorState, worklist: &mut Vec<Value>) {
             }
         }
         IteratorKind::Channel { .. } => {}
+        IteratorKind::Generator {
+            locals,
+            yield_from,
+            ..
+        } => {
+            for v in locals {
+                worklist.push(v.clone());
+            }
+            if let Some(yf) = yield_from {
+                worklist.push(Value::Iterator(yf.clone()));
+            }
+        }
     }
 }

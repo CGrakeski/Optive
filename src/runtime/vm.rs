@@ -42,6 +42,68 @@ enum HotFlow {
     Fail,
 }
 
+/// `run_interpreter` 出口：正常值、任务已挂起、或调试器请求暂停。
+enum InterpResult {
+    Value(Option<Value>),
+    Suspended,
+    DebugBreak,
+    /// 生成器 `yield` / `yield from` 产出一个值后挂起。
+    Yielded(Value),
+}
+
+/// 当前正在跑的调度任务边界（挂起时裁剪到此水位）。
+struct TaskRunCtx {
+    task: Rc<RefCell<TaskInner>>,
+    stop_ucf: usize,
+    stop_locals: usize,
+    stop_nts: usize,
+    stop_stack: usize,
+    stop_func_stack: usize,
+    stop_func_frames: usize,
+    stop_try: usize,
+    stop_iters: usize,
+    stop_fast_ret: usize,
+    stop_lw_bases: usize,
+    stop_lw_sp: usize,
+    stop_lw_depth: usize,
+    stop_lw_base: usize,
+    stop_lw_entry_pc: usize,
+    stop_lw_frame_slots: usize,
+}
+
+/// 挂起任务的纤程快照。
+pub(crate) struct TaskFiber {
+    code: Rc<Vec<Instruction>>,
+    hot_ops: Rc<[u8]>,
+    hot_args: Rc<[i64]>,
+    pc: usize,
+    active_line_map: Rc<Vec<usize>>,
+    active_column_map: Rc<Vec<usize>>,
+    stack: Vec<StackVal>,
+    locals_stack: Vec<Vec<Value>>,
+    name_to_slot: Vec<Option<FxHashMap<String, usize>>>,
+    user_call_frames: Vec<UserCallFrame>,
+    func_stack: Vec<Rc<FunctionObject>>,
+    func_frames: Vec<FuncFrame>,
+    try_stack: Vec<TryFrame>,
+    iterators: Vec<ActiveIter>,
+    fast_ret_pcs: Vec<usize>,
+    lw_slots: Vec<StackVal>,
+    lw_bases: Vec<usize>,
+    lw_base: usize,
+    lw_depth: usize,
+    lw_entry_pc: usize,
+    lw_frame_slots: usize,
+}
+
+fn suspend_budget_default() -> usize {
+    std::env::var("OPTIVE_SUSPEND_BUDGET")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(8_192)
+}
+
 impl StackVal {
     #[inline]
     fn from_value(v: Value) -> Self {
@@ -136,7 +198,10 @@ fn validate_hot_bytecode(hot: &crate::hot_code::HotCode) -> Result<()> {
         let op = hot.ops[pc];
         let arg = hot.args[pc];
         // 跳转类指令的目标必须落在 [0, n)。
-        let is_jump = matches!(op, H_GOTO | H_GOTO_IF | H_GOTO_IF_NOT);
+        let is_jump = matches!(
+            op,
+            H_GOTO | H_GOTO_IF | H_GOTO_IF_NOT | H_LOOP_COUNTDOWN
+        );
         if is_jump {
             let target = arg;
             if target < 0 || (target as usize) >= n {
@@ -149,7 +214,8 @@ fn validate_hot_bytecode(hot: &crate::hot_code::HotCode) -> Result<()> {
         // 槽位 / 参数计数字段不得为负（否则 as usize 会变成巨大偏移）。
         let is_slot_or_argc = matches!(
             op,
-            H_LOAD_FAST | H_STORE_FAST | H_RET_FAST | H_CALL_SELF
+            H_LOAD_FAST | H_STORE_FAST | H_RET_FAST | H_CALL_SELF | H_LOAD_FAST_SUB_IMM
+                | H_LOAD_FAST_LE_IMM
         );
         if is_slot_or_argc && arg < 0 {
             return Err(RuntimeError::msg(format!(
@@ -252,8 +318,8 @@ pub struct Vm {
     macro_eval_scopes: Vec<EvalSnapshot>,
     convert_tables: FxHashMap<String, Rc<RefCell<DispatchTable>>>,
     pub source_file: String,
-    /// 当前执行中的顶层代码块源文本（REPL / 脚本）。
-    pub(crate) current_source: Option<Rc<str>>,
+    /// 当前执行中的顶层代码块源文本（REPL / 脚本 / 调试器）。
+    pub current_source: Option<Rc<str>>,
     /// 运行失败 unwind 前捕获；供错误格式化消费。
     pub(crate) last_error_stack: Vec<ErrorStackFrame>,
     pub import_base: std::path::PathBuf,
@@ -290,6 +356,8 @@ pub struct Vm {
     /// CallSelf 进入时的入口 PC；返回时与 func_stack 等状态一并恢复。
     lw_entry_pc: usize,
     lw_frame_slots: usize,
+    /// 缓存的 `max_call_depth()`，避免热路径每次读 `OnceLock`。
+    cached_max_depth: usize,
     /// 热路径 Ret 延迟完成：保存 (leave_scope, result) 待外层解释循环处理。
     pending_ret: Option<(bool, StackVal)>,
     /// 热路径是否已失败；用 bool 避免每次错误路径都 Option::take。
@@ -306,6 +374,28 @@ pub struct Vm {
     pub(crate) protocols: FxHashMap<String, Rc<crate::protocol::ProtocolDef>>,
     /// M:1 协作调度就绪队列。
     pub(crate) ready_tasks: VecDeque<Rc<RefCell<TaskInner>>>,
+    /// 挂起任务的纤程快照（键为 `Rc::as_ptr(task)`）。
+    task_fibers: FxHashMap<usize, TaskFiber>,
+    /// 当前调度任务上下文；`None` 表示主纤程。
+    task_ctx: Option<TaskRunCtx>,
+    /// 每片最多执行的字节码条数。
+    suspend_budget: usize,
+    /// 本片剩余预算。
+    budget_left: usize,
+    /// 任务请求挂起（显式 `suspend` 或预算耗尽）。
+    pending_suspend: bool,
+    /// 主纤程预算耗尽，需跑一轮就绪队列。
+    pending_main_yield: bool,
+    /// 正在 `advance_iterator` 恢复生成器。
+    generator_resuming: bool,
+    /// 当前恢复的生成器状态（供 Yield/YieldFrom 写回）。
+    active_generator: Option<Rc<RefCell<IteratorState>>>,
+    /// Yield 刚产出的值，由 `run_interpreter` 转为 `InterpResult::Yielded`。
+    pending_gen_yield: Option<Value>,
+    /// 调试会话状态；`None` 时热路径仅多一次空检查。
+    pub debug: Option<Rc<RefCell<crate::debug::DebugState>>>,
+    /// 运行时能力隔离：网络 / 文件系统 / 环境变量网关。默认全开。
+    pub caps: crate::caps::Capabilities,
 }
 
 #[derive(Clone)]
@@ -314,6 +404,10 @@ pub(crate) struct EvalSnapshot {
     pub(crate) locals_stack: Vec<Vec<Value>>,
     pub(crate) name_to_slot: Vec<Option<FxHashMap<String, usize>>>,
     code: Rc<Vec<Instruction>>,
+    hot_ops: Rc<[u8]>,
+    hot_args: Rc<[i64]>,
+    active_line_map: Rc<Vec<usize>>,
+    active_column_map: Rc<Vec<usize>>,
     pc: usize,
     stack: Vec<StackVal>,
     functions: FxHashMap<String, Rc<FunctionObject>>,
@@ -368,6 +462,8 @@ enum StepAction {
     NewVarOrLoad(String),
     LoadFast(usize),
     StoreFast(usize),
+    LoadFastSubImm { slot: usize, imm: i64 },
+    LoadFastLeImm { slot: usize, imm: i64 },
     BindFast {
         slot: usize,
         name: String,
@@ -379,6 +475,7 @@ enum StepAction {
     Goto(usize),
     GotoIf(usize),
     GotoIfNot(usize),
+    LoopCountdown(usize),
     Call { argc: usize },
     CallSelf { argc: usize },
     CallList,
@@ -432,7 +529,9 @@ enum StepAction {
     GoCall { argc: usize },
     GoValue,
     Await,
+    Suspend,
     Yield,
+    YieldFrom,
     SelectTryRecv,
     SelectTrySend,
     SelectPollTask,
@@ -510,6 +609,7 @@ impl Vm {
             lw_depth: 0,
             lw_entry_pc: 0,
             lw_frame_slots: 0,
+            cached_max_depth: max_call_depth(),
             pending_ret: None,
             hot_failed: false,
             hot_error: None,
@@ -519,6 +619,17 @@ impl Vm {
             set_element_contracts: FxHashMap::default(),
             protocols: FxHashMap::default(),
             ready_tasks: VecDeque::new(),
+            task_fibers: FxHashMap::default(),
+            task_ctx: None,
+            suspend_budget: suspend_budget_default(),
+            budget_left: suspend_budget_default(),
+            pending_suspend: false,
+            pending_main_yield: false,
+            generator_resuming: false,
+            active_generator: None,
+            pending_gen_yield: None,
+            debug: None,
+            caps: crate::caps::Capabilities::full(),
         };
         builtins::install_globals(&mut vm);
         type_registry::install_core_types(&mut vm);
@@ -867,6 +978,7 @@ impl Vm {
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
             ),
+            finalized: true,
         }
     }
 
@@ -1174,7 +1286,7 @@ impl Vm {
 
     #[inline(always)]
     fn call_self_lightweight(&mut self, argc: usize, entry_pc: usize, frame_slots: usize) {
-        if self.lw_depth >= max_call_depth() {
+        if self.lw_depth >= self.cached_max_depth {
             self.set_hot_error(RuntimeError::msg("RecursionError: maximum recursion depth exceeded"));
             return;
         }
@@ -1287,8 +1399,12 @@ impl Vm {
         self.lw_bases_sp = n;
         // SAFETY: n < lw_bases_sp（旧值）<= lw_bases.len()。
         let base = self.lw_bases[n];
+        // 只清理 Heap 槽（防止 Rc/Box 延迟释放）；Int/Bool/Empty 无析构，
+        // 下次 call_self 会覆盖，跳过可省去 ~2.7M 次/帧的空写。
         for i in base..self.lw_sp {
-            self.lw_slots[i] = StackVal::Empty;
+            if matches!(self.lw_slots[i], StackVal::Heap(_)) {
+                self.lw_slots[i] = StackVal::Empty;
+            }
         }
         self.lw_sp = base;
         self.lw_depth -= 1;
@@ -1532,6 +1648,61 @@ impl Vm {
                 self.store_fast_sv(slot, v);
                 HotFlow::Cont
             }
+            H_LOAD_FAST_SUB_IMM => {
+                let (slot, imm) = crate::hot_code::decode_slot_imm(arg);
+                // 快路径：lw_depth > 0 且槽为 Int → 就地减法无溢出检查。
+                if self.lw_depth != 0 {
+                    let idx = self.lw_base + slot;
+                    if idx < self.lw_sp {
+                        if let StackVal::Int(n) = &self.lw_slots[idx] {
+                            self.pc = pc + 1;
+                            let (r, ov) = n.overflowing_sub(imm);
+                            if !ov {
+                                self.op_push_int(r);
+                                HotFlow::Cont
+                            } else {
+                                // 溢出 → 慢路径 BigInt 提升。
+                                let v = Value::Num(Num::Small(*n));
+                                self.op_push(StackVal::from_value(v));
+                                self.op_push_int(imm);
+                                let b = self.op_pop();
+                                let a = self.op_pop();
+                                if let Err(e) = self.exec_sub_slow(a, b) {
+                                    self.set_hot_error(e);
+                                    return HotFlow::Fail;
+                                }
+                                HotFlow::Cont
+                            }
+                        } else {
+                            // 非 Int（Heap）→ 冷路径（pc 未推进，step 会处理）。
+                            HotFlow::Cold
+                        }
+                    } else {
+                        HotFlow::Cold
+                    }
+                } else {
+                    HotFlow::Cold
+                }
+            }
+            H_LOAD_FAST_LE_IMM => {
+                let (slot, imm) = crate::hot_code::decode_slot_imm(arg);
+                if self.lw_depth != 0 {
+                    let idx = self.lw_base + slot;
+                    if idx < self.lw_sp {
+                        if let StackVal::Int(n) = &self.lw_slots[idx] {
+                            self.pc = pc + 1;
+                            self.op_push_bool(*n <= imm);
+                            HotFlow::Cont
+                        } else {
+                            HotFlow::Cold
+                        }
+                    } else {
+                        HotFlow::Cold
+                    }
+                } else {
+                    HotFlow::Cold
+                }
+            }
             H_ADD_NUM => {
                 self.pc = pc + 1;
                 if self.binop_ints_inplace(|x, y| {
@@ -1703,6 +1874,24 @@ impl Vm {
                 self.pc = arg as usize;
                 HotFlow::Cont
             }
+            H_LOOP_COUNTDOWN => {
+                let sp = self.stack_sp;
+                if sp > 0 {
+                    // SAFETY: sp > 0 且 sp <= stack.len()，故 sp-1 合法。
+                    if let StackVal::Int(n) = &mut self.stack[sp - 1] {
+                        if *n <= 0 {
+                            self.stack_sp = sp - 1;
+                            self.pc = arg as usize;
+                        } else {
+                            *n -= 1;
+                            self.pc = pc + 1;
+                        }
+                        return HotFlow::Cont;
+                    }
+                }
+                // 非 Int（如 BigInt）走冷路径；勿推进 pc。
+                HotFlow::Cold
+            }
             H_GOTO_IF_NOT => {
                 // 常见：比较结果 Bool 在 TOS
                 self.pc = pc + 1;
@@ -1781,7 +1970,7 @@ impl Vm {
                         self.set_hot_error(RuntimeError::msg("CallSelf outside function"));
                         return HotFlow::Fail;
                     };
-                    if !func.lightweight {
+                    if !func.lightweight || self.debug.is_some() {
                         return HotFlow::Cold;
                     }
                     self.lw_entry_pc = func.entry_pc;
@@ -1850,7 +2039,7 @@ impl Vm {
 
     #[inline(always)]
     fn call_self_lw1(&mut self, entry_pc: usize) {
-        if self.lw_depth >= max_call_depth() {
+        if self.lw_depth >= self.cached_max_depth {
             self.set_hot_error(RuntimeError::msg("RecursionError: maximum recursion depth exceeded"));
             return;
         }
@@ -1869,12 +2058,47 @@ impl Vm {
 
     pub fn run(&mut self) -> Result<Value> {
         match self.run_interpreter(None)? {
-            Some(v) => Ok(v),
-            None => Ok(self.stack_top()),
+            InterpResult::Value(Some(v)) => Ok(v),
+            InterpResult::Value(None) => Ok(self.stack_top()),
+            InterpResult::Suspended => Err(RuntimeError::msg(
+                "internal error: main fiber suspended unexpectedly",
+            )),
+            InterpResult::DebugBreak => Err(RuntimeError::msg(
+                "internal error: debug break without debugger session",
+            )),
+            InterpResult::Yielded(_) => Err(RuntimeError::msg(
+                "internal error: generator yield outside iterator",
+            )),
         }
     }
 
-    fn run_interpreter(&mut self, until_depth: Option<usize>) -> Result<Option<Value>> {
+    /// 调试会话：跑到断点/步进停点，或程序结束。
+    pub fn run_until_debug_break(&mut self) -> Result<Option<Value>> {
+        match self.run_interpreter(None)? {
+            InterpResult::Value(Some(v)) => Ok(Some(v)),
+            InterpResult::Value(None) => Ok(Some(self.stack_top())),
+            InterpResult::DebugBreak => Ok(None),
+            InterpResult::Suspended => Err(RuntimeError::msg(
+                "internal error: main fiber suspended unexpectedly",
+            )),
+            InterpResult::Yielded(_) => Err(RuntimeError::msg(
+                "internal error: generator yield outside iterator",
+            )),
+        }
+    }
+
+    #[inline]
+    fn check_debug_pause(&mut self) -> Option<InterpResult> {
+        let dbg = self.debug.clone()?;
+        let mut state = dbg.borrow_mut();
+        if crate::debug::should_pause(self, &mut state) {
+            crate::debug::mark_stopped(self, &mut state);
+            return Some(InterpResult::DebugBreak);
+        }
+        None
+    }
+
+    fn run_interpreter(&mut self, until_depth: Option<usize>) -> Result<InterpResult> {
         self.ensure_op_stack(256);
         'outer: loop {
             // 仅在外层刷新切片；CallSelf/Cont 热路径不碰 Rc / ptr_eq。
@@ -1885,14 +2109,20 @@ impl Vm {
             let code_len = ops.len();
 
             'hot: loop {
+                if self.pending_suspend {
+                    return self.complete_task_suspend();
+                }
+                if self.debug.is_some() && self.task_ctx.is_none() {
+                    if let Some(r) = self.check_debug_pause() {
+                        return Ok(r);
+                    }
+                }
                 let pc = self.pc;
                 if pc >= code_len {
                     break 'hot;
                 }
                 match self.dispatch_hot_u8(ops, args, pc) {
                     HotFlow::Cont if self.hot_failed => {
-                        // 部分热路径在 set_hot_error 后仍返回 Cont（如 CallSelf 递归超限、
-                        // pop_hot 下溢）；统一在此升级为失败，避免静默继续执行。
                         self.hot_failed = false;
                         let e = self
                             .hot_error
@@ -1903,11 +2133,30 @@ impl Vm {
                             false => {
                                 self.record_error_stack();
                                 self.unwind_user_calls_on_error()?;
-                                return Err(self.finalize_runtime_error(e));
+                                return self.finish_uncaught(e);
                             }
                         }
                     }
-                    HotFlow::Cont => continue 'hot,
+                    HotFlow::Cont => {
+                        self.tick_budget();
+                        if self.pending_suspend {
+                            return self.complete_task_suspend();
+                        }
+                        if self.pending_main_yield {
+                            self.pending_main_yield = false;
+                            if let Err(e) = self.scheduler_yield() {
+                                match self.handle_or_promote_error(&e)? {
+                                    true => continue 'outer,
+                                    false => {
+                                        self.record_error_stack();
+                                        self.unwind_user_calls_on_error()?;
+                                        return self.finish_uncaught(e);
+                                    }
+                                }
+                            }
+                        }
+                        continue 'hot;
+                    }
                     HotFlow::Fail => {
                         self.hot_failed = false;
                         let e = self
@@ -1919,7 +2168,7 @@ impl Vm {
                             false => {
                                 self.record_error_stack();
                                 self.unwind_user_calls_on_error()?;
-                                return Err(self.finalize_runtime_error(e));
+                                return self.finish_uncaught(e);
                             }
                         }
                     }
@@ -1930,23 +2179,50 @@ impl Vm {
                             .expect("pending_ret set under HotFlow::PendingRet (theoretically unreachable)");
                         let result = result_sv.into_value();
                         if let Some(ret) = self.complete_user_return_instruction(leave, result)? {
-                            return Ok(Some(ret));
+                            return Ok(InterpResult::Value(Some(ret)));
                         }
                         if until_depth.is_some_and(|d| self.user_call_frames.len() == d) {
-                            return Ok(self.op_last_value());
+                            return Ok(InterpResult::Value(self.op_last_value()));
                         }
                         continue 'outer;
                     }
                     HotFlow::Cold => {
+                        let ops_ptr = Rc::as_ptr(&self.hot_ops) as *const u8;
+                        let args_ptr = Rc::as_ptr(&self.hot_args) as *const i64;
                         if let Err(e) = self.step() {
                             match self.handle_or_promote_error(&e)? {
                                 true => continue 'outer,
                                 false => {
                                     self.record_error_stack();
                                     self.unwind_user_calls_on_error()?;
-                                    return Err(self.finalize_runtime_error(e));
+                                    return self.finish_uncaught(e);
                                 }
                             }
+                        }
+                        self.tick_budget();
+                        if self.pending_suspend {
+                            return self.complete_task_suspend();
+                        }
+                        if self.pending_main_yield {
+                            self.pending_main_yield = false;
+                            if let Err(e) = self.scheduler_yield() {
+                                match self.handle_or_promote_error(&e)? {
+                                    true => continue 'outer,
+                                    false => {
+                                        self.record_error_stack();
+                                        self.unwind_user_calls_on_error()?;
+                                        return self.finish_uncaught(e);
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(v) = self.pending_gen_yield.take() {
+                            return Ok(InterpResult::Yielded(v));
+                        }
+                        if std::ptr::eq(Rc::as_ptr(&self.hot_ops) as *const u8, ops_ptr)
+                            && std::ptr::eq(Rc::as_ptr(&self.hot_args) as *const i64, args_ptr)
+                        {
+                            continue 'hot;
                         }
                         continue 'outer;
                     }
@@ -1955,20 +2231,20 @@ impl Vm {
 
             // pc 已越界（pc >= code_len）
             if until_depth.is_none() && self.user_call_frames.is_empty() {
-                return Ok(self.op_last_value());
+                return Ok(InterpResult::Value(self.op_last_value()));
             }
             if until_depth.is_some_and(|d| self.user_call_frames.len() <= d) {
-                return Ok(self.op_last_value());
+                return Ok(InterpResult::Value(self.op_last_value()));
             }
             if !self.user_call_frames.is_empty() {
                 if let Some(ret) = self.complete_user_return_instruction(false, Value::None)? {
-                    return Ok(Some(ret));
+                    return Ok(InterpResult::Value(Some(ret)));
                 }
                 continue 'outer;
             }
             break;
         }
-        Ok(None)
+        Ok(InterpResult::Value(None))
     }
 
     /// 若已有脚本异常则分发；否则把**任意**宿主错误提升为语言异常再 `throw`。
@@ -2093,6 +2369,8 @@ impl Vm {
             I::NewVarOrLoad(name) => StepAction::NewVarOrLoad(name.clone()),
             I::LoadFast(slot) => StepAction::LoadFast(*slot),
             I::StoreFast(slot) => StepAction::StoreFast(*slot),
+            I::LoadFastSubImm { slot, imm } => StepAction::LoadFastSubImm { slot: *slot, imm: *imm },
+            I::LoadFastLeImm { slot, imm } => StepAction::LoadFastLeImm { slot: *slot, imm: *imm },
             I::BindFast {
                 slot,
                 name,
@@ -2108,6 +2386,7 @@ impl Vm {
             I::Goto(target) => StepAction::Goto(*target),
             I::GotoIf(target) => StepAction::GotoIf(*target),
             I::GotoIfNot(target) => StepAction::GotoIfNot(*target),
+            I::LoopCountdown(target) => StepAction::LoopCountdown(*target),
             I::Call { argc } => StepAction::Call { argc: *argc },
             I::CallSelf { argc } => StepAction::CallSelf { argc: *argc },
             I::CallList => StepAction::CallList,
@@ -2171,7 +2450,9 @@ impl Vm {
             I::GoCall(argc) => StepAction::GoCall { argc: *argc },
             I::GoValue => StepAction::GoValue,
             I::Await => StepAction::Await,
+            I::Suspend => StepAction::Suspend,
             I::Yield => StepAction::Yield,
+            I::YieldFrom => StepAction::YieldFrom,
             I::SelectTryRecv => StepAction::SelectTryRecv,
             I::SelectTrySend => StepAction::SelectTrySend,
             I::SelectPollTask => StepAction::SelectPollTask,
@@ -2652,6 +2933,31 @@ impl Vm {
                     self.local_set(slot, val);
                 }
             }
+            StepAction::LoadFastSubImm { slot, imm } => {
+                let sv = self.load_fast_sv(slot);
+                self.op_push(sv);
+                self.op_push_int(imm);
+                let b = self.op_pop();
+                let a = self.op_pop();
+                self.exec_sub_slow(a, b)?;
+            }
+            StepAction::LoadFastLeImm { slot, imm } => {
+                let sv = self.load_fast_sv(slot);
+                let a = match sv {
+                    StackVal::Int(n) => Value::Num(Num::Small(n)),
+                    other => other.into_value(),
+                };
+                let ord = match &a {
+                    Value::Num(n) => n.cmp_num(&Num::Small(imm)),
+                    _ => {
+                        return Err(RuntimeError::type_err(format!(
+                            "cannot compare {} with number",
+                            a.type_name()
+                        )));
+                    }
+                };
+                self.op_push_bool(ord == std::cmp::Ordering::Less || ord == std::cmp::Ordering::Equal);
+            }
             StepAction::Label => {}
             StepAction::Goto(target) => {
                 self.jump_to_pc(target);
@@ -2666,6 +2972,29 @@ impl Vm {
                 let cond = self.pop()?;
                 if !self.value_is_truthy_fast(&cond) {
                     self.jump_to_pc(target);
+                }
+            }
+            StepAction::LoopCountdown(target) => {
+                let counter = self.pop()?;
+                match counter {
+                    Value::Num(n) => {
+                        if n.cmp_num(&Num::Small(0)) != std::cmp::Ordering::Greater {
+                            self.jump_to_pc(target);
+                        } else {
+                            // 复用减法慢路径以正确处理 BigInt / 溢出提升。
+                            self.op_push(StackVal::from_value(Value::Num(n)));
+                            self.op_push_int(1);
+                            let b = self.pop_hot();
+                            let a = self.pop_hot();
+                            self.exec_sub_slow(a, b)?;
+                        }
+                    }
+                    other => {
+                        return Err(RuntimeError::type_err(format!(
+                            "loop count must be a number, got {}",
+                            other.type_name()
+                        )));
+                    }
                 }
             }
             StepAction::Call { argc } => {
@@ -2688,7 +3017,7 @@ impl Vm {
                     .last()
                     .cloned()
                     .ok_or_else(|| RuntimeError::msg("CallSelf outside function"))?;
-                if func.lightweight {
+                if func.lightweight && self.debug.is_none() {
                     self.call_self_lightweight(argc, func.entry_pc, func.frame_slots);
                 } else {
                     self.call_args_buf.clear();
@@ -2828,8 +3157,8 @@ impl Vm {
                 let val = self.pop()?;
                 let idx = self.pop()?;
                 let obj = self.pop()?;
+                // 与 Store 一致：赋值语句不向操作数栈压返回值，否则会污染外层已压栈实参。
                 index_set(self, &obj, &idx, val)?;
-                self.push_none();
             }
             StepAction::SliceGet => {
                 let step = self.pop()?;
@@ -2846,22 +3175,18 @@ impl Vm {
                 let start = self.pop()?;
                 let obj = self.pop()?;
                 slice_set(self, &obj, &start, &end, &step, val)?;
-                self.push_none();
             }
             StepAction::DelIndex => {
                 let idx = self.pop()?;
                 let obj = self.pop()?;
                 del_index(self, &obj, &idx)?;
-                self.push_none();
             }
             StepAction::DelName(name) => {
                 self.delete_name(&name)?;
-                self.push_none();
             }
             StepAction::DelAttr(field) => {
                 let obj = self.pop()?;
                 del_attr(self, &obj, &field)?;
-                self.push_none();
             }
             StepAction::GetAttr(field) => {
                 let obj = self.pop()?;
@@ -2886,7 +3211,6 @@ impl Vm {
                 let val = self.pop()?;
                 let obj = self.pop()?;
                 set_field(self, &obj, &field, val)?;
-                self.push_none();
             }
             StepAction::IterNew => {
                 let obj = self.pop()?;
@@ -3103,8 +3427,21 @@ impl Vm {
                 let result = self.await_value(v)?;
                 self.push_value(result);
             }
+            StepAction::Suspend => {
+                self.budget_left = self.suspend_budget;
+                if self.task_ctx.is_some() {
+                    self.pending_suspend = true;
+                } else {
+                    self.scheduler_yield()?;
+                }
+            }
             StepAction::Yield => {
-                self.scheduler_yield()?;
+                let v = self.pop()?;
+                self.generator_yield_value(v)?;
+            }
+            StepAction::YieldFrom => {
+                let iterable = self.pop()?;
+                self.generator_yield_from(iterable)?;
             }
             StepAction::SelectTryRecv => {
                 let ch = self.pop()?;
@@ -3509,6 +3846,9 @@ impl Vm {
             Value::Builtin(f) => f(self, &args),
             Value::Function(func) => {
                 let bound = self.bind_call_arguments(&func, args, kwargs)?;
+                if func.is_generator {
+                    return self.make_generator_iterator(func, bound);
+                }
                 self.setup_user_call(func, bound, false)?;
                 self.user_call_deferred = true;
                 Ok(Value::None)
@@ -3517,6 +3857,9 @@ impl Vm {
                 let type_args = infer_generic_type_args_from_values(&template, &args)?;
                 let func = specialize_generic_runtime(self, &template, type_args)?;
                 let bound = self.bind_call_arguments(&func, args, kwargs)?;
+                if func.is_generator {
+                    return self.make_generator_iterator(func, bound);
+                }
                 self.setup_user_call(func, bound, false)?;
                 self.user_call_deferred = true;
                 Ok(Value::None)
@@ -3785,7 +4128,37 @@ impl Vm {
         self.pc = 0;
 
         let result = match self.run_interpreter(None) {
-            Ok(v) => v.unwrap_or_else(|| self.stack_top()),
+            Ok(InterpResult::Value(v)) => v.unwrap_or_else(|| self.stack_top()),
+            Ok(InterpResult::Suspended) => {
+                self.leave_scope();
+                self.code = saved_code;
+                self.hot_ops = saved_hot_ops;
+                self.hot_args = saved_hot_args;
+                self.pc = saved_pc;
+                return Err(RuntimeError::msg(
+                    "internal error: task suspended inside macro expansion",
+                ));
+            }
+            Ok(InterpResult::DebugBreak) => {
+                self.leave_scope();
+                self.code = saved_code;
+                self.hot_ops = saved_hot_ops;
+                self.hot_args = saved_hot_args;
+                self.pc = saved_pc;
+                return Err(RuntimeError::msg(
+                    "internal error: debug break inside macro expansion",
+                ));
+            }
+            Ok(InterpResult::Yielded(_)) => {
+                self.leave_scope();
+                self.code = saved_code;
+                self.hot_ops = saved_hot_ops;
+                self.hot_args = saved_hot_args;
+                self.pc = saved_pc;
+                return Err(RuntimeError::msg(
+                    "internal error: generator yield inside macro expansion",
+                ));
+            }
             Err(e) => {
                 self.leave_scope();
                 self.code = saved_code;
@@ -3992,6 +4365,10 @@ impl Vm {
             locals_stack: self.locals_stack.clone(),
             name_to_slot: self.name_to_slot.clone(),
             code: self.code.clone(),
+            hot_ops: self.hot_ops.clone(),
+            hot_args: self.hot_args.clone(),
+            active_line_map: self.active_line_map.clone(),
+            active_column_map: self.active_column_map.clone(),
             pc: self.pc,
             stack: self.stack.get(..self.stack_sp).unwrap_or(&[]).to_vec(),
             functions: self.functions.clone(),
@@ -4009,9 +4386,10 @@ impl Vm {
         self.locals_stack = snap.locals_stack;
         self.name_to_slot = snap.name_to_slot;
         self.code = snap.code;
-        let hot = crate::hot_code::HotCode::encode(&self.code);
-        self.hot_ops = hot.ops;
-        self.hot_args = hot.args;
+        self.hot_ops = snap.hot_ops;
+        self.hot_args = snap.hot_args;
+        self.active_line_map = snap.active_line_map;
+        self.active_column_map = snap.active_column_map;
         self.pc = snap.pc;
         self.stack = snap.stack;
         self.stack_sp = self.stack.len();
@@ -4026,6 +4404,15 @@ impl Vm {
 
     pub(crate) fn run_snippet(&mut self, program: CompiledProgram) -> Result<()> {
         let saved = self.snapshot_for_eval();
+        if let Err(e) = self.run_snippet_keep(program) {
+            self.restore_eval_snapshot(saved);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// 加载并跑一段程序；不恢复快照（由调用方负责）。
+    pub(crate) fn run_snippet_keep(&mut self, program: CompiledProgram) -> Result<()> {
         self.functions.extend(program.functions);
         self.macros.extend(program.macros);
         self.struct_defs.extend(program.struct_defs);
@@ -4035,12 +4422,11 @@ impl Vm {
         self.code = Rc::new(program.code);
         self.hot_ops = program.hot.ops.clone();
         self.hot_args = program.hot.args.clone();
+        self.active_line_map = Rc::new(program.line_map);
+        self.active_column_map = Rc::new(program.column_map);
         self.pc = 0;
         self.op_clear();
-        if let Err(e) = self.run_interpreter(None) {
-            self.restore_eval_snapshot(saved);
-            return Err(e);
-        }
+        self.run_interpreter(None)?;
         Ok(())
     }
 
@@ -4230,13 +4616,43 @@ impl Vm {
     }
 
     pub(crate) fn call_user_function(&mut self, func: Rc<FunctionObject>, args: Vec<Value>) -> Result<Value> {
+        match self.call_user_function_poll(func, args)? {
+            InterpResult::Value(v) => Ok(v.unwrap_or(Value::None)),
+            InterpResult::Suspended => Err(RuntimeError::msg(
+                "internal error: task suspended outside scheduler",
+            )),
+            InterpResult::DebugBreak => Err(RuntimeError::msg(
+                "internal error: debug break outside debugger session",
+            )),
+            InterpResult::Yielded(_) => Err(RuntimeError::msg(
+                "internal error: generator yield outside iterator",
+            )),
+        }
+    }
+
+    fn call_user_function_poll(
+        &mut self,
+        func: Rc<FunctionObject>,
+        args: Vec<Value>,
+    ) -> Result<InterpResult> {
         let bound = self.bind_call_arguments(&func, args, DictMap::new())?;
+        if func.is_generator {
+            return Ok(InterpResult::Value(Some(
+                self.make_generator_iterator(func, bound)?,
+            )));
+        }
         let stack_base = self.stack_sp;
         let stop_depth = self.user_call_frames.len();
         self.setup_user_call(func, bound, false)?;
-        let result = self.run_interpreter(Some(stop_depth))?.unwrap_or_else(|| Value::None);
-        self.op_truncate(stack_base);
-        Ok(result)
+        match self.run_interpreter(Some(stop_depth))? {
+            InterpResult::Value(v) => {
+                self.op_truncate(stack_base);
+                Ok(InterpResult::Value(Some(v.unwrap_or(Value::None))))
+            }
+            InterpResult::Suspended => Ok(InterpResult::Suspended),
+            InterpResult::DebugBreak => Ok(InterpResult::DebugBreak),
+            InterpResult::Yielded(v) => Ok(InterpResult::Yielded(v)),
+        }
     }
 
     fn setup_user_call(
@@ -4245,7 +4661,7 @@ impl Vm {
         args: Vec<Value>,
         reenter: bool,
     ) -> Result<()> {
-        if self.user_call_frames.len() >= max_call_depth() {
+        if self.user_call_frames.len() >= self.cached_max_depth {
             return Err(RuntimeError::msg("RecursionError: maximum recursion depth exceeded"));
         }
         let args = self.apply_implicit_param_converts(&func, args)?;
@@ -4286,7 +4702,9 @@ impl Vm {
         if func.uses_name_map {
             if let Some(names) = self.name_to_slot.last_mut().and_then(|m| m.as_mut()) {
                 if let Some(captured) = &func.captured {
-                    for (name, val) in captured {
+                    let mut caps: Vec<_> = captured.iter().collect();
+                    caps.sort_by(|a, b| a.0.cmp(b.0));
+                    for (name, val) in caps {
                         if func.params.iter().any(|p| p.name == *name) {
                             continue;
                         }
@@ -4299,13 +4717,16 @@ impl Vm {
                 }
             }
         } else if let Some(captured) = &func.captured {
-            for (name, val) in captured {
+            let mut caps: Vec<_> = captured.iter().collect();
+            caps.sort_by(|a, b| a.0.cmp(b.0));
+            for (name, val) in caps {
                 if func.params.iter().any(|p| p.name == *name) {
                     continue;
                 }
                 if slot < locals.len() {
                     locals[slot] = val.clone();
                 }
+                let _ = name;
                 slot += 1;
             }
         }
@@ -4443,7 +4864,7 @@ impl Vm {
         Ok(())
     }
 
-    fn line_from_map(line_map: &[usize], pc: usize) -> usize {
+    pub(crate) fn line_from_map(line_map: &[usize], pc: usize) -> usize {
         if pc == 0 {
             return line_map.first().copied().unwrap_or(0);
         }
@@ -4513,6 +4934,280 @@ impl Vm {
         std::mem::take(&mut self.last_error_stack)
     }
 
+    fn finish_uncaught(&mut self, e: RuntimeError) -> Result<InterpResult> {
+        let finalized = self.finalize_runtime_error(e);
+        if let Some(dbg) = &self.debug {
+            if self.task_ctx.is_none() {
+                let mut st = dbg.borrow_mut();
+                st.last_uncaught = Some(finalized.message().to_string());
+                st.request_break(crate::debug::StopReason::Uncaught);
+                crate::debug::mark_stopped(self, &mut st);
+                return Ok(InterpResult::DebugBreak);
+            }
+        }
+        Err(finalized)
+    }
+
+    #[inline]
+    pub fn debug_call_depth(&self) -> usize {
+        self.user_call_frames.len() + self.lw_depth
+    }
+
+    pub fn debug_current_func_name(&self) -> Option<String> {
+        self.func_stack.last().map(|f| f.name.clone())
+    }
+
+    pub fn debug_store_local(&mut self, name: &str, value: Value) -> bool {
+        for i in (0..self.name_to_slot.len()).rev() {
+            if let Some(map) = &self.name_to_slot[i] {
+                if let Some(&slot) = map.get(name) {
+                    if let Some(locals) = self.locals_stack.get_mut(i) {
+                        if slot < locals.len() {
+                            match &locals[slot] {
+                                Value::Cell(c) => {
+                                    *c.borrow_mut() = value;
+                                }
+                                _ => locals[slot] = value,
+                            }
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    pub fn debug_list_locals(&self) -> Vec<(String, Value)> {
+        let mut out = Vec::new();
+        // 1) 当前函数的快局部（含形参）——从 BindFast 指令与 params 重建名字→槽
+        if let Some(func) = self.func_stack.last() {
+            let mut map: FxHashMap<String, usize> = FxHashMap::default();
+            for (i, p) in func.params.iter().enumerate() {
+                map.entry(p.name.clone()).or_insert(i);
+            }
+            for ins in func.body.iter() {
+                if let crate::opcode::Instruction::BindFast { slot, name, .. } = ins {
+                    map.entry(name.clone()).or_insert(*slot);
+                }
+            }
+            if let Some(locals) = self.locals_stack.last() {
+                let mut pairs: Vec<_> = map.iter().collect();
+                pairs.sort_by(|a, b| a.0.cmp(b.0));
+                for (name, &slot) in pairs {
+                    if let Some(v) = locals.get(slot) {
+                        let val = match v {
+                            Value::Cell(c) => c.borrow().clone(),
+                            other => other.clone(),
+                        };
+                        out.push((name.clone(), val));
+                    }
+                }
+            }
+        }
+        // 2) 仍可见的 name-mapped 词法作用域
+        for i in (0..self.name_to_slot.len()).rev() {
+            if let Some(map) = &self.name_to_slot[i] {
+                let mut pairs: Vec<_> = map.iter().collect();
+                pairs.sort_by(|a, b| a.0.cmp(b.0));
+                for (name, &slot) in pairs {
+                    if let Some(locals) = self.locals_stack.get(i) {
+                        if let Some(v) = locals.get(slot) {
+                            let val = match v {
+                                Value::Cell(c) => c.borrow().clone(),
+                                other => other.clone(),
+                            };
+                            if !out.iter().any(|(n, _)| n == name) {
+                                out.push((name.clone(), val));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// 当前函数可见的局部名（快局部 + name-mapped 作用域），供 eval 绑定注入用。
+    pub(crate) fn debug_visible_local_names(&self) -> Vec<String> {        let mut names: Vec<String> = Vec::new();
+        let mut seen: FxHashSet<String> = FxHashSet::default();
+        if let Some(func) = self.func_stack.last() {
+            for p in &func.params {
+                if seen.insert(p.name.clone()) {
+                    names.push(p.name.clone());
+                }
+            }
+            for ins in func.body.iter() {
+                if let crate::opcode::Instruction::BindFast { name, .. } = ins {
+                    if seen.insert(name.clone()) {
+                        names.push(name.clone());
+                    }
+                }
+            }
+        }
+        for i in (0..self.name_to_slot.len()).rev() {
+            if let Some(map) = &self.name_to_slot[i] {
+                for name in map.keys() {
+                    if seen.insert(name.clone()) {
+                        names.push(name.clone());
+                    }
+                }
+            }
+        }
+        names
+    }
+
+    /// 调试器求值用：按名取值，快局部 → 词法作用域 → 全局。
+    pub(crate) fn debug_load_name(&self, name: &str) -> Result<Value> {
+        if let Some(func) = self.func_stack.last() {
+            let mut slot: Option<usize> = None;
+            for (i, p) in func.params.iter().enumerate() {
+                if p.name == name {
+                    slot = Some(i);
+                    break;
+                }
+            }
+            if slot.is_none() {
+                for ins in func.body.iter() {
+                    if let crate::opcode::Instruction::BindFast { slot: s, name: n, .. } = ins {
+                        if n == name {
+                            slot = Some(*s);
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some(s) = slot {
+                if let Some(locals) = self.locals_stack.last() {
+                    if let Some(v) = locals.get(s) {
+                        return Ok(match v {
+                            Value::Cell(c) => c.borrow().clone(),
+                            other => other.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        self.load_name(name)
+    }
+
+    /// 调试器求值：把 `bindings` 作为词法局部注入，跑 snippet，再恢复。
+    pub(crate) fn eval_debug_snippet(
+        &mut self,
+        bindings: &[String],
+        program: crate::opcode::CompiledProgram,
+    ) -> Result<Value> {
+        let saved = self.snapshot_for_eval();
+        let dbg = self.debug.take();
+
+        // 取每个绑定名的当前值（必须在隔离调用栈之前，否则 func_stack 为空）。
+        let values: Vec<Value> = bindings
+            .iter()
+            .map(|n| self.debug_load_name(n).unwrap_or(Value::None))
+            .collect();
+
+        // 隔离暂停函数的调用栈：snippet 的 Ret 不能弹掉原程序的 user_call_frames / func_stack。
+        let saved_ucf = std::mem::take(&mut self.user_call_frames);
+        let saved_fs = std::mem::take(&mut self.func_stack);
+        let saved_ff = std::mem::take(&mut self.func_frames);
+        let saved_try = std::mem::take(&mut self.try_stack);
+        let saved_iters = std::mem::take(&mut self.iterators);
+        let saved_ucd = self.user_call_deferred;
+        self.user_call_deferred = false;
+
+        let result = (|| -> Result<Value> {
+            self.functions.extend(program.functions.clone());
+            self.macros.extend(program.macros.clone());
+            self.struct_defs.extend(program.struct_defs.clone());
+            self.enum_defs.extend(program.enum_defs.clone());
+            self.variant_defs.extend(program.variant_defs.clone());
+            self.init_script_globals(program.global_names.clone());
+            self.code = Rc::new(program.code);
+            self.hot_ops = program.hot.ops.clone();
+            self.hot_args = program.hot.args.clone();
+            self.active_line_map = Rc::new(program.line_map.clone());
+            self.active_column_map = Rc::new(program.column_map.clone());
+            self.pc = 0;
+            self.op_clear();
+
+            // 推入绑定作用域，让 snippet 能按名引用这些局部。
+            self.enter_scope();
+            let frame = self.locals_stack.len() - 1;
+            let locals = self.locals_stack.last_mut().unwrap();
+            locals.resize(bindings.len(), Value::None);
+            for (i, v) in values.iter().enumerate() {
+                locals[i] = v.clone();
+            }
+            if !bindings.is_empty() {
+                let map = self.scope_name_map_mut(frame);
+                for (i, name) in bindings.iter().enumerate() {
+                    map.insert(name.clone(), i);
+                }
+            }
+
+            let run_res = self.run_interpreter(None);
+            let top = self.stack_top();
+            self.leave_scope();
+            run_res?;
+            Ok(top)
+        })();
+
+        self.restore_eval_snapshot(saved);
+        // 恢复隔离的调用栈
+        self.user_call_frames = saved_ucf;
+        self.func_stack = saved_fs;
+        self.func_frames = saved_ff;
+        self.try_stack = saved_try;
+        self.iterators = saved_iters;
+        self.user_call_deferred = saved_ucd;
+        self.debug = dbg;
+        result
+    }
+
+    pub fn debug_build_stack_frames(&self) -> Vec<ErrorStackFrame> {
+        let mut frames = Vec::new();
+        for (i, ucf) in self.user_call_frames.iter().enumerate() {
+            let (func, file, source) = if i == 0 {
+                (
+                    "<module>".to_string(),
+                    self.source_file.clone(),
+                    self.current_source.clone(),
+                )
+            } else {
+                let caller = &self.user_call_frames[i - 1].func;
+                (
+                    caller.name.clone(),
+                    caller.source_file.clone(),
+                    caller.source.clone(),
+                )
+            };
+            frames.push(ErrorStackFrame {
+                func,
+                file,
+                line: Self::line_from_map(&ucf.saved_line_map, ucf.saved_pc),
+                column: Self::line_from_map(&ucf.saved_column_map, ucf.saved_pc).max(1),
+                source,
+            });
+        }
+        let (func, file, source) = if let Some(f) = self.func_stack.last() {
+            (f.name.clone(), f.source_file.clone(), f.source.clone())
+        } else {
+            (
+                "<module>".to_string(),
+                self.source_file.clone(),
+                self.current_source.clone(),
+            )
+        };
+        frames.push(ErrorStackFrame {
+            func,
+            file,
+            line: crate::debug::line_at_pc(self),
+            column: crate::debug::column_at_pc(self).max(1),
+            source,
+        });
+        frames
+    }
+
     pub(crate) fn dispatch_overload(
         &mut self,
         overloads: &[Rc<FunctionObject>],
@@ -4536,6 +5231,9 @@ impl Vm {
         &mut self,
         state: &Rc<RefCell<IteratorState>>,
     ) -> Result<Option<Value>> {
+        if matches!(&state.borrow().kind, IteratorKind::Generator { .. }) {
+            return self.resume_generator(state);
+        }
         loop {
             match &mut state.borrow_mut().kind {
                 IteratorKind::Range {
@@ -4646,8 +5344,279 @@ impl Vm {
                     }
                     return Ok(Some(v));
                 }
+                IteratorKind::Generator { .. } => {
+                    unreachable!("generators handled before advance_iterator loop");
+                }
             }
         }
+    }
+
+    fn make_generator_iterator(
+        &mut self,
+        func: Rc<FunctionObject>,
+        args: Vec<Value>,
+    ) -> Result<Value> {
+        let args = self.apply_implicit_param_converts(&func, args)?;
+        if self.active_exception.is_some() {
+            return Ok(Value::None);
+        }
+        self.check_strong_params(&func, &args)?;
+        if self.active_exception.is_some() {
+            return Ok(Value::None);
+        }
+
+        let captured_len = func.captured.as_ref().map(|c| c.len()).unwrap_or(0);
+        let frame_size = func.frame_slots.max(func.params.len() + captured_len);
+        let mut locals = vec![Value::None; frame_size];
+        let mut name_map = if func.uses_name_map {
+            Some(FxHashMap::default())
+        } else {
+            None
+        };
+
+        let mut slot = func.params.len();
+        if let Some(captured) = &func.captured {
+            let mut caps: Vec<_> = captured.iter().collect();
+            caps.sort_by(|a, b| a.0.cmp(b.0));
+            for (name, val) in caps {
+                if func.params.iter().any(|p| p.name == *name) {
+                    continue;
+                }
+                if slot < locals.len() {
+                    locals[slot] = val.clone();
+                }
+                if let Some(names) = name_map.as_mut() {
+                    names.insert(name.clone(), slot);
+                }
+                slot += 1;
+            }
+        }
+        for (i, val) in args.into_iter().enumerate() {
+            if i < locals.len() {
+                locals[i] = val;
+            }
+            if let (Some(names), Some(param)) = (name_map.as_mut(), func.params.get(i)) {
+                names.insert(param.name.clone(), i);
+            }
+        }
+        if let Some(names) = name_map.as_mut() {
+            for (i, param) in func.params.iter().enumerate() {
+                names.entry(param.name.clone()).or_insert(i);
+            }
+        }
+
+        Ok(IteratorState {
+            kind: IteratorKind::Generator {
+                func,
+                locals,
+                name_map,
+                pc: 0,
+                exhausted: false,
+                yield_from: None,
+            },
+        }
+        .as_value())
+    }
+
+    fn resume_generator(
+        &mut self,
+        state: &Rc<RefCell<IteratorState>>,
+    ) -> Result<Option<Value>> {
+        loop {
+            let (func, locals, name_map, pc, exhausted, yield_from) = {
+                let st = state.borrow();
+                let IteratorKind::Generator {
+                    func,
+                    locals,
+                    name_map,
+                    pc,
+                    exhausted,
+                    yield_from,
+                } = &st.kind
+                else {
+                    return Err(RuntimeError::msg("internal: resume_generator on non-generator"));
+                };
+                (
+                    func.clone(),
+                    locals.clone(),
+                    name_map.clone(),
+                    *pc,
+                    *exhausted,
+                    yield_from.clone(),
+                )
+            };
+            if exhausted {
+                return Ok(None);
+            }
+            if let Some(yf) = yield_from {
+                match self.advance_iterator(&yf)? {
+                    Some(v) => return Ok(Some(v)),
+                    None => {
+                        if let IteratorKind::Generator { yield_from, .. } =
+                            &mut state.borrow_mut().kind
+                        {
+                            *yield_from = None;
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            let stack_base = self.stack_sp;
+            let stop_depth = self.user_call_frames.len();
+            self.active_generator = Some(state.clone());
+            self.generator_resuming = true;
+
+            if func.track_frames {
+                let call_line = self.current_line();
+                self.func_frames.push(FuncFrame {
+                    name: func.name.clone(),
+                    file: self.source_file.clone(),
+                    line: call_line,
+                });
+            }
+            self.func_stack.push(func.clone());
+            self.name_to_slot.push(name_map);
+            self.locals_stack.push(locals);
+            self.user_call_frames.push(UserCallFrame {
+                saved_code: self.code.clone(),
+                saved_hot_ops: self.hot_ops.clone(),
+                saved_hot_args: self.hot_args.clone(),
+                saved_pc: self.pc,
+                saved_line_map: self.active_line_map.clone(),
+                saved_column_map: self.active_column_map.clone(),
+                func: func.clone(),
+                pushed_func_stack: true,
+            });
+            self.code = func.body.clone();
+            validate_function_hot(&func)?;
+            self.hot_ops = func.hot.ops.clone();
+            self.hot_args = func.hot.args.clone();
+            self.active_line_map = func.line_map.clone();
+            self.active_column_map = func.column_map.clone();
+            self.pc = pc;
+
+            let result = self.run_interpreter(Some(stop_depth));
+            self.generator_resuming = false;
+            self.active_generator = None;
+
+            match result? {
+                InterpResult::Yielded(v) => {
+                    self.op_truncate(stack_base);
+                    return Ok(Some(v));
+                }
+                InterpResult::Value(_) => {
+                    if let IteratorKind::Generator { exhausted, .. } =
+                        &mut state.borrow_mut().kind
+                    {
+                        *exhausted = true;
+                    }
+                    self.op_truncate(stack_base);
+                    return Ok(None);
+                }
+                InterpResult::Suspended => {
+                    return Err(RuntimeError::msg(
+                        "internal error: generator suspended via task scheduler",
+                    ));
+                }
+                InterpResult::DebugBreak => {
+                    return Err(RuntimeError::msg(
+                        "internal error: debug break inside generator",
+                    ));
+                }
+            }
+        }
+    }
+
+    fn generator_yield_value(&mut self, v: Value) -> Result<()> {
+        if !self.generator_resuming {
+            return Err(RuntimeError::msg(
+                "`yield` is only valid inside a generator function or do",
+            ));
+        }
+        self.capture_generator_pause()?;
+        self.pending_gen_yield = Some(v);
+        Ok(())
+    }
+
+    fn generator_yield_from(&mut self, iterable: Value) -> Result<()> {
+        if !self.generator_resuming {
+            return Err(RuntimeError::msg(
+                "`yield from` is only valid inside a generator function or do",
+            ));
+        }
+        let iter = match iterable {
+            Value::Iterator(it) => it,
+            other => Rc::new(RefCell::new(crate::value::value_to_iterable(&other)?)),
+        };
+        // 内层生成器的 resume 会改写 active_generator / generator_resuming，需保存外层。
+        let saved_active = self.active_generator.clone();
+        let saved_resuming = self.generator_resuming;
+        match self.advance_iterator(&iter)? {
+            Some(v) => {
+                self.active_generator = saved_active.clone();
+                self.generator_resuming = saved_resuming;
+                if let Some(state) = &saved_active {
+                    if let IteratorKind::Generator { yield_from, .. } =
+                        &mut state.borrow_mut().kind
+                    {
+                        *yield_from = Some(iter);
+                    }
+                }
+                self.capture_generator_pause()?;
+                self.pending_gen_yield = Some(v);
+            }
+            None => {
+                self.active_generator = saved_active;
+                self.generator_resuming = saved_resuming;
+                // 空可迭代：继续执行下一条指令。
+            }
+        }
+        Ok(())
+    }
+
+    fn capture_generator_pause(&mut self) -> Result<()> {
+        let Some(state) = self.active_generator.clone() else {
+            return Err(RuntimeError::msg(
+                "internal: yield without active generator",
+            ));
+        };
+        let locals = self
+            .locals_stack
+            .last()
+            .cloned()
+            .ok_or_else(|| RuntimeError::msg("internal: generator missing locals"))?;
+        let name_map = self
+            .name_to_slot
+            .last()
+            .cloned()
+            .flatten();
+        let pc = self.pc;
+        if let IteratorKind::Generator {
+            locals: l,
+            name_map: nm,
+            pc: p,
+            ..
+        } = &mut state.borrow_mut().kind
+        {
+            *l = locals;
+            *nm = name_map;
+            *p = pc;
+        }
+
+        let frame = self.user_call_frames.pop().ok_or_else(|| {
+            RuntimeError::msg("internal: generator missing call frame")
+        })?;
+        self.locals_stack.pop();
+        self.name_to_slot.pop();
+        if frame.pushed_func_stack {
+            self.func_stack.pop();
+        }
+        if frame.func.track_frames {
+            self.func_frames.pop();
+        }
+        self.restore_user_call_frame(frame)?;
+        Ok(())
     }
 
     pub(crate) fn spawn_task(&mut self, callable: Value, args: Vec<Value>) -> Value {
@@ -4663,28 +5632,307 @@ impl Vm {
         Value::Task(Rc::new(RefCell::new(TaskInner::done(value))))
     }
 
+    #[inline]
+    fn tick_budget(&mut self) {
+        if self.budget_left > 0 {
+            self.budget_left -= 1;
+        }
+        if self.budget_left == 0 {
+            self.budget_left = self.suspend_budget;
+            if self.task_ctx.is_some() {
+                self.pending_suspend = true;
+            } else {
+                self.pending_main_yield = true;
+            }
+        }
+    }
+
+    fn task_ptr_key(task: &Rc<RefCell<TaskInner>>) -> usize {
+        Rc::as_ptr(task) as usize
+    }
+
+    fn snapshot_task_ctx(task: Rc<RefCell<TaskInner>>, vm: &Vm) -> TaskRunCtx {
+        TaskRunCtx {
+            task,
+            stop_ucf: vm.user_call_frames.len(),
+            stop_locals: vm.locals_stack.len(),
+            stop_nts: vm.name_to_slot.len(),
+            stop_stack: vm.stack_sp,
+            stop_func_stack: vm.func_stack.len(),
+            stop_func_frames: vm.func_frames.len(),
+            stop_try: vm.try_stack.len(),
+            stop_iters: vm.iterators.len(),
+            stop_fast_ret: vm.fast_ret_sp,
+            stop_lw_bases: vm.lw_bases_sp,
+            stop_lw_sp: vm.lw_sp,
+            stop_lw_depth: vm.lw_depth,
+            stop_lw_base: vm.lw_base,
+            stop_lw_entry_pc: vm.lw_entry_pc,
+            stop_lw_frame_slots: vm.lw_frame_slots,
+        }
+    }
+
+    fn capture_fiber(&mut self, ctx: &TaskRunCtx) -> TaskFiber {
+        let stack = if self.stack_sp > ctx.stop_stack {
+            let mut s = Vec::with_capacity(self.stack_sp - ctx.stop_stack);
+            for i in ctx.stop_stack..self.stack_sp {
+                s.push(std::mem::replace(&mut self.stack[i], StackVal::Empty));
+            }
+            s
+        } else {
+            Vec::new()
+        };
+        let locals_stack = self.locals_stack.split_off(ctx.stop_locals);
+        let name_to_slot = self.name_to_slot.split_off(ctx.stop_nts);
+        let user_call_frames = self.user_call_frames.split_off(ctx.stop_ucf);
+        let func_stack = self.func_stack.split_off(ctx.stop_func_stack);
+        let func_frames = self.func_frames.split_off(ctx.stop_func_frames);
+        let try_stack = {
+            let mut ts = self.try_stack.split_off(ctx.stop_try);
+            for f in &mut ts {
+                f.user_call_depth = f.user_call_depth.saturating_sub(ctx.stop_ucf);
+                f.stack_sp = f.stack_sp.saturating_sub(ctx.stop_stack);
+                f.iterators_len = f.iterators_len.saturating_sub(ctx.stop_iters);
+                f.fast_ret_sp = f.fast_ret_sp.saturating_sub(ctx.stop_fast_ret);
+            }
+            ts
+        };
+        let iterators = self.iterators.split_off(ctx.stop_iters);
+
+        let fast_ret_pcs = if self.fast_ret_sp > ctx.stop_fast_ret {
+            self.fast_ret_pcs[ctx.stop_fast_ret..self.fast_ret_sp].to_vec()
+        } else {
+            Vec::new()
+        };
+        self.fast_ret_sp = ctx.stop_fast_ret;
+
+        let lw_bases = if self.lw_bases_sp > ctx.stop_lw_bases {
+            self.lw_bases[ctx.stop_lw_bases..self.lw_bases_sp]
+                .iter()
+                .map(|b| b.saturating_sub(ctx.stop_lw_sp))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.lw_bases_sp = ctx.stop_lw_bases;
+
+        let lw_slots = if self.lw_sp > ctx.stop_lw_sp {
+            let mut slots = Vec::with_capacity(self.lw_sp - ctx.stop_lw_sp);
+            for i in ctx.stop_lw_sp..self.lw_sp {
+                slots.push(std::mem::replace(&mut self.lw_slots[i], StackVal::Empty));
+            }
+            slots
+        } else {
+            Vec::new()
+        };
+
+        let fiber = TaskFiber {
+            code: self.code.clone(),
+            hot_ops: self.hot_ops.clone(),
+            hot_args: self.hot_args.clone(),
+            pc: self.pc,
+            active_line_map: self.active_line_map.clone(),
+            active_column_map: self.active_column_map.clone(),
+            stack,
+            locals_stack,
+            name_to_slot,
+            user_call_frames,
+            func_stack,
+            func_frames,
+            try_stack,
+            iterators,
+            fast_ret_pcs,
+            lw_slots,
+            lw_bases,
+            lw_base: self.lw_base.saturating_sub(ctx.stop_lw_sp),
+            lw_depth: self.lw_depth.saturating_sub(ctx.stop_lw_depth),
+            lw_entry_pc: self.lw_entry_pc,
+            lw_frame_slots: self.lw_frame_slots,
+        };
+
+        self.stack_sp = ctx.stop_stack;
+        self.lw_sp = ctx.stop_lw_sp;
+        self.lw_depth = ctx.stop_lw_depth;
+        self.lw_base = ctx.stop_lw_base;
+        self.lw_entry_pc = ctx.stop_lw_entry_pc;
+        self.lw_frame_slots = ctx.stop_lw_frame_slots;
+
+        // 恢复主/外层代码指针：取刚拆下的最底帧的 saved_*（setup_user_call 时保存）。
+        if let Some(frame) = fiber.user_call_frames.first() {
+            self.code = frame.saved_code.clone();
+            self.hot_ops = frame.saved_hot_ops.clone();
+            self.hot_args = frame.saved_hot_args.clone();
+            self.pc = frame.saved_pc;
+            self.active_line_map = frame.saved_line_map.clone();
+            self.active_column_map = frame.saved_column_map.clone();
+        }
+
+        fiber
+    }
+
+    fn install_fiber(&mut self, task: Rc<RefCell<TaskInner>>, mut fiber: TaskFiber) {
+        let ctx = Self::snapshot_task_ctx(task, self);
+
+        self.code = fiber.code;
+        self.hot_ops = fiber.hot_ops;
+        self.hot_args = fiber.hot_args;
+        self.pc = fiber.pc;
+        self.active_line_map = fiber.active_line_map;
+        self.active_column_map = fiber.active_column_map;
+
+        for sv in fiber.stack.drain(..) {
+            self.op_push(sv);
+        }
+        self.locals_stack.append(&mut fiber.locals_stack);
+        self.name_to_slot.append(&mut fiber.name_to_slot);
+        self.user_call_frames.append(&mut fiber.user_call_frames);
+        self.func_stack.append(&mut fiber.func_stack);
+        self.func_frames.append(&mut fiber.func_frames);
+        for mut f in fiber.try_stack.drain(..) {
+            f.user_call_depth += ctx.stop_ucf;
+            f.stack_sp += ctx.stop_stack;
+            f.iterators_len += ctx.stop_iters;
+            f.fast_ret_sp += ctx.stop_fast_ret;
+            self.try_stack.push(f);
+        }
+        self.iterators.append(&mut fiber.iterators);
+
+        for pc in fiber.fast_ret_pcs.drain(..) {
+            if self.fast_ret_sp >= self.fast_ret_pcs.len() {
+                self.fast_ret_pcs.push(pc);
+            } else {
+                self.fast_ret_pcs[self.fast_ret_sp] = pc;
+            }
+            self.fast_ret_sp += 1;
+        }
+        let lw_base_offset = self.lw_sp;
+        for b in fiber.lw_bases.drain(..) {
+            let abs = lw_base_offset + b;
+            if self.lw_bases_sp >= self.lw_bases.len() {
+                self.lw_bases.push(abs);
+            } else {
+                self.lw_bases[self.lw_bases_sp] = abs;
+            }
+            self.lw_bases_sp += 1;
+        }
+        for sv in fiber.lw_slots.drain(..) {
+            if self.lw_sp >= self.lw_slots.len() {
+                self.lw_slots.push(sv);
+            } else {
+                self.lw_slots[self.lw_sp] = sv;
+            }
+            self.lw_sp += 1;
+        }
+        self.lw_base = ctx.stop_lw_sp + fiber.lw_base;
+        self.lw_depth = ctx.stop_lw_depth + fiber.lw_depth;
+        self.lw_entry_pc = fiber.lw_entry_pc;
+        self.lw_frame_slots = fiber.lw_frame_slots;
+
+        self.task_ctx = Some(ctx);
+        self.budget_left = self.suspend_budget;
+        self.pending_suspend = false;
+    }
+
+    fn complete_task_suspend(&mut self) -> Result<InterpResult> {
+        self.pending_suspend = false;
+        let Some(ctx) = self.task_ctx.take() else {
+            return Err(RuntimeError::msg(
+                "internal error: suspend without task context",
+            ));
+        };
+        let key = Self::task_ptr_key(&ctx.task);
+        let fiber = self.capture_fiber(&ctx);
+        self.task_fibers.insert(key, fiber);
+        ctx.task.borrow_mut().state = TaskState::Suspended;
+        self.ready_tasks.push_back(ctx.task);
+        Ok(InterpResult::Suspended)
+    }
+
     pub(crate) fn scheduler_run_one(&mut self) -> Result<bool> {
         let Some(task) = self.ready_tasks.pop_front() else {
             return Ok(false);
         };
-        let pending = {
-            let mut inner = task.borrow_mut();
-            match std::mem::replace(&mut inner.state, TaskState::Running) {
-                TaskState::Pending { callable, args } => Some((callable, args)),
+        let key = Self::task_ptr_key(&task);
+        let saved_ctx = self.task_ctx.take();
+        let saved_budget = self.budget_left;
+        let saved_pending = self.pending_suspend;
+        self.pending_suspend = false;
+
+        let run_result = (|| -> Result<Option<Value>> {
+            let state = {
+                let mut inner = task.borrow_mut();
+                std::mem::replace(&mut inner.state, TaskState::Running)
+            };
+            match state {
+                TaskState::Pending { callable, args } => {
+                    self.task_ctx = Some(Self::snapshot_task_ctx(task.clone(), self));
+                    self.budget_left = self.suspend_budget;
+                    match self.call_value_poll(callable, args)? {
+                        InterpResult::Value(v) => {
+                            // 丢弃任务帧，保证不污染调用方（主 fiber / 外层任务）栈。
+                            if let Some(ctx) = self.task_ctx.take() {
+                                let _ = self.capture_fiber(&ctx);
+                            }
+                            Ok(Some(v.unwrap_or(Value::None)))
+                        }
+                        InterpResult::Suspended => Ok(None),
+                        InterpResult::DebugBreak => Ok(None),
+                        InterpResult::Yielded(v) => {
+                            if let Some(ctx) = self.task_ctx.take() {
+                                let _ = self.capture_fiber(&ctx);
+                            }
+                            Ok(Some(v))
+                        }
+                    }
+                }
+                TaskState::Suspended => {
+                    let Some(fiber) = self.task_fibers.remove(&key) else {
+                        return Err(RuntimeError::msg(
+                            "internal error: suspended task missing fiber",
+                        ));
+                    };
+                    self.install_fiber(task.clone(), fiber);
+                    let stop = self
+                        .task_ctx
+                        .as_ref()
+                        .map(|c| c.stop_ucf)
+                        .unwrap_or(0);
+                    match self.run_interpreter(Some(stop))? {
+                        InterpResult::Value(v) => {
+                            if let Some(ctx) = self.task_ctx.take() {
+                                let _ = self.capture_fiber(&ctx);
+                            }
+                            Ok(Some(v.unwrap_or(Value::None)))
+                        }
+                        InterpResult::Suspended => Ok(None),
+                        InterpResult::DebugBreak => Ok(None),
+                        InterpResult::Yielded(v) => {
+                            if let Some(ctx) = self.task_ctx.take() {
+                                let _ = self.capture_fiber(&ctx);
+                            }
+                            Ok(Some(v))
+                        }
+                    }
+                }
                 other => {
-                    inner.state = other;
-                    None
+                    task.borrow_mut().state = other;
+                    Ok(Some(Value::None))
                 }
             }
-        };
-        let Some((callable, args)) = pending else {
-            return Ok(true);
-        };
-        match self.call_value_to_completion(callable, args) {
-            Ok(v) => {
-                task.borrow_mut().state = TaskState::Done(v);
+        })();
+
+        match run_result {
+            Ok(Some(v)) => {
+                if matches!(task.borrow().state, TaskState::Running) {
+                    task.borrow_mut().state = TaskState::Done(v);
+                }
             }
+            Ok(None) => {}
             Err(e) => {
+                // 任务失败时同样回滚到 stop_*，避免残留栈槽破坏调用方的下一条指令。
+                if let Some(ctx) = self.task_ctx.take() {
+                    let _ = self.capture_fiber(&ctx);
+                }
                 let msg = e.message();
                 let exc = match exceptions::make_exception_kind(self, e.kind(), msg) {
                     Ok(v) => v,
@@ -4693,6 +5941,10 @@ impl Vm {
                 task.borrow_mut().state = TaskState::Failed(exc);
             }
         }
+
+        self.task_ctx = saved_ctx;
+        self.budget_left = saved_budget;
+        self.pending_suspend = saved_pending;
         Ok(true)
     }
 
@@ -4704,6 +5956,18 @@ impl Vm {
             }
         }
         Ok(())
+    }
+
+    /// 协作式让出：任务 fiber 设 `pending_suspend`（挂起并重回就绪队列），
+    /// 主 fiber 设 `pending_main_yield`（跑一轮就绪任务后继续）。
+    /// 供 `std.sync.yield` 与阻塞式 IO 内建在操作前后让出 CPU，避免长 IO 饿死其它 fiber。
+    pub(crate) fn request_cooperative_yield(&mut self) {
+        self.budget_left = self.suspend_budget;
+        if self.task_ctx.is_some() {
+            self.pending_suspend = true;
+        } else {
+            self.pending_main_yield = true;
+        }
     }
 
     pub(crate) fn await_value(&mut self, value: Value) -> Result<Value> {
@@ -4718,7 +5982,7 @@ impl Vm {
                     self.throw_value(e)?;
                     return Ok(Value::None);
                 }
-                TaskState::Pending { .. } => {
+                TaskState::Pending { .. } | TaskState::Suspended => {
                     if !self.ready_tasks.iter().any(|t| Rc::ptr_eq(t, &task)) {
                         self.ready_tasks.push_back(task.clone());
                     }
@@ -4739,23 +6003,24 @@ impl Vm {
         }
     }
 
-    pub(crate) fn call_value_to_completion(
-        &mut self,
-        callee: Value,
-        args: Vec<Value>,
-    ) -> Result<Value> {
+    fn call_value_poll(&mut self, callee: Value, args: Vec<Value>) -> Result<InterpResult> {
         match callee {
-            Value::Function(f) => self.call_user_function(f, args),
-            Value::Builtin(f) => f(self, &args),
+            Value::Function(f) => self.call_user_function_poll(f, args),
+            Value::Builtin(f) => Ok(InterpResult::Value(Some(f(self, &args)?))),
             other => {
                 let stop = self.user_call_frames.len();
                 let result = self.call_value(other, args)?;
                 if self.user_call_deferred {
-                    Ok(self
-                        .run_interpreter(Some(stop))?
-                        .unwrap_or(Value::None))
+                    match self.run_interpreter(Some(stop))? {
+                        InterpResult::Value(v) => {
+                            Ok(InterpResult::Value(Some(v.unwrap_or(Value::None))))
+                        }
+                        InterpResult::Suspended => Ok(InterpResult::Suspended),
+                        InterpResult::DebugBreak => Ok(InterpResult::DebugBreak),
+                        InterpResult::Yielded(v) => Ok(InterpResult::Yielded(v)),
+                    }
                 } else {
-                    Ok(result)
+                    Ok(InterpResult::Value(Some(result)))
                 }
             }
         }
@@ -4842,6 +6107,265 @@ impl Vm {
                 return Err(RuntimeError::msg("DeadlockError: mutex lock blocked"));
             }
         }
+    }
+
+    pub(crate) fn rwmutex_read(
+        &mut self,
+        s: &Rc<RefCell<crate::value::SyncInner>>,
+    ) -> Result<Value> {
+        use crate::value::{SyncGuardInner, SyncInner};
+        loop {
+            {
+                let mut inner = s.borrow_mut();
+                if let SyncInner::RWMutex {
+                    readers, writer, ..
+                } = &mut *inner
+                {
+                    if !*writer {
+                        *readers += 1;
+                        return Ok(Value::SyncGuard(Rc::new(RefCell::new(
+                            SyncGuardInner::Read { mu: s.clone() },
+                        ))));
+                    }
+                } else {
+                    return Err(RuntimeError::type_err("expected RWMutex"));
+                }
+            }
+            if !self.scheduler_run_one()? {
+                return Err(RuntimeError::msg("DeadlockError: RWMutex.read blocked"));
+            }
+        }
+    }
+
+    pub(crate) fn rwmutex_write(
+        &mut self,
+        s: &Rc<RefCell<crate::value::SyncInner>>,
+    ) -> Result<Value> {
+        use crate::value::{SyncGuardInner, SyncInner};
+        loop {
+            {
+                let mut inner = s.borrow_mut();
+                if let SyncInner::RWMutex {
+                    readers, writer, ..
+                } = &mut *inner
+                {
+                    if !*writer && *readers == 0 {
+                        *writer = true;
+                        return Ok(Value::SyncGuard(Rc::new(RefCell::new(
+                            SyncGuardInner::Write { mu: s.clone() },
+                        ))));
+                    }
+                } else {
+                    return Err(RuntimeError::type_err("expected RWMutex"));
+                }
+            }
+            if !self.scheduler_run_one()? {
+                return Err(RuntimeError::msg("DeadlockError: RWMutex.write blocked"));
+            }
+        }
+    }
+
+    pub(crate) fn waitgroup_wait(
+        &mut self,
+        s: &Rc<RefCell<crate::value::SyncInner>>,
+    ) -> Result<Value> {
+        use crate::value::SyncInner;
+        loop {
+            {
+                let inner = s.borrow();
+                if let SyncInner::WaitGroup { count } = &*inner {
+                    if *count == 0 {
+                        return Ok(Value::None);
+                    }
+                } else {
+                    return Err(RuntimeError::type_err("expected WaitGroup"));
+                }
+            }
+            if !self.scheduler_run_one()? {
+                return Err(RuntimeError::msg("DeadlockError: WaitGroup.wait blocked"));
+            }
+        }
+    }
+
+    pub(crate) fn semaphore_acquire(
+        &mut self,
+        s: &Rc<RefCell<crate::value::SyncInner>>,
+    ) -> Result<Value> {
+        use crate::value::SyncInner;
+        loop {
+            {
+                let mut inner = s.borrow_mut();
+                if let SyncInner::Semaphore { permits } = &mut *inner {
+                    if *permits > 0 {
+                        *permits -= 1;
+                        return Ok(Value::None);
+                    }
+                } else {
+                    return Err(RuntimeError::type_err("expected Semaphore"));
+                }
+            }
+            if !self.scheduler_run_one()? {
+                return Err(RuntimeError::msg(
+                    "DeadlockError: Semaphore.acquire blocked",
+                ));
+            }
+        }
+    }
+
+    pub(crate) fn once_do(
+        &mut self,
+        s: &Rc<RefCell<crate::value::SyncInner>>,
+        callable: Value,
+    ) -> Result<Value> {
+        use crate::value::SyncInner;
+        // 已完成 → 直接返回缓存
+        {
+            let inner = s.borrow();
+            if let SyncInner::Once { done, value } = &*inner {
+                if *done {
+                    return Ok(value.clone());
+                }
+            } else {
+                return Err(RuntimeError::type_err("expected Once"));
+            }
+        }
+        // 标记进行中：done=true 且 value 仍为 None，阻止重入
+        {
+            let mut inner = s.borrow_mut();
+            if let SyncInner::Once { done, value } = &mut *inner {
+                if *done {
+                    return Ok(value.clone());
+                }
+                *done = true;
+            }
+        }
+        let result = match self.call_value_poll(callable, vec![]) {
+            Ok(InterpResult::Value(v)) => v.unwrap_or(Value::None),
+            Ok(InterpResult::Suspended) => {
+                if let SyncInner::Once { done, value } = &mut *s.borrow_mut() {
+                    *done = false;
+                    *value = Value::None;
+                }
+                return Err(RuntimeError::msg(
+                    "Once.run: callable suspended; use a non-suspending function",
+                ));
+            }
+            Ok(InterpResult::DebugBreak) => {
+                if let SyncInner::Once { done, value } = &mut *s.borrow_mut() {
+                    *done = false;
+                    *value = Value::None;
+                }
+                return Err(RuntimeError::msg("Once.run interrupted by debugger"));
+            }
+            Ok(InterpResult::Yielded(_)) => {
+                if let SyncInner::Once { done, value } = &mut *s.borrow_mut() {
+                    *done = false;
+                    *value = Value::None;
+                }
+                return Err(RuntimeError::msg(
+                    "Once.run: callable is a generator; pass a non-generator function",
+                ));
+            }
+            Err(e) => {
+                if let SyncInner::Once { done, value } = &mut *s.borrow_mut() {
+                    *done = false;
+                    *value = Value::None;
+                }
+                return Err(e);
+            }
+        };
+        if let SyncInner::Once { value, .. } = &mut *s.borrow_mut() {
+            *value = result.clone();
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn barrier_wait(
+        &mut self,
+        s: &Rc<RefCell<crate::value::SyncInner>>,
+    ) -> Result<Value> {
+        use crate::value::SyncInner;
+        let my_gen = {
+            let mut inner = s.borrow_mut();
+            let SyncInner::Barrier {
+                n,
+                waiting,
+                generation,
+            } = &mut *inner
+            else {
+                return Err(RuntimeError::type_err("expected Barrier"));
+            };
+            *waiting += 1;
+            if *waiting as i64 >= *n {
+                *waiting = 0;
+                *generation = generation.wrapping_add(1);
+                return Ok(Value::None);
+            }
+            *generation
+        };
+        loop {
+            {
+                let inner = s.borrow();
+                if let SyncInner::Barrier { generation, .. } = &*inner {
+                    if *generation != my_gen {
+                        return Ok(Value::None);
+                    }
+                } else {
+                    return Err(RuntimeError::type_err("expected Barrier"));
+                }
+            }
+            if !self.scheduler_run_one()? {
+                return Err(RuntimeError::msg("DeadlockError: Barrier.wait blocked"));
+            }
+        }
+    }
+
+    pub(crate) fn cond_wait(
+        &mut self,
+        cond: &Rc<RefCell<crate::value::SyncInner>>,
+        guard: &Rc<RefCell<MutexInner>>,
+    ) -> Result<Value> {
+        use crate::value::SyncInner;
+        // 登记 waiter，释放锁
+        {
+            let mut inner = cond.borrow_mut();
+            let SyncInner::Cond { waiters, .. } = &mut *inner else {
+                return Err(RuntimeError::type_err("expected Cond"));
+            };
+            *waiters += 1;
+        }
+        guard.borrow_mut().locked = false;
+
+        // 等待信号
+        loop {
+            let got = {
+                let mut inner = cond.borrow_mut();
+                let SyncInner::Cond { signals, waiters } = &mut *inner else {
+                    return Err(RuntimeError::type_err("expected Cond"));
+                };
+                if *signals > 0 {
+                    *signals -= 1;
+                    *waiters -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if got {
+                break;
+            }
+            if !self.scheduler_run_one()? {
+                // 回滚 waiter 计数
+                if let SyncInner::Cond { waiters, .. } = &mut *cond.borrow_mut() {
+                    *waiters = (*waiters - 1).max(0);
+                }
+                return Err(RuntimeError::msg("DeadlockError: Cond.wait blocked"));
+            }
+        }
+
+        // 重新加锁
+        self.mutex_lock(guard)?;
+        Ok(Value::None)
     }
 
     pub(crate) fn zip_iterables(&self, iterables: Vec<Value>) -> Result<Value> {
@@ -5361,6 +6885,8 @@ fn get_attr(vm: &mut Vm, obj: &Value, field: &str) -> Result<Value> {
         Value::Channel(ch) => crate::concurrency::get_channel_method(ch, field),
         Value::Mutex(m) => crate::concurrency::get_mutex_method(m, field),
         Value::MutexGuard(m) => crate::concurrency::get_mutex_guard_method(m, field),
+        Value::Sync(s) => crate::concurrency::get_sync_method(s, field),
+        Value::SyncGuard(g) => crate::concurrency::get_sync_guard_method(g, field),
         Value::Struct(s) => {
             if let Some(idx) = s.def.fields.iter().position(|f| f == field) {
                 return Ok(s.slots.borrow()[idx].clone());

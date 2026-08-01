@@ -513,6 +513,45 @@ fn maybe_accepts(vm: &Vm, val: &Value, params: &[TypeExpr]) -> bool {
     matches!(val, Value::None) || crate::types::type_accepts(vm, val, inner)
 }
 
+/// `Tuple[T1, T2, ...]` —— 定长异构元组：长度与逐元素类型须匹配。
+fn tuple_match_distance(vm: &Vm, val: &Value, params: &[TypeExpr]) -> Option<usize> {
+    let Value::Tuple(t) = val else { return None };
+    if t.len() != params.len() {
+        return None;
+    }
+    let mut sum = 0usize;
+    for (v, p) in t.iter().zip(params.iter()) {
+        sum += crate::types::type_expr_match_distance(vm, v, p)?;
+    }
+    Some(sum)
+}
+
+fn tuple_accepts(vm: &Vm, val: &Value, params: &[TypeExpr]) -> bool {
+    let Value::Tuple(t) = val else { return false };
+    if t.len() != params.len() {
+        return false;
+    }
+    t.iter()
+        .zip(params.iter())
+        .all(|(v, p)| crate::types::type_accepts(vm, v, p))
+}
+
+/// `Callable` —— 任意可调用值（函数/内建/泛型函数）。带参时仅校验可调用性。
+fn callable_match_distance(_vm: &Vm, val: &Value, _params: &[TypeExpr]) -> Option<usize> {
+    is_callable_value(val).then_some(0)
+}
+
+fn callable_accepts(_vm: &Vm, val: &Value, _params: &[TypeExpr]) -> bool {
+    is_callable_value(val)
+}
+
+fn is_callable_value(val: &Value) -> bool {
+    matches!(
+        val,
+        Value::Function(_) | Value::GenericFunction(_) | Value::Builtin(_)
+    )
+}
+
 fn variance_implies(
     vm: &Vm,
     actual: &TypeExpr,
@@ -580,6 +619,24 @@ fn lookup_type_form(name: &str) -> Option<&'static TypeFormEntry> {
             TypeFormEntry {
                 match_distance: maybe_match_distance,
                 accepts: maybe_accepts,
+                infer: None,
+                implies: None,
+            },
+        ),
+        (
+            "Tuple",
+            TypeFormEntry {
+                match_distance: tuple_match_distance,
+                accepts: tuple_accepts,
+                infer: None,
+                implies: None,
+            },
+        ),
+        (
+            "Callable",
+            TypeFormEntry {
+                match_distance: callable_match_distance,
+                accepts: callable_accepts,
                 infer: None,
                 implies: None,
             },
@@ -772,6 +829,12 @@ pub fn call_primitive_ctor(_vm: &mut Vm, type_name: &str, args: Vec<Value>) -> O
         ))),
         "Channel" | "channel" => Some(crate::concurrency::construct_channel(&args)),
         "Mutex" | "mutex" => Some(crate::concurrency::construct_mutex(&args)),
+        "RWMutex" => Some(crate::concurrency::construct_rwmutex(&args)),
+        "WaitGroup" => Some(crate::concurrency::construct_waitgroup(&args)),
+        "Semaphore" => Some(crate::concurrency::construct_semaphore(&args)),
+        "Once" => Some(crate::concurrency::construct_once(&args)),
+        "Barrier" => Some(crate::concurrency::construct_barrier(&args)),
+        "Cond" => Some(crate::concurrency::construct_cond(&args)),
         "type" if args.len() == 1 => Some(Ok(Value::type_ref(args[0].type_name()))),
         "type" => Some(Err(type_ctor_arity_error(
             "type",
@@ -1174,6 +1237,315 @@ fn value_rshift(a: &Value, b: &Value) -> Result<Value> {
     a.rshift(b)
 }
 
+/// printf 风格字符串格式化：`fmt % args`。
+///
+/// - `rhs` 为 `List`/`Tuple` → 按位置消费转换说明；
+/// - `rhs` 为 `Dict` → 支持 `%(key)s` 键控；
+/// - 其它 → 当作单个值消费（仅一个转换说明）。
+///
+/// 支持的转换类型：`s r d i u f e g x X o b c %`，可选 `[flags][width][.precision]`。
+fn percent_format(fmt: &str, rhs: &Value) -> Result<String> {
+    let bytes: Vec<char> = fmt.chars().collect();
+    let n = bytes.len();
+    let mut out = String::with_capacity(fmt.len() + 8);
+    let mut i = 0;
+    // 位置参数迭代器
+    let pos: Vec<Value> = match rhs {
+        Value::List(l) => l.borrow().clone(),
+        Value::Tuple(t) => t.to_vec(),
+        _ => vec![rhs.clone()],
+    };
+    let mut pos_idx = 0usize;
+    let dict = if let Value::Dict(d) = rhs { Some(d.clone()) } else { None };
+
+    while i < n {
+        let c = bytes[i];
+        if c != '%' {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        // 命中 %，解析转换说明
+        i += 1;
+        if i >= n {
+            return Err(RuntimeError::value_err("incomplete format specifier"));
+        }
+        if bytes[i] == '%' {
+            out.push('%');
+            i += 1;
+            continue;
+        }
+        // 可选 (key)
+        let key: Option<String> = if bytes[i] == '(' {
+            let start = i + 1;
+            let end = (start..n).find(|&j| bytes[j] == ')')
+                .ok_or_else(|| RuntimeError::value_err("unterminated %(key) in format"))?;
+            let k: String = bytes[start..end].iter().collect();
+            i = end + 1;
+            Some(k)
+        } else {
+            None
+        };
+        // flags
+        let mut left_align = false;
+        let mut zero_pad = false;
+        let mut plus_sign = false;
+        let mut space_sign = false;
+        let mut alt = false;
+        loop {
+            match bytes.get(i) {
+                Some('-') => left_align = true,
+                Some('0') => zero_pad = true,
+                Some('+') => plus_sign = true,
+                Some(' ') => space_sign = true,
+                Some('#') => alt = true,
+                _ => break,
+            }
+            i += 1;
+        }
+        // width
+        let mut width = 0usize;
+        while let Some(d @ '0'..='9') = bytes.get(i) {
+            width = width * 10 + (*d as usize - '0' as usize);
+            i += 1;
+        }
+        // precision
+        let mut precision: Option<usize> = None;
+        if bytes.get(i) == Some(&'.') {
+            i += 1;
+            let mut p = 0usize;
+            while let Some(d @ '0'..='9') = bytes.get(i) {
+                p = p * 10 + (*d as usize - '0' as usize);
+                i += 1;
+            }
+            precision = Some(p);
+        }
+        // type
+        let conv = *bytes.get(i).ok_or_else(|| {
+            RuntimeError::value_err("incomplete format specifier (missing type)")
+        })?;
+        i += 1;
+
+        // 取值
+        let val: Value = if let Some(k) = &key {
+            let d = dict
+                .as_ref()
+                .ok_or_else(|| RuntimeError::value_err("%(key) requires a dict argument"))?;
+            d.borrow()
+                .get(&ValueKey::Text(k.clone()))
+                .cloned()
+                .ok_or_else(|| RuntimeError::value_err(format!("missing format key '{k}'")))?
+        } else {
+            if pos_idx >= pos.len() {
+                return Err(RuntimeError::value_err(
+                    "not enough arguments for format string",
+                ));
+            }
+            let v = pos[pos_idx].clone();
+            pos_idx += 1;
+            v
+        };
+
+        let formatted = format_one(conv, &val, precision, plus_sign, space_sign, alt)?;
+        let formatted = apply_width(&formatted, width, left_align, zero_pad, conv);
+        out.push_str(&formatted);
+    }
+    if pos_idx != pos.len() && dict.is_none() {
+        // 位置参数有剩余（且非 dict 模式）
+        return Err(RuntimeError::value_err(
+            "too many arguments for format string",
+        ));
+    }
+    Ok(out)
+}
+
+fn format_one(
+    conv: char,
+    val: &Value,
+    precision: Option<usize>,
+    plus_sign: bool,
+    space_sign: bool,
+    alt: bool,
+) -> Result<String> {
+    match conv {
+        's' => {
+            let s = val.print_string();
+            Ok(if let Some(p) = precision {
+                s.chars().take(p).collect()
+            } else {
+                s
+            })
+        }
+        'r' => Ok(val.print_string()),
+        'd' | 'i' | 'u' => {
+            let s = format_int_radix(val, 10, false, plus_sign, space_sign, alt)?;
+            Ok(s)
+        }
+        'f' | 'F' => {
+            let f = to_f64_for_fmt(val)?;
+            Ok(format!("{:.*}", precision.unwrap_or(6), f))
+        }
+        'e' | 'E' => {
+            let f = to_f64_for_fmt(val)?;
+            let s = if conv == 'e' {
+                format!("{:.*e}", precision.unwrap_or(6), f)
+            } else {
+                format!("{:.*E}", precision.unwrap_or(6), f)
+            };
+            Ok(s)
+        }
+        'g' | 'G' => {
+            let f = to_f64_for_fmt(val)?;
+            Ok(format!("{:.*}", precision.unwrap_or(6), f))
+        }
+        'x' => Ok(format_int_radix(val, 16, false, plus_sign, space_sign, alt)?),
+        'X' => Ok(format_int_radix(val, 16, true, plus_sign, space_sign, alt)?),
+        'o' => Ok(format_int_radix(val, 8, false, plus_sign, space_sign, alt)?),
+        'b' => Ok(format_int_radix(val, 2, false, plus_sign, space_sign, alt)?),
+        'c' => {
+            let ch = match val {
+                Value::Num(n) => {
+                    let cp = n.to_i64().ok_or_else(|| {
+                        RuntimeError::value_err("%c needs an integer codepoint")
+                    })? as u32;
+                    char::from_u32(cp)
+                        .ok_or_else(|| RuntimeError::value_err("invalid codepoint for %c"))?
+                }
+                Value::Text(s) => s.chars().next().ok_or_else(|| {
+                    RuntimeError::value_err("%c needs a non-empty text")
+                })?,
+                _ => return Err(RuntimeError::value_err("%c needs num or text")),
+            };
+            Ok(ch.to_string())
+        }
+        other => Err(RuntimeError::value_err(format!(
+            "unsupported format type '%{other}'"
+        ))),
+    }
+}
+
+fn to_f64_for_fmt(v: &Value) -> Result<f64> {
+    match v {
+        Value::Num(n) => n.to_f64_checked().ok().ok_or_else(|| {
+            RuntimeError::value_err("value is not representable as float for format")
+        }),
+        Value::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
+        _ => Err(RuntimeError::value_err("not a number for numeric format")),
+    }
+}
+
+/// 整数按给定进制格式化（支持大整数）。`upper` 仅对 16 进制生效。`alt` 加 `0x`/`0`/`0b` 前缀。
+fn format_int_radix(
+    v: &Value,
+    radix: u32,
+    upper: bool,
+    plus_sign: bool,
+    space_sign: bool,
+    alt: bool,
+) -> Result<String> {
+    let n = match v {
+        Value::Num(n) => n,
+        Value::Bool(b) => return Ok((if *b { 1 } else { 0 }).to_string()),
+        _ => return Err(RuntimeError::value_err("not an integer for integer format")),
+    };
+    let prefix = if alt {
+        match radix {
+            16 => if upper { "0X" } else { "0x" },
+            8 => "0",
+            2 => "0b",
+            _ => "",
+        }
+    } else {
+        ""
+    };
+    let s = match n {
+        Num::Small(i) => {
+            let mag = (*i).unsigned_abs() as u128;
+            let body = match radix {
+                10 => mag.to_string(),
+                16 => format!("{:x}", mag),
+                8 => format!("{:o}", mag),
+                2 => format!("{:b}", mag),
+                _ => return Err(RuntimeError::value_err("unsupported radix")),
+            };
+            let body = if upper && radix == 16 { body.to_uppercase() } else { body };
+            if *i < 0 {
+                format!("-{prefix}{body}")
+            } else if plus_sign {
+                format!("+{prefix}{body}")
+            } else if space_sign {
+                format!(" {prefix}{body}")
+            } else {
+                format!("{prefix}{body}")
+            }
+        }
+        Num::Int(bi) => {
+            use num_traits::Signed;
+            let mag = bi.abs();
+            let body = match radix {
+                10 => mag.to_str_radix(10),
+                16 => mag.to_str_radix(16),
+                8 => mag.to_str_radix(8),
+                2 => mag.to_str_radix(2),
+                _ => return Err(RuntimeError::value_err("unsupported radix")),
+            };
+            let body = if upper && radix == 16 { body.to_uppercase() } else { body };
+            if bi.is_negative() {
+                format!("-{prefix}{body}")
+            } else if plus_sign {
+                format!("+{prefix}{body}")
+            } else if space_sign {
+                format!(" {prefix}{body}")
+            } else {
+                format!("{prefix}{body}")
+            }
+        }
+        Num::Rat(_) => {
+            return Err(RuntimeError::value_err(
+                "rational cannot be formatted as integer; use %f or %s",
+            ));
+        }
+    };
+    Ok(s)
+}
+
+fn apply_width(s: &str, width: usize, left_align: bool, zero_pad: bool, conv: char) -> String {
+    if width == 0 {
+        return s.to_string();
+    }
+    let len = s.chars().count();
+    if len >= width {
+        return s.to_string();
+    }
+    let pad = width - len;
+    // 数字零填充只对数字转换且未左对齐时生效，且填充在符号之后
+    let is_numeric = matches!(conv, 'd' | 'i' | 'u' | 'f' | 'e' | 'E' | 'g' | 'G' | 'x' | 'X' | 'o' | 'b');
+    if zero_pad && !left_align && is_numeric {
+        // 找符号前缀
+        let (sign, body) = if let Some(stripped) = s.strip_prefix('-') {
+            ("-", stripped)
+        } else if let Some(stripped) = s.strip_prefix('+') {
+            ("+", stripped)
+        } else if let Some(stripped) = s.strip_prefix(' ') {
+            (" ", stripped)
+        } else {
+            ("", s)
+        };
+        let zeros: String = "0".repeat(pad);
+        return format!("{sign}{zeros}{body}");
+    }
+    let padding: String = if zero_pad && !left_align {
+        "0".repeat(pad)
+    } else {
+        " ".repeat(pad)
+    };
+    if left_align {
+        format!("{s}{padding}")
+    } else {
+        format!("{padding}{s}")
+    }
+}
+
 fn install_primitive_methods(vm: &mut Vm) {
     fn bin_magic(
         method: &'static str,
@@ -1239,6 +1611,20 @@ fn install_primitive_methods(vm: &mut Vm) {
     let mut text_methods = FxHashMap::default();
     text_methods.insert("__add__".into(), bin_magic("__add__", false, value_add));
     text_methods.insert("__radd__".into(), bin_magic("__radd__", true, value_add));
+    text_methods.insert(
+        "__mod__".into(),
+        Rc::new(|_vm, args| {
+            if args.len() != 2 {
+                return Err(RuntimeError::type_err("__mod__ requires 2 arguments"));
+            }
+            match (&args[0], &args[1]) {
+                (Value::Text(fmt), rhs) => {
+                    Ok(Value::Text(percent_format(fmt, rhs)?))
+                }
+                _ => Err(RuntimeError::type_err("text % expects (text, value)")),
+            }
+        }),
+    );
     text_methods.insert(
         "__mul__".into(),
         Rc::new(|_vm, args| {
@@ -1590,6 +1976,7 @@ fn install_primitive_type_globals(vm: &mut Vm) {
         "text", "num", "bool", "list", "dict", "set", "tuple", "bytes", "iterator", "nonetype",
         "type", "AST", "Frame", "Traceback", "ptr", "i8", "u8", "i16", "u16", "i32", "u32", "i64",
         "u64", "isize", "usize", "f32", "f64", "Channel", "Mutex",
+        "RWMutex", "WaitGroup", "Semaphore", "Once", "Barrier", "Cond",
     ] {
         vm.globals
             .entry(ty.into())
@@ -1599,6 +1986,12 @@ fn install_primitive_type_globals(vm: &mut Vm) {
     vm.globals.insert("type".into(), Value::type_ref("type"));
     vm.globals.insert("Channel".into(), Value::type_ref("Channel"));
     vm.globals.insert("Mutex".into(), Value::type_ref("Mutex"));
+    vm.globals.insert("RWMutex".into(), Value::type_ref("RWMutex"));
+    vm.globals.insert("WaitGroup".into(), Value::type_ref("WaitGroup"));
+    vm.globals.insert("Semaphore".into(), Value::type_ref("Semaphore"));
+    vm.globals.insert("Once".into(), Value::type_ref("Once"));
+    vm.globals.insert("Barrier".into(), Value::type_ref("Barrier"));
+    vm.globals.insert("Cond".into(), Value::type_ref("Cond"));
 }
 
 fn primitive_convert_handler(type_name: &'static str) -> BuiltinFn {

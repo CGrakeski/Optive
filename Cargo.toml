@@ -22,7 +22,7 @@ hex = "0.4"
 digest = "0.10"
 hmac = "0.12"
 gix = { version = "0.85", features = ["blocking-network-client", "worktree-mutation", "blocking-http-transport-reqwest-rust-tls"] }
-reqwest = { version = "0.11", features = ["rustls-tls-native-roots"] }
+reqwest = { version = "0.11", features = ["rustls-tls-native-roots", "blocking"] }
 indicatif = "0"
 log = "0.4.33"
 libloading = "0.8"
@@ -33,6 +33,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 rustyline = { version = "15", features = ["derive"] }
+base64 = "0.22"
+flate2 = "1"
+serde_yaml = "0.9"
+roxmltree = "0.20"
+csv = "1"
 
 [dev-dependencies]
 pretty_assertions = "1"

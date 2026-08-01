@@ -29,10 +29,10 @@ impl Parser {
             next_pipe_id: 0,
         };
         let mut stmts = Vec::new();
-        p.skip_newlines();
+        p.skip_newlines_only();
         while !p.is_at_end() {
             stmts.push(p.parse_stmt()?);
-            p.skip_newlines();
+            p.skip_newlines_only();
         }
         Ok(Program { stmts })
     }
@@ -97,6 +97,15 @@ impl Parser {
     }
 
     fn match_kind(&mut self, kind: TokenKind) -> bool {
+        // 表达式中的行/块注释在匹配前丢弃；语句级注释由 parse_stmt 单独收取。
+        if !matches!(kind, TokenKind::LineComment | TokenKind::BlockComment) {
+            while matches!(
+                self.current().kind,
+                TokenKind::LineComment | TokenKind::BlockComment
+            ) {
+                self.advance();
+            }
+        }
         if self.check(kind) {
             self.advance();
             true
@@ -106,6 +115,12 @@ impl Parser {
     }
 
     fn expect(&mut self, kind: TokenKind, msg: &str) -> Result<Token, ParseError> {
+        while matches!(
+            self.current().kind,
+            TokenKind::LineComment | TokenKind::BlockComment
+        ) {
+            self.advance();
+        }
         if self.check(kind) {
             Ok(self.advance())
         } else {
@@ -122,7 +137,27 @@ impl Parser {
     }
 
     fn skip_newlines(&mut self) {
-        while self.match_kind(TokenKind::Newline) {}
+        // 表达式等上下文：换行与注释均可跳过（注释不进中间 AST）。
+        while matches!(
+            self.current().kind,
+            TokenKind::Newline | TokenKind::LineComment | TokenKind::BlockComment
+        ) {
+            self.advance();
+        }
+    }
+
+    /// 仅跳过换行，保留注释 token（语句边界用，以便收成 `Stmt::Comment`）。
+    fn skip_newlines_only(&mut self) {
+        while self.match_kind_raw(TokenKind::Newline) {}
+    }
+
+    fn match_kind_raw(&mut self, kind: TokenKind) -> bool {
+        if self.current().kind == kind {
+            self.advance();
+            true
+        } else {
+            false
+        }
     }
 
     /// 语句位置的 `{...}`：字典/集合字面量 vs 语句块。
@@ -137,7 +172,12 @@ impl Parser {
             return false;
         }
         i += 1;
-        while i < self.tokens.len() && self.tokens[i].kind == TokenKind::Newline {
+        while i < self.tokens.len()
+            && matches!(
+                self.tokens[i].kind,
+                TokenKind::Newline | TokenKind::LineComment | TokenKind::BlockComment
+            )
+        {
             i += 1;
         }
         if i >= self.tokens.len() {
@@ -220,8 +260,23 @@ impl Parser {
     }
 
     fn parse_stmt(&mut self) -> Result<LocatedStmt, ParseError> {
+        self.skip_newlines_only();
         let line = self.current().line;
         let column = self.current().column;
+        if matches!(
+            self.current().kind,
+            TokenKind::LineComment | TokenKind::BlockComment
+        ) {
+            let tok = self.advance();
+            return Ok(LocatedStmt {
+                line,
+                column,
+                stmt: Stmt::Comment {
+                    is_block: tok.kind == TokenKind::BlockComment,
+                    text: tok.value,
+                },
+            });
+        }
         Ok(LocatedStmt {
             line,
             column,
@@ -243,7 +298,10 @@ impl Parser {
             decorators.extend(self.parse_decorator_prefix()?);
             self.expect(TokenKind::KwMake, "expected 'make' after with")?;
             if self.match_kind(TokenKind::KwFunc) {
-                return self.parse_func_decl(vis, decorators);
+                return self.parse_func_decl(vis, decorators, false);
+            }
+            if self.match_kind(TokenKind::KwGen) {
+                return self.parse_func_decl(vis, decorators, true);
             }
             if self.check(TokenKind::KwDo) {
                 let loc = self.loc_here();
@@ -251,10 +309,13 @@ impl Parser {
                 let do_expr = self.parse_do_func_expr(loc)?;
                 return Ok(Stmt::Expr(self.apply_decorators_to_expr(decorators, do_expr)?));
             }
-            return Err(self.error("expected 'func' or 'do' after with make"));
+            return Err(self.error("expected 'func', 'gen', or 'do' after with make"));
         }
         if self.match_kind(TokenKind::KwFunc) {
-            return self.parse_func_decl(vis, decorators);
+            return self.parse_func_decl(vis, decorators, false);
+        }
+        if self.match_kind(TokenKind::KwGen) {
+            return self.parse_func_decl(vis, decorators, true);
         }
 
         if is_const {
@@ -295,6 +356,20 @@ impl Parser {
                 None
             };
             return Ok(Stmt::Return(expr));
+        }
+        if self.match_kind(TokenKind::KwYield) {
+            // `yield from expr`
+            if self.check(TokenKind::Identifier) && self.current().value == "from" {
+                self.advance();
+                let expr = self.parse_expr()?;
+                return Ok(Stmt::YieldFrom(expr));
+            }
+            let expr = if self.is_expr_start() {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            return Ok(Stmt::Yield(expr));
         }
         if self.check(TokenKind::KwIf) {
             if self.tokens.get(self.pos + 1).map(|t| t.kind) == Some(TokenKind::LParen) {
@@ -455,9 +530,10 @@ impl Parser {
     fn parse_visibility(&mut self) -> Visibility {
         if self.match_kind(TokenKind::KwIntern) {
             Visibility::Internal
-        } else {
-            let _ = self.match_kind(TokenKind::KwExport);
+        } else if self.match_kind(TokenKind::KwExport) {
             Visibility::Exported
+        } else {
+            Visibility::Default
         }
     }
 
@@ -682,7 +758,10 @@ impl Parser {
     /// 从当前位置起，能否看到 `decorator* (func|do|with)`（允许装饰器间换行）。
     fn decorator_chain_leads_to_target(&self) -> bool {
         let mut i = self.pos;
-        while self.tokens.get(i).map(|t| t.kind) == Some(TokenKind::Newline) {
+        while matches!(
+            self.tokens.get(i).map(|t| t.kind),
+            Some(TokenKind::Newline | TokenKind::LineComment | TokenKind::BlockComment)
+        ) {
             i += 1;
         }
         loop {
@@ -694,7 +773,14 @@ impl Parser {
                     }
                     i += 1;
                     loop {
-                        while self.tokens.get(i).map(|t| t.kind) == Some(TokenKind::Newline) {
+                        while matches!(
+                            self.tokens.get(i).map(|t| t.kind),
+                            Some(
+                                TokenKind::Newline
+                                    | TokenKind::LineComment
+                                    | TokenKind::BlockComment
+                            )
+                        ) {
                             i += 1;
                         }
                         match self.tokens.get(i).map(|t| t.kind) {
@@ -896,6 +982,7 @@ impl Parser {
         &mut self,
         visibility: Visibility,
         decorators: Vec<Expr>,
+        is_generator: bool,
     ) -> Result<Stmt, ParseError> {
         let name = self
             .expect(TokenKind::Identifier, "expected function name")?
@@ -923,6 +1010,7 @@ impl Parser {
             return_strong,
             return_wrapper,
             body,
+            is_generator,
         })
     }
 
@@ -1250,10 +1338,10 @@ impl Parser {
         self.expect(TokenKind::LBrace, "expected '{'")?;
         self.brace_depth += 1;
         let mut stmts = Vec::new();
-        self.skip_newlines();
+        self.skip_newlines_only();
         while !self.check(TokenKind::RBrace) && !self.is_at_end() {
             stmts.push(self.parse_stmt()?);
-            self.skip_newlines();
+            self.skip_newlines_only();
         }
         self.expect(TokenKind::RBrace, "expected '}'")?;
         self.brace_depth -= 1;
@@ -1575,10 +1663,19 @@ impl Parser {
             .expect(TokenKind::Identifier, "expected case name")?
             .value;
         self.expect(TokenKind::Assign, "expected '=' in variant case")?;
-        self.expect(TokenKind::KwTyped, "expected 'typed' after '='")?;
-        self.expect(TokenKind::KwStruct, "expected 'struct' after typed")?;
-        self.expect(TokenKind::LBrace, "expected '{' after typed struct")?;
-        let fields = self.parse_variant_field_list_in_brace()?;
+        // `Case = struct { let x }` 与 `Case = typed struct { x: T }` 都合法；
+        // 不强制 typed——载荷形状就是一个 struct 声明体。
+        let typed = self.match_kind(TokenKind::KwTyped);
+        self.expect(
+            TokenKind::KwStruct,
+            "expected 'struct' or 'typed struct' after '='",
+        )?;
+        self.expect(TokenKind::LBrace, "expected '{' after struct")?;
+        let fields = if typed {
+            self.parse_variant_field_list_in_brace()?
+        } else {
+            self.parse_struct_field_list_in_brace()?
+        };
         Ok(VariantCaseDecl {
             name: case_name,
             fields,
@@ -1620,6 +1717,37 @@ impl Parser {
         let mut fields = Vec::new();
         while !self.check(TokenKind::RBrace) && !self.is_at_end() {
             fields.push(self.parse_variant_field()?);
+            self.skip_newlines();
+        }
+        self.expect(TokenKind::RBrace, "expected '}' after case struct fields")?;
+        Ok(fields)
+    }
+
+    /// 普通 struct 字段体：`let`/`var` 名 [类型] [= 默认值]，供 variant case 与命名 struct 共用。
+    fn parse_struct_field_list_in_brace(&mut self) -> Result<Vec<StructField>, ParseError> {
+        self.skip_newlines();
+        let mut fields = Vec::new();
+        while !self.check(TokenKind::RBrace) && !self.is_at_end() {
+            let mutable = self.match_kind(TokenKind::KwVar);
+            if !mutable {
+                self.expect(TokenKind::KwLet, "expected let/var field")?;
+            }
+            let fname = self
+                .expect(TokenKind::Identifier, "expected field name")?
+                .value;
+            let (type_expr, type_strong) = self.parse_optional_type()?;
+            let default_expr = if self.match_kind(TokenKind::Assign) {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            fields.push(StructField {
+                mutable,
+                name: fname,
+                type_expr,
+                type_strong,
+                default_expr,
+            });
             self.skip_newlines();
         }
         self.expect(TokenKind::RBrace, "expected '}' after case struct fields")?;
@@ -2048,6 +2176,7 @@ impl Parser {
     fn parse_comparison_ex(&mut self, allow_macro: bool) -> Result<Expr, ParseError> {
         let mut expr = self.parse_bitor_ex(allow_macro)?;
         loop {
+            self.skip_newlines();
             let op = match self.current().kind {
                 TokenKind::EqEq => BinaryOp::Eq,
                 TokenKind::Ne => BinaryOp::Ne,
@@ -2205,16 +2334,17 @@ impl Parser {
             self.advance();
             self.skip_newlines();
             if self.check(TokenKind::KwYield) {
-                self.advance();
-                return Ok(Expr::new(
-                    loc,
-                    ExprKind::Await {
-                        operand: Box::new(Expr::new(loc, ExprKind::Yield)),
-                    },
+                return Err(self.error(
+                    "'await yield' was removed; use 'suspend' to yield to the scheduler",
                 ));
             }
             let operand = self.parse_comparison_ex(allow_macro)?;
             return Ok(Expr::new(loc, ExprKind::Await { operand: Box::new(operand) }));
+        }
+        if self.check(TokenKind::KwSuspend) {
+            let loc = self.loc_here();
+            self.advance();
+            return Ok(Expr::new(loc, ExprKind::Suspend));
         }
         if self.check(TokenKind::Minus) {
             let loc = self.loc_here();
@@ -2289,15 +2419,26 @@ impl Parser {
             return Ok(self.advance().value);
         }
         let tok = self.current();
-        if tok.kind == TokenKind::KwMatch {
-            self.advance();
-            return Ok("match".into());
+        // 允许部分关键字作成员名：`obj.match`、`std.sync.yield` 等。
+        match tok.kind {
+            TokenKind::KwMatch => {
+                self.advance();
+                Ok("match".into())
+            }
+            TokenKind::KwYield => {
+                self.advance();
+                Ok("yield".into())
+            }
+            TokenKind::KwDo => {
+                self.advance();
+                Ok("do".into())
+            }
+            _ => Err(ParseError::here(
+                tok.line,
+                tok.column,
+                "expected field name",
+            )),
         }
-        Err(ParseError::here(
-            tok.line,
-            tok.column,
-            "expected field name",
-        ))
     }
 
     fn parse_postfix_inner(&mut self, allow_macro: bool) -> Result<Expr, ParseError> {

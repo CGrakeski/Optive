@@ -320,6 +320,15 @@ pub enum IteratorKind {
     Channel {
         channel: Rc<RefCell<ChannelInner>>,
     },
+    /// 用户生成器：调用含 `yield` 的 func/do 得到的惰性迭代器。
+    Generator {
+        func: Rc<FunctionObject>,
+        locals: Vec<Value>,
+        name_map: Option<FxHashMap<String, usize>>,
+        pc: usize,
+        exhausted: bool,
+        yield_from: Option<Rc<RefCell<IteratorState>>>,
+    },
 }
 
 #[derive(Clone)]
@@ -451,6 +460,8 @@ pub enum TaskState {
         args: Vec<Value>,
     },
     Running,
+    /// 已挂起；纤程快照由 VM 侧 `task_fibers` 表持有。
+    Suspended,
     Done(Value),
     Failed(Value),
 }
@@ -546,6 +557,34 @@ impl MutexInner {
     }
 }
 
+/// 其余并发原语（RWMutex / WaitGroup / Semaphore / Once / Barrier / Cond）的统一载荷。
+#[derive(Clone)]
+pub enum SyncInner {
+    /// 读写锁：`readers` 为当前活跃读者数，`writer` 为是否有写者持有。
+    RWMutex {
+        value: Value,
+        readers: usize,
+        writer: bool,
+    },
+    /// 等待组：`count` 降到 0 时唤醒所有 `wait()`。
+    WaitGroup { count: i64 },
+    /// 计数信号量：`permits` 为可用许可数。
+    Semaphore { permits: i64 },
+    /// 一次性执行：`done` 后 `value` 缓存首次结果。
+    Once { done: bool, value: Value },
+    /// 屏障：凑齐 `n` 个 `wait()` 后全部放行（`generation` 递增）。
+    Barrier { n: i64, waiting: usize, generation: u64 },
+    /// 条件变量：`signals` 为待消费的唤醒令牌，`waiters` 为当前等待者数。
+    Cond { signals: i64, waiters: i64 },
+}
+
+/// RWMutex 的读/写守卫，支持 `with` 自动释放。
+#[derive(Clone)]
+pub enum SyncGuardInner {
+    Read { mu: Rc<RefCell<SyncInner>> },
+    Write { mu: Rc<RefCell<SyncInner>> },
+}
+
 #[derive(Clone)]
 pub enum Value {
     None,
@@ -592,6 +631,10 @@ pub enum Value {
     Mutex(Rc<RefCell<MutexInner>>),
     /// `Mutex.lock()` 得到的守卫，可用于 `with`。
     MutexGuard(Rc<RefCell<MutexInner>>),
+    /// 其余并发原语（RWMutex/WaitGroup/Semaphore/Once/Barrier/Cond）。
+    Sync(Rc<RefCell<SyncInner>>),
+    /// RWMutex 读/写守卫。
+    SyncGuard(Rc<RefCell<SyncGuardInner>>),
 }
 
 /// [`Value::TypeSpec`] 的堆载荷 — 移出 `Value` 枚举以保持栈表示紧凑。
@@ -751,6 +794,18 @@ impl Value {
             Value::Channel(_) => "Channel",
             Value::Mutex(_) => "Mutex",
             Value::MutexGuard(_) => "MutexGuard",
+            Value::Sync(s) => match &*s.borrow() {
+                SyncInner::RWMutex { .. } => "RWMutex",
+                SyncInner::WaitGroup { .. } => "WaitGroup",
+                SyncInner::Semaphore { .. } => "Semaphore",
+                SyncInner::Once { .. } => "Once",
+                SyncInner::Barrier { .. } => "Barrier",
+                SyncInner::Cond { .. } => "Cond",
+            },
+            Value::SyncGuard(g) => match &*g.borrow() {
+                SyncGuardInner::Read { .. } => "RWMutexReadGuard",
+                SyncGuardInner::Write { .. } => "RWMutexWriteGuard",
+            },
         }
     }
 
@@ -882,6 +937,18 @@ impl Value {
             Value::Channel(_) => "<Channel>".to_string(),
             Value::Mutex(_) => "<Mutex>".to_string(),
             Value::MutexGuard(_) => "<MutexGuard>".to_string(),
+            Value::Sync(s) => match &*s.borrow() {
+                SyncInner::RWMutex { .. } => "<RWMutex>".to_string(),
+                SyncInner::WaitGroup { .. } => "<WaitGroup>".to_string(),
+                SyncInner::Semaphore { .. } => "<Semaphore>".to_string(),
+                SyncInner::Once { .. } => "<Once>".to_string(),
+                SyncInner::Barrier { .. } => "<Barrier>".to_string(),
+                SyncInner::Cond { .. } => "<Cond>".to_string(),
+            },
+            Value::SyncGuard(g) => match &*g.borrow() {
+                SyncGuardInner::Read { .. } => "<RWMutexReadGuard>".to_string(),
+                SyncGuardInner::Write { .. } => "<RWMutexWriteGuard>".to_string(),
+            },
         }
     }
 
@@ -1091,6 +1158,8 @@ impl Value {
             (Value::Channel(a), Value::Channel(b)) => Ok(Rc::ptr_eq(a, b)),
             (Value::Mutex(a), Value::Mutex(b)) => Ok(Rc::ptr_eq(a, b)),
             (Value::MutexGuard(a), Value::MutexGuard(b)) => Ok(Rc::ptr_eq(a, b)),
+            (Value::Sync(a), Value::Sync(b)) => Ok(Rc::ptr_eq(a, b)),
+            (Value::SyncGuard(a), Value::SyncGuard(b)) => Ok(Rc::ptr_eq(a, b)),
             (Value::TypeSpec(a), Value::TypeSpec(b)) => {
                 Ok(a.name == b.name && a.args == b.args)
             }
@@ -1133,6 +1202,8 @@ pub fn values_identical(a: &Value, b: &Value) -> bool {
         (Value::Channel(x), Value::Channel(y)) => Rc::ptr_eq(x, y),
         (Value::Mutex(x), Value::Mutex(y)) => Rc::ptr_eq(x, y),
         (Value::MutexGuard(x), Value::MutexGuard(y)) => Rc::ptr_eq(x, y),
+        (Value::Sync(x), Value::Sync(y)) => Rc::ptr_eq(x, y),
+        (Value::SyncGuard(x), Value::SyncGuard(y)) => Rc::ptr_eq(x, y),
         (Value::Function(x), Value::Function(y)) => Rc::ptr_eq(x, y),
         (Value::GenericFunction(x), Value::GenericFunction(y)) => Rc::ptr_eq(x, y),
         (Value::Builtin(x), Value::Builtin(y)) => std::ptr::eq(x, y),
@@ -1484,6 +1555,9 @@ impl IteratorState {
                     Ok(Some(v))
                 }
             }
+            IteratorKind::Generator { .. } => Err(RuntimeError::msg(
+                "internal: generator iteration must use Vm::advance_iterator",
+            )),
         }
     }
 }

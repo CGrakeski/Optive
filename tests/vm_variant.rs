@@ -20,6 +20,23 @@ wrapped = Result(ok)
 }
 
 #[test]
+fn variant_case_plain_struct_body() {
+    assert_num(
+        r#"
+variant Expr {
+    Lit = struct { let value }
+    Bin = struct { let op let left let right }
+}
+
+e = Expr.Lit(42)
+b = Expr.Bin("+", e, Expr.Lit(1))
+1
+"#,
+        "1",
+    );
+}
+
+#[test]
 fn return_wrapper_double_wrap() {
     assert_text(
         r#"

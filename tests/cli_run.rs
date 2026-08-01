@@ -345,6 +345,39 @@ logging = { git = "https://github.com/example/logging.git", rev = "eeeeeeeeeeeee
     );
 }
 
+#[test]
+fn run_inline_code_flag() {
+    let root = tempfile_project("inline_c");
+    let (code, stdout, stderr) = run_optive(&["-c", "print(40 + 2)"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(stdout.contains("42"), "expected 42, got: {stdout}");
+}
+
+#[test]
+fn run_inline_code_multiline() {
+    let root = tempfile_project("inline_c_ml");
+    let src = "let x = 1\nprint(x + 1)\n";
+    let (code, stdout, stderr) = run_optive(&["-c", src], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(stdout.contains("2"), "expected 2, got: {stdout}");
+}
+
+#[test]
+fn run_inline_code_hex_escape() {
+    let root = tempfile_project("inline_c_hex");
+    let (code, stdout, stderr) = run_optive(&["-c", r#"print("\x41\x42")"#], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(stdout.contains("AB"), "expected AB, got: {stdout}");
+}
+
+#[test]
+fn run_inline_code_missing_arg() {
+    let root = tempfile_project("inline_c_miss");
+    let (code, _stdout, stderr) = run_optive(&["-c"], &root);
+    assert_eq!(code, 2, "stderr={stderr}");
+    assert!(stderr.contains("usage") || stderr.contains("-c"), "stderr={stderr}");
+}
+
 fn tempfile_project(name: &str) -> PathBuf {
     let mut dir = std::env::temp_dir();
     dir.push(format!("optive_test_{name}_{}", std::process::id()));

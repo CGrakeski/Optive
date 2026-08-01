@@ -48,6 +48,19 @@ fn single_type_index_operand(val: &Value) -> crate::Result<TypeExpr> {
     Ok(args.remove(0))
 }
 
+/// 将运行时 `TypeSpec` 转为 `TypeExpr`。
+/// 无参的类型形态（如 `Callable()`、`Maybe()`）仍走 `Generic`，避免被当成普通类型名。
+pub fn type_spec_to_type_expr(spec: &crate::value::TypeSpecData) -> TypeExpr {
+    if spec.args.is_empty() && !type_registry::is_type_form(&spec.name) {
+        TypeExpr::Name(spec.name.clone())
+    } else {
+        TypeExpr::Generic {
+            name: spec.name.clone(),
+            params: spec.args.clone(),
+        }
+    }
+}
+
 /// `val` 是否为 `type_name` 的实例或子类型（is-a，非类型句柄相等）。
 pub fn instance_is_a(vm: &Vm, val: &Value, type_name: &str) -> bool {
     if type_name == "Never" {

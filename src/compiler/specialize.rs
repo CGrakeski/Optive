@@ -87,6 +87,16 @@ pub(crate) fn specialize_with_entry(code: &mut [Instruction], entry_env: &[Optio
                 let t = stack.pop().unwrap_or(None);
                 env_set(&mut env, *slot, t);
             }
+            Instruction::LoadFastSubImm { slot, .. } => {
+                let t = env_get(&env, *slot);
+                // 结果类型：若槽为 Num 则差仍为 Num；否则未知。
+                stack.push(if t == Some(Tag::Num) { Some(Tag::Num) } else { None });
+            }
+            Instruction::LoadFastLeImm { slot, .. } => {
+                let t = env_get(&env, *slot);
+                let _ = t;
+                stack.push(Some(Tag::Bool));
+            }
             Instruction::Load(_)
             | Instruction::LoadGlobal(_)
             | Instruction::LoadMacro(_)
@@ -123,6 +133,12 @@ pub(crate) fn specialize_with_entry(code: &mut [Instruction], entry_env: &[Optio
             Instruction::GotoIf(_) | Instruction::GotoIfNot(_) => {
                 let _ = stack.pop();
                 // 落空路径保留当前 env/stack；跳转目标在 Label 处清空。
+            }
+            Instruction::LoopCountdown(_) => {
+                // 继续路径：计数器仍在栈顶；跳出路径在 Label 处清空。
+                if let Some(top) = stack.last_mut() {
+                    *top = Some(Tag::Num);
+                }
             }
             Instruction::VecNew(n) => {
                 for _ in 0..*n {
@@ -350,7 +366,10 @@ pub(crate) fn specialize_with_entry(code: &mut [Instruction], entry_env: &[Optio
                 let _ = stack.pop();
                 stack.push(None);
             }
-            Instruction::Yield => {}
+            Instruction::Suspend => {}
+            Instruction::Yield | Instruction::YieldFrom => {
+                let _ = stack.pop();
+            }
             Instruction::SelectTryRecv | Instruction::SelectPollTask => {
                 let _ = stack.pop();
                 // value? + bool 或仅 bool — 保守清空后压未知

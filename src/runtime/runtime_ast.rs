@@ -302,7 +302,7 @@ pub fn ast_from_expr(expr: &Expr) -> RuntimeAstNode {
         | ExprKind::Handle { .. }
         | ExprKind::Go { .. }
         | ExprKind::Await { .. }
-        | ExprKind::Yield
+        | ExprKind::Suspend
         | ExprKind::Select { .. }
         | ExprKind::NamedAssign { .. }
         | ExprKind::Set(_)
@@ -333,7 +333,11 @@ fn ast_from_macro_call_arg(arg: &MacroCallArg) -> AstCallArg {
 pub fn ast_from_block(block: &Block) -> RuntimeAstNode {
     RuntimeAstNode {
         kind: AstNodeKind::BlockStmt,
-        stmts: block.iter().map(|ls| ast_from_stmt(&ls.stmt)).collect(),
+        stmts: block
+            .iter()
+            .filter(|ls| !matches!(ls.stmt, Stmt::Comment { .. }))
+            .map(|ls| ast_from_stmt(&ls.stmt))
+            .collect(),
         ..default_node()
     }
 }
