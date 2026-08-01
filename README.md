@@ -1,7 +1,6 @@
 # Optive
 
-[![CI](https://github.com/Optive/Optive/actions/workflows/ci.yml/badge.svg)](https://github.com/Optive/Optive/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: MulanPSL-2.0](https://img.shields.io/badge/license-MulanPSL--2.0-blue.svg)](LICENSE)
 
 **Optive** 是一门动态、表达式丰富的脚本语言，用 Rust 实现的解释器：词法分析 → 语法分析 → 字节码 VM。支持软/硬类型注解、泛型、协议、管道、模式匹配、宏，以及通过 `extern` 调用 C ABI 动态库；并自带基于 Git 的依赖管理（`Optive.toml` / `optive.lock` / `Optive.cache`）。
 
@@ -162,4 +161,4 @@ CI（`.github/workflows/ci.yml`）在 ubuntu / windows / macos 三平台上跑 f
 
 ## 许可证
 
-MIT，见 `LICENSE`。
+MulanPSL-2.0，见 `LICENSE`。
