@@ -1,7 +1,9 @@
 //! 依赖图解析与安装（ensure / update）。
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::cache::ProjectCache;
 use super::git_ops;
@@ -44,7 +46,7 @@ pub struct DepBinding {
     pub id: PackageId,
 }
 
-pub type DepMap = HashMap<(PackageId, String), DepBinding>;
+pub type DepMap = FxHashMap<(PackageId, String), DepBinding>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolveMode {
@@ -105,8 +107,8 @@ pub fn ensure_graph(
         || project.manifest.track_latest;
 
     let mut report = ResolveReport::default();
-    let mut binding: HashMap<(String, String), String> = HashMap::new();
-    let mut dep_map: DepMap = HashMap::new();
+    let mut binding: FxHashMap<(String, String), String> = FxHashMap::default();
+    let mut dep_map: DepMap = FxHashMap::default();
     let mut queue: VecDeque<(String, String, Dependency)> = VecDeque::new();
 
     let dry = opts.mode == ResolveMode::DryRun;
@@ -116,7 +118,7 @@ pub fn ensure_graph(
         Some(Store::open()?)
     };
     // LOCAL_DEPS：检测同名不同 id
-    let mut local_name_ids: HashMap<String, String> = HashMap::new();
+    let mut local_name_ids: FxHashMap<String, String> = FxHashMap::default();
 
     for (name, dep) in &project.manifest.dependencies {
         if let Some(ref only) = opts.only_root_dep {
@@ -292,7 +294,7 @@ pub fn ensure_graph(
 
         if let Some(ref mut st) = store {
             let ids: Vec<String> = report.edges.iter().map(|e| e.id.clone()).collect();
-            let uniq: HashSet<String> = ids.into_iter().collect();
+            let uniq: FxHashSet<String> = ids.into_iter().collect();
             let ids: Vec<String> = uniq.into_iter().collect();
             let key = project_key(project);
             st.set_project_refs(&key, &ids)?;
@@ -316,13 +318,13 @@ fn ensure_from_lock(
     cache: &mut ProjectCache,
 ) -> Result<EnsureResult, Box<dyn std::error::Error>> {
     let mut report = ResolveReport::default();
-    let mut dep_map: DepMap = HashMap::new();
+    let mut dep_map: DepMap = FxHashMap::default();
     let mut store = if home::use_local_deps() {
         None
     } else {
         Some(Store::open()?)
     };
-    let mut local_name_ids: HashMap<String, String> = HashMap::new();
+    let mut local_name_ids: FxHashMap<String, String> = FxHashMap::default();
 
     for edge in &lock.edges {
         let computed = store::content_id(&edge.git, &edge.rev);
@@ -384,7 +386,7 @@ fn ensure_from_lock(
 
     cache.save(&project.cache_path())?;
     if let Some(ref mut st) = store {
-        let ids: HashSet<String> = lock.edges.iter().map(|e| e.id.clone()).collect();
+        let ids: FxHashSet<String> = lock.edges.iter().map(|e| e.id.clone()).collect();
         st.set_project_refs(&project_key(project), &ids.into_iter().collect::<Vec<_>>())?;
     }
 
@@ -404,15 +406,15 @@ fn materialize_lock_subtree(
     dry: bool,
     store: &mut Option<Store>,
     cache: &mut ProjectCache,
-    binding: &mut HashMap<(String, String), String>,
+    binding: &mut FxHashMap<(String, String), String>,
     dep_map: &mut DepMap,
     report: &mut ResolveReport,
-    local_name_ids: &mut HashMap<String, String>,
+    local_name_ids: &mut FxHashMap<String, String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut q: VecDeque<&LockEdge> = VecDeque::new();
     q.push_back(root_edge);
     // 按 (parent, name) 去重，保留菱形依赖的多条入边。
-    let mut seen_keys: HashSet<(String, String)> = HashSet::new();
+    let mut seen_keys: FxHashSet<(String, String)> = FxHashSet::default();
 
     while let Some(edge) = q.pop_front() {
         let key = (edge.parent.clone(), edge.name.clone());

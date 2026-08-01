@@ -1,0 +1,10 @@
+// 调用方：`use` 引入 keyword_or_ident；本模块另有 struct，易与错误全局槽位混淆
+use "./use_keeps_def_module_globals.tive".{ keyword_or_ident }
+
+struct Lexer {
+    let source
+}
+
+export func via_use(s) {
+    return keyword_or_ident(s)
+}

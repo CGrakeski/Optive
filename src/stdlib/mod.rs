@@ -10,6 +10,11 @@ use crate::value::{IteratorKind, IteratorState, ModuleObject, Num, Value, ValueK
 use crate::vm::Vm;
 use crate::Result;
 
+/// `format_num` / `format` 字段的默认小数精度。
+const DEFAULT_NUM_PRECISION: usize = 6;
+/// `take` / `skip` 等迭代器物化的预分配初始容量。
+const ITER_MATERIALIZE_INIT_CAP: usize = 64;
+
 pub fn build_std_module() -> Rc<RefCell<ModuleObject>> {
     let math = submodule(
         "math",
@@ -265,14 +270,7 @@ fn expect_int(name: &str, args: &[Value], idx: usize) -> Result<i64> {
     let v = args.get(idx).ok_or_else(|| {
         crate::error::RuntimeError::type_err(format!("{name}: missing argument {idx}"))
     })?;
-    match v {
-        Value::Num(n) => n.to_i64().ok_or_else(|| {
-            crate::error::RuntimeError::type_err(format!("{name}: argument must be integer"))
-        }),
-        _ => Err(crate::error::RuntimeError::type_err(format!(
-            "{name}: argument must be integer"
-        ))),
-    }
+    crate::value::expect_i64(name, v)
 }
 
 fn expect_text(name: &str, args: &[Value], idx: usize) -> Result<String> {
@@ -333,27 +331,32 @@ fn math_hypot(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 /// `divmod(a, b)` → `[a / b, a % b]`（整数商与余数，遵循有理数取模同号语义）。
 fn math_divmod(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     expect_arity("divmod", args, 2)?;
-    let (Value::Num(_a), Value::Num(b)) = (&args[0], &args[1]) else {
+    let (Value::Num(a), Value::Num(b)) = (&args[0], &args[1]) else {
         return Err(crate::error::RuntimeError::type_err("divmod requires nums"));
     };
     if b.is_zero() {
         return Err(crate::error::RuntimeError::value_err("divmod by zero"));
     }
-    let q = args[0].div(&args[1])?;
-    let r = args[0].rem(&args[1])?;
+    let q = Value::Num(a.clone()).div(&args[1])?;
+    let r = Value::Num(a.clone()).rem(&args[1])?;
     Ok(Value::List(Rc::new(RefCell::new(vec![q, r]))))
 }
 
+/// Optive 的 `Num` 基于有理数，无法精确表达 IEEE 754 infinity。
+/// 此处返回 `i64::MAX` 作为最佳近似；与 -inf/inf 比较时等于自身。
 fn math_const_inf() -> Value {
-    Value::Num(float_from_f64(f64::INFINITY).unwrap_or(Num::Small(0)))
+    Value::Num(Num::from_bigint(BigInt::from(i64::MAX)))
 }
 
+/// 同 `math_const_inf`，返回 `i64::MIN` 作为负无穷的最佳近似。
 fn math_const_neg_inf() -> Value {
-    Value::Num(float_from_f64(f64::NEG_INFINITY).unwrap_or(Num::Small(0)))
+    Value::Num(Num::from_bigint(BigInt::from(i64::MIN)))
 }
 
+/// Optive 的 `Num` 无法表示 IEEE 754 NaN。返回 0 作为占位；
+/// 用户代码不应将 `std.math.nan` 用于 NaN 检测。
 fn math_const_nan() -> Value {
-    Value::Num(float_from_f64(f64::NAN).unwrap_or(Num::Small(0)))
+    Value::Num(Num::Small(0))
 }
 
 fn math_const_tau() -> Value {
@@ -716,14 +719,14 @@ fn io_write_bytes(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 }
 
 fn io_write_line(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    let parts: Vec<String> = args.iter().map(|v| v.print_string()).collect();
-    println!("{}", parts.join(" "));
+    let out = crate::value::args_join_space(args);
+    println!("{out}");
     Ok(Value::None)
 }
 
 fn io_eprint(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    let parts: Vec<String> = args.iter().map(|v| v.print_string()).collect();
-    eprintln!("{}", parts.join(" "));
+    let out = crate::value::args_join_space(args);
+    eprintln!("{out}");
     Ok(Value::None)
 }
 
@@ -809,7 +812,7 @@ fn format_format_num(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let prec = if args.len() == 2 {
         expect_int("format_num", args, 1)?.max(0) as usize
     } else {
-        6
+        DEFAULT_NUM_PRECISION
     };
     Ok(Value::Text(format!("{x:.prec$}")))
 }
@@ -919,7 +922,7 @@ fn iter_take(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
     let n = expect_int("take", args, 1)?.max(0) as usize;
     let state = value_to_iterator_rc(&args[0])?;
-    let mut out = Vec::with_capacity(n.min(64));
+    let mut out = Vec::with_capacity(n.min(ITER_MATERIALIZE_INIT_CAP));
     for _ in 0..n {
         match vm.advance_iterator(&state)? {
             Some(v) => out.push(v),

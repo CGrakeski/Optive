@@ -96,13 +96,41 @@ pub(crate) struct TaskFiber {
     lw_frame_slots: usize,
 }
 
-fn suspend_budget_default() -> usize {
-    std::env::var("OPTIVE_SUSPEND_BUDGET")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(8_192)
+/// 辅助宏：从环境变量读取正的 usize，带缓存或不带缓存。
+macro_rules! env_usize {
+    (cached $name:ident, $env:literal, $default:expr) => {
+        fn $name() -> usize {
+            static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            *CACHED.get_or_init(|| {
+                std::env::var($env)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&n| n > 0)
+                    .unwrap_or($default)
+            })
+        }
+    };
+    ($name:ident, $env:literal, $default:expr) => {
+        fn $name() -> usize {
+            std::env::var($env)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or($default)
+        }
+    };
 }
+
+env_usize!(suspend_budget_default, "OPTIVE_SUSPEND_BUDGET", 8_192);
+env_usize!(cached max_call_depth, "OPTIVE_MAX_CALL_DEPTH", 10_000);
+env_usize!(cached gc_auto_threshold, "OPTIVE_GC_THRESHOLD", 8_192);
+
+// 预分配容量常量 — 避免热路径扩容，控制初始内存占用。
+const STACK_INIT_CAP: usize = 256;
+const CALL_ARGS_BUF_INIT_CAP: usize = 8;
+const FAST_RET_PCS_INIT_CAP: usize = 128;
+const LW_SLOTS_INIT_CAP: usize = 1024;
+const LW_BASES_INIT_CAP: usize = 128;
 
 impl StackVal {
     #[inline]
@@ -155,19 +183,6 @@ impl StackVal {
             StackVal::Heap(b) => b.is_truthy(),
         }
     }
-}
-
-/// 用户调用与轻量 CallSelf 的最大嵌套深度（防无限递归占满栈）。
-/// 可用环境变量 `OPTIVE_MAX_CALL_DEPTH` 覆盖。
-fn max_call_depth() -> usize {
-    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("OPTIVE_MAX_CALL_DEPTH")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(10_000)
-    })
 }
 
 /// 加载期一次性校验热字节码结构。畸形字节码在此干净报错，
@@ -225,19 +240,6 @@ fn validate_hot_bytecode(hot: &crate::hot_code::HotCode) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// GC 跟踪表超过此阈值时自动触发环收集。
-/// 可用环境变量 `OPTIVE_GC_THRESHOLD` 覆盖。
-fn gc_auto_threshold() -> usize {
-    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("OPTIVE_GC_THRESHOLD")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(8_192)
-    })
 }
 
 #[derive(Clone)]
@@ -559,7 +561,7 @@ impl Vm {
             code: Rc::new(Vec::new()),
             hot_ops: Rc::from([]),
             hot_args: Rc::from([]),
-            stack: Vec::with_capacity(256),
+            stack: Vec::with_capacity(STACK_INIT_CAP),
             stack_sp: 0,
             globals: FxHashMap::default(),
             locals_stack: Vec::new(),
@@ -598,11 +600,11 @@ impl Vm {
             script_global_names: Vec::new(),
             script_globals: Vec::new(),
             local_frame_pool: Vec::new(),
-            call_args_buf: Vec::with_capacity(8),
-            fast_ret_pcs: Vec::with_capacity(128),
+            call_args_buf: Vec::with_capacity(CALL_ARGS_BUF_INIT_CAP),
+            fast_ret_pcs: Vec::with_capacity(FAST_RET_PCS_INIT_CAP),
             fast_ret_sp: 0,
-            lw_slots: Vec::with_capacity(1024),
-            lw_bases: Vec::with_capacity(128),
+            lw_slots: Vec::with_capacity(LW_SLOTS_INIT_CAP),
+            lw_bases: Vec::with_capacity(LW_BASES_INIT_CAP),
             lw_bases_sp: 0,
             lw_sp: 0,
             lw_base: 0,
@@ -694,23 +696,18 @@ impl Vm {
         for v in self.globals.values() {
             worklist.push(v.clone());
         }
-        // 已注册函数及其闭包捕获
+        // 已注册函数 / 调用栈 / 重载表：函数对象 + 闭包捕获
+        let push_func = |worklist: &mut Vec<Value>, f: &Rc<FunctionObject>| {
+            worklist.push(Value::Function(f.clone()));
+            if let Some(cap) = &f.captured {
+                worklist.extend(cap.values().cloned());
+            }
+        };
         for f in self.functions.values() {
-            worklist.push(Value::Function(f.clone()));
-            if let Some(cap) = &f.captured {
-                for v in cap.values() {
-                    worklist.push(v.clone());
-                }
-            }
+            push_func(&mut worklist, f);
         }
-        // 当前调用栈上的函数对象
         for f in &self.func_stack {
-            worklist.push(Value::Function(f.clone()));
-            if let Some(cap) = &f.captured {
-                for v in cap.values() {
-                    worklist.push(v.clone());
-                }
-            }
+            push_func(&mut worklist, f);
         }
         // 活动异常
         if let Some(exc) = &self.active_exception {
@@ -727,12 +724,7 @@ impl Vm {
         // 重载分发表
         for fns in self.overload_tables.values() {
             for f in fns {
-                worklist.push(Value::Function(f.clone()));
-                if let Some(cap) = &f.captured {
-                    for v in cap.values() {
-                        worklist.push(v.clone());
-                    }
-                }
+                push_func(&mut worklist, f);
             }
         }
         // 已加载模块
@@ -766,18 +758,14 @@ impl Vm {
             }
             for f in snap.functions.values() {
                 if let Some(cap) = &f.captured {
-                    for v in cap.values() {
-                        worklist.push(v.clone());
-                    }
+                    worklist.extend(cap.values().cloned());
                 }
             }
         }
         // 用户调用帧中挂起的闭包捕获
         for fr in &self.user_call_frames {
             if let Some(cap) = &fr.func.captured {
-                for v in cap.values() {
-                    worklist.push(v.clone());
-                }
+                worklist.extend(cap.values().cloned());
             }
         }
 

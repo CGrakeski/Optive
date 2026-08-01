@@ -1713,6 +1713,21 @@ impl fmt::Display for Value {
     }
 }
 
+/// 将值切片转为空格分隔的显示文本，供 `print`/`eprint` 等使用。
+pub fn args_join_space(args: &[Value]) -> String {
+    args.iter().map(|v| v.print_string()).collect::<Vec<_>>().join(" ")
+}
+
+/// 将 `Value` 解析为 `i64`（`WaitGroup.add`、`range`、`randint` 等共用）。
+pub fn expect_i64(name: &str, v: &Value) -> Result<i64> {
+    match v {
+        Value::Num(n) => n
+            .to_i64()
+            .ok_or_else(|| RuntimeError::type_err(format!("{name}: expected integer"))),
+        _ => Err(RuntimeError::type_err(format!("{name}: expected integer"))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

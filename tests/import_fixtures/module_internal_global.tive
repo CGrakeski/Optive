@@ -1,0 +1,12 @@
+// 回归：导入模块内非 export 函数须能读本模块 let（见 SelfOptive BUG_REPORT）
+let PREFIX = "ab"
+
+func via_let(s) {
+    return s[0:2] == PREFIX
+}
+
+export func test_let() {
+    return via_let("abc")
+}
+
+export let TOP = PREFIX

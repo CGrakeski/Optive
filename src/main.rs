@@ -485,18 +485,7 @@ fn run_script_path_with_deps(
     let source = fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let file = path.to_string_lossy().to_string();
-    let mut vm = Vm::new();
-    vm.caps = caps;
-    inject_dep_map(&mut vm, ensured, project_root);
-    match run_source_in_vm(&mut vm, &source, &file) {
-        Ok(v) => {
-            if !matches!(v, optive::value::Value::None) {
-                println!("{}", v.display_string());
-            }
-            Ok(())
-        }
-        Err(e) => Err(e.to_string().into()),
-    }
+    run_in_vm(&source, &file, caps, |vm| inject_dep_map(vm, ensured, project_root))
 }
 
 fn run_script_file(path: &str, caps: optive::caps::Capabilities) {
@@ -510,23 +499,24 @@ fn run_script_path(path: &Path, caps: optive::caps::Capabilities) -> Result<(), 
     let source = fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let file = path.to_string_lossy().to_string();
-    let mut vm = Vm::new();
-    vm.caps = caps;
-    match run_source_in_vm(&mut vm, &source, &file) {
-        Ok(v) => {
-            if !matches!(v, optive::value::Value::None) {
-                println!("{}", v.display_string());
-            }
-            Ok(())
-        }
-        Err(e) => Err(e.to_string().into()),
-    }
+    run_in_vm(&source, &file, caps, |_| {})
 }
 
 fn run_inline_source(source: &str, caps: optive::caps::Capabilities) -> Result<(), Box<dyn std::error::Error>> {
+    run_in_vm(source, "<string>", caps, |_| {})
+}
+
+/// 公共 VM 执行入口：创建 VM、设置能力、运行源码、打印非 None 结果。
+fn run_in_vm(
+    source: &str,
+    file: &str,
+    caps: optive::caps::Capabilities,
+    setup: impl FnOnce(&mut Vm),
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut vm = Vm::new();
     vm.caps = caps;
-    match run_source_in_vm(&mut vm, source, "<string>") {
+    setup(&mut vm);
+    match run_source_in_vm(&mut vm, source, file) {
         Ok(v) => {
             if !matches!(v, optive::value::Value::None) {
                 println!("{}", v.display_string());

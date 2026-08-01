@@ -1,0 +1,6 @@
+export var counter = 0
+
+export func bump() {
+    counter = counter + 1
+    return counter
+}

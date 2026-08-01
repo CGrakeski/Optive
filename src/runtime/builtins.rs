@@ -67,8 +67,8 @@ pub fn install_globals(vm: &mut Vm) {
     }
 }
 fn builtin_print(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    let parts: Vec<String> = args.iter().map(|v| v.print_string()).collect();
-    println!("{}", parts.join(" "));
+    let out = crate::value::args_join_space(args);
+    println!("{out}");
     Ok(Value::None)
 }
 

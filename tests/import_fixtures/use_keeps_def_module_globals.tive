@@ -1,0 +1,12 @@
+// 定义模块：KEYWORD 表仅存在于此模块
+intern let KEYWORDS = {
+    "let": "KwLet",
+}
+
+export func keyword_or_ident(text) {
+    let k = KEYWORDS.get(text, none)
+    if (k is none) {
+        return "Identifier"
+    }
+    return k
+}

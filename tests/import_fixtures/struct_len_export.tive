@@ -1,0 +1,11 @@
+export struct Token { let kind let value }
+
+export friend func describe(t:: Token) {
+    return len(t.kind) + len(t.value)
+}
+
+export func make_tokens(src) {
+    let t = Token("+", "+")
+    let n = len(src)
+    return n
+}

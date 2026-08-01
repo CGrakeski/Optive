@@ -218,6 +218,33 @@ impl Generator {
         Ok(())
     }
 
+    /// 暂存栈上的 `args`/`kwargs`，对其一做原地修改后再压回栈。
+    /// `mutate_args == true` 时修改 args 列表，否则修改 kwargs 字典。
+    fn with_call_arg_temps(
+        &mut self,
+        mutate_args: bool,
+        f: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<()> {
+        let args_tmp = self.cg.fresh_temp("__call_args");
+        let kw_tmp = self.cg.fresh_temp("__call_kwargs");
+        self.emit_store_temp(&kw_tmp);
+        self.emit_store_temp(&args_tmp);
+        if mutate_args {
+            self.emit_load_temp(&args_tmp);
+        } else {
+            self.emit_load_temp(&kw_tmp);
+        }
+        f(self)?;
+        if mutate_args {
+            self.emit_store_temp(&args_tmp);
+        } else {
+            self.emit_store_temp(&kw_tmp);
+        }
+        self.emit_load_temp(&args_tmp);
+        self.emit_load_temp(&kw_tmp);
+        Ok(())
+    }
+
     /// 生成位置参数列表与关键字参数字典（栈：args_list, kwargs_dict）。
     fn gen_call_args_and_kwargs(&mut self, args: &[CallArg]) -> Result<()> {
         self.cg.emit(Instruction::VecNew(0));
@@ -231,41 +258,25 @@ impl Generator {
                 self.cg.emit(Instruction::Call { argc: 2 });
             } else if let Some(name) = &a.name {
                 // kwargs[name] = value；保留 kwargs 在栈上
-                // 栈：args, kwargs → 经临时槽复制 kwargs
-                let args_tmp = self.cg.fresh_temp("__call_args");
-                let kw_tmp = self.cg.fresh_temp("__call_kwargs");
-                self.emit_store_temp(&kw_tmp);
-                self.emit_store_temp(&args_tmp);
-                self.emit_load_temp(&kw_tmp);
-                self.cg
-                    .emit(Instruction::Push(Value::Text(name.clone())));
-                self.gen_expr(&a.value)?;
-                self.cg.emit(Instruction::DictSet);
-                self.emit_store_temp(&kw_tmp);
-                self.emit_load_temp(&args_tmp);
-                self.emit_load_temp(&kw_tmp);
+                self.with_call_arg_temps(false, |this| {
+                    this.cg
+                        .emit(Instruction::Push(Value::Text(name.clone())));
+                    this.gen_expr(&a.value)?;
+                    this.cg.emit(Instruction::DictSet);
+                    Ok(())
+                })?;
             } else if a.is_splat {
-                let args_tmp = self.cg.fresh_temp("__call_args");
-                let kw_tmp = self.cg.fresh_temp("__call_kwargs");
-                self.emit_store_temp(&kw_tmp);
-                self.emit_store_temp(&args_tmp);
-                self.emit_load_temp(&args_tmp);
-                self.gen_expr(&a.value)?;
-                self.cg.emit(Instruction::ListExtend);
-                self.emit_store_temp(&args_tmp);
-                self.emit_load_temp(&args_tmp);
-                self.emit_load_temp(&kw_tmp);
+                self.with_call_arg_temps(true, |this| {
+                    this.gen_expr(&a.value)?;
+                    this.cg.emit(Instruction::ListExtend);
+                    Ok(())
+                })?;
             } else {
-                let args_tmp = self.cg.fresh_temp("__call_args");
-                let kw_tmp = self.cg.fresh_temp("__call_kwargs");
-                self.emit_store_temp(&kw_tmp);
-                self.emit_store_temp(&args_tmp);
-                self.emit_load_temp(&args_tmp);
-                self.gen_expr(&a.value)?;
-                self.cg.emit(Instruction::ListAppend);
-                self.emit_store_temp(&args_tmp);
-                self.emit_load_temp(&args_tmp);
-                self.emit_load_temp(&kw_tmp);
+                self.with_call_arg_temps(true, |this| {
+                    this.gen_expr(&a.value)?;
+                    this.cg.emit(Instruction::ListAppend);
+                    Ok(())
+                })?;
             }
         }
         Ok(())
