@@ -1,8 +1,6 @@
 //! 宏 / quote / eval 用的运行时 AST 值。
 
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
 
 use crate::ast::{
     Block, BinaryOp, CallArg, CatchClause, CatchPattern, Expr, ExprKind, ForItem, LValue,
@@ -11,9 +9,11 @@ use crate::ast::{
 use crate::codegen::Generator;
 use crate::error::RuntimeError;
 use crate::parser::Parser;
+use crate::shared::Shared;
 use crate::value::{FieldTypeInfo, Num, StructDef, StructInstance, Value};
 use crate::vm::Vm;
 use crate::Result;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AstNodeKind {
@@ -123,7 +123,7 @@ pub struct RuntimeAstNode {
 
 impl RuntimeAstNode {
     pub fn as_value(self) -> Value {
-        Value::RuntimeAst(Rc::new(self))
+        Value::RuntimeAst(Arc::new(self))
     }
 }
 
@@ -768,7 +768,7 @@ pub fn quote_binding_to_value(node: &RuntimeAstNode) -> Result<Value> {
             let inner = node.slot_a.as_ref().ok_or_else(|| {
                 RuntimeError::msg("FrozenAst binding missing payload")
             })?;
-            Ok(Value::RuntimeAst(Rc::new((**inner).clone())))
+            Ok(Value::RuntimeAst(Arc::new((**inner).clone())))
         }
         AstNodeKind::Vector => {
             let items: Vec<Value> = node
@@ -776,7 +776,7 @@ pub fn quote_binding_to_value(node: &RuntimeAstNode) -> Result<Value> {
                 .iter()
                 .map(quote_binding_to_value)
                 .collect::<Result<_>>()?;
-            Ok(Value::List(Rc::new(RefCell::new(items))))
+            Ok(Value::List(Shared::new(items)))
         }
         _ => Ok(node.clone().as_value()),
     }
@@ -1276,7 +1276,7 @@ fn ast_to_call_arg(arg: &AstCallArg) -> Result<CallArg> {
 fn ast_to_macro_call_arg(arg: &AstCallArg) -> Result<MacroCallArg> {
     Ok(MacroCallArg {
         is_splat: arg.is_splat,
-        node: std::rc::Rc::new(arg.value.clone()),
+        node: Arc::new(arg.value.clone()),
     })
 }
 
@@ -1328,7 +1328,7 @@ pub fn parse_to_ast(source: &str) -> Result<RuntimeAstNode> {
 }
 
 pub fn clone_ast_value(v: &Value) -> Result<Value> {
-    Ok(Value::RuntimeAst(Rc::new(value_as_ast(v)?)))
+    Ok(Value::RuntimeAst(Arc::new(value_as_ast(v)?)))
 }
 
 pub fn compose_ast_type_convert(type_ast: &Value, value_ast: &Value) -> Result<Value> {
@@ -1398,7 +1398,7 @@ pub fn ast_vec_extend(vec_value: &Value, more: &Value) -> Result<Value> {
     let more_nodes = expect_ast_list(more, "ast_vec_extend")?;
     let mut borrow = lst.borrow_mut();
     for n in more_nodes {
-        borrow.push(Value::RuntimeAst(Rc::new(n)));
+        borrow.push(Value::RuntimeAst(Arc::new(n)));
     }
     Ok(vec_value.clone())
 }
@@ -1414,11 +1414,11 @@ fn runtime_ast_to_struct(vm: &Vm, node: &RuntimeAstNode) -> Result<Value> {
             .unwrap_or(Value::None)
     };
     let call_args_list = |args: &[AstCallArg]| -> Value {
-        Value::List(Rc::new(std::cell::RefCell::new(
+        Value::List(Shared::new(
             args.iter()
                 .map(|a| a.value.clone().as_value())
                 .collect(),
-        )))
+        ))
     };
 
     let (name, slots): (&str, Vec<Value>) = match node.kind {
@@ -1478,20 +1478,20 @@ fn runtime_ast_to_struct(vm: &Vm, node: &RuntimeAstNode) -> Result<Value> {
         ),
         AstNodeKind::Vector => (
             "AstVector",
-            vec![Value::List(Rc::new(std::cell::RefCell::new(
+            vec![Value::List(Shared::new(
                 node.children
                     .iter()
                     .map(|c| c.clone().as_value())
                     .collect(),
-            )))],
+            ))],
         ),
         AstNodeKind::QuoteExpr => (
             "AstQuote",
             vec![
                 ast_field(node.slot_a.as_deref()),
-                Value::List(Rc::new(std::cell::RefCell::new(
+                Value::List(Shared::new(
                     node.bindings.iter().map(|b| b.clone().as_value()).collect(),
-                ))),
+                )),
             ],
         ),
         other => {
@@ -1510,9 +1510,9 @@ fn make_struct_instance(vm: &Vm, name: &str, slots: Vec<Value>) -> Result<Value>
         .get(name)
         .cloned()
         .ok_or_else(|| RuntimeError::msg(format!("unknown struct type: {name}")))?;
-    Ok(Value::Struct(Rc::new(StructInstance {
+    Ok(Value::Struct(Arc::new(StructInstance {
         def,
-        slots: std::cell::RefCell::new(slots),
+        slots: crate::shared::SyncCell::new(slots),
         generic_args: Vec::new(),
     })))
 }
@@ -1569,7 +1569,7 @@ pub fn register_ast_struct_types(vm: &mut Vm) {
 
     for (name, base, fields) in defs {
         vm.struct_defs.entry(name.to_string()).or_insert_with(|| {
-            Rc::new(StructDef {
+            Arc::new(StructDef {
                 name: name.to_string(),
                 base: base.map(str::to_string),
                 fields: fields.iter().map(|(f, _)| f.to_string()).collect(),
@@ -1580,15 +1580,14 @@ pub fn register_ast_struct_types(vm: &mut Vm) {
                     .map(|_| FieldTypeInfo::default())
                     .collect(),
                 type_params: Vec::new(),
+                c_layout: None,
             })
         });
         vm.globals
-            .entry(name.to_string())
-            .or_insert_with(|| Value::type_ref(name));
+            .or_insert_with(name.to_string(), || Value::type_ref(name));
     }
     vm.globals
-        .entry("AST".to_string())
-        .or_insert_with(|| Value::type_ref("AST"));
+        .or_insert_with("AST".to_string(), || Value::type_ref("AST"));
 }
 
 pub fn check_macro_param_ast_kind(param_type: &TypeExpr, ast: &RuntimeAstNode) -> Result<()> {

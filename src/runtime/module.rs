@@ -8,12 +8,12 @@ use crate::value::{ModuleObject, Value};
 use crate::vm::{DepPackage, Vm};
 use crate::Result;
 use rustc_hash::FxHashMap;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::Arc;
 
+use crate::shared::Shared;
 /// 已挂到其它已加载模块的函数（`use` 引入）不得换绑到当前模块。
 fn module_env_already_finalized(func: &FunctionObject) -> bool {
     func.module_env
@@ -23,9 +23,9 @@ fn module_env_already_finalized(func: &FunctionObject) -> bool {
 
 /// 把模块快照挂到函数（含体内嵌套 `Push(Function)`），使 LoadGlobal/StoreGlobal 解析模块绑定。
 fn function_with_module_env(
-    func: &Rc<FunctionObject>,
-    env: &Rc<ModuleGlobalEnv>,
-) -> Rc<FunctionObject> {
+    func: &Arc<FunctionObject>,
+    env: &Arc<ModuleGlobalEnv>,
+) -> Arc<FunctionObject> {
     if module_env_already_finalized(func) {
         return func.clone();
     }
@@ -40,13 +40,13 @@ fn function_with_module_env(
         }
     }
     if changed {
-        f.body = Rc::new(body);
+        f.body = Arc::new(body);
         f.hot = hot_code::HotCode::encode(&f.body);
     }
-    Rc::new(f)
+    Arc::new(f)
 }
 
-fn rebind_export_value(val: &Value, env: &Rc<ModuleGlobalEnv>) -> Value {
+fn rebind_export_value(val: &Value, env: &Arc<ModuleGlobalEnv>) -> Value {
     match val {
         Value::Function(f) => Value::Function(function_with_module_env(f, env)),
         Value::Dispatch(table) => {
@@ -88,7 +88,7 @@ pub fn find_module(vm: &mut Vm, module_name: &str) -> Result<Value> {
     load_user_module(vm, module_name)
 }
 
-fn resolve_builtin_path(vm: &Vm, module_name: &str) -> Option<Rc<RefCell<ModuleObject>>> {
+fn resolve_builtin_path(vm: &Vm, module_name: &str) -> Option<Shared<ModuleObject>> {
     let parts: Vec<&str> = module_name.split('.').collect();
     if parts.is_empty() {
         return None;
@@ -127,8 +127,8 @@ fn run_module_source(
     vm.current_package_id = prev_pkg;
     vm.package_root = prev_root;
     run_result?;
-    let module_env = Rc::new(vm.snapshot_module_global_env());
-    let new_functions: HashMap<String, Rc<FunctionObject>> = vm
+    let module_env = Arc::new(vm.snapshot_module_global_env());
+    let new_functions: HashMap<String, Arc<FunctionObject>> = vm
         .functions
         .iter()
         .filter(|(k, _)| !snap.functions.contains_key(*k))
@@ -162,10 +162,10 @@ fn run_module_source(
         }
     }
 
-    let mut new_overloads: FxHashMap<String, Vec<Rc<FunctionObject>>> = FxHashMap::default();
+    let mut new_overloads: FxHashMap<String, Vec<Arc<FunctionObject>>> = FxHashMap::default();
     for name in module_overload_keys {
         if let Some(overloads) = vm.overload_tables.get(&name) {
-            let patched: Vec<Rc<FunctionObject>> = overloads
+            let patched: Vec<Arc<FunctionObject>> = overloads
                 .iter()
                 .map(|f| function_with_module_env(f, &module_env))
                 .collect();
@@ -314,10 +314,10 @@ fn load_file_as_module(
     package_root: Option<PathBuf>,
 ) -> Result<Value> {
     let source = read_module_file(file_path)?;
-    let placeholder = Rc::new(RefCell::new(ModuleObject::new_user(
+    let placeholder = Shared::new(ModuleObject::new_user(
         last.to_string(),
         module_name.to_string(),
-    )));
+    ));
     vm.module_cache
         .insert(module_name.to_string(), placeholder.clone());
     let import_base = file_path
@@ -549,13 +549,13 @@ fn load_string_module(vm: &mut Vm, path: &str) -> Result<Value> {
         vm.current_package_id.clone(),
         vm.package_root.clone(),
     )?;
-    let module = Rc::new(RefCell::new(ModuleObject {
+    let module = Shared::new(ModuleObject {
         name: alias.clone(),
         full_name: canonical.clone(),
         exports,
         children: HashMap::new(),
         is_user: true,
-    }));
+    });
     vm.module_cache.insert(cache_key, module.clone());
     Ok(Value::Module(module))
 }

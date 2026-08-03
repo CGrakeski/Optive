@@ -1,6 +1,5 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use num_bigint::BigInt;
 use num_traits::Zero;
@@ -12,6 +11,7 @@ use crate::value::{DictMap, Num, Value, ValueKey};
 use crate::vm::Vm;
 use crate::Result;
 
+use crate::shared::{Shared, SyncCell};
 pub fn install_globals(vm: &mut Vm) {
     vm.globals.insert("true".into(), Value::Bool(true));
     vm.globals.insert("false".into(), Value::Bool(false));
@@ -63,7 +63,7 @@ pub fn install_globals(vm: &mut Vm) {
         ("__finalize_enum__", builtin_finalize_enum),
     ];
     for (name, f) in builtins {
-        vm.globals.insert(name.into(), Value::Builtin(Rc::new(f)));
+        vm.globals.insert(name.into(), Value::Builtin(Arc::new(f)));
     }
 }
 fn builtin_print(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -299,7 +299,7 @@ fn builtin_make_closure(vm: &mut Vm, args: &[Value]) -> Result<Value> {
                 .insert(name.clone(), Value::Cell(cell));
         }
     }
-    Ok(Value::Function(Rc::new(f)))
+    Ok(Value::Function(Arc::new(f)))
 }
 
 fn builtin_with_exit(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -355,9 +355,9 @@ fn builtin_copy(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         return Err(crate::error::RuntimeError::type_err("copy requires 1 argument"));
     }
     Ok(match &args[0] {
-        Value::List(l) => Value::List(Rc::new(RefCell::new(l.borrow().clone()))),
-        Value::Dict(d) => Value::Dict(Rc::new(RefCell::new(d.borrow().clone()))),
-        Value::Set(s) => Value::Set(Rc::new(RefCell::new(s.borrow().clone()))),
+        Value::List(l) => Value::List(Shared::new(l.borrow().clone())),
+        Value::Dict(d) => Value::Dict(Shared::new(d.borrow().clone())),
+        Value::Set(s) => Value::Set(Shared::new(s.borrow().clone())),
         other => other.clone(),
     })
 }
@@ -378,8 +378,8 @@ fn deep_copy_value(v: &Value, memo: &mut HashMap<usize, Value>) -> Result<Value>
     }
     Ok(match v {
         Value::List(l) => {
-            let key = Rc::as_ptr(l) as usize;
-            let out = Rc::new(RefCell::new(Vec::new()));
+            let key = l.as_ptr() as usize;
+            let out = Shared::new(Vec::new());
             memo.insert(key, Value::List(out.clone()));
             let items = l
                 .borrow()
@@ -390,8 +390,8 @@ fn deep_copy_value(v: &Value, memo: &mut HashMap<usize, Value>) -> Result<Value>
             Value::List(out)
         }
         Value::Dict(d) => {
-            let key = Rc::as_ptr(d) as usize;
-            let out = Rc::new(RefCell::new(DictMap::new()));
+            let key = d.as_ptr() as usize;
+            let out = Shared::new(DictMap::new());
             memo.insert(key, Value::Dict(out.clone()));
             let mut copied = DictMap::new();
             for (k, val) in d.borrow().iter() {
@@ -401,8 +401,8 @@ fn deep_copy_value(v: &Value, memo: &mut HashMap<usize, Value>) -> Result<Value>
             Value::Dict(out)
         }
         Value::Set(s) => {
-            let key = Rc::as_ptr(s) as usize;
-            let out = Rc::new(RefCell::new(s.borrow().clone()));
+            let key = s.as_ptr() as usize;
+            let out = Shared::new(s.borrow().clone());
             memo.insert(key, Value::Set(out.clone()));
             Value::Set(out)
         }
@@ -411,14 +411,14 @@ fn deep_copy_value(v: &Value, memo: &mut HashMap<usize, Value>) -> Result<Value>
                 .iter()
                 .map(|item| deep_copy_value(item, memo))
                 .collect::<Result<Vec<_>>>()?;
-            Value::Tuple(Rc::from(items.into_boxed_slice()))
+            Value::Tuple(Arc::from(items.into_boxed_slice()))
         }
-        Value::Bytes(b) => Value::Bytes(Rc::new(b.as_ref().clone())),
+        Value::Bytes(b) => Value::Bytes(Arc::new(b.as_ref().clone())),
         Value::Struct(s) => {
-            let key = Rc::as_ptr(s) as usize;
-            let out = Rc::new(crate::value::StructInstance {
+            let key = Arc::as_ptr(s) as usize;
+            let out = Arc::new(crate::value::StructInstance {
                 def: s.def.clone(),
-                slots: RefCell::new(Vec::new()),
+                slots: SyncCell::new(Vec::new()),
                 generic_args: s.generic_args.clone(),
             });
             memo.insert(key, Value::Struct(out.clone()));
@@ -432,11 +432,11 @@ fn deep_copy_value(v: &Value, memo: &mut HashMap<usize, Value>) -> Result<Value>
             Value::Struct(out)
         }
         Value::Variant(v) => {
-            let key = Rc::as_ptr(v) as usize;
+            let key = Arc::as_ptr(v) as usize;
             if let Some(cached) = memo.get(&key) {
                 return Ok(cached.clone());
             }
-            let filled = Rc::new(crate::value::VariantInstance {
+            let filled = Arc::new(crate::value::VariantInstance {
                 inst_name: v.inst_name.clone(),
                 def: v.def.clone(),
                 generic_args: v.generic_args.clone(),
@@ -447,25 +447,25 @@ fn deep_copy_value(v: &Value, memo: &mut HashMap<usize, Value>) -> Result<Value>
             Value::Variant(filled)
         }
         Value::Cell(c) => {
-            let key = Rc::as_ptr(c) as usize;
-            let out = Rc::new(RefCell::new(Value::None));
+            let key = c.as_ptr() as usize;
+            let out = Shared::new(Value::None);
             memo.insert(key, Value::Cell(out.clone()));
             *out.borrow_mut() = deep_copy_value(&c.borrow(), memo)?;
             Value::Cell(out)
         }
-        Value::RuntimeAst(a) => Value::RuntimeAst(Rc::new((**a).clone())),
+        Value::RuntimeAst(a) => Value::RuntimeAst(Arc::new((**a).clone())),
         other => other.clone(),
     })
 }
 
 fn cycle_key(v: &Value) -> Option<usize> {
     match v {
-        Value::List(r) => Some(Rc::as_ptr(r) as usize),
-        Value::Dict(r) => Some(Rc::as_ptr(r) as usize),
-        Value::Set(r) => Some(Rc::as_ptr(r) as usize),
-        Value::Struct(r) => Some(Rc::as_ptr(r) as usize),
-        Value::Variant(r) => Some(Rc::as_ptr(r) as usize),
-        Value::Cell(r) => Some(Rc::as_ptr(r) as usize),
+        Value::List(r) => Some(r.as_ptr() as usize),
+        Value::Dict(r) => Some(r.as_ptr() as usize),
+        Value::Set(r) => Some(r.as_ptr() as usize),
+        Value::Struct(r) => Some(Arc::as_ptr(r) as usize),
+        Value::Variant(r) => Some(Arc::as_ptr(r) as usize),
+        Value::Cell(r) => Some(r.as_ptr() as usize),
         _ => None,
     }
 }
@@ -475,12 +475,12 @@ fn builtin_id(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         return Err(crate::error::RuntimeError::type_err("id requires 1 argument"));
     }
     let ptr = match &args[0] {
-        Value::List(r) => Rc::as_ptr(r) as usize,
-        Value::Dict(r) => Rc::as_ptr(r) as usize,
-        Value::Set(r) => Rc::as_ptr(r) as usize,
-        Value::Function(r) => Rc::as_ptr(r) as usize,
-        Value::Struct(r) => Rc::as_ptr(r) as usize,
-        Value::Iterator(r) => Rc::as_ptr(r) as usize,
+        Value::List(r) => r.as_ptr() as usize,
+        Value::Dict(r) => r.as_ptr() as usize,
+        Value::Set(r) => r.as_ptr() as usize,
+        Value::Function(r) => Arc::as_ptr(r) as usize,
+        Value::Struct(r) => Arc::as_ptr(r) as usize,
+        Value::Iterator(r) => r.as_ptr() as usize,
         Value::Text(s) => s.as_ptr() as usize,
         other => other as *const Value as usize,
     };
@@ -503,7 +503,7 @@ fn builtin_next(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
     let state = match &args[0] {
         Value::Iterator(it) => it.clone(),
-        other => Rc::new(RefCell::new(crate::value::value_to_iterable(other)?)),
+        other => Shared::new(crate::value::value_to_iterable(other)?),
     };
     match vm.advance_iterator(&state)? {
         Some(v) => Ok(v),
@@ -585,7 +585,7 @@ fn builtin_dict_ctor(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         map.insert(key, args[i + 1].clone());
         i += 2;
     }
-    Ok(Value::Dict(Rc::new(RefCell::new(map))))
+    Ok(Value::Dict(Shared::new(map)))
 }
 
 fn builtin_rational(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -717,7 +717,7 @@ fn builtin_make_genexpr(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
     let source = match &args[0] {
         Value::Iterator(it) => it.clone(),
-        other => Rc::new(RefCell::new(crate::value::value_to_iterable(other)?)),
+        other => Shared::new(crate::value::value_to_iterable(other)?),
     };
     let elem = match &args[1] {
         Value::Function(f) => f.clone(),
@@ -749,7 +749,7 @@ fn builtin_make_genexpr(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
             ))
         }
     };
-    Ok(Value::Iterator(Rc::new(RefCell::new(
+    Ok(Value::Iterator(Shared::new(
         crate::value::IteratorState {
             kind: crate::value::IteratorKind::GenExpr {
                 source,
@@ -758,7 +758,7 @@ fn builtin_make_genexpr(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
                 guards,
             },
         },
-    ))))
+    )))
 }
 
 fn builtin_attach_defaults(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -797,7 +797,7 @@ fn builtin_attach_defaults(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
             }
         })
         .collect();
-    Ok(Value::Function(Rc::new(func)))
+    Ok(Value::Function(Arc::new(func)))
 }
 
 fn builtin_merge_kwargs(_vm: &mut Vm, args: &[Value]) -> Result<Value> {

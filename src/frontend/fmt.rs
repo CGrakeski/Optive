@@ -405,6 +405,7 @@ impl Formatter {
                 base,
                 fields,
                 methods,
+                layout,
             } => {
                 self.emit_visibility(*visibility);
                 if *typed {
@@ -456,6 +457,10 @@ impl Formatter {
                 }
                 self.indent(depth);
                 self.buf.push('}');
+                if let Some(l) = layout {
+                    self.buf.push_str(": ");
+                    self.emit_type(l);
+                }
             }
             Stmt::MacroDecl {
                 visibility,

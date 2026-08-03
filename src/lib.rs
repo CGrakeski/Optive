@@ -12,8 +12,8 @@ pub use compiler::{
 };
 pub use frontend::{ast, diagnostics, error, fmt, lexer, parser, token};
 pub use runtime::{
-    builtins, caps, concurrency, c_types, debug, enum_variant, exceptions, ffi, gc, module, runtime_ast,
-    sized, traceback, type_registry, types, value, vm,
+    builtins, caps, concurrency, c_types, debug, enum_variant, exceptions, ffi, ffi_extra, gc, module,
+    ptr_registry, runtime_ast, scheduler, shared, sized, traceback, type_registry, types, value, vm,
 };
 pub use stdlib as std_modules;
 
@@ -48,7 +48,7 @@ pub fn run_source(source: &str) -> Result<value::Value> {
 
 pub fn run_source_in_vm(vm: &mut vm::Vm, source: &str, file: &str) -> Result<value::Value> {
     vm.source_file = file.to_string();
-    vm.current_source = Some(std::rc::Rc::from(source));
+    vm.current_source = Some(std::sync::Arc::from(source));
     if file != "<script>" && file != "<repl>" {
         let path = std::path::Path::new(file);
         if let Some(parent) = path.parent() {
@@ -78,20 +78,23 @@ fn format_runtime_error(
     line: usize,
     stack: &[vm::ErrorStackFrame],
 ) -> RuntimeError {
+    let kind = err.kind();
     let message = err.message().to_string();
     // 已格式化的诊断（解析风格）不应再次包装。
     if message.starts_with("error:") || message.starts_with("\nTraceback") {
         return err.clone();
     }
     if !stack.is_empty() {
-        return RuntimeError::msg(diagnostics::format_runtime_with_stack(
-            source, file, &message, stack,
-        ));
+        return RuntimeError::typed(
+            kind,
+            diagnostics::format_runtime_with_stack(source, file, &message, stack),
+        );
     }
     if line > 0 {
-        RuntimeError::msg(diagnostics::format_runtime_at_line(
-            source, file, line, &message,
-        ))
+        RuntimeError::typed(
+            kind,
+            diagnostics::format_runtime_at_line(source, file, line, &message),
+        )
     } else {
         err.clone()
     }

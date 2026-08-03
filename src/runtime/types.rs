@@ -1,7 +1,7 @@
 //! `::` / `=>` 注解的运行时类型接受检查。
 
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::ast::TypeExpr;
 use crate::error::RuntimeError;
@@ -75,7 +75,7 @@ pub fn instance_is_a(vm: &Vm, val: &Value, type_name: &str) -> bool {
     if let Some(edef) = vm.enum_defs.get(type_name) {
         return matches!(
             val,
-            Value::EnumMember(m) if Rc::ptr_eq(&m.def, edef)
+            Value::EnumMember(m) if Arc::ptr_eq(&m.def, edef)
         );
     }
     if let Value::Struct(s) = val {
@@ -296,13 +296,13 @@ pub fn seal_container_contract(vm: &mut Vm, val: &Value, ty: &TypeExpr) {
         TypeExpr::Generic { name, params } if name == "list" && params.len() == 1 => {
             if let Value::List(rc) = val {
                 vm.list_element_contracts
-                    .insert(Rc::as_ptr(rc) as usize, params[0].clone());
+                    .insert(rc.as_ptr() as usize, params[0].clone());
             }
         }
         TypeExpr::Generic { name, params } if name == "dict" && params.len() == 2 => {
             if let Value::Dict(rc) = val {
                 vm.dict_contracts.insert(
-                    Rc::as_ptr(rc) as usize,
+                    rc.as_ptr() as usize,
                     (params[0].clone(), params[1].clone()),
                 );
             }
@@ -310,7 +310,7 @@ pub fn seal_container_contract(vm: &mut Vm, val: &Value, ty: &TypeExpr) {
         TypeExpr::Generic { name, params } if name == "set" && params.len() == 1 => {
             if let Value::Set(rc) = val {
                 vm.set_element_contracts
-                    .insert(Rc::as_ptr(rc) as usize, params[0].clone());
+                    .insert(rc.as_ptr() as usize, params[0].clone());
             }
         }
         _ => {}

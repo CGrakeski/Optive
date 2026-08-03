@@ -1,8 +1,8 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::ast::{FuncParam, TypeExpr};
+use crate::shared::SyncCell;
 use crate::value::Value;
 
 #[derive(Debug, Clone)]
@@ -535,7 +535,7 @@ pub fn peephole_fuse(code: Vec<Instruction>) -> (Vec<Instruction>, Vec<usize>) {
 pub struct MacroObject {
     pub name: String,
     pub params: Vec<crate::ast::MacroParam>,
-    pub body: Rc<Vec<Instruction>>,
+    pub body: Arc<Vec<Instruction>>,
     pub entry_label: usize,
     pub fast_locals: usize,
     pub variadic_param_index: Option<usize>,
@@ -547,7 +547,7 @@ impl MacroObject {
         Self {
             name: name.into(),
             params,
-            body: Rc::new(body),
+            body: Arc::new(body),
             entry_label: 0,
             fast_locals: 0,
             variadic_param_index,
@@ -556,13 +556,13 @@ impl MacroObject {
 }
 
 /// 模块全局名表与绑定的快照；挂到该模块内编译的函数上，使导入后 `LoadGlobal`/`StoreGlobal` 仍可用。
-/// `globals` 用 `RefCell`：导入后模块函数写入模块自己的绑定，而非污染调用方 globals。
+/// `globals` 用 `SyncCell`（parking_lot）：导入后模块函数写入模块自己的绑定，且可跨线程共享。
 /// `finalized`：模块加载结束、live 快照挂上后为 true。编译期占位 env 为 false，
 /// 以便加载收尾可升级；已 finalized 的函数（含 `use` 引入的外模块函数）不得再被换绑。
 #[derive(Clone)]
 pub struct ModuleGlobalEnv {
     pub global_names: Vec<String>,
-    pub globals: RefCell<HashMap<String, Value>>,
+    pub globals: SyncCell<HashMap<String, Value>>,
     pub finalized: bool,
 }
 
@@ -577,7 +577,7 @@ pub struct GenericFunctionTemplate {
     pub return_wrapper: Option<crate::ast::Expr>,
     pub is_generator: bool,
     /// 定义处源码（REPL 分段特化时供错误展示）。
-    pub source: Option<Rc<str>>,
+    pub source: Option<Arc<str>>,
     pub source_file: String,
 }
 
@@ -585,11 +585,11 @@ pub struct GenericFunctionTemplate {
 pub struct FunctionObject {
     pub name: String,
     pub params: Vec<crate::ast::FuncParam>,
-    pub body: Rc<Vec<Instruction>>,
+    pub body: Arc<Vec<Instruction>>,
     /// 与 `body` 等长的紧凑热操作码（`u8` + 操作数），供热循环使用。
     pub hot: crate::hot_code::HotCode,
-    pub line_map: Rc<Vec<usize>>,
-    pub column_map: Rc<Vec<usize>>,
+    pub line_map: Arc<Vec<usize>>,
+    pub column_map: Arc<Vec<usize>>,
     pub entry_label: usize,
     pub fast_locals: usize,
     pub is_builtin_body: bool,
@@ -614,9 +614,9 @@ pub struct FunctionObject {
     /// 体含 `yield` / `yield from`：调用返回 iterator，不立即执行体。
     pub is_generator: bool,
     /// 若设置，`LoadGlobal` 相对本模块环境解析，而非调用方的 `script_global_names` / `globals`。
-    pub module_env: Option<Rc<ModuleGlobalEnv>>,
+    pub module_env: Option<Arc<ModuleGlobalEnv>>,
     /// 定义本函数的源码（供运行时错误展示上下文；REPL 分多段定义时必需）。
-    pub source: Option<Rc<str>>,
+    pub source: Option<Arc<str>>,
     /// 定义本函数时的文件名。
     pub source_file: String,
 }
@@ -627,10 +627,10 @@ impl FunctionObject {
         Self {
             name: name.into(),
             params,
-            body: Rc::new(body),
+            body: Arc::new(body),
             hot,
-            line_map: Rc::new(Vec::new()),
-            column_map: Rc::new(Vec::new()),
+            line_map: Arc::new(Vec::new()),
+            column_map: Arc::new(Vec::new()),
             entry_label: 0,
             fast_locals: 0,
             is_builtin_body: false,
@@ -711,14 +711,14 @@ pub struct CompiledProgram {
     pub hot: crate::hot_code::HotCode,
     pub line_map: Vec<usize>,
     pub column_map: Vec<usize>,
-    pub functions: HashMap<String, Rc<FunctionObject>>,
-    pub macros: HashMap<String, Rc<MacroObject>>,
-    pub struct_defs: HashMap<String, Rc<crate::value::StructDef>>,
-    pub enum_defs: HashMap<String, Rc<crate::value::EnumDef>>,
-    pub variant_defs: HashMap<String, Rc<crate::value::VariantDef>>,
-    pub overload_tables: HashMap<String, Vec<Rc<FunctionObject>>>,
-    pub protocols: HashMap<String, Rc<crate::protocol::ProtocolDef>>,
-    pub generic_functions: HashMap<String, Rc<GenericFunctionTemplate>>,
+    pub functions: HashMap<String, Arc<FunctionObject>>,
+    pub macros: HashMap<String, Arc<MacroObject>>,
+    pub struct_defs: HashMap<String, Arc<crate::value::StructDef>>,
+    pub enum_defs: HashMap<String, Arc<crate::value::EnumDef>>,
+    pub variant_defs: HashMap<String, Arc<crate::value::VariantDef>>,
+    pub overload_tables: HashMap<String, Vec<Arc<FunctionObject>>>,
+    pub protocols: HashMap<String, Arc<crate::protocol::ProtocolDef>>,
+    pub generic_functions: HashMap<String, Arc<GenericFunctionTemplate>>,
     /// 本编译单元经 LoadGlobal/StoreGlobal 引用的名字（index → name）。
     pub global_names: Vec<String>,
 }

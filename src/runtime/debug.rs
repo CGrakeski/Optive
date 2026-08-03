@@ -2,16 +2,16 @@
 //!
 //! 热路径仅在 `Vm.debug.is_some()` 时多一次 Option 检查；未附加调试器时与原先一致。
 
-use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::error::RuntimeError;
 use crate::value::{TaskState, Value};
 use crate::vm::{ErrorStackFrame, Vm};
 use crate::Result;
 
+use crate::shared::Shared;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepMode {
     /// 步入：下一源码行即停（可进入调用）。
@@ -125,12 +125,12 @@ pub fn normalize_path(p: &str) -> String {
         .replace('\\', "/")
 }
 
-pub fn attach(vm: &mut Vm, state: Rc<RefCell<DebugState>>) {
+pub fn attach(vm: &mut Vm, state: Shared<DebugState>) {
     vm.debug = Some(state);
 }
 
 /// 当前执行位置的文件 / 源文本（优先函数定义处）。
-pub fn current_location(vm: &Vm) -> (String, Option<Rc<str>>) {
+pub fn current_location(vm: &Vm) -> (String, Option<Arc<str>>) {
     if let Some(f) = vm.func_stack.last() {
         if !f.source_file.is_empty() && f.source_file != "<script>" {
             return (f.source_file.clone(), f.source.clone());

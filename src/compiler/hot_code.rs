@@ -1,6 +1,6 @@
 //! 紧凑热操作码：与 `Instruction` 等长并行，热循环只 match `u8`，避开巨型枚举分发。
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::opcode::Instruction;
 use crate::value::{Num, Value};
@@ -35,15 +35,15 @@ pub const H_COLD: u8 = 255;
 
 #[derive(Clone, Default)]
 pub struct HotCode {
-    pub ops: Rc<[u8]>,
-    pub args: Rc<[i64]>,
+    pub ops: Arc<[u8]>,
+    pub args: Arc<[i64]>,
 }
 
 impl HotCode {
     pub fn empty() -> Self {
         Self {
-            ops: Rc::from([]),
-            args: Rc::from([]),
+            ops: Arc::from([]),
+            args: Arc::from([]),
         }
     }
 
@@ -90,8 +90,8 @@ impl HotCode {
             args.push(arg);
         }
         Self {
-            ops: Rc::from(ops),
-            args: Rc::from(args),
+            ops: Arc::from(ops),
+            args: Arc::from(args),
         }
     }
 }

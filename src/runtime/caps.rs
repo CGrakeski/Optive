@@ -28,6 +28,8 @@ pub struct Capabilities {
     pub fs: FsPolicy,
     /// 是否允许 `std.os.setenv` / `chdir` 等改变进程环境的操作。
     pub env: bool,
+    /// 是否允许 `C.frompath` / `extern` 加载并调用本地动态库。
+    pub ffi: bool,
 }
 
 impl Default for Capabilities {
@@ -43,15 +45,28 @@ impl Capabilities {
             network: true,
             fs: FsPolicy::Unrestricted,
             env: true,
+            ffi: true,
         }
     }
 
-    /// 沙箱：禁网、禁改环境、文件系统限制在 `roots` 之下。
+    /// 沙箱：禁网、禁改环境、禁 FFI、文件系统限制在 `roots` 之下。
     pub fn sandbox(roots: Vec<PathBuf>) -> Self {
         Capabilities {
             network: false,
             fs: FsPolicy::Allow(roots),
             env: false,
+            ffi: false,
+        }
+    }
+
+    /// FFI 网关：`C.frompath` / `extern` 绑定时先过此关。
+    pub fn check_ffi(&self, op: &str) -> Result<(), RuntimeError> {
+        if self.ffi {
+            Ok(())
+        } else {
+            Err(RuntimeError::io_err(format!(
+                "{op}: native FFI disabled (sandbox; pass --allow-ffi to enable)"
+            )))
         }
     }
 
@@ -162,6 +177,12 @@ mod tests {
         let c = Capabilities::sandbox(vec![PathBuf::from(".")]);
         assert!(c.check_network("http.get").is_err());
         assert!(c.check_env("setenv").is_err());
+        assert!(c.check_ffi("C.frompath").is_err());
+    }
+
+    #[test]
+    fn full_allows_ffi() {
+        assert!(Capabilities::full().check_ffi("extern").is_ok());
     }
 
     #[test]

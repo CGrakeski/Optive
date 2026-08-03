@@ -11,13 +11,17 @@ use optive::caps::{Capabilities, FsPolicy};
 /// 从参数切片中剥离能力标志，返回（能力集，剩余参数）。
 ///
 /// 支持：
-/// - `--sandbox`：禁网 + 禁改环境 + 文件系统限制在 cwd
+/// - `--sandbox`：禁网 + 禁改环境 + 禁 FFI + 文件系统限制在 cwd
 /// - `--sandbox=DIR`：同上，但限制在 DIR
 /// - `--no-network`：仅禁网
 /// - `--allow-path DIR`：把 DIR 加入文件系统允许根（可重复；不改变网络/环境）
+/// - `--allow-ffi`：在沙箱下显式允许 `C.frompath` / `extern`
+/// - `--no-ffi`：禁止原生 FFI（即使非 sandbox）
 pub fn parse_caps(args: &[String]) -> Result<(Capabilities, Vec<String>), Box<dyn std::error::Error>> {
     let mut no_network = false;
     let mut env_off = false;
+    let mut ffi_off = false;
+    let mut ffi_on = false;
     let mut roots: Vec<PathBuf> = Vec::new();
     let mut remaining: Vec<String> = Vec::new();
 
@@ -26,14 +30,18 @@ pub fn parse_caps(args: &[String]) -> Result<(Capabilities, Vec<String>), Box<dy
         let a = &args[i];
         match a.as_str() {
             "--no-network" => no_network = true,
+            "--no-ffi" => ffi_off = true,
+            "--allow-ffi" => ffi_on = true,
             "--sandbox" => {
                 no_network = true;
                 env_off = true;
+                ffi_off = true;
                 roots.push(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
             }
             s if s.starts_with("--sandbox=") => {
                 no_network = true;
                 env_off = true;
+                ffi_off = true;
                 let dir = &s["--sandbox=".len()..];
                 roots.push(if dir.is_empty() {
                     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
@@ -62,6 +70,13 @@ pub fn parse_caps(args: &[String]) -> Result<(Capabilities, Vec<String>), Box<dy
     }
     if !roots.is_empty() {
         caps.fs = FsPolicy::Allow(roots);
+    }
+    // `--allow-ffi` 覆盖 sandbox 默认禁 FFI；`--no-ffi` 最终关闭。
+    if ffi_off {
+        caps.ffi = false;
+    }
+    if ffi_on {
+        caps.ffi = true;
     }
     Ok((caps, remaining))
 }

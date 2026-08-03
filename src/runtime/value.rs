@@ -2,24 +2,24 @@ use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::{One, Signed, ToPrimitive, Zero};
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::error::RuntimeError;
 use crate::opcode::FunctionObject;
 use crate::opcode::MacroObject;
 use crate::runtime_ast::RuntimeAstNode;
+use crate::shared::{Shared, SyncCell};
 use crate::Result;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Num {
     Small(i64),
-    /// 堆上整数 — 放在 `Rc` 后以保持 `Value` 紧凑。
-    Int(Rc<BigInt>),
-    /// 堆上有理数 — 放在 `Rc` 后以保持 `Value` 紧凑。
-    Rat(Rc<BigRational>),
+    /// 堆上整数 — 放在 `Arc` 后以保持 `Value` 紧凑。
+    Int(Arc<BigInt>),
+    /// 堆上有理数 — 放在 `Arc` 后以保持 `Value` 紧凑。
+    Rat(Arc<BigRational>),
 }
 
 impl Num {
@@ -35,7 +35,7 @@ impl Num {
     pub fn from_bigint(n: BigInt) -> Self {
         match n.to_i64() {
             Some(i) => Num::Small(i),
-            None => Num::Int(Rc::new(n)),
+            None => Num::Int(Arc::new(n)),
         }
     }
 
@@ -44,7 +44,7 @@ impl Num {
         if r.denom() == &One::one() {
             return Self::from_bigint(r.numer().clone());
         }
-        Num::Rat(Rc::new(r))
+        Num::Rat(Arc::new(r))
     }
 
     pub fn from_literal(text: &str) -> Result<Self> {
@@ -235,14 +235,14 @@ impl fmt::Display for Num {
     }
 }
 
-pub type BuiltinFn = Rc<dyn Fn(&mut crate::vm::Vm, &[Value]) -> Result<Value>>;
+pub type BuiltinFn = Arc<dyn Fn(&mut crate::vm::Vm, &[Value]) -> Result<Value> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct ModuleObject {
     pub name: String,
     pub full_name: String,
     pub exports: HashMap<String, Value>,
-    pub children: HashMap<String, Rc<RefCell<ModuleObject>>>,
+    pub children: HashMap<String, Shared<ModuleObject>>,
     pub is_user: bool,
 }
 
@@ -274,7 +274,7 @@ impl ModuleObject {
 #[derive(Clone)]
 pub struct DispatchTable {
     pub name: String,
-    pub handlers: Rc<RefCell<Vec<Value>>>,
+    pub handlers: Shared<Vec<Value>>,
 }
 
 #[derive(Clone)]
@@ -289,22 +289,22 @@ pub enum IteratorKind {
         index: usize,
     },
     Zip {
-        children: Vec<Rc<RefCell<IteratorState>>>,
+        children: Vec<Shared<IteratorState>>,
     },
     Map {
-        func: Rc<FunctionObject>,
-        source: Rc<RefCell<IteratorState>>,
+        func: Arc<FunctionObject>,
+        source: Shared<IteratorState>,
     },
     Filter {
-        func: Rc<FunctionObject>,
-        source: Rc<RefCell<IteratorState>>,
+        func: Arc<FunctionObject>,
+        source: Shared<IteratorState>,
     },
     /// 生成器推导式：惰性求值 elem，可选 guards。
     GenExpr {
-        source: Rc<RefCell<IteratorState>>,
+        source: Shared<IteratorState>,
         arity: usize,
-        elem: Rc<FunctionObject>,
-        guards: Vec<Rc<FunctionObject>>,
+        elem: Arc<FunctionObject>,
+        guards: Vec<Arc<FunctionObject>>,
     },
     /// `repeat(x[, n])`：`n` 为 `None` 时无限重复。
     Repeat {
@@ -318,16 +318,16 @@ pub enum IteratorKind {
     },
     /// `for (v in ch)`：阻塞 recv，关闭后结束。
     Channel {
-        channel: Rc<RefCell<ChannelInner>>,
+        channel: Shared<ChannelInner>,
     },
     /// 用户生成器：调用含 `yield` 的 func/do 得到的惰性迭代器。
     Generator {
-        func: Rc<FunctionObject>,
+        func: Arc<FunctionObject>,
         locals: Vec<Value>,
         name_map: Option<FxHashMap<String, usize>>,
         pc: usize,
         exhausted: bool,
-        yield_from: Option<Rc<RefCell<IteratorState>>>,
+        yield_from: Option<Shared<IteratorState>>,
     },
 }
 
@@ -581,8 +581,8 @@ pub enum SyncInner {
 /// RWMutex 的读/写守卫，支持 `with` 自动释放。
 #[derive(Clone)]
 pub enum SyncGuardInner {
-    Read { mu: Rc<RefCell<SyncInner>> },
-    Write { mu: Rc<RefCell<SyncInner>> },
+    Read { mu: Shared<SyncInner> },
+    Write { mu: Shared<SyncInner> },
 }
 
 #[derive(Clone)]
@@ -595,46 +595,46 @@ pub enum Value {
     /// 裸指针地址（宿主指针宽度）。
     Ptr(usize),
     /// `C.frompath` 得到的动态库句柄。
-    DllHandle(Rc<crate::ffi::DllHandle>),
+    DllHandle(Arc<crate::ffi::DllHandle>),
     Text(String),
     /// 裸类型句柄（`num`、`MyStruct` 等）— 与 `Text` 字符串值区分。
     TypeRef(String),
-    List(Rc<RefCell<Vec<Value>>>),
-    Dict(Rc<RefCell<DictMap>>),
+    List(Shared<Vec<Value>>),
+    Dict(Shared<DictMap>),
     /// 可哈希值的有序集合。空集用 `set()`，不是 `{}`（空字典）。
-    Set(Rc<RefCell<SetMap>>),
+    Set(Shared<SetMap>),
     /// 不可变定长序列。空元组为 `()`。
-    Tuple(Rc<[Value]>),
+    Tuple(Arc<[Value]>),
     /// 原始字节缓冲（非 Unicode 文本）。
-    Bytes(Rc<Vec<u8>>),
-    Iterator(Rc<RefCell<IteratorState>>),
-    Function(Rc<FunctionObject>),
-    GenericFunction(Rc<crate::opcode::GenericFunctionTemplate>),
-    Macro(Rc<MacroObject>),
+    Bytes(Arc<Vec<u8>>),
+    Iterator(Shared<IteratorState>),
+    Function(Arc<FunctionObject>),
+    GenericFunction(Arc<crate::opcode::GenericFunctionTemplate>),
+    Macro(Arc<MacroObject>),
     Builtin(BuiltinFn),
-    Struct(Rc<StructInstance>),
-    Module(Rc<RefCell<ModuleObject>>),
-    RuntimeAst(Rc<RuntimeAstNode>),
-    Dispatch(Rc<RefCell<DispatchTable>>),
-    Cell(Rc<RefCell<Value>>),
+    Struct(Arc<StructInstance>),
+    Module(Shared<ModuleObject>),
+    RuntimeAst(Arc<RuntimeAstNode>),
+    Dispatch(Shared<DispatchTable>),
+    Cell(Shared<Value>),
     /// 泛型结构体索引得到的特化类型句柄，如用于 `Box[num](v)` 的 `Box[num]`。
-    TypeSpec(Rc<TypeSpecData>),
+    TypeSpec(Arc<TypeSpecData>),
     /// 数值枚举成员，如 `Color.Red`。
-    EnumMember(Rc<EnumMemberData>),
+    EnumMember(Arc<EnumMemberData>),
     /// 外层 variant 包装（双层包装）。
-    Variant(Rc<VariantInstance>),
+    Variant(Arc<VariantInstance>),
     /// 协作式任务句柄（`go` / `await`）。
-    Task(Rc<RefCell<TaskInner>>),
+    Task(Shared<TaskInner>),
     /// 通道（`Channel()` / `Channel(n)`）。
-    Channel(Rc<RefCell<ChannelInner>>),
+    Channel(Shared<ChannelInner>),
     /// 互斥锁（`Mutex(v)`）。
-    Mutex(Rc<RefCell<MutexInner>>),
+    Mutex(Shared<MutexInner>),
     /// `Mutex.lock()` 得到的守卫，可用于 `with`。
-    MutexGuard(Rc<RefCell<MutexInner>>),
+    MutexGuard(Shared<MutexInner>),
     /// 其余并发原语（RWMutex/WaitGroup/Semaphore/Once/Barrier/Cond）。
-    Sync(Rc<RefCell<SyncInner>>),
+    Sync(Shared<SyncInner>),
     /// RWMutex 读/写守卫。
-    SyncGuard(Rc<RefCell<SyncGuardInner>>),
+    SyncGuard(Shared<SyncGuardInner>),
 }
 
 /// [`Value::TypeSpec`] 的堆载荷 — 移出 `Value` 枚举以保持栈表示紧凑。
@@ -645,8 +645,8 @@ pub struct TypeSpecData {
 }
 
 impl TypeSpecData {
-    pub fn new(name: impl Into<String>, args: Vec<crate::ast::TypeExpr>) -> Rc<Self> {
-        Rc::new(Self {
+    pub fn new(name: impl Into<String>, args: Vec<crate::ast::TypeExpr>) -> Arc<Self> {
+        Arc::new(Self {
             name: name.into(),
             args,
         })
@@ -691,7 +691,7 @@ pub struct EnumDef {
 
 #[derive(Clone)]
 pub struct EnumMemberData {
-    pub def: Rc<EnumDef>,
+    pub def: Arc<EnumDef>,
     pub member_index: usize,
     pub type_name: String,
 }
@@ -712,7 +712,7 @@ pub struct VariantDef {
 #[derive(Clone)]
 pub struct VariantInstance {
     pub inst_name: String,
-    pub def: Rc<VariantDef>,
+    pub def: Arc<VariantDef>,
     pub generic_args: Vec<TypeExpr>,
     pub case_idx: usize,
     pub payload: Value,
@@ -733,12 +733,14 @@ pub struct StructDef {
     pub typed: bool,
     pub field_types: Vec<FieldTypeInfo>,
     pub type_params: Vec<(String, Option<TypeExpr>)>,
+    /// `typed struct … : C.layout` 时填充；供 `C.load` / `C.store` / `C.alloc(T)`。
+    pub c_layout: Option<std::sync::Arc<crate::ffi_extra::CStructLayout>>,
 }
 
 #[derive(Clone)]
 pub struct StructInstance {
-    pub def: Rc<StructDef>,
-    pub slots: RefCell<Vec<Value>>,
+    pub def: Arc<StructDef>,
+    pub slots: SyncCell<Vec<Value>>,
     pub generic_args: Vec<TypeExpr>,
 }
 
@@ -966,24 +968,24 @@ impl Value {
             (Value::List(a), Value::List(b)) => {
                 let mut out = a.borrow().clone();
                 out.extend(b.borrow().iter().cloned());
-                Ok(Value::List(Rc::new(RefCell::new(out))))
+                Ok(Value::List(Shared::new(out)))
             }
             (Value::Tuple(a), Value::Tuple(b)) => {
                 let mut out = a.to_vec();
                 out.extend(b.iter().cloned());
-                Ok(Value::Tuple(Rc::from(out.into_boxed_slice())))
+                Ok(Value::Tuple(Arc::from(out.into_boxed_slice())))
             }
             (Value::Bytes(a), Value::Bytes(b)) => {
                 let mut out = a.as_ref().clone();
                 out.extend_from_slice(b.as_ref());
-                Ok(Value::Bytes(Rc::new(out)))
+                Ok(Value::Bytes(Arc::new(out)))
             }
             (Value::Set(a), Value::Set(b)) => {
                 let mut out = a.borrow().clone();
                 for k in b.borrow().iter() {
                     out.insert(k.clone());
                 }
-                Ok(Value::Set(Rc::new(RefCell::new(out))))
+                Ok(Value::Set(Shared::new(out)))
             }
             _ => Err(RuntimeError::unsupported(format!(
                 "unsupported + between {} and {}",
@@ -1148,28 +1150,28 @@ impl Value {
                 Ok(true)
             }
             (Value::Bytes(a), Value::Bytes(b)) => Ok(a.as_ref() == b.as_ref()),
-            (Value::Struct(a), Value::Struct(b)) => Ok(Rc::ptr_eq(a, b)),
-            (Value::Iterator(a), Value::Iterator(b)) => Ok(Rc::ptr_eq(a, b)),
-            (Value::RuntimeAst(a), Value::RuntimeAst(b)) => Ok(Rc::ptr_eq(a, b)),
-            (Value::Dispatch(a), Value::Dispatch(b)) => Ok(Rc::ptr_eq(a, b)),
-            (Value::Macro(a), Value::Macro(b)) => Ok(Rc::ptr_eq(a, b)),
-            (Value::Cell(a), Value::Cell(b)) => Ok(Rc::ptr_eq(a, b)),
-            (Value::Task(a), Value::Task(b)) => Ok(Rc::ptr_eq(a, b)),
-            (Value::Channel(a), Value::Channel(b)) => Ok(Rc::ptr_eq(a, b)),
-            (Value::Mutex(a), Value::Mutex(b)) => Ok(Rc::ptr_eq(a, b)),
-            (Value::MutexGuard(a), Value::MutexGuard(b)) => Ok(Rc::ptr_eq(a, b)),
-            (Value::Sync(a), Value::Sync(b)) => Ok(Rc::ptr_eq(a, b)),
-            (Value::SyncGuard(a), Value::SyncGuard(b)) => Ok(Rc::ptr_eq(a, b)),
+            (Value::Struct(a), Value::Struct(b)) => Ok(Arc::ptr_eq(a, b)),
+            (Value::Iterator(a), Value::Iterator(b)) => Ok(Shared::ptr_eq(a, b)),
+            (Value::RuntimeAst(a), Value::RuntimeAst(b)) => Ok(Arc::ptr_eq(a, b)),
+            (Value::Dispatch(a), Value::Dispatch(b)) => Ok(Shared::ptr_eq(a, b)),
+            (Value::Macro(a), Value::Macro(b)) => Ok(Arc::ptr_eq(a, b)),
+            (Value::Cell(a), Value::Cell(b)) => Ok(Shared::ptr_eq(a, b)),
+            (Value::Task(a), Value::Task(b)) => Ok(Shared::ptr_eq(a, b)),
+            (Value::Channel(a), Value::Channel(b)) => Ok(Shared::ptr_eq(a, b)),
+            (Value::Mutex(a), Value::Mutex(b)) => Ok(Shared::ptr_eq(a, b)),
+            (Value::MutexGuard(a), Value::MutexGuard(b)) => Ok(Shared::ptr_eq(a, b)),
+            (Value::Sync(a), Value::Sync(b)) => Ok(Shared::ptr_eq(a, b)),
+            (Value::SyncGuard(a), Value::SyncGuard(b)) => Ok(Shared::ptr_eq(a, b)),
             (Value::TypeSpec(a), Value::TypeSpec(b)) => {
                 Ok(a.name == b.name && a.args == b.args)
             }
             (Value::EnumMember(a), Value::EnumMember(b)) => {
-                Ok(Rc::ptr_eq(&a.def, &b.def) && a.member_index == b.member_index)
+                Ok(Arc::ptr_eq(&a.def, &b.def) && a.member_index == b.member_index)
             }
             (Value::EnumMember(m), Value::Num(n)) | (Value::Num(n), Value::EnumMember(m)) => {
                 Ok(crate::enum_variant::enum_member_numeric_value(m).eq_num(n))
             }
-            (Value::Variant(a), Value::Variant(b)) => Ok(Rc::ptr_eq(a, b)),
+            (Value::Variant(a), Value::Variant(b)) => Ok(Arc::ptr_eq(a, b)),
             _ => Err(RuntimeError::unsupported(format!(
                 "unsupported == between {} and {}",
                 self.type_name(),
@@ -1187,30 +1189,30 @@ pub fn values_identical(a: &Value, b: &Value) -> bool {
         (Value::Num(x), Value::Num(y)) => x.eq_num(y),
         (Value::Text(x), Value::Text(y)) => x == y,
         (Value::TypeRef(x), Value::TypeRef(y)) => x == y,
-        (Value::List(x), Value::List(y)) => Rc::ptr_eq(x, y),
-        (Value::Dict(x), Value::Dict(y)) => Rc::ptr_eq(x, y),
-        (Value::Set(x), Value::Set(y)) => Rc::ptr_eq(x, y),
-        (Value::Tuple(x), Value::Tuple(y)) => Rc::ptr_eq(x, y),
-        (Value::Bytes(x), Value::Bytes(y)) => Rc::ptr_eq(x, y),
-        (Value::Struct(x), Value::Struct(y)) => Rc::ptr_eq(x, y),
-        (Value::Iterator(x), Value::Iterator(y)) => Rc::ptr_eq(x, y),
-        (Value::RuntimeAst(x), Value::RuntimeAst(y)) => Rc::ptr_eq(x, y),
-        (Value::Dispatch(x), Value::Dispatch(y)) => Rc::ptr_eq(x, y),
-        (Value::Macro(x), Value::Macro(y)) => Rc::ptr_eq(x, y),
-        (Value::Cell(x), Value::Cell(y)) => Rc::ptr_eq(x, y),
-        (Value::Task(x), Value::Task(y)) => Rc::ptr_eq(x, y),
-        (Value::Channel(x), Value::Channel(y)) => Rc::ptr_eq(x, y),
-        (Value::Mutex(x), Value::Mutex(y)) => Rc::ptr_eq(x, y),
-        (Value::MutexGuard(x), Value::MutexGuard(y)) => Rc::ptr_eq(x, y),
-        (Value::Sync(x), Value::Sync(y)) => Rc::ptr_eq(x, y),
-        (Value::SyncGuard(x), Value::SyncGuard(y)) => Rc::ptr_eq(x, y),
-        (Value::Function(x), Value::Function(y)) => Rc::ptr_eq(x, y),
-        (Value::GenericFunction(x), Value::GenericFunction(y)) => Rc::ptr_eq(x, y),
+        (Value::List(x), Value::List(y)) => Shared::ptr_eq(x, y),
+        (Value::Dict(x), Value::Dict(y)) => Shared::ptr_eq(x, y),
+        (Value::Set(x), Value::Set(y)) => Shared::ptr_eq(x, y),
+        (Value::Tuple(x), Value::Tuple(y)) => Arc::ptr_eq(x, y),
+        (Value::Bytes(x), Value::Bytes(y)) => Arc::ptr_eq(x, y),
+        (Value::Struct(x), Value::Struct(y)) => Arc::ptr_eq(x, y),
+        (Value::Iterator(x), Value::Iterator(y)) => Shared::ptr_eq(x, y),
+        (Value::RuntimeAst(x), Value::RuntimeAst(y)) => Arc::ptr_eq(x, y),
+        (Value::Dispatch(x), Value::Dispatch(y)) => Shared::ptr_eq(x, y),
+        (Value::Macro(x), Value::Macro(y)) => Arc::ptr_eq(x, y),
+        (Value::Cell(x), Value::Cell(y)) => Shared::ptr_eq(x, y),
+        (Value::Task(x), Value::Task(y)) => Shared::ptr_eq(x, y),
+        (Value::Channel(x), Value::Channel(y)) => Shared::ptr_eq(x, y),
+        (Value::Mutex(x), Value::Mutex(y)) => Shared::ptr_eq(x, y),
+        (Value::MutexGuard(x), Value::MutexGuard(y)) => Shared::ptr_eq(x, y),
+        (Value::Sync(x), Value::Sync(y)) => Shared::ptr_eq(x, y),
+        (Value::SyncGuard(x), Value::SyncGuard(y)) => Shared::ptr_eq(x, y),
+        (Value::Function(x), Value::Function(y)) => Arc::ptr_eq(x, y),
+        (Value::GenericFunction(x), Value::GenericFunction(y)) => Arc::ptr_eq(x, y),
         (Value::Builtin(x), Value::Builtin(y)) => std::ptr::eq(x, y),
-        (Value::Module(x), Value::Module(y)) => Rc::ptr_eq(x, y),
+        (Value::Module(x), Value::Module(y)) => Shared::ptr_eq(x, y),
         (Value::TypeSpec(a), Value::TypeSpec(b)) => a.name == b.name && a.args == b.args,
-        (Value::EnumMember(x), Value::EnumMember(y)) => Rc::ptr_eq(x, y),
-        (Value::Variant(x), Value::Variant(y)) => Rc::ptr_eq(x, y),
+        (Value::EnumMember(x), Value::EnumMember(y)) => Arc::ptr_eq(x, y),
+        (Value::Variant(x), Value::Variant(y)) => Arc::ptr_eq(x, y),
         _ => false,
     }
 }
@@ -1431,14 +1433,14 @@ impl IteratorState {
         }
     }
 
-    pub fn from_zip(children: Vec<Rc<RefCell<IteratorState>>>) -> Self {
+    pub fn from_zip(children: Vec<Shared<IteratorState>>) -> Self {
         Self {
             kind: IteratorKind::Zip { children },
         }
     }
 
     pub fn as_value(self) -> Value {
-        Value::Iterator(Rc::new(RefCell::new(self)))
+        Value::Iterator(Shared::new(self))
     }
 
     pub fn next_value(&mut self, vm: &mut crate::vm::Vm) -> crate::Result<Option<Value>> {
@@ -1472,7 +1474,7 @@ impl IteratorState {
                         None => return Ok(None),
                     }
                 }
-                Ok(Some(Value::List(Rc::new(RefCell::new(out)))))
+                Ok(Some(Value::List(Shared::new(out))))
             }
             IteratorKind::Map { func, source } => {
                 let mut src = source.borrow_mut();
@@ -1619,10 +1621,10 @@ pub fn value_to_iterable(v: &Value) -> crate::Result<IteratorState> {
                 .borrow()
                 .iter()
                 .map(|(k, v)| {
-                    Value::List(Rc::new(RefCell::new(vec![
+                    Value::List(Shared::new(vec![
                         value_key_to_value(k),
                         v.clone(),
-                    ])))
+                    ]))
                 })
                 .collect();
             Ok(IteratorState::from_list(items))
@@ -1764,7 +1766,7 @@ mod tests {
 
     #[test]
     fn value_truthy_empty_list() {
-        assert!(!Value::List(Rc::new(RefCell::new(vec![]))).is_truthy());
+        assert!(!Value::List(Shared::new(vec![])).is_truthy());
     }
 
     #[test]

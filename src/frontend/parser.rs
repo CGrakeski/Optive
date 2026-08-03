@@ -3,7 +3,7 @@ use crate::error::ParseError;
 use crate::lexer::Lexer;
 use crate::runtime_ast;
 use crate::token::{Token, TokenKind};
-use std::rc::Rc;
+use std::sync::Arc;
 
 pub struct Parser {
     tokens: Vec<Token>,
@@ -663,16 +663,7 @@ impl Parser {
 
     fn parse_type_expr(&mut self) -> Result<TypeExpr, ParseError> {
         let name = self.parse_type_name()?;
-        let mut ty = if self.match_kind(TokenKind::LBracket) {
-            let mut params = vec![self.parse_type_expr()?];
-            while self.match_kind(TokenKind::Comma) {
-                params.push(self.parse_type_expr()?);
-            }
-            self.expect(TokenKind::RBracket, "expected ']'")?;
-            TypeExpr::Generic { name, params }
-        } else {
-            TypeExpr::Name(name)
-        };
+        let mut ty = TypeExpr::Name(name);
         while self.match_kind(TokenKind::Dot) {
             let field = self
                 .expect(TokenKind::Identifier, "expected attribute after '.'")?
@@ -682,7 +673,36 @@ impl Parser {
                 field,
             };
         }
+        // `ptr[i32]` / `C.types.ptr[i32]`：点链之后的类型实参
+        if self.match_kind(TokenKind::LBracket) {
+            let path = Self::flatten_type_path(&ty).ok_or_else(|| {
+                ParseError::here(
+                    self.current().line,
+                    self.current().column,
+                    "expected type name path before '[...]'",
+                )
+            })?;
+            let mut params = vec![self.parse_type_expr()?];
+            while self.match_kind(TokenKind::Comma) {
+                params.push(self.parse_type_expr()?);
+            }
+            self.expect(TokenKind::RBracket, "expected ']'")?;
+            ty = TypeExpr::Generic {
+                name: path,
+                params,
+            };
+        }
         Ok(ty)
+    }
+
+    fn flatten_type_path(ty: &TypeExpr) -> Option<String> {
+        match ty {
+            TypeExpr::Name(n) => Some(n.clone()),
+            TypeExpr::Attr { object, field } => {
+                Some(format!("{}.{}", Self::flatten_type_path(object)?, field))
+            }
+            _ => None,
+        }
     }
 
     fn parse_type_name(&mut self) -> Result<String, ParseError> {
@@ -1825,6 +1845,11 @@ impl Parser {
             self.skip_newlines();
         }
         self.expect(TokenKind::RBrace, "expected '}'")?;
+        let layout = if self.match_kind(TokenKind::Colon) {
+            Some(self.parse_type_expr()?)
+        } else {
+            None
+        };
         Ok(Stmt::StructDecl {
             visibility,
             typed,
@@ -1833,6 +1858,7 @@ impl Parser {
             base,
             fields,
             methods,
+            layout,
         })
     }
 
@@ -2563,7 +2589,7 @@ impl Parser {
         let is_splat = self.match_kind(TokenKind::Star);
         // 解析期将实参表达式冻结为 AST；宏实参不是运行时 Expr。
         let expr = self.parse_expr()?;
-        let node = Rc::new(runtime_ast::ast_from_expr(&expr));
+        let node = Arc::new(runtime_ast::ast_from_expr(&expr));
         Ok(MacroCallArg { is_splat, node })
     }
 

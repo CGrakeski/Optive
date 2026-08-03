@@ -1,6 +1,5 @@
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 
@@ -13,6 +12,18 @@ use crate::monomorph;
 use crate::runtime_ast;
 use crate::value::{FieldTypeInfo, Num, StructDef, Value};
 use crate::Result;
+
+use crate::shared::Shared;
+
+fn is_c_layout_annotation(ty: &TypeExpr) -> bool {
+    match ty {
+        TypeExpr::Attr { object, field } if field == "layout" => {
+            matches!(object.as_ref(), TypeExpr::Name(n) if n == "C")
+        }
+        TypeExpr::Name(n) if n == "C.layout" => true,
+        _ => false,
+    }
+}
 
 enum CompKind {
     List,
@@ -203,7 +214,7 @@ impl Generator {
             .collect();
         if default_exprs.is_empty() {
             self.cg
-                .emit(Instruction::Push(Value::Function(Rc::new(func))));
+                .emit(Instruction::Push(Value::Function(Arc::new(func))));
             return Ok(());
         }
         for expr in &default_exprs {
@@ -211,7 +222,7 @@ impl Generator {
         }
         self.cg.emit(Instruction::VecNew(default_exprs.len()));
         self.cg
-            .emit(Instruction::Push(Value::Function(Rc::new(func))));
+            .emit(Instruction::Push(Value::Function(Arc::new(func))));
         self.cg
             .emit(Instruction::Load("__attach_defaults__".into()));
         self.cg.emit(Instruction::Call { argc: 2 });
@@ -454,12 +465,12 @@ impl Generator {
     /// 将本编译单元的全局名表绑定到各函数，使 `LoadGlobal` 下标
     /// 在 REPL 多次 `load_program` 替换后仍保持有效。
     fn attach_compile_global_envs(&mut self) {
-        let env = Rc::new(crate::opcode::ModuleGlobalEnv {
+        let env = Arc::new(crate::opcode::ModuleGlobalEnv {
             global_names: self.program.global_names.clone(),
-            globals: std::cell::RefCell::new(HashMap::new()),
+            globals: crate::shared::SyncCell::new(HashMap::new()),
             finalized: false,
         });
-        let updated: HashMap<String, Rc<FunctionObject>> = self
+        let updated: HashMap<String, Arc<FunctionObject>> = self
             .program
             .functions
             .iter()
@@ -467,7 +478,7 @@ impl Generator {
                 let func = if f.module_env.is_none() {
                     let mut func = (**f).clone();
                     func.module_env = Some(env.clone());
-                    Rc::new(func)
+                    Arc::new(func)
                 } else {
                     f.clone()
                 };
@@ -487,16 +498,16 @@ impl Generator {
                 continue;
             }
             let mut func = (*f).clone();
-            func.body = Rc::new(body);
+            func.body = Arc::new(body);
             func.hot = crate::hot_code::HotCode::encode(&func.body);
-            self.program.functions.insert(name, Rc::new(func));
+            self.program.functions.insert(name, Arc::new(func));
         }
     }
 
     fn patch_function_pushes(
         code: &mut [Instruction],
-        functions: &HashMap<String, Rc<FunctionObject>>,
-        env: &Rc<crate::opcode::ModuleGlobalEnv>,
+        functions: &HashMap<String, Arc<FunctionObject>>,
+        env: &Arc<crate::opcode::ModuleGlobalEnv>,
     ) -> bool {
         let mut changed = false;
         for ins in code.iter_mut() {
@@ -510,12 +521,12 @@ impl Generator {
                     } else {
                         let mut func = (**u).clone();
                         func.module_env = Some(env.clone());
-                        Rc::new(func)
+                        Arc::new(func)
                     }
                 } else {
                     let mut func = (**f).clone();
                     func.module_env = Some(env.clone());
-                    Rc::new(func)
+                    Arc::new(func)
                 };
                 *ins = Instruction::Push(Value::Function(replacement));
                 changed = true;
@@ -716,7 +727,7 @@ impl Generator {
                             is_generator: is_gen,
                         },
                     )?;
-                    self.program.functions.insert(name.clone(), Rc::new(func.clone()));
+                    self.program.functions.insert(name.clone(), Arc::new(func.clone()));
                     self.emit_function_value_with_defaults(params, func)?;
                     if !free.is_empty() {
                         for fname in &free {
@@ -730,7 +741,7 @@ impl Generator {
                         self.cg.emit(Instruction::Call { argc: 2 });
                     }
                 } else {
-                    let template = Rc::new(GenericFunctionTemplate {
+                    let template = Arc::new(GenericFunctionTemplate {
                         name: name.clone(),
                         type_params: type_params.clone(),
                         params: params.clone(),
@@ -770,7 +781,7 @@ impl Generator {
                 members,
                 visibility,
             } => {
-                let def = Rc::new(protocol::protocol_from_members(name.clone(), members.clone()));
+                let def = Arc::new(protocol::protocol_from_members(name.clone(), members.clone()));
                 self.program.protocols.insert(name.clone(), def);
                 self.cg
                     .emit(Instruction::Push(Value::type_ref(name.clone())));
@@ -788,8 +799,8 @@ impl Generator {
                 visibility,
             } => {
                 let mac = self.compile_macro(name, params, body)?;
-                self.program.macros.insert(name.clone(), Rc::new(mac.clone()));
-                self.cg.emit(Instruction::Push(Value::Macro(Rc::new(mac))));
+                self.program.macros.insert(name.clone(), Arc::new(mac.clone()));
+                self.cg.emit(Instruction::Push(Value::Macro(Arc::new(mac))));
                 self.cg.emit(Instruction::NewVar {
                     name: name.clone(),
                     is_const: false,
@@ -822,7 +833,7 @@ impl Generator {
                     self.cg
                         .emit(Instruction::Push(Value::Text(name.clone())));
                     self.cg
-                        .emit(Instruction::Push(Value::Function(Rc::new(handler))));
+                        .emit(Instruction::Push(Value::Function(Arc::new(handler))));
                     self.cg
                         .emit(Instruction::Load("__register_dispatch_handler__".into()));
                     self.cg.emit(Instruction::Call { argc: 2 });
@@ -997,6 +1008,7 @@ impl Generator {
                 base,
                 fields,
                 methods,
+                layout,
                 ..
             } => {
                 let field_names: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
@@ -1008,7 +1020,32 @@ impl Generator {
                         strict: Self::field_strict(*typed, f.type_strong, &f.type_expr),
                     })
                     .collect();
-                let def = Rc::new(StructDef {
+                let c_layout = if let Some(layout_ty) = layout {
+                    if !is_c_layout_annotation(layout_ty) {
+                        return Err(RuntimeError::type_err(format!(
+                            "struct '{name}': unsupported layout annotation (expected C.layout)"
+                        )));
+                    }
+                    if !*typed {
+                        return Err(RuntimeError::type_err(format!(
+                            "struct '{name}': C.layout requires `typed struct`"
+                        )));
+                    }
+                    let tmp = StructDef {
+                        name: name.clone(),
+                        base: base.clone(),
+                        fields: field_names.clone(),
+                        mutable_fields: mutable.clone(),
+                        typed: *typed,
+                        field_types: field_types.clone(),
+                        type_params: type_params.clone(),
+                        c_layout: None,
+                    };
+                    Some(Arc::new(crate::ffi_extra::layout_from_struct_def(&tmp)?))
+                } else {
+                    None
+                };
+                let def = Arc::new(StructDef {
                     name: name.clone(),
                     base: base.clone(),
                     fields: field_names,
@@ -1016,6 +1053,7 @@ impl Generator {
                     typed: *typed,
                     field_types,
                     type_params: type_params.clone(),
+                    c_layout,
                 });
                 self.program.struct_defs.insert(name.clone(), def.clone());
                 for m in methods {
@@ -1052,7 +1090,7 @@ impl Generator {
                             is_generator: false,
                         },
                     )?;
-                    let func_rc = Rc::new(func);
+                    let func_rc = Arc::new(func);
                     if m.outside {
                         self.program
                             .functions
@@ -1651,11 +1689,11 @@ impl Generator {
                 },
             )?;
             if method.name == "__generate__" {
-                generate_func = Some(Rc::new(func));
+                generate_func = Some(Arc::new(func));
             } else {
                 self.program
                     .functions
-                    .insert(full_name, Rc::new(func));
+                    .insert(full_name, Arc::new(func));
             }
         }
 
@@ -1862,7 +1900,7 @@ impl Generator {
         &mut self,
         name: &str,
         type_args: Vec<TypeExpr>,
-    ) -> Result<Rc<FunctionObject>> {
+    ) -> Result<Arc<FunctionObject>> {
         let template = self
             .program
             .generic_functions
@@ -1879,8 +1917,8 @@ impl Generator {
         template: &GenericFunctionTemplate,
         type_args: Vec<TypeExpr>,
         ctx: &TypeCheckContext,
-        cache: &mut HashMap<String, Rc<FunctionObject>>,
-    ) -> Result<Rc<FunctionObject>> {
+        cache: &mut HashMap<String, Arc<FunctionObject>>,
+    ) -> Result<Arc<FunctionObject>> {
         if type_args.len() != template.type_params.len() {
             return Err(RuntimeError::type_err(format!(
                 "generic function `{}` expects {} type argument(s), got {}",
@@ -1935,7 +1973,7 @@ impl Generator {
             func.source = template.source.clone();
             func.source_file = template.source_file.clone();
         }
-        let func = Rc::new(func);
+        let func = Arc::new(func);
         cache.insert(key, func.clone());
         Ok(func)
     }
@@ -2168,19 +2206,19 @@ impl Generator {
         let module_env = if func_global_names.is_empty() {
             None
         } else {
-            Some(Rc::new(crate::opcode::ModuleGlobalEnv {
+            Some(Arc::new(crate::opcode::ModuleGlobalEnv {
                 global_names: func_global_names,
-                globals: std::cell::RefCell::new(HashMap::new()),
+                globals: crate::shared::SyncCell::new(HashMap::new()),
                 finalized: false,
             }))
         };
         Ok(FunctionObject {
             name: name.to_string(),
             params: params.to_vec(),
-            body: Rc::new(body),
+            body: Arc::new(body),
             hot,
-            line_map: Rc::new(func_line_map),
-            column_map: Rc::new(func_column_map),
+            line_map: Arc::new(func_line_map),
+            column_map: Arc::new(func_column_map),
             entry_label: 0,
             fast_locals: sub.next_local_slot,
             is_builtin_body: false,
@@ -2367,13 +2405,13 @@ impl Generator {
                     RuntimeError::msg("macro call AST missing callee")
                 })?;
                 self.cg
-                    .emit(Instruction::Push(Value::RuntimeAst(Rc::new((**callee).clone()))));
+                    .emit(Instruction::Push(Value::RuntimeAst(Arc::new((**callee).clone()))));
                 self.cg
                     .emit(Instruction::Load("__ast_macro_call__".into()));
                 self.cg.emit(Instruction::Call { argc: 2 });
             }
             _ => {
-                self.cg.emit(Instruction::Push(Value::RuntimeAst(Rc::new(
+                self.cg.emit(Instruction::Push(Value::RuntimeAst(Arc::new(
                     node.clone(),
                 ))));
             }
@@ -2406,7 +2444,7 @@ impl Generator {
     fn gen_frozen_ast_expr(&mut self, expr: &Expr) -> Result<()> {
         let ast = runtime_ast::ast_from_expr(expr);
         self.cg
-            .emit(Instruction::Push(Value::RuntimeAst(Rc::new(ast))));
+            .emit(Instruction::Push(Value::RuntimeAst(Arc::new(ast))));
         Ok(())
     }
 
@@ -2643,7 +2681,7 @@ impl Generator {
             }
             ExprKind::Bytes(bytes) => {
                 self.cg
-                    .emit(Instruction::Push(Value::Bytes(Rc::new(bytes.clone()))));
+                    .emit(Instruction::Push(Value::Bytes(Arc::new(bytes.clone()))));
             }
             ExprKind::DoFunc {
                 params,
@@ -2745,20 +2783,20 @@ impl Generator {
                 for name in hygienic_names {
                     hyg_vals.push(Value::Text(name.clone()));
                 }
-                self.cg.emit(Instruction::Push(Value::List(Rc::new(RefCell::new(
+                self.cg.emit(Instruction::Push(Value::List(Shared::new(
                     hyg_vals,
-                )))));
+                ))));
                 let mut bind_vals = Vec::new();
                 for binding in bindings {
                     let ast = runtime_ast::ast_from_expr(binding);
-                    bind_vals.push(Value::RuntimeAst(Rc::new(ast)));
+                    bind_vals.push(Value::RuntimeAst(Arc::new(ast)));
                 }
-                self.cg.emit(Instruction::Push(Value::List(Rc::new(RefCell::new(
+                self.cg.emit(Instruction::Push(Value::List(Shared::new(
                     bind_vals,
-                )))));
+                ))));
                 let body_ast = runtime_ast::ast_from_block(body);
                 self.cg
-                    .emit(Instruction::Push(Value::RuntimeAst(Rc::new(body_ast))));
+                    .emit(Instruction::Push(Value::RuntimeAst(Arc::new(body_ast))));
                 self.cg.emit(Instruction::Load("quote".into()));
                 self.cg.emit(Instruction::Call { argc: 3 });
             }
@@ -3151,7 +3189,7 @@ impl Generator {
             },
         )?;
         self.cg
-            .emit(Instruction::Push(Value::Function(Rc::new(elem_fn))));
+            .emit(Instruction::Push(Value::Function(Arc::new(elem_fn))));
         if !elem_free.is_empty() {
             for name in &elem_free {
                 self.cg
@@ -3181,7 +3219,7 @@ impl Generator {
                 },
             )?;
             self.cg
-                .emit(Instruction::Push(Value::Function(Rc::new(g_fn))));
+                .emit(Instruction::Push(Value::Function(Arc::new(g_fn))));
             if !g_free.is_empty() {
                 for name in &g_free {
                     self.cg

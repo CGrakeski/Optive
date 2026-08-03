@@ -39,6 +39,7 @@ fn no_network_blocks_http() {
         network: false,
         fs: FsPolicy::Unrestricted,
         env: true,
+        ffi: true,
     };
     // caps 检查在真正发请求之前触发，故无需真实网络。
     assert_caps_err(
@@ -132,6 +133,7 @@ fn allow_path_alone_keeps_network() {
         network: true,
         fs: FsPolicy::Allow(cwd_root()),
         env: true,
+        ffi: true,
     };
     // 文件在根下应可访问。
     let v = run_with_caps(
@@ -158,6 +160,7 @@ fn allow_path_blocks_escape() {
         network: true,
         fs: FsPolicy::Allow(cwd_root()),
         env: true,
+        ffi: true,
     };
     assert_caps_err(
         r#"

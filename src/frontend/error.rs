@@ -23,6 +23,8 @@ pub enum ExceptionKind {
     AssertionError,
     NotImplemented,
     RecursionError,
+    /// 协作/并行调度下无可运行任务仍阻塞（channel / mutex / await 等）。
+    DeadlockError,
 }
 
 impl ExceptionKind {
@@ -45,6 +47,7 @@ impl ExceptionKind {
         Self::AssertionError,
         Self::NotImplemented,
         Self::RecursionError,
+        Self::DeadlockError,
     ];
 
     pub const fn type_name(self) -> &'static str {
@@ -67,6 +70,7 @@ impl ExceptionKind {
             Self::AssertionError => "AssertionError",
             Self::NotImplemented => "NotImplementedError",
             Self::RecursionError => "RecursionError",
+            Self::DeadlockError => "DeadlockError",
         }
     }
 
@@ -89,7 +93,7 @@ impl ExceptionKind {
             Self::UnsupportedOp => Some(Self::TypeError),
             Self::ZeroDivision => Some(Self::ArithmeticError),
             Self::KeyError | Self::IndexError => Some(Self::LookupError),
-            Self::RecursionError => Some(Self::Runtime),
+            Self::RecursionError | Self::DeadlockError => Some(Self::Runtime),
         }
     }
 
@@ -191,6 +195,10 @@ impl RuntimeError {
 
     pub fn stop_iteration(message: impl Into<String>) -> Self {
         Self::typed(ExceptionKind::StopIteration, message)
+    }
+
+    pub fn deadlock(message: impl Into<String>) -> Self {
+        Self::typed(ExceptionKind::DeadlockError, message)
     }
 
     pub fn kind(&self) -> ExceptionKind {

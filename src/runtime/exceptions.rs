@@ -1,13 +1,13 @@
 //! 内建异常类型。
 
-use std::rc::Rc;
 
 use crate::error::ExceptionKind;
 use crate::value::{FieldTypeInfo, StructDef, Value};
 use crate::vm::Vm;
+use std::sync::Arc;
 
-fn exc_def(name: &str, base: Option<&str>) -> Rc<StructDef> {
-    Rc::new(StructDef {
+fn exc_def(name: &str, base: Option<&str>) -> Arc<StructDef> {
+    Arc::new(StructDef {
         name: name.to_string(),
         base: base.map(str::to_string),
         fields: vec!["message".to_string(), "traceback".to_string()],
@@ -15,6 +15,7 @@ fn exc_def(name: &str, base: Option<&str>) -> Rc<StructDef> {
         typed: false,
         field_types: vec![FieldTypeInfo::default(), FieldTypeInfo::default()],
         type_params: Vec::new(),
+        c_layout: None,
     })
 }
 
@@ -27,8 +28,7 @@ pub fn install(vm: &mut Vm) {
             .entry(name.to_string())
             .or_insert_with(|| exc_def(name, base.as_deref()));
         vm.globals
-            .entry(name.to_string())
-            .or_insert_with(|| Value::type_ref(name));
+            .or_insert_with(name.to_string(), || Value::type_ref(name));
     }
 }
 
@@ -92,9 +92,9 @@ pub fn make_exception(vm: &Vm, type_name: &str, message: impl Into<String>) -> c
         .get(type_name)
         .cloned()
         .ok_or_else(|| crate::error::RuntimeError::msg(format!("unknown exception: {type_name}")))?;
-    Ok(Value::Struct(Rc::new(crate::value::StructInstance {
+    Ok(Value::Struct(Arc::new(crate::value::StructInstance {
         def,
-        slots: std::cell::RefCell::new(vec![
+        slots: crate::shared::SyncCell::new(vec![
             Value::Text(message.into()),
             Value::None,
         ]),
@@ -173,6 +173,15 @@ mod tests {
         assert_eq!(
             ExceptionKind::ZeroDivision.parent(),
             Some(ExceptionKind::ArithmeticError)
+        );
+        assert_eq!(
+            ExceptionKind::DeadlockError.parent(),
+            Some(ExceptionKind::Runtime)
+        );
+        assert_eq!(ExceptionKind::DeadlockError.type_name(), "DeadlockError");
+        assert_eq!(
+            RuntimeError::deadlock("channel recv blocked").kind(),
+            ExceptionKind::DeadlockError
         );
     }
 }

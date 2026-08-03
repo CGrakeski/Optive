@@ -549,8 +549,10 @@ fn print_help() {
     println!("  Optive debug [file|path]       Debug a script or project entry");
     println!();
     println!("Runtime capability flags (apply to run / up / debug / <script> / -c):");
-    println!("  --sandbox[=DIR]          No network, no env mutation, fs limited to DIR (default: cwd)");
+    println!("  --sandbox[=DIR]          No network, no env, no FFI; fs limited to DIR (default: cwd)");
     println!("  --no-network            Disable std.http");
+    println!("  --no-ffi                Disable C.frompath / extern");
+    println!("  --allow-ffi             Allow native FFI (overrides sandbox default)");
     println!("  --allow-path DIR         Allow fs access under DIR (repeatable; combines with --sandbox)");
     println!("  Optive -h, --help              Show this help");
     println!("  Optive -V, --version           Show version");

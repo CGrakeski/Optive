@@ -1,12 +1,15 @@
-//! 动态库加载与 C ABI 调用（MVP：平台默认调用约定）。
+//! 动态库加载与 C ABI 调用。
+//!
+//! libffi 的 `Cif`/`CodePtr` 含裸指针，本身非 `Send`/`Sync`。M:N 下 Builtin
+//! 须跨线程持有，故用 `FfiCallable` + 可重入全局锁串行化实际 call。
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use libffi::middle::{Arg, Cif, CodePtr, Type as FfiType};
 use libloading::Library;
+use parking_lot::ReentrantMutex;
 
 use crate::ast::TypeExpr;
 use crate::error::RuntimeError;
@@ -16,10 +19,31 @@ use crate::value::{BuiltinFn, ModuleObject, Value};
 use crate::vm::Vm;
 use crate::Result;
 
+use crate::shared::Shared;
+
+/// 跨线程持有的 FFI 调用描述；真实调用经 `FFI_CALL_LOCK` 串行。
+struct FfiCallable {
+    cif: Cif,
+    code: CodePtr,
+}
+
+// SAFETY: 指针指向已加载库内的稳定符号与 libffi 分配的 CIF；调用侧持全局锁。
+unsafe impl Send for FfiCallable {}
+unsafe impl Sync for FfiCallable {}
+
+/// 可重入：同步回调里再次 `extern` 不会自死锁。
+pub static FFI_CALL_LOCK: ReentrantMutex<()> = ReentrantMutex::new(());
+
 #[derive(Clone)]
 pub struct DllHandle {
     pub path: String,
-    pub lib: Rc<Library>,
+    pub lib: Arc<Library>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallConv {
+    C,
+    Stdcall,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,12 +63,38 @@ pub enum AbiType {
     F32,
     F64,
     Pointer,
+    /// 指针宽度；`extern` 可从 `text` 临时编成 NUL 结尾 UTF-8。
+    CharPtr,
+    /// 指针宽度；`extern` 可从 `text` 临时编成 UTF-16 NUL 结尾。
+    WCharPtr,
 }
 
 impl AbiType {
     pub fn from_type_expr(vm: &Vm, ty: &TypeExpr) -> Result<Self> {
-        let name = crate::types::resolve_type_expr_name(vm, ty)?;
-        Self::from_type_name(&name)
+        match ty {
+            TypeExpr::Generic { name, params }
+                if crate::ptr_registry::is_ptr_type_name(name) =>
+            {
+                let _ = params;
+                Ok(Self::Pointer)
+            }
+            _ => {
+                let name = crate::types::resolve_type_expr_name(vm, ty)?;
+                if crate::ptr_registry::is_ptr_type_name(&name) {
+                    return Ok(Self::Pointer);
+                }
+                // `typed struct : C.layout` 不能当 by-value ABI；须显式指针。
+                if let Some(def) = vm.struct_defs.get(&name) {
+                    if def.c_layout.is_some() {
+                        return Err(RuntimeError::type_err(format!(
+                            "unsupported C ABI type: {name} (struct by-value not supported; \
+                             use C.types.ptr[{name}] or C.types.void_ptr)"
+                        )));
+                    }
+                }
+                Self::from_type_name(&name)
+            }
+        }
     }
 
     pub fn from_type_name(name: &str) -> Result<Self> {
@@ -53,7 +103,7 @@ impl AbiType {
         })
     }
 
-    fn ffi_type(self) -> FfiType {
+    pub(crate) fn ffi_type(self) -> FfiType {
         match self {
             Self::Void => FfiType::void(),
             Self::Bool | Self::I8 => FfiType::i8(),
@@ -71,7 +121,7 @@ impl AbiType {
                     FfiType::i64()
                 }
             }
-            Self::Usize | Self::Pointer => {
+            Self::Usize | Self::Pointer | Self::CharPtr | Self::WCharPtr => {
                 if cfg!(target_pointer_width = "32") {
                     FfiType::u32()
                 } else {
@@ -84,25 +134,56 @@ impl AbiType {
     }
 }
 
+/// `(size, align)` in bytes for layout / `C.sizeof`.
+pub fn abi_size_align(abi: AbiType) -> (usize, usize) {
+    match abi {
+        AbiType::Void => (0, 1),
+        AbiType::Bool | AbiType::I8 | AbiType::U8 => (1, 1),
+        AbiType::I16 | AbiType::U16 => (2, 2),
+        AbiType::I32 | AbiType::U32 | AbiType::F32 => (4, 4),
+        AbiType::I64 | AbiType::U64 | AbiType::F64 => (8, 8),
+        AbiType::Isize
+        | AbiType::Usize
+        | AbiType::Pointer
+        | AbiType::CharPtr
+        | AbiType::WCharPtr => {
+            let w = std::mem::size_of::<usize>();
+            (w, w)
+        }
+    }
+}
+
 fn type_expr_name(vm: &Vm, ty: &TypeExpr) -> Result<String> {
     crate::types::resolve_type_expr_name(vm, ty)
 }
 
-pub fn load_library(path: &str) -> Result<Value> {
+pub fn load_library(vm: &mut Vm, path: &str) -> Result<Value> {
+    vm.caps.check_ffi("C.frompath")?;
     let lib = unsafe { Library::new(path) }.map_err(|e| {
         RuntimeError::msg(format!("failed to load dynamic library '{path}': {e}"))
     })?;
-    Ok(Value::DllHandle(Rc::new(DllHandle {
+    Ok(Value::DllHandle(Arc::new(DllHandle {
         path: path.to_string(),
-        lib: Rc::new(lib),
+        lib: Arc::new(lib),
     })))
 }
 
-/// 内置 `extern(handle[, symbol])` → 装饰器。
-pub fn builtin_extern(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    if args.is_empty() || args.len() > 2 {
+fn parse_call_conv(s: &str) -> Result<CallConv> {
+    match s.to_ascii_lowercase().as_str() {
+        "c" | "cdecl" | "default" => Ok(CallConv::C),
+        "stdcall" | "winapi" => Ok(CallConv::Stdcall),
+        other => Err(RuntimeError::type_err(format!(
+            "extern: unknown calling convention '{other}' (use \"c\" or \"stdcall\")"
+        ))),
+    }
+}
+
+/// 内置 `extern(handle[, symbol[, abi]])` → 装饰器。
+pub fn builtin_extern(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    vm.caps.check_ffi("extern")?;
+    if args.is_empty() || args.len() > 3 {
         return Err(RuntimeError::type_err(
-            "extern requires 1 or 2 arguments (handle[, symbol])",
+            "extern requires 1..=3 arguments (handle[, symbol[, abi]])",
         ));
     }
     let handle = match &args[0] {
@@ -113,19 +194,37 @@ pub fn builtin_extern(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
             ))
         }
     };
-    let symbol_override = if args.len() == 2 {
+    let mut symbol_override = None;
+    let mut conv = CallConv::C;
+    if args.len() >= 2 {
         match &args[1] {
-            Value::Text(s) => Some(s.clone()),
+            Value::Text(s) => {
+                // 二义：可能是 symbol 或 abi。若只有 2 参且像 abi 名，当作 abi。
+                if args.len() == 2 && matches!(s.as_str(), "c" | "cdecl" | "stdcall" | "winapi" | "default")
+                {
+                    conv = parse_call_conv(s)?;
+                } else {
+                    symbol_override = Some(s.clone());
+                }
+            }
             _ => {
                 return Err(RuntimeError::type_err(
-                    "extern: second argument must be text symbol name",
+                    "extern: second argument must be text (symbol or abi)",
                 ))
             }
         }
-    } else {
-        None
-    };
-    Ok(Value::Builtin(Rc::new(move |vm, deco_args| {
+    }
+    if args.len() == 3 {
+        match &args[2] {
+            Value::Text(s) => conv = parse_call_conv(s)?,
+            _ => {
+                return Err(RuntimeError::type_err(
+                    "extern: third argument must be text abi name",
+                ))
+            }
+        }
+    }
+    Ok(Value::Builtin(Arc::new(move |vm, deco_args| {
         if deco_args.len() != 1 {
             return Err(RuntimeError::type_err(
                 "extern decorator requires 1 argument (function)",
@@ -140,16 +239,18 @@ pub fn builtin_extern(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
                 )))
             }
         };
-        bind_extern_function(vm, handle.clone(), symbol_override.clone(), func)
+        bind_extern_function(vm, handle.clone(), symbol_override.clone(), conv, func)
     })))
 }
 
 fn bind_extern_function(
     vm: &mut Vm,
-    handle: Rc<DllHandle>,
+    handle: Arc<DllHandle>,
     symbol_override: Option<String>,
-    func: Rc<FunctionObject>,
+    conv: CallConv,
+    func: Arc<FunctionObject>,
 ) -> Result<Value> {
+    vm.caps.check_ffi("extern")?;
     let sym_name = symbol_override.unwrap_or_else(|| func.name.clone());
     let mut name_buf = sym_name.into_bytes();
     name_buf.push(0);
@@ -188,7 +289,12 @@ fn bind_extern_function(
     };
 
     let arg_ffi: Vec<FfiType> = arg_abis.iter().copied().map(AbiType::ffi_type).collect();
-    let cif = Cif::new(arg_ffi, ret_abi.ffi_type());
+    let mut cif = Cif::new(arg_ffi, ret_abi.ffi_type());
+    apply_call_conv(&mut cif, conv);
+    let ffi = Arc::new(FfiCallable {
+        cif,
+        code: code_ptr,
+    });
 
     let params = func.params.clone();
     let return_wrapper = func.return_wrapper.clone();
@@ -198,7 +304,7 @@ fn bind_extern_function(
     // 绑定后保留库句柄：调用性与用户侧句柄变量解耦，但库本身不得被卸载。
     let keep_lib = handle;
 
-    let wrapper: BuiltinFn = Rc::new(move |vm, call_args| {
+    let wrapper: BuiltinFn = Arc::new(move |vm, call_args| {
         let _keep_loaded = &keep_lib;
         if call_args.len() != params.len() {
             return Err(RuntimeError::type_err(format!(
@@ -254,7 +360,12 @@ fn bind_extern_function(
             .collect::<Result<_>>()?;
         let ffi_args: Vec<Arg> = storage.iter_mut().map(|s| s.as_arg()).collect();
 
-        let raw = unsafe { call_cif(&cif, code_ptr, &ffi_args, ret_abi)? };
+        let raw = super::ffi_extra::with_active_vm(vm, || {
+            let _guard = FFI_CALL_LOCK.lock();
+            let r = unsafe { call_cif(&ffi.cif, ffi.code, &ffi_args, ret_abi) };
+            super::ffi_extra::sample_error_codes();
+            r
+        })?;
         let mut out = abi_to_value(raw, ret_abi)?;
         if let Some(ref wrapper_expr) = return_wrapper {
             out = eval_wrapper_expr(vm, wrapper_expr, out)?;
@@ -275,6 +386,14 @@ fn bind_extern_function(
     Ok(Value::Builtin(wrapper))
 }
 
+fn apply_call_conv(cif: &mut Cif, conv: CallConv) {
+    use libffi::middle::ffi_abi_FFI_DEFAULT_ABI;
+    // 主流目标（含 win64）上 stdcall 与 default C 约定一致；
+    // 显式传 "stdcall" 仍接受，便于跨平台脚本。
+    let _ = conv;
+    cif.set_abi(ffi_abi_FFI_DEFAULT_ABI);
+}
+
 enum ArgStorage {
     I8(i8),
     U8(u8),
@@ -287,6 +406,9 @@ enum ArgStorage {
     F32(f32),
     F64(f64),
     Ptr(usize),
+    /// 缓冲 + 稳定指针槽（`as_arg` 取 `ptr`）。
+    OwnedCString { buf: Vec<u8>, ptr: usize },
+    OwnedWString { buf: Vec<u16>, ptr: usize },
 }
 
 impl ArgStorage {
@@ -303,6 +425,14 @@ impl ArgStorage {
             Self::F32(v) => Arg::new(v),
             Self::F64(v) => Arg::new(v),
             Self::Ptr(v) => Arg::new(v),
+            Self::OwnedCString { buf, ptr } => {
+                *ptr = buf.as_ptr() as usize;
+                Arg::new(ptr)
+            }
+            Self::OwnedWString { buf, ptr } => {
+                *ptr = buf.as_ptr() as usize;
+                Arg::new(ptr)
+            }
         }
     }
 }
@@ -333,6 +463,34 @@ fn value_to_storage(v: &Value, abi: AbiType) -> Result<ArgStorage> {
             }
         }
         AbiType::Usize | AbiType::Pointer => Ok(ArgStorage::Ptr(as_usize(v)?)),
+        AbiType::CharPtr => match v {
+            Value::Text(s) => {
+                let mut buf = s.as_bytes().to_vec();
+                buf.push(0);
+                let ptr = buf.as_ptr() as usize;
+                Ok(ArgStorage::OwnedCString { buf, ptr })
+            }
+            Value::Ptr(p) => Ok(ArgStorage::Ptr(*p)),
+            Value::None => Ok(ArgStorage::Ptr(0)),
+            other => Err(RuntimeError::type_err(format!(
+                "char* expects text or ptr, got {}",
+                other.type_name()
+            ))),
+        },
+        AbiType::WCharPtr => match v {
+            Value::Text(s) => {
+                let mut buf: Vec<u16> = s.encode_utf16().collect();
+                buf.push(0);
+                let ptr = buf.as_ptr() as usize;
+                Ok(ArgStorage::OwnedWString { buf, ptr })
+            }
+            Value::Ptr(p) => Ok(ArgStorage::Ptr(*p)),
+            Value::None => Ok(ArgStorage::Ptr(0)),
+            other => Err(RuntimeError::type_err(format!(
+                "wchar_t* expects text or ptr, got {}",
+                other.type_name()
+            ))),
+        },
         AbiType::F32 => Ok(ArgStorage::F32(as_f64(v)? as f32)),
         AbiType::F64 => Ok(ArgStorage::F64(as_f64(v)?)),
     }
@@ -388,7 +546,7 @@ unsafe fn call_cif(
             }
         }
         AbiType::U64 => RetStorage::U64(cif.call::<u64>(code, args)),
-        AbiType::Usize | AbiType::Pointer => {
+        AbiType::Usize | AbiType::Pointer | AbiType::CharPtr | AbiType::WCharPtr => {
             if cfg!(target_pointer_width = "32") {
                 RetStorage::U64(cif.call::<u32>(code, args) as u64)
             } else {
@@ -413,7 +571,10 @@ fn abi_to_value(ret: RetStorage, abi: AbiType) -> Result<Value> {
         (RetStorage::I64(v), AbiType::Isize) => Value::Sized(SizedNum::Isize(v as isize)),
         (RetStorage::I64(v), _) => Value::Sized(SizedNum::I64(v)),
         (RetStorage::U64(v), AbiType::Usize) => Value::Sized(SizedNum::Usize(v as usize)),
-        (RetStorage::U64(v), AbiType::Pointer) => Value::Ptr(v as usize),
+        (
+            RetStorage::U64(v),
+            AbiType::Pointer | AbiType::CharPtr | AbiType::WCharPtr,
+        ) => Value::Ptr(v as usize),
         (RetStorage::U64(v), _) => Value::Sized(SizedNum::U64(v)),
         (RetStorage::F32(v), _) => Value::Sized(SizedNum::F32(v)),
         (RetStorage::F64(v), _) => Value::Sized(SizedNum::F64(v)),
@@ -513,15 +674,23 @@ fn eval_type_operand(expr: &crate::ast::Expr) -> Result<Value> {
     }
 }
 
+fn export_builtin(
+    exports: &mut HashMap<String, Value>,
+    name: &str,
+    f: fn(&mut Vm, &[Value]) -> Result<Value>,
+) {
+    exports.insert(name.into(), Value::Builtin(Arc::new(f)));
+}
+
 /// 构建 `std.language.C` 模块（含 `types` 子模块）。
-pub fn build_c_language_module() -> Rc<RefCell<ModuleObject>> {
+pub fn build_c_language_module() -> Shared<ModuleObject> {
     let types = build_c_types_module();
     let mut children = HashMap::new();
     children.insert("types".into(), types.clone());
     let mut exports = HashMap::new();
     exports.insert(
         "frompath".into(),
-        Value::Builtin(Rc::new(|_vm, args| {
+        Value::Builtin(Arc::new(|vm, args| {
             if args.len() != 1 {
                 return Err(RuntimeError::type_err("C.frompath requires 1 text path"));
             }
@@ -529,20 +698,49 @@ pub fn build_c_language_module() -> Rc<RefCell<ModuleObject>> {
                 Value::Text(s) => s.clone(),
                 _ => return Err(RuntimeError::type_err("C.frompath requires text path")),
             };
-            load_library(&path)
+            load_library(vm, &path)
         })),
     );
     exports.insert("types".into(), Value::Module(types));
-    Rc::new(RefCell::new(ModuleObject {
+    exports.insert("layout".into(), Value::type_ref("C.layout"));
+    use super::ffi_extra as x;
+    export_builtin(&mut exports, "alloc", x::builtin_alloc);
+    export_builtin(&mut exports, "alloc_array", x::builtin_alloc_array);
+    export_builtin(&mut exports, "free", x::builtin_free);
+    export_builtin(&mut exports, "sizeof", x::builtin_sizeof);
+    export_builtin(&mut exports, "write_bytes", x::builtin_write_bytes);
+    export_builtin(&mut exports, "read_bytes", x::builtin_read_bytes);
+    export_builtin(&mut exports, "write_i32", x::builtin_write_i32);
+    export_builtin(&mut exports, "read_i32", x::builtin_read_i32);
+    export_builtin(&mut exports, "write_i64", x::builtin_write_i64);
+    export_builtin(&mut exports, "read_i64", x::builtin_read_i64);
+    export_builtin(&mut exports, "write_ptr", x::builtin_write_ptr);
+    export_builtin(&mut exports, "read_ptr", x::builtin_read_ptr);
+    export_builtin(&mut exports, "cstring", x::builtin_cstring);
+    export_builtin(&mut exports, "cstring_to_text", x::builtin_cstring_to_text);
+    export_builtin(&mut exports, "wstring", x::builtin_wstring);
+    export_builtin(&mut exports, "wstring_to_text", x::builtin_wstring_to_text);
+    export_builtin(&mut exports, "Struct", x::builtin_struct);
+    export_builtin(&mut exports, "load", x::builtin_load);
+    export_builtin(&mut exports, "store", x::builtin_store);
+    export_builtin(&mut exports, "ptr_live", x::builtin_ptr_live);
+    export_builtin(&mut exports, "ptr_check", x::builtin_ptr_check);
+    export_builtin(&mut exports, "unsafe_ptr", x::builtin_unsafe_ptr);
+    export_builtin(&mut exports, "cast_ptr", x::builtin_cast_ptr);
+    export_builtin(&mut exports, "errno", x::builtin_errno);
+    export_builtin(&mut exports, "last_error", x::builtin_last_error);
+    export_builtin(&mut exports, "callback", x::builtin_callback);
+    export_builtin(&mut exports, "callback_free", x::builtin_callback_free);
+    Shared::new(ModuleObject {
         name: "C".into(),
         full_name: "std.language.C".into(),
         exports,
         children,
         is_user: false,
-    }))
+    })
 }
 
-fn build_c_types_module() -> Rc<RefCell<ModuleObject>> {
+fn build_c_types_module() -> Shared<ModuleObject> {
     let mut exports = HashMap::new();
     for entry in crate::c_types::C_TYPES {
         let ty = Value::type_ref(entry.full_name());
@@ -552,26 +750,26 @@ fn build_c_types_module() -> Rc<RefCell<ModuleObject>> {
         }
     }
 
-    Rc::new(RefCell::new(ModuleObject {
+    Shared::new(ModuleObject {
         name: "types".into(),
         full_name: "std.language.C.types".into(),
         exports,
         children: HashMap::new(),
         is_user: false,
-    }))
+    })
 }
 
-pub fn build_language_module() -> Rc<RefCell<ModuleObject>> {
+pub fn build_language_module() -> Shared<ModuleObject> {
     let c = build_c_language_module();
     let mut children = HashMap::new();
     children.insert("C".into(), c.clone());
     let mut exports = HashMap::new();
     exports.insert("C".into(), Value::Module(c));
-    Rc::new(RefCell::new(ModuleObject {
+    Shared::new(ModuleObject {
         name: "language".into(),
         full_name: "std.language".into(),
         exports,
         children,
         is_user: false,
-    }))
+    })
 }

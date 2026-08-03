@@ -9,6 +9,11 @@ license = "MIT"
 name = "Optive"
 path = "src/main.rs"
 
+[features]
+default = ["mn"]
+## M:N 真并行调度（work-stealing）。关闭时仍用 Arc 堆，但只跑 1 个 worker（协作语义）。
+mn = []
+
 [dependencies]
 num-bigint = "0.4"
 num-rational = "0.4"
@@ -38,6 +43,10 @@ flate2 = "1"
 serde_yaml = "0.9"
 roxmltree = "0.20"
 csv = "1"
+parking_lot = "0.12"
+crossbeam-deque = "0.8"
+crossbeam-channel = "0.5"
+num_cpus = "1"
 
 [dev-dependencies]
 pretty_assertions = "1"

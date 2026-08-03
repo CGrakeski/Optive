@@ -253,7 +253,43 @@ pub static C_TYPES: &[CTypeDef] = &[
         export_aliases: &["void_ptr"],
         type_name_alts: &[],
     },
+    // 护照指针（与 void* 同宽）；可写 `ptr[T]` / `C.types.ptr[T]` 作类型形式。
+    CTypeDef {
+        c_name: "ptr",
+        abi: abi_ptr,
+        export_aliases: &[],
+        type_name_alts: &["pointer"],
+    },
+    // UTF-8 C 字符串指针：ABI 同 void*，extern 可从 text 临时编组。
+    CTypeDef {
+        c_name: "char*",
+        abi: abi_char_ptr,
+        export_aliases: &["char_ptr"],
+        type_name_alts: &[],
+    },
+    // UTF-16 宽字符串指针（Windows wchar_t* / LPCWSTR）。
+    CTypeDef {
+        c_name: "wchar_t*",
+        abi: abi_wchar_ptr,
+        export_aliases: &["wchar_ptr"],
+        type_name_alts: &[],
+    },
+    // 明确的无符号 char（char 在本实现中固定为 signed i8）。
+    CTypeDef {
+        c_name: "uchar",
+        abi: abi_u8,
+        export_aliases: &[],
+        type_name_alts: &[],
+    },
 ];
+
+fn abi_char_ptr() -> AbiType {
+    AbiType::CharPtr
+}
+
+fn abi_wchar_ptr() -> AbiType {
+    AbiType::WCharPtr
+}
 
 /// 语言侧可直接作 ABI 注解的名字（非 `C.types.*`）。
 type LangAbiEntry = (&'static str, fn() -> AbiType);
@@ -275,6 +311,8 @@ static LANG_ABI_NAMES: &[LangAbiEntry] = &[
     ("f64", abi_f64),
     ("ptr", abi_ptr),
     ("pointer", abi_ptr),
+    ("char_ptr", abi_char_ptr),
+    ("wchar_ptr", abi_wchar_ptr),
 ];
 
 impl CTypeDef {

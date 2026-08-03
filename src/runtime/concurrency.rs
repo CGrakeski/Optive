@@ -1,25 +1,25 @@
 //! Channel / Mutex / RWMutex / WaitGroup / Semaphore / Once / Barrier / Cond
 //! 构造与方法绑定。
 
-use std::cell::RefCell;
-use std::rc::Rc;
 
 use crate::error::RuntimeError;
+use crate::shared::Shared;
 use crate::value::{
     expect_i64, ChannelInner, MutexInner, Num, SyncGuardInner, SyncInner, Value,
 };
 use crate::Result;
+use std::sync::Arc;
 
 /// 创建方法的辅助宏：克隆捕获变量并包装为 `Value::Builtin`。
 /// 使用方式：`method!(捕获变量, vm_param, { 闭包体 })`
 macro_rules! method {
     ($cap:ident, $vm:ident, |$arg:ident| $body:block) => {{
         let $cap = $cap.clone();
-        Ok(Value::Builtin(Rc::new(move |$vm: &mut crate::vm::Vm, $arg: &[Value]| $body)))
+        Ok(Value::Builtin(Arc::new(move |$vm: &mut crate::vm::Vm, $arg: &[Value]| $body)))
     }};
 }
 
-pub fn get_channel_method(ch: &Rc<RefCell<ChannelInner>>, field: &str) -> Result<Value> {
+pub fn get_channel_method(ch: &Shared<ChannelInner>, field: &str) -> Result<Value> {
     match field {
         "send" => method!(ch, vm, |args| {
             if args.len() != 1 {
@@ -34,11 +34,12 @@ pub fn get_channel_method(ch: &Rc<RefCell<ChannelInner>>, field: &str) -> Result
             }
             vm.channel_recv(&ch)
         }),
-        "close" => method!(ch, _vm, |args| {
+        "close" => method!(ch, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err("Channel.close takes no arguments"));
             }
             ch.borrow_mut().closed = true;
+            vm.mn.notify_all();
             Ok(Value::None)
         }),
         _ => Err(RuntimeError::attr_err(format!(
@@ -47,7 +48,7 @@ pub fn get_channel_method(ch: &Rc<RefCell<ChannelInner>>, field: &str) -> Result
     }
 }
 
-pub fn get_mutex_method(m: &Rc<RefCell<MutexInner>>, field: &str) -> Result<Value> {
+pub fn get_mutex_method(m: &Shared<MutexInner>, field: &str) -> Result<Value> {
     match field {
         "lock" => method!(m, vm, |args| {
             if !args.is_empty() {
@@ -61,7 +62,7 @@ pub fn get_mutex_method(m: &Rc<RefCell<MutexInner>>, field: &str) -> Result<Valu
     }
 }
 
-pub fn get_mutex_guard_method(m: &Rc<RefCell<MutexInner>>, field: &str) -> Result<Value> {
+pub fn get_mutex_guard_method(m: &Shared<MutexInner>, field: &str) -> Result<Value> {
     match field {
         "get" => method!(m, _vm, |args| {
             if !args.is_empty() {
@@ -82,18 +83,20 @@ pub fn get_mutex_guard_method(m: &Rc<RefCell<MutexInner>>, field: &str) -> Resul
             }
             Ok(Value::MutexGuard(m.clone()))
         }),
-        "__exit__" => method!(m, _vm, |args| {
+        "__exit__" => method!(m, vm, |args| {
             let _ = args;
             m.borrow_mut().locked = false;
+            vm.mn.notify_all();
             Ok(Value::None)
         }),
-        "unlock" => method!(m, _vm, |args| {
+        "unlock" => method!(m, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err(
                     "MutexGuard.unlock takes no arguments",
                 ));
             }
             m.borrow_mut().locked = false;
+            vm.mn.notify_all();
             Ok(Value::None)
         }),
         _ => Err(RuntimeError::attr_err(format!(
@@ -102,7 +105,7 @@ pub fn get_mutex_guard_method(m: &Rc<RefCell<MutexInner>>, field: &str) -> Resul
     }
 }
 
-pub fn get_sync_method(s: &Rc<RefCell<SyncInner>>, field: &str) -> Result<Value> {
+pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
     let kind = match &*s.borrow() {
         SyncInner::RWMutex { .. } => "RWMutex",
         SyncInner::WaitGroup { .. } => "WaitGroup",
@@ -145,11 +148,11 @@ pub fn get_sync_method(s: &Rc<RefCell<SyncInner>>, field: &str) -> Result<Value>
             }
             Ok(Value::None)
         }),
-        ("WaitGroup", "done") => method!(s, _vm, |args| {
+        ("WaitGroup", "done") => method!(s, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err("WaitGroup.done takes no arguments"));
             }
-            match &mut *s.borrow_mut() {
+            let hit_zero = match &mut *s.borrow_mut() {
                 SyncInner::WaitGroup { count } => {
                     if *count <= 0 {
                         return Err(RuntimeError::value_err(
@@ -157,8 +160,12 @@ pub fn get_sync_method(s: &Rc<RefCell<SyncInner>>, field: &str) -> Result<Value>
                         ));
                     }
                     *count -= 1;
+                    *count == 0
                 }
                 _ => unreachable!(),
+            };
+            if hit_zero {
+                vm.mn.notify_all();
             }
             Ok(Value::None)
         }),
@@ -177,7 +184,7 @@ pub fn get_sync_method(s: &Rc<RefCell<SyncInner>>, field: &str) -> Result<Value>
             }
             vm.semaphore_acquire(&s)
         }),
-        ("Semaphore", "release") => method!(s, _vm, |args| {
+        ("Semaphore", "release") => method!(s, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err(
                     "Semaphore.release takes no arguments",
@@ -187,6 +194,7 @@ pub fn get_sync_method(s: &Rc<RefCell<SyncInner>>, field: &str) -> Result<Value>
                 SyncInner::Semaphore { permits } => *permits += 1,
                 _ => unreachable!(),
             }
+            vm.mn.notify_all();
             Ok(Value::None)
         }),
         // --- Once ---
@@ -220,7 +228,7 @@ pub fn get_sync_method(s: &Rc<RefCell<SyncInner>>, field: &str) -> Result<Value>
             };
             vm.cond_wait(&s, guard)
         }),
-        ("Cond", "signal") => method!(s, _vm, |args| {
+        ("Cond", "signal") => method!(s, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err("Cond.signal takes no arguments"));
             }
@@ -232,9 +240,10 @@ pub fn get_sync_method(s: &Rc<RefCell<SyncInner>>, field: &str) -> Result<Value>
                 }
                 _ => unreachable!(),
             }
+            vm.mn.notify_all();
             Ok(Value::None)
         }),
-        ("Cond", "broadcast") => method!(s, _vm, |args| {
+        ("Cond", "broadcast") => method!(s, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err(
                     "Cond.broadcast takes no arguments",
@@ -246,6 +255,7 @@ pub fn get_sync_method(s: &Rc<RefCell<SyncInner>>, field: &str) -> Result<Value>
                 }
                 _ => unreachable!(),
             }
+            vm.mn.notify_all();
             Ok(Value::None)
         }),
         _ => Err(RuntimeError::attr_err(format!(
@@ -254,7 +264,7 @@ pub fn get_sync_method(s: &Rc<RefCell<SyncInner>>, field: &str) -> Result<Value>
     }
 }
 
-pub fn get_sync_guard_method(g: &Rc<RefCell<SyncGuardInner>>, field: &str) -> Result<Value> {
+pub fn get_sync_guard_method(g: &Shared<SyncGuardInner>, field: &str) -> Result<Value> {
     match field {
         "get" => method!(g, _vm, |args| {
             if !args.is_empty() {
@@ -306,7 +316,7 @@ pub fn get_sync_guard_method(g: &Rc<RefCell<SyncGuardInner>>, field: &str) -> Re
             }
             Ok(Value::SyncGuard(g.clone()))
         }),
-        "__exit__" => method!(g, _vm, |args| {
+        "__exit__" => method!(g, vm, |args| {
             let _ = args;
             let (mu, is_write) = {
                 let guard = g.borrow();
@@ -326,6 +336,8 @@ pub fn get_sync_guard_method(g: &Rc<RefCell<SyncGuardInner>>, field: &str) -> Re
                     *readers -= 1;
                 }
             }
+            drop(inner);
+            vm.mn.notify_all();
             Ok(Value::None)
         }),
         _ => Err(RuntimeError::attr_err(format!(
@@ -354,29 +366,29 @@ pub fn construct_channel(args: &[Value]) -> Result<Value> {
             ))
         }
     };
-    Ok(Value::Channel(Rc::new(RefCell::new(ChannelInner::new(
+    Ok(Value::Channel(Shared::new(ChannelInner::new(
         capacity,
-    )))))
+    ))))
 }
 
 pub fn construct_mutex(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(RuntimeError::type_err("Mutex() requires 1 argument"));
     }
-    Ok(Value::Mutex(Rc::new(RefCell::new(MutexInner::new(
+    Ok(Value::Mutex(Shared::new(MutexInner::new(
         args[0].clone(),
-    )))))
+    ))))
 }
 
 pub fn construct_rwmutex(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(RuntimeError::type_err("RWMutex() requires 1 argument"));
     }
-    Ok(Value::Sync(Rc::new(RefCell::new(SyncInner::RWMutex {
+    Ok(Value::Sync(Shared::new(SyncInner::RWMutex {
         value: args[0].clone(),
         readers: 0,
         writer: false,
-    }))))
+    })))
 }
 
 pub fn construct_waitgroup(args: &[Value]) -> Result<Value> {
@@ -396,9 +408,9 @@ pub fn construct_waitgroup(args: &[Value]) -> Result<Value> {
             "WaitGroup count must be non-negative",
         ));
     }
-    Ok(Value::Sync(Rc::new(RefCell::new(SyncInner::WaitGroup {
+    Ok(Value::Sync(Shared::new(SyncInner::WaitGroup {
         count,
-    }))))
+    })))
 }
 
 pub fn construct_semaphore(args: &[Value]) -> Result<Value> {
@@ -413,19 +425,19 @@ pub fn construct_semaphore(args: &[Value]) -> Result<Value> {
             "Semaphore permits must be non-negative",
         ));
     }
-    Ok(Value::Sync(Rc::new(RefCell::new(SyncInner::Semaphore {
+    Ok(Value::Sync(Shared::new(SyncInner::Semaphore {
         permits,
-    }))))
+    })))
 }
 
 pub fn construct_once(args: &[Value]) -> Result<Value> {
     if !args.is_empty() {
         return Err(RuntimeError::type_err("Once() takes no arguments"));
     }
-    Ok(Value::Sync(Rc::new(RefCell::new(SyncInner::Once {
+    Ok(Value::Sync(Shared::new(SyncInner::Once {
         done: false,
         value: Value::None,
-    }))))
+    })))
 }
 
 pub fn construct_barrier(args: &[Value]) -> Result<Value> {
@@ -440,21 +452,21 @@ pub fn construct_barrier(args: &[Value]) -> Result<Value> {
             "Barrier party count must be positive",
         ));
     }
-    Ok(Value::Sync(Rc::new(RefCell::new(SyncInner::Barrier {
+    Ok(Value::Sync(Shared::new(SyncInner::Barrier {
         n,
         waiting: 0,
         generation: 0,
-    }))))
+    })))
 }
 
 pub fn construct_cond(args: &[Value]) -> Result<Value> {
     if !args.is_empty() {
         return Err(RuntimeError::type_err("Cond() takes no arguments"));
     }
-    Ok(Value::Sync(Rc::new(RefCell::new(SyncInner::Cond {
+    Ok(Value::Sync(Shared::new(SyncInner::Cond {
         signals: 0,
         waiters: 0,
-    }))))
+    })))
 }
 
 pub fn deadline_from_secs(secs: &Value) -> Result<Value> {

@@ -1,6 +1,5 @@
-use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -17,6 +16,9 @@ use crate::opcode::{CompiledProgram, FunctionObject, Instruction, MacroObject, M
 use crate::value::{BuiltinFn, ChannelInner, DictMap, DispatchTable, IteratorKind, IteratorState, ModuleObject, MutexInner, Num, TaskInner, TaskState, Value, ValueKey, values_identical};
 use crate::Result;
 
+use crate::scheduler::{self, MnScheduler};
+use crate::shared::{Shared, SharedMap, SyncCell};
+use crossbeam_deque::Worker;
 /// 运行时可见的已安装依赖包。
 #[derive(Debug, Clone)]
 pub struct DepPackage {
@@ -52,8 +54,12 @@ enum InterpResult {
 }
 
 /// 当前正在跑的调度任务边界（挂起时裁剪到此水位）。
+///
+/// 同时保存**本 worker 宿主**在切入任务前的代码指针。纤程可能在 helper 上
+/// `setup_user_call`（当时 `saved_code` 为空），再被主线程偷走；挂起/结束时必须
+/// 恢复当前宿主状态，不能用另一线程帧里的 `saved_*`。
 struct TaskRunCtx {
-    task: Rc<RefCell<TaskInner>>,
+    task: Shared<TaskInner>,
     stop_ucf: usize,
     stop_locals: usize,
     stop_nts: usize,
@@ -69,21 +75,27 @@ struct TaskRunCtx {
     stop_lw_base: usize,
     stop_lw_entry_pc: usize,
     stop_lw_frame_slots: usize,
+    host_code: Arc<Vec<Instruction>>,
+    host_hot_ops: Arc<[u8]>,
+    host_hot_args: Arc<[i64]>,
+    host_pc: usize,
+    host_line_map: Arc<Vec<usize>>,
+    host_column_map: Arc<Vec<usize>>,
 }
 
 /// 挂起任务的纤程快照。
 pub(crate) struct TaskFiber {
-    code: Rc<Vec<Instruction>>,
-    hot_ops: Rc<[u8]>,
-    hot_args: Rc<[i64]>,
+    code: Arc<Vec<Instruction>>,
+    hot_ops: Arc<[u8]>,
+    hot_args: Arc<[i64]>,
     pc: usize,
-    active_line_map: Rc<Vec<usize>>,
-    active_column_map: Rc<Vec<usize>>,
+    active_line_map: Arc<Vec<usize>>,
+    active_column_map: Arc<Vec<usize>>,
     stack: Vec<StackVal>,
     locals_stack: Vec<Vec<Value>>,
     name_to_slot: Vec<Option<FxHashMap<String, usize>>>,
     user_call_frames: Vec<UserCallFrame>,
-    func_stack: Vec<Rc<FunctionObject>>,
+    func_stack: Vec<Arc<FunctionObject>>,
     func_frames: Vec<FuncFrame>,
     try_stack: Vec<TryFrame>,
     iterators: Vec<ActiveIter>,
@@ -259,13 +271,13 @@ pub(crate) struct TryFrame {
 
 #[derive(Clone)]
 struct UserCallFrame {
-    saved_code: Rc<Vec<Instruction>>,
-    saved_hot_ops: Rc<[u8]>,
-    saved_hot_args: Rc<[i64]>,
+    saved_code: Arc<Vec<Instruction>>,
+    saved_hot_ops: Arc<[u8]>,
+    saved_hot_args: Arc<[i64]>,
     saved_pc: usize,
-    saved_line_map: Rc<Vec<usize>>,
-    saved_column_map: Rc<Vec<usize>>,
-    func: Rc<FunctionObject>,
+    saved_line_map: Arc<Vec<usize>>,
+    saved_column_map: Arc<Vec<usize>>,
+    func: Arc<FunctionObject>,
     pushed_func_stack: bool,
 }
 
@@ -283,45 +295,45 @@ pub struct ErrorStackFrame {
     pub file: String,
     pub line: usize,
     pub column: usize,
-    pub source: Option<Rc<str>>,
+    pub source: Option<Arc<str>>,
 }
 
 pub struct Vm {
-    pub code: Rc<Vec<Instruction>>,
+    pub code: Arc<Vec<Instruction>>,
     /// 与 code 等长的紧凑热操作码。
-    hot_ops: Rc<[u8]>,
-    hot_args: Rc<[i64]>,
+    hot_ops: Arc<[u8]>,
+    hot_args: Arc<[i64]>,
     /// 主操作数栈存储区；有效元素个数由 stack_sp 限定（超出部分为复用缓冲）。
     stack: Vec<StackVal>,
     /// 逻辑栈顶下标；热路径用下标读写替代 Vec::push/pop。
     stack_sp: usize,
-    pub globals: FxHashMap<String, Value>,
+    pub globals: SharedMap,
     pub locals_stack: Vec<Vec<Value>>,
     pub name_to_slot: Vec<Option<FxHashMap<String, usize>>>,
-    pub func_stack: Vec<Rc<FunctionObject>>,
+    pub func_stack: Vec<Arc<FunctionObject>>,
     pub func_frames: Vec<FuncFrame>,
     pub pc: usize,
-    pub active_line_map: Rc<Vec<usize>>,
-    pub active_column_map: Rc<Vec<usize>>,
-    pub struct_defs: FxHashMap<String, Rc<crate::value::StructDef>>,
-    pub enum_defs: FxHashMap<String, Rc<crate::value::EnumDef>>,
-    pub variant_defs: FxHashMap<String, Rc<crate::value::VariantDef>>,
-    pub functions: FxHashMap<String, Rc<FunctionObject>>,
-    pub macros: FxHashMap<String, Rc<MacroObject>>,
+    pub active_line_map: Arc<Vec<usize>>,
+    pub active_column_map: Arc<Vec<usize>>,
+    pub struct_defs: FxHashMap<String, Arc<crate::value::StructDef>>,
+    pub enum_defs: FxHashMap<String, Arc<crate::value::EnumDef>>,
+    pub variant_defs: FxHashMap<String, Arc<crate::value::VariantDef>>,
+    pub functions: FxHashMap<String, Arc<FunctionObject>>,
+    pub macros: FxHashMap<String, Arc<MacroObject>>,
     pub(crate) try_stack: Vec<TryFrame>,
     pub(crate) active_exception: Option<Value>,
     pub(crate) iterators: Vec<ActiveIter>,
     pub(crate) const_names: FxHashSet<String>,
     /// 已声明但尚未执行到对应 store 的 const 名（允许先引用后赋值）。
     pub(crate) pending_const: FxHashSet<String>,
-    pub module_cache: FxHashMap<String, Rc<RefCell<ModuleObject>>>,
-    pub builtin_modules: FxHashMap<String, Rc<RefCell<ModuleObject>>>,
-    pub module_init_exports: Option<Rc<RefCell<HashMap<String, Value>>>>,
+    pub module_cache: FxHashMap<String, Shared<ModuleObject>>,
+    pub builtin_modules: FxHashMap<String, Shared<ModuleObject>>,
+    pub module_init_exports: Option<Shared<HashMap<String, Value>>>,
     macro_eval_scopes: Vec<EvalSnapshot>,
-    convert_tables: FxHashMap<String, Rc<RefCell<DispatchTable>>>,
+    convert_tables: FxHashMap<String, Shared<DispatchTable>>,
     pub source_file: String,
     /// 当前执行中的顶层代码块源文本（REPL / 脚本 / 调试器）。
-    pub current_source: Option<Rc<str>>,
+    pub current_source: Option<Arc<str>>,
     /// 运行失败 unwind 前捕获；供错误格式化消费。
     pub(crate) last_error_stack: Vec<ErrorStackFrame>,
     pub import_base: std::path::PathBuf,
@@ -331,7 +343,7 @@ pub struct Vm {
     pub current_package_id: String,
     /// 当前包根目录（依赖包内模块解析用）
     pub package_root: Option<std::path::PathBuf>,
-    pub overload_tables: FxHashMap<String, Vec<Rc<FunctionObject>>>,
+    pub overload_tables: FxHashMap<String, Vec<Arc<FunctionObject>>>,
     pub(crate) primitive_methods: FxHashMap<String, FxHashMap<String, BuiltinFn>>,
     user_call_frames: Vec<UserCallFrame>,
     user_call_deferred: bool,
@@ -373,11 +385,23 @@ pub struct Vm {
     pub(crate) dict_contracts: FxHashMap<usize, (crate::ast::TypeExpr, crate::ast::TypeExpr)>,
     pub(crate) set_element_contracts: FxHashMap<usize, crate::ast::TypeExpr>,
     /// 已编译程序中的协议定义（供运行时 `is_a` / `:: Protocol`）。
-    pub(crate) protocols: FxHashMap<String, Rc<crate::protocol::ProtocolDef>>,
-    /// M:1 协作调度就绪队列。
-    pub(crate) ready_tasks: VecDeque<Rc<RefCell<TaskInner>>>,
-    /// 挂起任务的纤程快照（键为 `Rc::as_ptr(task)`）。
+    pub(crate) protocols: FxHashMap<String, Arc<crate::protocol::ProtocolDef>>,
+    /// M:1 协作调度就绪队列（`OPTIVE_WORKERS<=1` 时使用，保留确定性顺序）。
+    pub(crate) ready_tasks: VecDeque<Shared<TaskInner>>,
+    /// 挂起任务的纤程快照（M:1 本地）；M:N 时改走 `mn.fibers`。
     task_fibers: FxHashMap<usize, TaskFiber>,
+    /// M:N 调度器（始终存在；worker 数见 `OPTIVE_WORKERS`）。
+    pub(crate) mn: Arc<MnScheduler>,
+    /// 本 OS 线程的 work-stealing 本地队列。
+    local_worker: Worker<Shared<TaskInner>>,
+    /// `mn.worker_count > 1` 时为真并行。
+    mn_parallel: bool,
+    /// `Vm::new` 主实例为 true；helper fork 为 false（仅主实例负责 shutdown）。
+    mn_primary: bool,
+    /// `scheduler_run_task` 嵌套深度；>0 时阻塞应挂起当前任务而非再入调度。
+    sched_depth: u32,
+    /// 同步原语请求「挂起并重试当前 Call」（由 `call_value` 武装栈/PC）。
+    block_suspend: bool,
     /// 当前调度任务上下文；`None` 表示主纤程。
     task_ctx: Option<TaskRunCtx>,
     /// 每片最多执行的字节码条数。
@@ -391,38 +415,38 @@ pub struct Vm {
     /// 正在 `advance_iterator` 恢复生成器。
     generator_resuming: bool,
     /// 当前恢复的生成器状态（供 Yield/YieldFrom 写回）。
-    active_generator: Option<Rc<RefCell<IteratorState>>>,
+    active_generator: Option<Shared<IteratorState>>,
     /// Yield 刚产出的值，由 `run_interpreter` 转为 `InterpResult::Yielded`。
     pending_gen_yield: Option<Value>,
     /// 调试会话状态；`None` 时热路径仅多一次空检查。
-    pub debug: Option<Rc<RefCell<crate::debug::DebugState>>>,
+    pub debug: Option<Shared<crate::debug::DebugState>>,
     /// 运行时能力隔离：网络 / 文件系统 / 环境变量网关。默认全开。
     pub caps: crate::caps::Capabilities,
 }
 
 #[derive(Clone)]
 pub(crate) struct EvalSnapshot {
-    pub(crate) globals: FxHashMap<String, Value>,
+    pub(crate) globals: SharedMap,
     pub(crate) locals_stack: Vec<Vec<Value>>,
     pub(crate) name_to_slot: Vec<Option<FxHashMap<String, usize>>>,
-    code: Rc<Vec<Instruction>>,
-    hot_ops: Rc<[u8]>,
-    hot_args: Rc<[i64]>,
-    active_line_map: Rc<Vec<usize>>,
-    active_column_map: Rc<Vec<usize>>,
+    code: Arc<Vec<Instruction>>,
+    hot_ops: Arc<[u8]>,
+    hot_args: Arc<[i64]>,
+    active_line_map: Arc<Vec<usize>>,
+    active_column_map: Arc<Vec<usize>>,
     pc: usize,
     stack: Vec<StackVal>,
-    functions: FxHashMap<String, Rc<FunctionObject>>,
-    macros: FxHashMap<String, Rc<MacroObject>>,
-    struct_defs: FxHashMap<String, Rc<crate::value::StructDef>>,
-    enum_defs: FxHashMap<String, Rc<crate::value::EnumDef>>,
-    variant_defs: FxHashMap<String, Rc<crate::value::VariantDef>>,
+    functions: FxHashMap<String, Arc<FunctionObject>>,
+    macros: FxHashMap<String, Arc<MacroObject>>,
+    struct_defs: FxHashMap<String, Arc<crate::value::StructDef>>,
+    enum_defs: FxHashMap<String, Arc<crate::value::EnumDef>>,
+    variant_defs: FxHashMap<String, Arc<crate::value::VariantDef>>,
     script_global_names: Vec<String>,
     script_globals: Vec<Value>,
 }
 
 pub(crate) struct ActiveIter {
-    state: Rc<RefCell<IteratorState>>,
+    state: Shared<IteratorState>,
 }
 
 enum StepAction {
@@ -542,14 +566,14 @@ enum StepAction {
 }
 
 pub struct ModuleInitSnapshot {
-    pub(crate) globals: FxHashMap<String, Value>,
-    pub(crate) functions: FxHashMap<String, Rc<FunctionObject>>,
-    pub(crate) macros: FxHashMap<String, Rc<MacroObject>>,
-    pub(crate) struct_defs: FxHashMap<String, Rc<crate::value::StructDef>>,
-    pub(crate) overload_tables: FxHashMap<String, Vec<Rc<FunctionObject>>>,
+    pub(crate) globals: SharedMap,
+    pub(crate) functions: FxHashMap<String, Arc<FunctionObject>>,
+    pub(crate) macros: FxHashMap<String, Arc<MacroObject>>,
+    pub(crate) struct_defs: FxHashMap<String, Arc<crate::value::StructDef>>,
+    pub(crate) overload_tables: FxHashMap<String, Vec<Arc<FunctionObject>>>,
     pub(crate) const_names: FxHashSet<String>,
-    pub(crate) module_init_exports: Option<Rc<RefCell<HashMap<String, Value>>>>,
-    pub(crate) code: Rc<Vec<Instruction>>,
+    pub(crate) module_init_exports: Option<Shared<HashMap<String, Value>>>,
+    pub(crate) code: Arc<Vec<Instruction>>,
     pub(crate) pc: usize,
     pub(crate) script_global_names: Vec<String>,
     pub(crate) script_globals: Vec<Value>,
@@ -557,20 +581,26 @@ pub struct ModuleInitSnapshot {
 
 impl Vm {
     pub fn new() -> Self {
+        Self::with_workers(scheduler::configured_workers())
+    }
+
+    /// 构造指定 OS worker 数的 Vm（`1` = M:1；`>1` = M:N）。测试与嵌入宿主可绕过环境变量。
+    pub fn with_workers(workers: usize) -> Self {
+        let workers = workers.max(1);
         let mut vm = Self {
-            code: Rc::new(Vec::new()),
-            hot_ops: Rc::from([]),
-            hot_args: Rc::from([]),
+            code: Arc::new(Vec::new()),
+            hot_ops: Arc::from([]),
+            hot_args: Arc::from([]),
             stack: Vec::with_capacity(STACK_INIT_CAP),
             stack_sp: 0,
-            globals: FxHashMap::default(),
+            globals: SharedMap::new(),
             locals_stack: Vec::new(),
             name_to_slot: Vec::new(),
             func_stack: Vec::new(),
             func_frames: Vec::new(),
             pc: 0,
-            active_line_map: Rc::new(Vec::new()),
-            active_column_map: Rc::new(Vec::new()),
+            active_line_map: Arc::new(Vec::new()),
+            active_column_map: Arc::new(Vec::new()),
             struct_defs: FxHashMap::default(),
             enum_defs: FxHashMap::default(),
             variant_defs: FxHashMap::default(),
@@ -622,6 +652,15 @@ impl Vm {
             protocols: FxHashMap::default(),
             ready_tasks: VecDeque::new(),
             task_fibers: FxHashMap::default(),
+            mn: {
+                // placeholder; overwritten below after stealer registration
+                MnScheduler::new(1)
+            },
+            local_worker: scheduler::new_local_worker(),
+            mn_parallel: false,
+            mn_primary: true,
+            sched_depth: 0,
+            block_suspend: false,
             task_ctx: None,
             suspend_budget: suspend_budget_default(),
             budget_left: suspend_budget_default(),
@@ -633,9 +672,16 @@ impl Vm {
             debug: None,
             caps: crate::caps::Capabilities::full(),
         };
+        let mn = MnScheduler::new(workers);
+        mn.register_stealer(vm.local_worker.stealer());
+        vm.mn = mn;
+        vm.mn_parallel = workers > 1;
         builtins::install_globals(&mut vm);
         type_registry::install_core_types(&mut vm);
         module::install_std(&mut vm);
+        if vm.mn_parallel {
+            vm.spawn_helper_workers();
+        }
         vm
     }
 
@@ -661,12 +707,18 @@ impl Vm {
     }
 
     /// 标记-清扫环收集：从根出发标记可达堆对象，再清空不可达容器内部。
-    /// 需临时取出 tracker（避免 RefCell 与 &mut self 别名冲突）。
+    /// M:N 下先请求 stop-the-world，再在安全点清空。
     pub fn gc_collect(&mut self) -> usize {
-        // 先将 tracker 移出 self（collect 需要 &Vm），处理完再挂回；否则无法同时持有 &mut self.gc 与 &Vm。
+        if self.mn_parallel {
+            self.mn.begin_stw();
+        }
+        // 先将 tracker 移出 self（collect 需要 &Vm），处理完再挂回。
         let mut tracker = std::mem::take(&mut self.gc);
         let cleared = tracker.collect(self);
         self.gc = tracker;
+        if self.mn_parallel {
+            self.mn.end_stw();
+        }
         cleared
     }
 
@@ -689,15 +741,15 @@ impl Vm {
             }
         }
         // 脚本顶层全局
-        for v in &self.script_globals {
+        for v in self.script_globals.iter() {
             worklist.push(v.clone());
         }
         // globals 表
-        for v in self.globals.values() {
+        for v in self.globals.values() {  // SharedMap::values clones
             worklist.push(v.clone());
         }
         // 已注册函数 / 调用栈 / 重载表：函数对象 + 闭包捕获
-        let push_func = |worklist: &mut Vec<Value>, f: &Rc<FunctionObject>| {
+        let push_func = |worklist: &mut Vec<Value>, f: &Arc<FunctionObject>| {
             worklist.push(Value::Function(f.clone()));
             if let Some(cap) = &f.captured {
                 worklist.extend(cap.values().cloned());
@@ -750,7 +802,7 @@ impl Vm {
                     worklist.push(v.clone());
                 }
             }
-            for v in &snap.script_globals {
+            for v in snap.script_globals.iter() {
                 worklist.push(v.clone());
             }
             for sv in &snap.stack {
@@ -775,7 +827,7 @@ impl Vm {
         }
     }
 
-    pub fn register_builtin_module(&mut self, name: &str, module: Rc<RefCell<ModuleObject>>) {
+    pub fn register_builtin_module(&mut self, name: &str, module: Shared<ModuleObject>) {
         self.builtin_modules.insert(name.to_string(), module);
     }
 
@@ -799,8 +851,9 @@ impl Vm {
         &mut self,
         snap: &ModuleInitSnapshot,
         package_name: &str,
-    ) -> Rc<RefCell<HashMap<String, Value>>> {
-        self.globals.clear();
+    ) -> Shared<HashMap<String, Value>> {
+        // 模块 init 换新表，避免 clear 共享 Arc 误伤调用方 / 其他 worker
+        self.globals = SharedMap::new();
         self.const_names.clear();
         self.pending_const.clear();
         self.op_clear();
@@ -808,8 +861,8 @@ impl Vm {
         self.name_to_slot.clear();
         self.func_stack.clear();
         self.func_frames.clear();
-        self.active_line_map = Rc::new(Vec::new());
-        self.active_column_map = Rc::new(Vec::new());
+        self.active_line_map = Arc::new(Vec::new());
+        self.active_column_map = Arc::new(Vec::new());
         self.try_stack.clear();
         self.active_exception = None;
         self.iterators.clear();
@@ -821,7 +874,7 @@ impl Vm {
             Value::Text(package_name.to_string()),
         );
 
-        let exports = Rc::new(RefCell::new(HashMap::new()));
+        let exports = Shared::new(HashMap::new());
         self.module_init_exports = Some(exports.clone());
 
         self.functions = snap.functions.clone();
@@ -834,10 +887,10 @@ impl Vm {
     pub(crate) fn finish_module_init(
         &mut self,
         snap: ModuleInitSnapshot,
-        new_functions: HashMap<String, Rc<FunctionObject>>,
-        new_macros: HashMap<String, Rc<MacroObject>>,
-        new_struct_defs: HashMap<String, Rc<crate::value::StructDef>>,
-        new_overloads: FxHashMap<String, Vec<Rc<FunctionObject>>>,
+        new_functions: HashMap<String, Arc<FunctionObject>>,
+        new_macros: HashMap<String, Arc<MacroObject>>,
+        new_struct_defs: HashMap<String, Arc<crate::value::StructDef>>,
+        new_overloads: FxHashMap<String, Vec<Arc<FunctionObject>>>,
     ) {
         self.globals = snap.globals;
         self.functions = snap.functions;
@@ -856,8 +909,8 @@ impl Vm {
         self.name_to_slot.clear();
         self.func_stack.clear();
         self.func_frames.clear();
-        self.active_line_map = Rc::new(Vec::new());
-        self.active_column_map = Rc::new(Vec::new());
+        self.active_line_map = Arc::new(Vec::new());
+        self.active_column_map = Arc::new(Vec::new());
         self.try_stack.clear();
         self.active_exception = None;
         self.iterators.clear();
@@ -909,11 +962,11 @@ impl Vm {
         self.hot_error = None;
         self.last_error_stack.clear();
 
-        self.code = Rc::new(program.code);
+        self.code = Arc::new(program.code);
         self.hot_ops = program.hot.ops.clone();
         self.hot_args = program.hot.args.clone();
-        self.active_line_map = Rc::new(program.line_map);
-        self.active_column_map = Rc::new(program.column_map);
+        self.active_line_map = Arc::new(program.line_map);
+        self.active_column_map = Arc::new(program.column_map);
         self.struct_defs.extend(program.struct_defs);
         self.enum_defs.extend(program.enum_defs);
         self.variant_defs.extend(program.variant_defs);
@@ -960,11 +1013,8 @@ impl Vm {
     pub(crate) fn snapshot_module_global_env(&self) -> ModuleGlobalEnv {
         ModuleGlobalEnv {
             global_names: self.script_global_names.clone(),
-            globals: std::cell::RefCell::new(
-                self.globals
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
+            globals: crate::shared::SyncCell::new(
+                self.globals.deep_clone().into_iter().collect(),
             ),
             finalized: true,
         }
@@ -975,12 +1025,7 @@ impl Vm {
         self.script_globals = self
             .script_global_names
             .iter()
-            .map(|name| {
-                self.globals
-                    .get(name)
-                    .cloned()
-                    .unwrap_or(Value::None)
-            })
+            .map(|name| self.globals.get(name).unwrap_or(Value::None))
             .collect();
     }
 
@@ -1474,7 +1519,7 @@ impl Vm {
             (Value::List(x), Value::List(y)) => {
                 let mut out = x.borrow().clone();
                 out.extend(y.borrow().iter().cloned());
-                let val = Value::List(Rc::new(RefCell::new(out)));
+                let val = Value::List(Shared::new(out));
                 self.track_value(&val);
                 self.push_value(val);
             }
@@ -2090,8 +2135,8 @@ impl Vm {
         self.ensure_op_stack(256);
         'outer: loop {
             // 仅在外层刷新切片；CallSelf/Cont 热路径不碰 Rc / ptr_eq。
-            let hot_ops = Rc::clone(&self.hot_ops);
-            let hot_args = Rc::clone(&self.hot_args);
+            let hot_ops = Arc::clone(&self.hot_ops);
+            let hot_args = Arc::clone(&self.hot_args);
             let ops = hot_ops.as_ref();
             let args = hot_args.as_ref();
             let code_len = ops.len();
@@ -2175,8 +2220,8 @@ impl Vm {
                         continue 'outer;
                     }
                     HotFlow::Cold => {
-                        let ops_ptr = Rc::as_ptr(&self.hot_ops) as *const u8;
-                        let args_ptr = Rc::as_ptr(&self.hot_args) as *const i64;
+                        let ops_ptr = Arc::as_ptr(&self.hot_ops) as *const u8;
+                        let args_ptr = Arc::as_ptr(&self.hot_args) as *const i64;
                         if let Err(e) = self.step() {
                             match self.handle_or_promote_error(&e)? {
                                 true => continue 'outer,
@@ -2207,8 +2252,8 @@ impl Vm {
                         if let Some(v) = self.pending_gen_yield.take() {
                             return Ok(InterpResult::Yielded(v));
                         }
-                        if std::ptr::eq(Rc::as_ptr(&self.hot_ops) as *const u8, ops_ptr)
-                            && std::ptr::eq(Rc::as_ptr(&self.hot_args) as *const i64, args_ptr)
+                        if std::ptr::eq(Arc::as_ptr(&self.hot_ops) as *const u8, ops_ptr)
+                            && std::ptr::eq(Arc::as_ptr(&self.hot_args) as *const i64, args_ptr)
                         {
                             continue 'hot;
                         }
@@ -2995,6 +3040,10 @@ impl Vm {
                 self.call_args_buf.reverse();
                 let args = std::mem::take(&mut self.call_args_buf);
                 let result = self.call_value(callee, args)?;
+                if self.pending_suspend {
+                    // arm_call_retry 已回绕栈与 PC，勿压返回值。
+                    return Ok(());
+                }
                 if !self.user_call_deferred && self.active_exception.is_none() {
                     self.push_value(result);
                 }
@@ -3028,6 +3077,9 @@ impl Vm {
                     _ => return Err(RuntimeError::type_err("CallList requires arg list")),
                 };
                 let result = self.call_value(callee, args)?;
+                if self.pending_suspend {
+                    return Ok(());
+                }
                 if !self.user_call_deferred && self.active_exception.is_none() {
                     self.push_value(result);
                 }
@@ -3045,6 +3097,9 @@ impl Vm {
                     _ => return Err(RuntimeError::type_err("CallEx requires kwargs dict")),
                 };
                 let result = self.call_value_ex(callee, positional, kwargs)?;
+                if self.pending_suspend {
+                    return Ok(());
+                }
                 if !self.user_call_deferred && self.active_exception.is_none() {
                     self.push_value(result);
                 }
@@ -3098,7 +3153,7 @@ impl Vm {
                     elems.push(self.pop()?);
                 }
                 elems.reverse();
-                let val = Value::List(Rc::new(RefCell::new(elems)));
+                let val = Value::List(Shared::new(elems));
                 self.track_value(&val);
                 self.push_value(val);
             }
@@ -3109,7 +3164,7 @@ impl Vm {
                     let k = self.pop()?;
                     map.insert(ValueKey::from_value(&k)?, v);
                 }
-                let val = Value::Dict(Rc::new(RefCell::new(map)));
+                let val = Value::Dict(Shared::new(map));
                 self.track_value(&val);
                 self.push_value(val);
             }
@@ -3123,7 +3178,7 @@ impl Vm {
                 for v in elems {
                     set.insert(ValueKey::from_value(&v)?);
                 }
-                let val = Value::Set(Rc::new(RefCell::new(set)));
+                let val = Value::Set(Shared::new(set));
                 self.track_value(&val);
                 self.push_value(val);
             }
@@ -3203,7 +3258,7 @@ impl Vm {
             StepAction::IterNew => {
                 let obj = self.pop()?;
                 let state = crate::value::value_to_iterable(&obj)?;
-                let rc = Rc::new(RefCell::new(state));
+                let rc = Shared::new(state);
                 self.gc.track_iter(&rc);
                 self.iterators.push(ActiveIter {
                     state: rc,
@@ -3341,7 +3396,7 @@ impl Vm {
                     self.push_value(item.clone());
                 }
                 let rest: Vec<Value> = items[before..rest_end].to_vec();
-                self.push_value(Value::List(Rc::new(RefCell::new(rest))));
+                self.push_value(Value::List(Shared::new(rest)));
                 for item in items.iter().skip(rest_end) {
                     self.push_value(item.clone());
                 }
@@ -3412,7 +3467,16 @@ impl Vm {
             }
             StepAction::Await => {
                 let v = self.pop()?;
-                let result = self.await_value(v)?;
+                let result = self.await_value(v.clone())?;
+                if self.block_suspend {
+                    self.block_suspend = false;
+                    self.push_value(v);
+                    if self.pc > 0 {
+                        self.pc -= 1;
+                    }
+                    self.pending_suspend = true;
+                    return Ok(());
+                }
                 self.push_value(result);
             }
             StepAction::Suspend => {
@@ -3521,7 +3585,7 @@ impl Vm {
         }
     }
 
-    pub(crate) fn register_enum_def(&mut self, name: String, def: Rc<crate::value::EnumDef>) {
+    pub(crate) fn register_enum_def(&mut self, name: String, def: Arc<crate::value::EnumDef>) {
         for (func_name, func) in crate::enum_variant::builtin_enum_method_entries(&name, &def) {
             self.functions.insert(func_name, func);
         }
@@ -3560,16 +3624,15 @@ impl Vm {
         }
         self.globals
             .get(name)
-            .cloned()
             .ok_or_else(|| RuntimeError::name_err(format!("undefined name: {name}")))
     }
 
-    pub(crate) fn upgrade_binding_to_cell(&mut self, name: &str) -> Result<Rc<RefCell<Value>>> {
+    pub(crate) fn upgrade_binding_to_cell(&mut self, name: &str) -> Result<Shared<Value>> {
         if let Value::Cell(cell) = self.get_binding(name)? {
             return Ok(cell);
         }
         let val = self.load_name(name)?;
-        let cell = Rc::new(RefCell::new(val));
+        let cell = Shared::new(val);
         self.gc.track_cell(&cell);
         self.set_binding_raw(name, Value::Cell(cell.clone()))?;
         Ok(cell)
@@ -3831,7 +3894,15 @@ impl Vm {
             Value::Struct(ref _s) if self.struct_has_method(&callee, "__call__") => {
                 self.call_struct_method(&callee, "__call__", args)
             }
-            Value::Builtin(f) => f(self, &args),
+            Value::Builtin(f) => {
+                let out = f(self, &args)?;
+                if self.block_suspend {
+                    self.block_suspend = false;
+                    self.arm_call_retry(Value::Builtin(f), args);
+                    return Ok(Value::None);
+                }
+                Ok(out)
+            }
             Value::Function(func) => {
                 let bound = self.bind_call_arguments(&func, args, kwargs)?;
                 if func.is_generator {
@@ -3933,7 +4004,7 @@ impl Vm {
 
         if let Some(vi) = var_i {
             let rest: Vec<Value> = positional[ai..].to_vec();
-            let list = Value::List(Rc::new(RefCell::new(rest)));
+            let list = Value::List(Shared::new(rest));
             self.track_value(&list);
             bound[vi] = Some(list);
         } else if ai < positional.len() {
@@ -3962,7 +4033,7 @@ impl Vm {
         }
 
         if let Some(ki) = kwvar_i {
-            let dict = Value::Dict(Rc::new(RefCell::new(kwargs)));
+            let dict = Value::Dict(Shared::new(kwargs));
             self.track_value(&dict);
             bound[ki] = Some(dict);
         } else if !kwargs.is_empty() {
@@ -3982,11 +4053,11 @@ impl Vm {
                 continue;
             }
             if param.is_variadic {
-                let list = Value::List(Rc::new(RefCell::new(Vec::new())));
+                let list = Value::List(Shared::new(Vec::new()));
                 self.track_value(&list);
                 bound[pi] = Some(list);
             } else if param.is_kwvariadic {
-                let dict = Value::Dict(Rc::new(RefCell::new(DictMap::new())));
+                let dict = Value::Dict(Shared::new(DictMap::new()));
                 self.track_value(&dict);
                 bound[pi] = Some(dict);
             } else if let Some(Some(d)) = func.defaults.get(pi) {
@@ -4035,7 +4106,7 @@ impl Vm {
                 resolved[i] = arg.clone();
             }
             let packed: Vec<Value> = args.iter().skip(vi).cloned().collect();
-            resolved[vi] = Value::List(Rc::new(RefCell::new(packed)));
+            resolved[vi] = Value::List(Shared::new(packed));
             Ok(resolved)
         } else if args.len() > param_count {
             Err(RuntimeError::type_err(format!(
@@ -4053,7 +4124,7 @@ impl Vm {
         }
     }
 
-    fn call_macro(&mut self, mac: Rc<MacroObject>, args: Vec<Value>) -> Result<Value> {
+    fn call_macro(&mut self, mac: Arc<MacroObject>, args: Vec<Value>) -> Result<Value> {
         for (i, arg) in args.iter().enumerate() {
             if !matches!(arg, Value::RuntimeAst(_)) {
                 return Err(RuntimeError::type_err(format!(
@@ -4091,7 +4162,7 @@ impl Vm {
         Ok(expanded)
     }
 
-    fn run_macro_body(&mut self, mac: Rc<MacroObject>, args: Vec<Value>) -> Result<Value> {
+    fn run_macro_body(&mut self, mac: Arc<MacroObject>, args: Vec<Value>) -> Result<Value> {
         self.enter_scope();
         for (i, param) in mac.params.iter().enumerate() {
             let val = args.get(i).cloned().unwrap_or(Value::None);
@@ -4245,14 +4316,14 @@ impl Vm {
         }
         match val {
             Value::List(l) => Ok(Value::List(l.clone())),
-            Value::Text(s) => Ok(Value::List(Rc::new(RefCell::new(
+            Value::Text(s) => Ok(Value::List(Shared::new(
                 s.chars().map(|c| Value::Text(c.to_string())).collect(),
-            )))),
+            ))),
             _ => Err(RuntimeError::type_err("object is not iterable")),
         }
     }
 
-    pub(crate) fn get_or_create_dispatch(&mut self, name: &str) -> Rc<RefCell<DispatchTable>> {
+    pub(crate) fn get_or_create_dispatch(&mut self, name: &str) -> Shared<DispatchTable> {
         if let Some(t) = self.globals.get(name).and_then(|v| {
             if let Value::Dispatch(t) = v {
                 Some(t.clone())
@@ -4262,31 +4333,31 @@ impl Vm {
         }) {
             return t;
         }
-        let table = Rc::new(RefCell::new(DispatchTable {
+        let table = Shared::new(DispatchTable {
             name: name.to_string(),
-            handlers: Rc::new(RefCell::new(Vec::new())),
-        }));
+            handlers: Shared::new(Vec::new()),
+        });
         self.globals
             .insert(name.to_string(), Value::Dispatch(table.clone()));
         table
     }
 
-    pub(crate) fn get_or_create_convert(&mut self, type_name: &str) -> Rc<RefCell<DispatchTable>> {
+    pub(crate) fn get_or_create_convert(&mut self, type_name: &str) -> Shared<DispatchTable> {
         let key = format!("__convert__:{type_name}");
         self.convert_tables
             .entry(key.clone())
             .or_insert_with(|| {
-                Rc::new(RefCell::new(DispatchTable {
+                Shared::new(DispatchTable {
                     name: key,
-                    handlers: Rc::new(RefCell::new(Vec::new())),
-                }))
+                    handlers: Shared::new(Vec::new()),
+                })
             })
             .clone()
     }
 
-    fn call_dispatch(&mut self, table: &Rc<RefCell<DispatchTable>>, args: Vec<Value>) -> Result<Value> {
+    fn call_dispatch(&mut self, table: &Shared<DispatchTable>, args: Vec<Value>) -> Result<Value> {
         enum DispatchTarget {
-            Function(Rc<FunctionObject>),
+            Function(Arc<FunctionObject>),
             Builtin(BuiltinFn),
         }
 
@@ -4315,7 +4386,15 @@ impl Vm {
         if let Some((_, _, target)) = best {
             return match target {
                 DispatchTarget::Function(func) => self.call_user_function(func, args),
-                DispatchTarget::Builtin(f) => f(self, &args),
+                DispatchTarget::Builtin(f) => {
+                    let out = f(self, &args)?;
+                    if self.block_suspend {
+                        self.block_suspend = false;
+                        self.arm_call_retry(Value::Builtin(f), args);
+                        return Ok(Value::None);
+                    }
+                    Ok(out)
+                }
             };
         }
         let table_name = table.borrow().name.clone();
@@ -4407,11 +4486,11 @@ impl Vm {
         self.enum_defs.extend(program.enum_defs);
         self.variant_defs.extend(program.variant_defs);
         self.init_script_globals(program.global_names);
-        self.code = Rc::new(program.code);
+        self.code = Arc::new(program.code);
         self.hot_ops = program.hot.ops.clone();
         self.hot_args = program.hot.args.clone();
-        self.active_line_map = Rc::new(program.line_map);
-        self.active_column_map = Rc::new(program.column_map);
+        self.active_line_map = Arc::new(program.line_map);
+        self.active_column_map = Arc::new(program.column_map);
         self.pc = 0;
         self.op_clear();
         self.run_interpreter(None)?;
@@ -4471,7 +4550,7 @@ impl Vm {
 
     pub(crate) fn call_user_function_catching(
         &mut self,
-        func: Rc<FunctionObject>,
+        func: Arc<FunctionObject>,
         args: Vec<Value>,
     ) -> std::result::Result<std::result::Result<Value, Value>, RuntimeError> {
         match self.call_user_function(func, args) {
@@ -4550,10 +4629,10 @@ impl Vm {
 
     pub(crate) fn check_list_element_write(
         &mut self,
-        list: &Rc<RefCell<Vec<Value>>>,
+        list: &Shared<Vec<Value>>,
         elem: &Value,
     ) -> Result<()> {
-        let ptr = Rc::as_ptr(list) as usize;
+        let ptr = list.as_ptr() as usize;
         let Some(ty) = self.list_element_contracts.get(&ptr).cloned() else {
             return Ok(());
         };
@@ -4562,11 +4641,11 @@ impl Vm {
 
     pub(crate) fn check_dict_write(
         &mut self,
-        dict: &Rc<RefCell<crate::value::DictMap>>,
+        dict: &Shared<crate::value::DictMap>,
         key: &Value,
         val: &Value,
     ) -> Result<()> {
-        let ptr = Rc::as_ptr(dict) as usize;
+        let ptr = dict.as_ptr() as usize;
         let Some((kty, vty)) = self.dict_contracts.get(&ptr).cloned() else {
             return Ok(());
         };
@@ -4576,10 +4655,10 @@ impl Vm {
 
     pub(crate) fn check_set_element_write(
         &mut self,
-        set: &Rc<RefCell<crate::value::SetMap>>,
+        set: &Shared<crate::value::SetMap>,
         elem: &Value,
     ) -> Result<()> {
-        let ptr = Rc::as_ptr(set) as usize;
+        let ptr = set.as_ptr() as usize;
         let Some(ty) = self.set_element_contracts.get(&ptr).cloned() else {
             return Ok(());
         };
@@ -4603,7 +4682,7 @@ impl Vm {
         self.raise_type_error(msg)
     }
 
-    pub(crate) fn call_user_function(&mut self, func: Rc<FunctionObject>, args: Vec<Value>) -> Result<Value> {
+    pub(crate) fn call_user_function(&mut self, func: Arc<FunctionObject>, args: Vec<Value>) -> Result<Value> {
         match self.call_user_function_poll(func, args)? {
             InterpResult::Value(v) => Ok(v.unwrap_or(Value::None)),
             InterpResult::Suspended => Err(RuntimeError::msg(
@@ -4620,7 +4699,7 @@ impl Vm {
 
     fn call_user_function_poll(
         &mut self,
-        func: Rc<FunctionObject>,
+        func: Arc<FunctionObject>,
         args: Vec<Value>,
     ) -> Result<InterpResult> {
         let bound = self.bind_call_arguments(&func, args, DictMap::new())?;
@@ -4645,7 +4724,7 @@ impl Vm {
 
     fn setup_user_call(
         &mut self,
-        func: Rc<FunctionObject>,
+        func: Arc<FunctionObject>,
         args: Vec<Value>,
         reenter: bool,
     ) -> Result<()> {
@@ -5110,11 +5189,11 @@ impl Vm {
             self.enum_defs.extend(program.enum_defs.clone());
             self.variant_defs.extend(program.variant_defs.clone());
             self.init_script_globals(program.global_names.clone());
-            self.code = Rc::new(program.code);
+            self.code = Arc::new(program.code);
             self.hot_ops = program.hot.ops.clone();
             self.hot_args = program.hot.args.clone();
-            self.active_line_map = Rc::new(program.line_map.clone());
-            self.active_column_map = Rc::new(program.column_map.clone());
+            self.active_line_map = Arc::new(program.line_map.clone());
+            self.active_column_map = Arc::new(program.column_map.clone());
             self.pc = 0;
             self.op_clear();
 
@@ -5198,10 +5277,10 @@ impl Vm {
 
     pub(crate) fn dispatch_overload(
         &mut self,
-        overloads: &[Rc<FunctionObject>],
+        overloads: &[Arc<FunctionObject>],
         args: &[Value],
     ) -> Result<Value> {
-        let mut best: Option<(usize, Rc<FunctionObject>)> = None;
+        let mut best: Option<(usize, Arc<FunctionObject>)> = None;
         for func in overloads {
             if let Some(score) = types::dispatch_match_score(self, func, args) {
                 if best.as_ref().map(|(s, _)| score < *s).unwrap_or(true) {
@@ -5217,7 +5296,7 @@ impl Vm {
 
     pub(crate) fn advance_iterator(
         &mut self,
-        state: &Rc<RefCell<IteratorState>>,
+        state: &Shared<IteratorState>,
     ) -> Result<Option<Value>> {
         if matches!(&state.borrow().kind, IteratorKind::Generator { .. }) {
             return self.resume_generator(state);
@@ -5252,7 +5331,7 @@ impl Vm {
                             None => return Ok(None),
                         }
                     }
-                    return Ok(Some(Value::List(Rc::new(RefCell::new(out)))));
+                    return Ok(Some(Value::List(Shared::new(out))));
                 }
                 IteratorKind::Map { func, source } => {
                     let func = func.clone();
@@ -5341,7 +5420,7 @@ impl Vm {
 
     fn make_generator_iterator(
         &mut self,
-        func: Rc<FunctionObject>,
+        func: Arc<FunctionObject>,
         args: Vec<Value>,
     ) -> Result<Value> {
         let args = self.apply_implicit_param_converts(&func, args)?;
@@ -5408,7 +5487,7 @@ impl Vm {
 
     fn resume_generator(
         &mut self,
-        state: &Rc<RefCell<IteratorState>>,
+        state: &Shared<IteratorState>,
     ) -> Result<Option<Value>> {
         loop {
             let (func, locals, name_map, pc, exhausted, yield_from) = {
@@ -5535,7 +5614,7 @@ impl Vm {
         }
         let iter = match iterable {
             Value::Iterator(it) => it,
-            other => Rc::new(RefCell::new(crate::value::value_to_iterable(&other)?)),
+            other => Shared::new(crate::value::value_to_iterable(&other)?),
         };
         // 内层生成器的 resume 会改写 active_generator / generator_resuming，需保存外层。
         let saved_active = self.active_generator.clone();
@@ -5608,20 +5687,196 @@ impl Vm {
     }
 
     pub(crate) fn spawn_task(&mut self, callable: Value, args: Vec<Value>) -> Value {
-        let task = Rc::new(RefCell::new(TaskInner::pending(callable, args)));
-        self.ready_tasks.push_back(task.clone());
+        let task = Shared::new(TaskInner::pending(callable, args));
+        self.enqueue_task(task.clone());
         Value::Task(task)
+    }
+
+    fn enqueue_task(&mut self, task: Shared<TaskInner>) {
+        if self.mn_parallel {
+            self.local_worker.push(task);
+            self.mn.notify_one();
+        } else {
+            self.ready_tasks.push_back(task);
+        }
+    }
+
+    fn take_ready_task(&mut self) -> Option<Shared<TaskInner>> {
+        if self.mn_parallel {
+            self.mn.steal_task(&self.local_worker)
+        } else {
+            self.ready_tasks.pop_front()
+        }
+    }
+
+    fn fiber_insert(&mut self, key: usize, fiber: TaskFiber) {
+        if self.mn_parallel {
+            self.mn.fibers.lock().insert(key, fiber);
+        } else {
+            self.task_fibers.insert(key, fiber);
+        }
+    }
+
+    fn fiber_take(&mut self, key: usize) -> Option<TaskFiber> {
+        if self.mn_parallel {
+            self.mn.fibers.lock().remove(&key)
+        } else {
+            self.task_fibers.remove(&key)
+        }
+    }
+
+    /// 为 M:N 辅助线程复制一份可共享 globals/注册表的 Vm。
+    fn fork_worker(&self) -> Self {
+        let local_worker = scheduler::new_local_worker();
+        self.mn.register_stealer(local_worker.stealer());
+        Self {
+            code: Arc::new(Vec::new()),
+            hot_ops: Arc::from([]),
+            hot_args: Arc::from([]),
+            stack: Vec::with_capacity(STACK_INIT_CAP),
+            stack_sp: 0,
+            globals: self.globals.clone(),
+            locals_stack: Vec::new(),
+            name_to_slot: Vec::new(),
+            func_stack: Vec::new(),
+            func_frames: Vec::new(),
+            pc: 0,
+            active_line_map: Arc::new(Vec::new()),
+            active_column_map: Arc::new(Vec::new()),
+            struct_defs: self.struct_defs.clone(),
+            enum_defs: self.enum_defs.clone(),
+            variant_defs: self.variant_defs.clone(),
+            functions: self.functions.clone(),
+            macros: self.macros.clone(),
+            try_stack: Vec::new(),
+            active_exception: None,
+            iterators: Vec::new(),
+            const_names: self.const_names.clone(),
+            pending_const: FxHashSet::default(),
+            module_cache: self.module_cache.clone(),
+            builtin_modules: self.builtin_modules.clone(),
+            module_init_exports: None,
+            macro_eval_scopes: Vec::new(),
+            convert_tables: self.convert_tables.clone(),
+            source_file: self.source_file.clone(),
+            current_source: self.current_source.clone(),
+            last_error_stack: Vec::new(),
+            import_base: self.import_base.clone(),
+            dep_map: self.dep_map.clone(),
+            current_package_id: self.current_package_id.clone(),
+            package_root: self.package_root.clone(),
+            overload_tables: self.overload_tables.clone(),
+            primitive_methods: self.primitive_methods.clone(),
+            user_call_frames: Vec::new(),
+            user_call_deferred: false,
+            script_global_names: self.script_global_names.clone(),
+            script_globals: self.script_globals.clone(),
+            local_frame_pool: Vec::new(),
+            call_args_buf: Vec::with_capacity(CALL_ARGS_BUF_INIT_CAP),
+            fast_ret_pcs: Vec::with_capacity(FAST_RET_PCS_INIT_CAP),
+            fast_ret_sp: 0,
+            lw_slots: Vec::with_capacity(LW_SLOTS_INIT_CAP),
+            lw_bases: Vec::with_capacity(LW_BASES_INIT_CAP),
+            lw_bases_sp: 0,
+            lw_sp: 0,
+            lw_base: 0,
+            lw_depth: 0,
+            lw_entry_pc: 0,
+            lw_frame_slots: 0,
+            cached_max_depth: self.cached_max_depth,
+            pending_ret: None,
+            hot_failed: false,
+            hot_error: None,
+            gc: crate::gc::GcTracker::new(),
+            list_element_contracts: self.list_element_contracts.clone(),
+            dict_contracts: self.dict_contracts.clone(),
+            set_element_contracts: self.set_element_contracts.clone(),
+            protocols: self.protocols.clone(),
+            ready_tasks: VecDeque::new(),
+            task_fibers: FxHashMap::default(),
+            mn: self.mn.clone(),
+            local_worker,
+            mn_parallel: true,
+            mn_primary: false,
+            sched_depth: 0,
+            block_suspend: false,
+            task_ctx: None,
+            suspend_budget: self.suspend_budget,
+            budget_left: self.suspend_budget,
+            pending_suspend: false,
+            pending_main_yield: false,
+            generator_resuming: false,
+            active_generator: None,
+            pending_gen_yield: None,
+            debug: self.debug.clone(),
+            caps: self.caps.clone(),
+        }
+    }
+
+    fn spawn_helper_workers(&self) {
+        let n = self.mn.worker_count;
+        for i in 1..n {
+            let mut worker_vm = self.fork_worker();
+            let mn = self.mn.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("optive-w{i}"))
+                .spawn(move || {
+                    mn.mark_helper_started();
+                    while !mn.is_shutdown() {
+                        match worker_vm.take_ready_task() {
+                            Some(task) => {
+                                let _ = worker_vm.scheduler_run_task(task);
+                            }
+                            None => mn.wait_brief(),
+                        }
+                    }
+                });
+        }
+    }
+
+    /// 阻塞等待时：
+    /// - 已在任务纤程内（`sched_depth>0`）：**禁止再入** `scheduler_run_one`
+    ///   （嵌套 capture 会破坏外层栈）；改为挂起本任务，让外层调度器继续；
+    /// - 否则先跑就绪队列；M:N 下再短等。
+    fn wait_or_deadlock(&mut self, msg: &str) -> Result<()> {
+        self.mn.poll_safepoint();
+        // 任务内阻塞：立即挂起并回绕 Call，由外层（主纤程/其它 worker）推进。
+        if self.sched_depth > 0 && self.task_ctx.is_some() {
+            self.block_suspend = true;
+            return Ok(());
+        }
+        if self.scheduler_run_one()? {
+            return Ok(());
+        }
+        if self.mn_parallel {
+            self.mn.wait_brief();
+            return Ok(());
+        }
+        Err(RuntimeError::deadlock(msg))
+    }
+
+    /// 将 callee/args 压回栈并把 PC 拨回 Call，供挂起恢复后重试。
+    fn arm_call_retry(&mut self, callee: Value, args: Vec<Value>) {
+        for a in args {
+            self.push_value(a);
+        }
+        self.push_value(callee);
+        if self.pc > 0 {
+            self.pc -= 1;
+        }
+        self.pending_suspend = true;
     }
 
     pub(crate) fn task_from_value(&mut self, value: Value) -> Value {
         if matches!(value, Value::Task(_)) {
             return value;
         }
-        Value::Task(Rc::new(RefCell::new(TaskInner::done(value))))
+        Value::Task(Shared::new(TaskInner::done(value)))
     }
 
     #[inline]
     fn tick_budget(&mut self) {
+        self.mn.poll_safepoint();
         if self.budget_left > 0 {
             self.budget_left -= 1;
         }
@@ -5635,11 +5890,11 @@ impl Vm {
         }
     }
 
-    fn task_ptr_key(task: &Rc<RefCell<TaskInner>>) -> usize {
-        Rc::as_ptr(task) as usize
+    fn task_ptr_key(task: &Shared<TaskInner>) -> usize {
+        task.as_ptr() as usize
     }
 
-    fn snapshot_task_ctx(task: Rc<RefCell<TaskInner>>, vm: &Vm) -> TaskRunCtx {
+    fn snapshot_task_ctx(task: Shared<TaskInner>, vm: &Vm) -> TaskRunCtx {
         TaskRunCtx {
             task,
             stop_ucf: vm.user_call_frames.len(),
@@ -5657,6 +5912,12 @@ impl Vm {
             stop_lw_base: vm.lw_base,
             stop_lw_entry_pc: vm.lw_entry_pc,
             stop_lw_frame_slots: vm.lw_frame_slots,
+            host_code: vm.code.clone(),
+            host_hot_ops: vm.hot_ops.clone(),
+            host_hot_args: vm.hot_args.clone(),
+            host_pc: vm.pc,
+            host_line_map: vm.active_line_map.clone(),
+            host_column_map: vm.active_column_map.clone(),
         }
     }
 
@@ -5745,21 +6006,30 @@ impl Vm {
         self.lw_entry_pc = ctx.stop_lw_entry_pc;
         self.lw_frame_slots = ctx.stop_lw_frame_slots;
 
-        // 恢复主/外层代码指针：取刚拆下的最底帧的 saved_*（setup_user_call 时保存）。
-        if let Some(frame) = fiber.user_call_frames.first() {
-            self.code = frame.saved_code.clone();
-            self.hot_ops = frame.saved_hot_ops.clone();
-            self.hot_args = frame.saved_hot_args.clone();
-            self.pc = frame.saved_pc;
-            self.active_line_map = frame.saved_line_map.clone();
-            self.active_column_map = frame.saved_column_map.clone();
-        }
+        // 始终恢复本 worker 切入任务前的代码指针（见 TaskRunCtx 注释）。
+        self.code = ctx.host_code.clone();
+        self.hot_ops = ctx.host_hot_ops.clone();
+        self.hot_args = ctx.host_hot_args.clone();
+        self.pc = ctx.host_pc;
+        self.active_line_map = ctx.host_line_map.clone();
+        self.active_column_map = ctx.host_column_map.clone();
 
         fiber
     }
 
-    fn install_fiber(&mut self, task: Rc<RefCell<TaskInner>>, mut fiber: TaskFiber) {
+    fn install_fiber(&mut self, task: Shared<TaskInner>, mut fiber: TaskFiber) {
         let ctx = Self::snapshot_task_ctx(task, self);
+
+        // 纤程可能从其它 worker 迁来：最底帧的 saved_* 仍是旧宿主（helper 上常为空）。
+        // 改写为当前宿主，这样任务 return 时 restore_user_call_frame 不会清掉主模块代码。
+        if let Some(frame) = fiber.user_call_frames.first_mut() {
+            frame.saved_code = self.code.clone();
+            frame.saved_hot_ops = self.hot_ops.clone();
+            frame.saved_hot_args = self.hot_args.clone();
+            frame.saved_pc = self.pc;
+            frame.saved_line_map = self.active_line_map.clone();
+            frame.saved_column_map = self.active_column_map.clone();
+        }
 
         self.code = fiber.code;
         self.hot_ops = fiber.hot_ops;
@@ -5830,27 +6100,45 @@ impl Vm {
         };
         let key = Self::task_ptr_key(&ctx.task);
         let fiber = self.capture_fiber(&ctx);
-        self.task_fibers.insert(key, fiber);
+        self.fiber_insert(key, fiber);
         ctx.task.borrow_mut().state = TaskState::Suspended;
-        self.ready_tasks.push_back(ctx.task);
+        self.enqueue_task(ctx.task);
         Ok(InterpResult::Suspended)
     }
 
     pub(crate) fn scheduler_run_one(&mut self) -> Result<bool> {
-        let Some(task) = self.ready_tasks.pop_front() else {
+        let Some(task) = self.take_ready_task() else {
             return Ok(false);
         };
+        self.scheduler_run_task(task)
+    }
+
+    fn scheduler_run_task(&mut self, task: Shared<TaskInner>) -> Result<bool> {
         let key = Self::task_ptr_key(&task);
+        // 认领：仅 Pending/Suspended 可进入 Running。重复入队的副本直接跳过。
+        let state = {
+            let mut inner = task.borrow_mut();
+            match &inner.state {
+                TaskState::Pending { .. } | TaskState::Suspended => {
+                    std::mem::replace(&mut inner.state, TaskState::Running)
+                }
+                TaskState::Running | TaskState::Done(_) | TaskState::Failed(_) => {
+                    return Ok(false);
+                }
+            }
+        };
+
         let saved_ctx = self.task_ctx.take();
         let saved_budget = self.budget_left;
         let saved_pending = self.pending_suspend;
+        let saved_block_suspend = self.block_suspend;
         self.pending_suspend = false;
+        // 任务内阻塞挂起不得泄漏到调用方（主 fiber 的 Channel.recv 等），
+        // 否则调用方会误走 arm_call_retry / 把栈上残留的 Task 当成 recv 结果。
+        self.block_suspend = false;
+        self.sched_depth = self.sched_depth.saturating_add(1);
 
         let run_result = (|| -> Result<Option<Value>> {
-            let state = {
-                let mut inner = task.borrow_mut();
-                std::mem::replace(&mut inner.state, TaskState::Running)
-            };
             match state {
                 TaskState::Pending { callable, args } => {
                     self.task_ctx = Some(Self::snapshot_task_ctx(task.clone(), self));
@@ -5874,7 +6162,7 @@ impl Vm {
                     }
                 }
                 TaskState::Suspended => {
-                    let Some(fiber) = self.task_fibers.remove(&key) else {
+                    let Some(fiber) = self.fiber_take(key) else {
                         return Err(RuntimeError::msg(
                             "internal error: suspended task missing fiber",
                         ));
@@ -5902,9 +6190,8 @@ impl Vm {
                         }
                     }
                 }
-                other => {
-                    task.borrow_mut().state = other;
-                    Ok(Some(Value::None))
+                TaskState::Running | TaskState::Done(_) | TaskState::Failed(_) => {
+                    unreachable!("claimed only Pending/Suspended")
                 }
             }
         })();
@@ -5930,17 +6217,29 @@ impl Vm {
             }
         }
 
+        self.sched_depth = self.sched_depth.saturating_sub(1);
         self.task_ctx = saved_ctx;
         self.budget_left = saved_budget;
         self.pending_suspend = saved_pending;
+        self.block_suspend = saved_block_suspend;
+        self.mn.notify_all();
         Ok(true)
     }
 
     pub(crate) fn scheduler_yield(&mut self) -> Result<()> {
-        let n = self.ready_tasks.len();
-        for _ in 0..n {
-            if !self.scheduler_run_one()? {
-                break;
+        if self.mn_parallel {
+            // 并行：尽量抽干本地/全局一小批任务。
+            for _ in 0..64 {
+                if !self.scheduler_run_one()? {
+                    break;
+                }
+            }
+        } else {
+            let n = self.ready_tasks.len();
+            for _ in 0..n {
+                if !self.scheduler_run_one()? {
+                    break;
+                }
             }
         }
         Ok(())
@@ -5971,20 +6270,24 @@ impl Vm {
                     return Ok(Value::None);
                 }
                 TaskState::Pending { .. } | TaskState::Suspended => {
-                    if !self.ready_tasks.iter().any(|t| Rc::ptr_eq(t, &task)) {
+                    if self.mn_parallel {
+                        self.enqueue_task(task.clone());
+                    } else if !self.ready_tasks.iter().any(|t| Shared::ptr_eq(t, &task)) {
                         self.ready_tasks.push_back(task.clone());
                     }
-                    if !self.scheduler_run_one()? {
-                        return Err(RuntimeError::msg(
-                            "DeadlockError: no runnable tasks while awaiting",
-                        ));
+                    self.wait_or_deadlock(
+                        "no runnable tasks while awaiting",
+                    )?;
+                    if self.block_suspend {
+                        return Ok(Value::None);
                     }
                 }
                 TaskState::Running => {
-                    if !self.scheduler_run_one()? {
-                        return Err(RuntimeError::msg(
-                            "DeadlockError: no runnable tasks while awaiting",
-                        ));
+                    self.wait_or_deadlock(
+                        "no runnable tasks while awaiting",
+                    )?;
+                    if self.block_suspend {
+                        return Ok(Value::None);
                     }
                 }
             }
@@ -6016,7 +6319,7 @@ impl Vm {
 
     pub(crate) fn channel_send(
         &mut self,
-        ch: &Rc<RefCell<ChannelInner>>,
+        ch: &Shared<ChannelInner>,
         value: Value,
     ) -> Result<()> {
         loop {
@@ -6026,18 +6329,18 @@ impl Vm {
             };
             match outcome {
                 Some(Ok(())) => {
+                    self.mn.notify_all();
                     if ch.borrow().capacity == Some(0) {
                         loop {
                             if ch.borrow().queue.is_empty() {
                                 return Ok(());
                             }
-                            if !self.scheduler_run_one()? {
-                                if ch.borrow().queue.is_empty() {
-                                    return Ok(());
-                                }
-                                return Err(RuntimeError::msg(
-                                    "DeadlockError: channel send blocked",
-                                ));
+                            self.wait_or_deadlock("channel send blocked")?;
+                            if self.block_suspend {
+                                return Ok(());
+                            }
+                            if ch.borrow().queue.is_empty() {
+                                return Ok(());
                             }
                         }
                     }
@@ -6049,10 +6352,9 @@ impl Vm {
                     ));
                 }
                 None => {
-                    if !self.scheduler_run_one()? {
-                        return Err(RuntimeError::msg(
-                            "DeadlockError: channel send blocked",
-                        ));
+                    self.wait_or_deadlock("channel send blocked")?;
+                    if self.block_suspend {
+                        return Ok(());
                     }
                 }
             }
@@ -6061,7 +6363,7 @@ impl Vm {
 
     pub(crate) fn channel_recv(
         &mut self,
-        ch: &Rc<RefCell<ChannelInner>>,
+        ch: &Shared<ChannelInner>,
     ) -> Result<Value> {
         loop {
             let outcome = {
@@ -6069,20 +6371,22 @@ impl Vm {
                 inner.try_recv()
             };
             match outcome {
-                Some(Some(v)) => return Ok(v),
+                Some(Some(v)) => {
+                    self.mn.notify_all();
+                    return Ok(v);
+                }
                 Some(None) => return Ok(Value::None),
                 None => {
-                    if !self.scheduler_run_one()? {
-                        return Err(RuntimeError::msg(
-                            "DeadlockError: channel recv blocked",
-                        ));
+                    self.wait_or_deadlock("channel recv blocked")?;
+                    if self.block_suspend {
+                        return Ok(Value::None);
                     }
                 }
             }
         }
     }
 
-    pub(crate) fn mutex_lock(&mut self, m: &Rc<RefCell<MutexInner>>) -> Result<Value> {
+    pub(crate) fn mutex_lock(&mut self, m: &Shared<MutexInner>) -> Result<Value> {
         loop {
             {
                 let mut inner = m.borrow_mut();
@@ -6091,15 +6395,16 @@ impl Vm {
                     return Ok(Value::MutexGuard(m.clone()));
                 }
             }
-            if !self.scheduler_run_one()? {
-                return Err(RuntimeError::msg("DeadlockError: mutex lock blocked"));
+            self.wait_or_deadlock("mutex lock blocked")?;
+            if self.block_suspend {
+                return Ok(Value::None);
             }
         }
     }
 
     pub(crate) fn rwmutex_read(
         &mut self,
-        s: &Rc<RefCell<crate::value::SyncInner>>,
+        s: &Shared<crate::value::SyncInner>,
     ) -> Result<Value> {
         use crate::value::{SyncGuardInner, SyncInner};
         loop {
@@ -6111,23 +6416,24 @@ impl Vm {
                 {
                     if !*writer {
                         *readers += 1;
-                        return Ok(Value::SyncGuard(Rc::new(RefCell::new(
+                        return Ok(Value::SyncGuard(Shared::new(
                             SyncGuardInner::Read { mu: s.clone() },
-                        ))));
+                        )));
                     }
                 } else {
                     return Err(RuntimeError::type_err("expected RWMutex"));
                 }
             }
-            if !self.scheduler_run_one()? {
-                return Err(RuntimeError::msg("DeadlockError: RWMutex.read blocked"));
+            self.wait_or_deadlock("RWMutex.read blocked")?;
+            if self.block_suspend {
+                return Ok(Value::None);
             }
         }
     }
 
     pub(crate) fn rwmutex_write(
         &mut self,
-        s: &Rc<RefCell<crate::value::SyncInner>>,
+        s: &Shared<crate::value::SyncInner>,
     ) -> Result<Value> {
         use crate::value::{SyncGuardInner, SyncInner};
         loop {
@@ -6139,23 +6445,24 @@ impl Vm {
                 {
                     if !*writer && *readers == 0 {
                         *writer = true;
-                        return Ok(Value::SyncGuard(Rc::new(RefCell::new(
+                        return Ok(Value::SyncGuard(Shared::new(
                             SyncGuardInner::Write { mu: s.clone() },
-                        ))));
+                        )));
                     }
                 } else {
                     return Err(RuntimeError::type_err("expected RWMutex"));
                 }
             }
-            if !self.scheduler_run_one()? {
-                return Err(RuntimeError::msg("DeadlockError: RWMutex.write blocked"));
+            self.wait_or_deadlock("RWMutex.write blocked")?;
+            if self.block_suspend {
+                return Ok(Value::None);
             }
         }
     }
 
     pub(crate) fn waitgroup_wait(
         &mut self,
-        s: &Rc<RefCell<crate::value::SyncInner>>,
+        s: &Shared<crate::value::SyncInner>,
     ) -> Result<Value> {
         use crate::value::SyncInner;
         loop {
@@ -6169,15 +6476,16 @@ impl Vm {
                     return Err(RuntimeError::type_err("expected WaitGroup"));
                 }
             }
-            if !self.scheduler_run_one()? {
-                return Err(RuntimeError::msg("DeadlockError: WaitGroup.wait blocked"));
+            self.wait_or_deadlock("WaitGroup.wait blocked")?;
+            if self.block_suspend {
+                return Ok(Value::None);
             }
         }
     }
 
     pub(crate) fn semaphore_acquire(
         &mut self,
-        s: &Rc<RefCell<crate::value::SyncInner>>,
+        s: &Shared<crate::value::SyncInner>,
     ) -> Result<Value> {
         use crate::value::SyncInner;
         loop {
@@ -6192,17 +6500,16 @@ impl Vm {
                     return Err(RuntimeError::type_err("expected Semaphore"));
                 }
             }
-            if !self.scheduler_run_one()? {
-                return Err(RuntimeError::msg(
-                    "DeadlockError: Semaphore.acquire blocked",
-                ));
+            self.wait_or_deadlock("Semaphore.acquire blocked")?;
+            if self.block_suspend {
+                return Ok(Value::None);
             }
         }
     }
 
     pub(crate) fn once_do(
         &mut self,
-        s: &Rc<RefCell<crate::value::SyncInner>>,
+        s: &Shared<crate::value::SyncInner>,
         callable: Value,
     ) -> Result<Value> {
         use crate::value::SyncInner;
@@ -6270,7 +6577,7 @@ impl Vm {
 
     pub(crate) fn barrier_wait(
         &mut self,
-        s: &Rc<RefCell<crate::value::SyncInner>>,
+        s: &Shared<crate::value::SyncInner>,
     ) -> Result<Value> {
         use crate::value::SyncInner;
         let my_gen = {
@@ -6287,6 +6594,8 @@ impl Vm {
             if *waiting as i64 >= *n {
                 *waiting = 0;
                 *generation = generation.wrapping_add(1);
+                drop(inner);
+                self.mn.notify_all();
                 return Ok(Value::None);
             }
             *generation
@@ -6302,16 +6611,17 @@ impl Vm {
                     return Err(RuntimeError::type_err("expected Barrier"));
                 }
             }
-            if !self.scheduler_run_one()? {
-                return Err(RuntimeError::msg("DeadlockError: Barrier.wait blocked"));
+            self.wait_or_deadlock("Barrier.wait blocked")?;
+            if self.block_suspend {
+                return Ok(Value::None);
             }
         }
     }
 
     pub(crate) fn cond_wait(
         &mut self,
-        cond: &Rc<RefCell<crate::value::SyncInner>>,
-        guard: &Rc<RefCell<MutexInner>>,
+        cond: &Shared<crate::value::SyncInner>,
+        guard: &Shared<MutexInner>,
     ) -> Result<Value> {
         use crate::value::SyncInner;
         // 登记 waiter，释放锁
@@ -6342,12 +6652,19 @@ impl Vm {
             if got {
                 break;
             }
-            if !self.scheduler_run_one()? {
-                // 回滚 waiter 计数
-                if let SyncInner::Cond { waiters, .. } = &mut *cond.borrow_mut() {
-                    *waiters = (*waiters - 1).max(0);
+            match self.wait_or_deadlock("Cond.wait blocked") {
+                Ok(()) => {
+                    if self.block_suspend {
+                        // 挂起前保持 waiter 登记；恢复后重试 Cond.wait Call。
+                        return Ok(Value::None);
+                    }
                 }
-                return Err(RuntimeError::msg("DeadlockError: Cond.wait blocked"));
+                Err(e) => {
+                    if let SyncInner::Cond { waiters, .. } = &mut *cond.borrow_mut() {
+                        *waiters = (*waiters - 1).max(0);
+                    }
+                    return Err(e);
+                }
             }
         }
 
@@ -6360,9 +6677,17 @@ impl Vm {
         let mut children = Vec::new();
         for it in iterables {
             let state = crate::value::value_to_iterable(&it)?;
-            children.push(Rc::new(RefCell::new(state)));
+            children.push(Shared::new(state));
         }
         Ok(IteratorState::from_zip(children).as_value())
+    }
+}
+
+impl Drop for Vm {
+    fn drop(&mut self) {
+        if self.mn_primary && self.mn_parallel {
+            self.mn.shutdown();
+        }
     }
 }
 
@@ -6409,26 +6734,39 @@ fn compare_num(a: &Value, b: &Value) -> Result<i32> {
 
 fn index_value(vm: &mut Vm, obj: &Value, idx: &Value) -> Result<Value> {
     match (obj, idx) {
-        (Value::TypeRef(ref type_name), idx) if types::is_generic_type_formable(vm, type_name) => {
+        (Value::TypeRef(ref type_name), idx)
+            if types::is_generic_type_formable(vm, type_name)
+                || crate::type_registry::is_type_form(type_name)
+                || crate::ptr_registry::is_ptr_type_name(type_name) =>
+        {
             let args = types::type_index_operand_to_args(idx)?;
-            let def = vm.struct_defs.get(type_name).ok_or_else(|| {
-                RuntimeError::msg(format!("unknown generic struct type: {type_name}"))
-            })?;
-            if args.len() != def.type_params.len() {
-                return Err(RuntimeError::type_err(format!(
-                    "struct {type_name} expects {} type argument(s), got {}",
-                    def.type_params.len(),
-                    args.len()
-                )));
+            if let Some(def) = vm.struct_defs.get(type_name) {
+                if !def.type_params.is_empty() && args.len() != def.type_params.len() {
+                    return Err(RuntimeError::type_err(format!(
+                        "struct {type_name} expects {} type argument(s), got {}",
+                        def.type_params.len(),
+                        args.len()
+                    )));
+                }
+            } else if crate::ptr_registry::is_ptr_type_name(type_name) && args.len() != 1 {
+                return Err(RuntimeError::type_err(
+                    "ptr[T] expects exactly 1 type argument",
+                ));
             }
             Ok(Value::TypeSpec(crate::value::TypeSpecData::new(
                 type_name.clone(),
                 args,
             )))
         }
+        (Value::Ptr(addr), Value::Num(n)) => {
+            let i = n
+                .to_i64()
+                .ok_or_else(|| RuntimeError::type_err("pointer index must be integer"))?;
+            crate::ffi_extra::ptr_index_get(vm, *addr, i)
+        }
         (Value::List(v), Value::Num(n)) => {
             let i = num_to_isize(n)?;
-            let borrowed = v.try_borrow().map_err(|_| {
+            let borrowed = v.try_borrow().ok_or_else(|| {
                 RuntimeError::msg("RuntimeError: list is already borrowed")
             })?;
             let len = borrowed.len() as isize;
@@ -6485,6 +6823,12 @@ fn index_value(vm: &mut Vm, obj: &Value, idx: &Value) -> Result<Value> {
 
 fn index_set(vm: &mut Vm, obj: &Value, idx: &Value, val: Value) -> Result<()> {
     match (obj, idx) {
+        (Value::Ptr(addr), Value::Num(n)) => {
+            let i = n
+                .to_i64()
+                .ok_or_else(|| RuntimeError::type_err("pointer index must be integer"))?;
+            crate::ffi_extra::ptr_index_set(vm, *addr, i, val)
+        }
         (Value::List(v), Value::Num(n)) => {
             let i = num_to_isize(n)?;
             let len = v.borrow().len() as isize;
@@ -6525,7 +6869,7 @@ fn slice_get(
                 .into_iter()
                 .map(|i| v.borrow()[i].clone())
                 .collect();
-            Ok(Value::List(Rc::new(RefCell::new(out))))
+            Ok(Value::List(Shared::new(out)))
         }
         Value::Tuple(t) => {
             let len = t.len() as isize;
@@ -6537,7 +6881,7 @@ fn slice_get(
             let len = b.len() as isize;
             let indices = compute_slice_indices(len, start, end, step)?;
             let out: Vec<u8> = indices.into_iter().map(|i| b[i]).collect();
-            Ok(Value::Bytes(Rc::new(out)))
+            Ok(Value::Bytes(Arc::new(out)))
         }
         Value::Text(s) => {
             let chars: Vec<char> = s.chars().collect();
@@ -6776,7 +7120,7 @@ fn variant_type_attr(vm: &mut Vm, variant_name: &str, field: &str) -> Result<Val
         .ok_or_else(|| RuntimeError::msg(format!("unknown variant: {variant_name}")))?;
     if let Some(case) = vdef.cases.iter().find(|c| c.name == field) {
         let struct_name = case.struct_name.clone();
-        return Ok(Value::Builtin(Rc::new(move |vm, args| {
+        return Ok(Value::Builtin(Arc::new(move |vm, args| {
             make_struct(vm, &struct_name, args.to_vec(), None)
         })));
     }
@@ -6795,7 +7139,7 @@ fn enum_type_attr(vm: &mut Vm, enum_name: &str, field: &str) -> Result<Value> {
     if let Some(func) = vm.functions.get(&method_name) {
         let cls = Value::type_ref(enum_name);
         let func = func.clone();
-        return Ok(Value::Builtin(Rc::new(move |vm, args| {
+        return Ok(Value::Builtin(Arc::new(move |vm, args| {
             let mut full_args = vec![cls.clone()];
             full_args.extend_from_slice(args);
             vm.call_user_function(func.clone(), full_args)
@@ -6803,7 +7147,7 @@ fn enum_type_attr(vm: &mut Vm, enum_name: &str, field: &str) -> Result<Value> {
     }
     if field == "name_of" {
         let enum_name = enum_name.to_string();
-        return Ok(Value::Builtin(Rc::new(move |vm, args| {
+        return Ok(Value::Builtin(Arc::new(move |vm, args| {
             crate::enum_variant::enum_name_of(vm, &enum_name, args)
         })));
     }
@@ -6823,7 +7167,7 @@ fn type_spec_attr(
         if vdef.cases.iter().any(|c| c.name == field) {
             let struct_name = format!("{name}.{field}");
             let generic_args = type_args.to_vec();
-            return Ok(Value::Builtin(Rc::new(move |vm, args| {
+            return Ok(Value::Builtin(Arc::new(move |vm, args| {
                 make_struct(vm, &struct_name, args.to_vec(), Some(generic_args.clone()))
             })));
         }
@@ -6883,7 +7227,7 @@ fn get_attr(vm: &mut Vm, obj: &Value, field: &str) -> Result<Value> {
             if let Some(func) = vm.functions.get(&method_name) {
                 let self_val = obj.clone();
                 let func = func.clone();
-                return Ok(Value::Builtin(Rc::new(move |vm, args| {
+                return Ok(Value::Builtin(Arc::new(move |vm, args| {
                     let mut full_args = vec![self_val.clone()];
                     full_args.extend_from_slice(args);
                     vm.call_user_function(func.clone(), full_args)
@@ -6892,7 +7236,7 @@ fn get_attr(vm: &mut Vm, obj: &Value, field: &str) -> Result<Value> {
             if let Some(overloads) = vm.overload_tables.get(&method_name) {
                 let self_val = obj.clone();
                 let overloads = overloads.clone();
-                return Ok(Value::Builtin(Rc::new(move |vm, args| {
+                return Ok(Value::Builtin(Arc::new(move |vm, args| {
                     let mut full_args = vec![self_val.clone()];
                     full_args.extend_from_slice(args);
                     vm.dispatch_overload(&overloads, &full_args)
@@ -7032,9 +7376,9 @@ fn make_struct(
             }
         }
     }
-    let val = Value::Struct(Rc::new(crate::value::StructInstance {
+    let val = Value::Struct(Arc::new(crate::value::StructInstance {
         def,
-        slots: RefCell::new(slots),
+        slots: SyncCell::new(slots),
         generic_args,
     }));
     vm.track_value(&val);
@@ -7095,7 +7439,7 @@ fn match_values_equal(a: &Value, b: &Value) -> bool {
         (Value::Num(x), Value::Num(y)) => x.cmp_num(y) == std::cmp::Ordering::Equal,
         (Value::Text(x), Value::Text(y)) => x == y,
         (Value::EnumMember(x), Value::EnumMember(y)) => {
-            std::rc::Rc::ptr_eq(&x.def, &y.def) && x.member_index == y.member_index
+            std::sync::Arc::ptr_eq(&x.def, &y.def) && x.member_index == y.member_index
         }
         (Value::EnumMember(m), Value::Num(n)) | (Value::Num(n), Value::EnumMember(m)) => {
             enum_member_numeric_value(m).eq_num(n)
@@ -7126,9 +7470,9 @@ fn specialize_generic_runtime(
     vm: &mut Vm,
     template: &crate::opcode::GenericFunctionTemplate,
     type_args: Vec<TypeExpr>,
-) -> Result<Rc<FunctionObject>> {
+) -> Result<Arc<FunctionObject>> {
     let ctx = crate::protocol::TypeCheckContext::from_vm(vm);
-    let mut cache: HashMap<String, Rc<FunctionObject>> = vm
+    let mut cache: HashMap<String, Arc<FunctionObject>> = vm
         .functions
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))

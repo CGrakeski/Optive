@@ -1,17 +1,17 @@
 //! 数值 `enum` 与代数 `variant` 支持。
 
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
 
 use crate::ast::{EnumMemberDecl, EnumMethodDecl, Expr, ExprKind, StructField, TypeExpr, VariantCaseDecl};
 use crate::error::RuntimeError;
 use crate::opcode::{FunctionObject, Instruction};
+use crate::shared::Shared;
 use crate::value::{
     EnumDef, EnumMemberData, EnumMemberInfo, FieldTypeInfo, Num, StructDef, Value, VariantCaseDef,
     VariantDef, VariantInstance,
 };
 use crate::Result;
+use std::sync::Arc;
 
 pub fn default_enum_values(members: &[EnumMemberDecl]) -> Result<Vec<EnumMemberInfo>> {
     let mut out = Vec::new();
@@ -56,13 +56,13 @@ pub fn eval_const_num(expr: &Expr) -> Result<Num> {
     }
 }
 
-pub fn build_enum_def(name: &str, members: Vec<EnumMemberInfo>) -> Rc<EnumDef> {
-    Rc::new(EnumDef { name: name.to_string(), members })
+pub fn build_enum_def(name: &str, members: Vec<EnumMemberInfo>) -> Arc<EnumDef> {
+    Arc::new(EnumDef { name: name.to_string(), members })
 }
 
-pub fn enum_member_value(def: &Rc<EnumDef>, index: usize) -> Value {
+pub fn enum_member_value(def: &Arc<EnumDef>, index: usize) -> Value {
     let type_name = enum_member_type_name(def, &def.members[index].name);
-    Value::EnumMember(Rc::new(EnumMemberData {
+    Value::EnumMember(Arc::new(EnumMemberData {
         def: def.clone(),
         member_index: index,
         type_name,
@@ -89,7 +89,7 @@ pub fn build_variant_def(
     name: &str,
     type_params: Vec<(String, Option<TypeExpr>)>,
     cases: &[VariantCaseDecl],
-) -> (Rc<VariantDef>, Vec<(String, Rc<StructDef>)>) {
+) -> (Arc<VariantDef>, Vec<(String, Arc<StructDef>)>) {
     let mut case_defs = Vec::new();
     let mut struct_defs = Vec::new();
     for case in cases {
@@ -110,7 +110,7 @@ pub fn build_variant_def(
         });
         struct_defs.push((
             struct_name.clone(),
-            Rc::new(StructDef {
+            Arc::new(StructDef {
                 name: struct_name,
                 base: None,
                 fields,
@@ -118,11 +118,12 @@ pub fn build_variant_def(
                 typed: true,
                 field_types,
                 type_params: type_params.clone(),
+                c_layout: None,
             }),
         ));
     }
     (
-        Rc::new(VariantDef {
+        Arc::new(VariantDef {
             name: name.to_string(),
             type_params,
             cases: case_defs,
@@ -133,12 +134,12 @@ pub fn build_variant_def(
 
 pub fn wrap_variant(
     inst_name: &str,
-    def: &Rc<VariantDef>,
+    def: &Arc<VariantDef>,
     generic_args: Vec<TypeExpr>,
     case_idx: usize,
     payload: Value,
 ) -> Value {
-    Value::Variant(Rc::new(VariantInstance {
+    Value::Variant(Arc::new(VariantInstance {
         inst_name: inst_name.to_string(),
         def: def.clone(),
         generic_args,
@@ -169,24 +170,24 @@ pub fn enum_name_of(vm: &mut crate::vm::Vm, enum_name: &str, args: &[Value]) -> 
 
 pub fn builtin_enum_method_entries(
     enum_name: &str,
-    def: &Rc<EnumDef>,
-) -> Vec<(String, Rc<FunctionObject>)> {
+    def: &Arc<EnumDef>,
+) -> Vec<(String, Arc<FunctionObject>)> {
     let members_name = format!("{enum_name}.members");
     let def_members = def.clone();
     let members_body = vec![
-        Instruction::Push(Value::List(Rc::new(RefCell::new(
+        Instruction::Push(Value::List(Shared::new(
             def_members
                 .members
                 .iter()
                 .enumerate()
                 .map(|(i, _)| enum_member_value(&def_members, i))
                 .collect(),
-        )))),
+        ))),
         Instruction::Ret,
     ];
     vec![(
         members_name,
-        Rc::new(FunctionObject::new(
+        Arc::new(FunctionObject::new(
             format!("{enum_name}.members"),
             vec![crate::ast::FuncParam {
                 name: "cls".into(),
@@ -204,8 +205,8 @@ pub fn builtin_enum_method_entries(
 
 pub fn install_builtin_enum_methods(
     enum_name: &str,
-    def: &Rc<EnumDef>,
-    functions: &mut HashMap<String, Rc<FunctionObject>>,
+    def: &Arc<EnumDef>,
+    functions: &mut HashMap<String, Arc<FunctionObject>>,
 ) {
     for (name, func) in builtin_enum_method_entries(enum_name, def) {
         functions.insert(name, func);

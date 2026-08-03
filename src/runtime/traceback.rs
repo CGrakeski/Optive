@@ -1,16 +1,16 @@
 //! Frame / Traceback 运行时值。
 
-use std::cell::RefCell;
-use std::rc::Rc;
 
 use crate::value::{FieldTypeInfo, StructDef, StructInstance, Value};
 use crate::vm::Vm;
 
+use crate::shared::{Shared, SyncCell};
+use std::sync::Arc;
 pub const FRAME_TYPE: &str = "Frame";
 pub const TRACEBACK_TYPE: &str = "Traceback";
 
-fn frame_def() -> Rc<StructDef> {
-    Rc::new(StructDef {
+fn frame_def() -> Arc<StructDef> {
+    Arc::new(StructDef {
         name: FRAME_TYPE.into(),
         base: None,
         fields: vec![
@@ -28,11 +28,12 @@ fn frame_def() -> Rc<StructDef> {
             FieldTypeInfo::default(),
         ],
         type_params: Vec::new(),
+        c_layout: None,
     })
 }
 
-fn traceback_def() -> Rc<StructDef> {
-    Rc::new(StructDef {
+fn traceback_def() -> Arc<StructDef> {
+    Arc::new(StructDef {
         name: TRACEBACK_TYPE.into(),
         base: None,
         fields: vec!["frames".into()],
@@ -40,6 +41,7 @@ fn traceback_def() -> Rc<StructDef> {
         typed: true,
         field_types: vec![FieldTypeInfo::default()],
         type_params: Vec::new(),
+        c_layout: None,
     })
 }
 
@@ -51,11 +53,9 @@ pub fn install(vm: &mut Vm) {
         .entry(TRACEBACK_TYPE.into())
         .or_insert_with(traceback_def);
     vm.globals
-        .entry(FRAME_TYPE.into())
-        .or_insert_with(|| Value::type_ref(FRAME_TYPE));
+        .or_insert_with(FRAME_TYPE.into(), || Value::type_ref(FRAME_TYPE));
     vm.globals
-        .entry(TRACEBACK_TYPE.into())
-        .or_insert_with(|| Value::type_ref(TRACEBACK_TYPE));
+        .or_insert_with(TRACEBACK_TYPE.into(), || Value::type_ref(TRACEBACK_TYPE));
 }
 
 pub fn make_frame(
@@ -65,9 +65,9 @@ pub fn make_frame(
     module: impl Into<String>,
 ) -> Value {
     let def = frame_def();
-    Value::Struct(Rc::new(StructInstance {
+    Value::Struct(Arc::new(StructInstance {
         def,
-        slots: RefCell::new(vec![
+        slots: SyncCell::new(vec![
             Value::Text(file.into()),
             Value::Num(crate::value::Num::Small(line)),
             Value::Text(func.into()),
@@ -79,9 +79,9 @@ pub fn make_frame(
 
 pub fn make_traceback(frames: Vec<Value>) -> Value {
     let def = traceback_def();
-    Value::Struct(Rc::new(StructInstance {
+    Value::Struct(Arc::new(StructInstance {
         def,
-        slots: RefCell::new(vec![Value::List(Rc::new(RefCell::new(frames)))]),
+        slots: SyncCell::new(vec![Value::List(Shared::new(frames))]),
         generic_args: Vec::new(),
     }))
 }
@@ -128,9 +128,9 @@ pub fn set_exception_traceback(exc: &Value, tb: Value) -> Value {
     } else if slots.len() == 1 {
         slots.push(tb);
     }
-    Value::Struct(Rc::new(StructInstance {
+    Value::Struct(Arc::new(StructInstance {
         def: s.def.clone(),
-        slots: RefCell::new(slots),
+        slots: SyncCell::new(slots),
         generic_args: s.generic_args.clone(),
     }))
 }

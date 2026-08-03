@@ -1,7 +1,7 @@
 //! Protocol（协议）定义与类型约束检查。
 
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::ast::{ProtocolMember, TypeExpr};
 use crate::error::RuntimeError;
@@ -33,16 +33,16 @@ pub fn protocol_from_members(name: String, members: Vec<ProtocolMember>) -> Prot
 }
 
 pub fn is_protocol(
-    protocols: &std::collections::HashMap<String, Rc<ProtocolDef>, impl std::hash::BuildHasher>,
+    protocols: &std::collections::HashMap<String, Arc<ProtocolDef>, impl std::hash::BuildHasher>,
     name: &str,
 ) -> bool {
     protocols.contains_key(name)
 }
 
 pub struct TypeCheckContext {
-    pub struct_defs: HashMap<String, Rc<crate::value::StructDef>>,
-    pub functions: HashMap<String, Rc<crate::opcode::FunctionObject>>,
-    pub protocols: HashMap<String, Rc<ProtocolDef>>,
+    pub struct_defs: HashMap<String, Arc<crate::value::StructDef>>,
+    pub functions: HashMap<String, Arc<crate::opcode::FunctionObject>>,
+    pub protocols: HashMap<String, Arc<ProtocolDef>>,
 }
 
 impl TypeCheckContext {

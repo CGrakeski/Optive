@@ -14,7 +14,7 @@
 - **渐进式类型**：可写软类型注解（解释期检查）或硬类型注解（编译期单态化），也可完全不写。
 - **泛型与协议**：`protocol` 定义接口，`struct`/`enum`/`variant` 实现之；编译器按需单态化生成专用字节码。
 - **元编程**：`macro` / `quote` 宏系统，编译期展开。
-- **C 互操作**：`extern "C"` 加载 `.dll`/`.so`/`.dylib`，直接调用 C ABI 函数（见 [`docs/ffi-c.md`](docs/ffi-c.md)）。
+- **C 互操作**：`extern` 加载 `.dll`/`.so`/`.dylib`；护照指针、`typed struct : C.layout`、字符串编组、沙箱 FFI 门禁（见 [`docs/ffi-c.md`](docs/ffi-c.md)）。
 - **依赖管理**：Git URL 作为依赖源，内容寻址存储（CAS）+ SQLite 索引，`optive.lock` 保证可复现构建。
 - **REPL**：交互式多行输入，历史记录持久化。
 
@@ -118,12 +118,10 @@ src/
 ├── runtime/            字节码 VM + 运行时
 │   ├── vm.rs  module.rs  value.rs  types.rs  type_registry.rs
 │   ├── builtins.rs  gc.rs  exceptions.rs  traceback.rs
-│   ├── ffi.rs  c_types.rs  enum_variant.rs  runtime_ast.rs  sized.rs
+│   ├── ffi.rs  ffi_extra.rs  ptr_registry.rs  c_types.rs
+│   ├── caps.rs  concurrency.rs  enum_variant.rs  runtime_ast.rs  sized.rs
 ├── stdlib/             内置标准库
-└── cli/                包管理 CLI
-    ├── manifest.rs  lock.rs  resolve.rs  deps.rs  commands.rs
-    ├── new_project.rs  git_ops.rs  store.rs  cache.rs  doctor.rs
-    ├── home.rs  color.rs
+└── cli/                包管理 CLI（含 caps / debug / fmt 等）
 ```
 
 ---

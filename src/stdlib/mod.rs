@@ -1,6 +1,5 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use num_bigint::BigInt;
 use num_traits::Zero;
@@ -10,12 +9,13 @@ use crate::value::{IteratorKind, IteratorState, ModuleObject, Num, Value, ValueK
 use crate::vm::Vm;
 use crate::Result;
 
+use crate::shared::{Shared, SyncCell};
 /// `format_num` / `format` 字段的默认小数精度。
 const DEFAULT_NUM_PRECISION: usize = 6;
 /// `take` / `skip` 等迭代器物化的预分配初始容量。
 const ITER_MATERIALIZE_INIT_CAP: usize = 64;
 
-pub fn build_std_module() -> Rc<RefCell<ModuleObject>> {
+pub fn build_std_module() -> Shared<ModuleObject> {
     let math = submodule(
         "math",
         &[
@@ -196,13 +196,13 @@ pub fn build_std_module() -> Rc<RefCell<ModuleObject>> {
     std_children.insert("yaml".into(), build_yaml_module());
     std_children.insert("xml".into(), build_xml_module());
 
-    Rc::new(RefCell::new(ModuleObject {
+    Shared::new(ModuleObject {
         name: "std".into(),
         full_name: "std".into(),
         exports: exports(&[("concat", builtin(std_concat))]),
         children: std_children,
         is_user: false,
-    }))
+    })
 }
 
 fn math_const_pi() -> Value {
@@ -227,17 +227,17 @@ fn exports(entries: &[(&str, Value)]) -> HashMap<String, Value> {
 }
 
 fn builtin(f: fn(&mut Vm, &[Value]) -> Result<Value>) -> Value {
-    Value::Builtin(Rc::new(f))
+    Value::Builtin(Arc::new(f))
 }
 
-fn submodule(name: &str, entries: &[(&str, Value)]) -> Rc<RefCell<ModuleObject>> {
-    Rc::new(RefCell::new(ModuleObject {
+fn submodule(name: &str, entries: &[(&str, Value)]) -> Shared<ModuleObject> {
+    Shared::new(ModuleObject {
         name: name.into(),
         full_name: format!("std.{name}"),
         exports: exports(entries),
         children: HashMap::new(),
         is_user: false,
-    }))
+    })
 }
 
 fn expect_arity(name: &str, args: &[Value], n: usize) -> Result<()> {
@@ -339,7 +339,7 @@ fn math_divmod(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
     let q = Value::Num(a.clone()).div(&args[1])?;
     let r = Value::Num(a.clone()).rem(&args[1])?;
-    Ok(Value::List(Rc::new(RefCell::new(vec![q, r]))))
+    Ok(Value::List(Shared::new(vec![q, r])))
 }
 
 /// Optive 的 `Num` 基于有理数，无法精确表达 IEEE 754 infinity。
@@ -692,7 +692,7 @@ fn io_read_bytes(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let bytes = std::fs::read(&path)
         .map_err(|e| crate::error::RuntimeError::io_err(format!("read_bytes failed: {e}")))?;
     vm.request_cooperative_yield();
-    Ok(Value::Bytes(Rc::new(bytes)))
+    Ok(Value::Bytes(Arc::new(bytes)))
 }
 
 fn io_write_bytes(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -871,7 +871,7 @@ fn iter_to_list(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(crate::error::RuntimeError::type_err("to_list requires 1 argument"));
     }
-    Ok(Value::List(Rc::new(RefCell::new(materialize_iter(vm, &args[0])?))))
+    Ok(Value::List(Shared::new(materialize_iter(vm, &args[0])?)))
 }
 
 fn iter_to_set(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -882,7 +882,7 @@ fn iter_to_set(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     for item in materialize_iter(vm, &args[0])? {
         set.insert(ValueKey::from_value(&item)?);
     }
-    Ok(Value::Set(Rc::new(RefCell::new(set))))
+    Ok(Value::Set(Shared::new(set)))
 }
 
 fn iter_enumerate(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -894,13 +894,13 @@ fn iter_enumerate(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         .into_iter()
         .enumerate()
         .map(|(i, item)| {
-            Value::List(Rc::new(RefCell::new(vec![
+            Value::List(Shared::new(vec![
                 Value::Num(Num::Small(i as i64)),
                 item,
-            ])))
+            ]))
         })
         .collect();
-    Ok(Value::List(Rc::new(RefCell::new(pairs))))
+    Ok(Value::List(Shared::new(pairs)))
 }
 
 fn iter_chain(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -913,7 +913,7 @@ fn iter_chain(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     for arg in args {
         merged.extend(value_to_list(arg)?);
     }
-    Ok(Value::List(Rc::new(RefCell::new(merged))))
+    Ok(Value::List(Shared::new(merged)))
 }
 
 fn iter_take(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -929,7 +929,7 @@ fn iter_take(vm: &mut Vm, args: &[Value]) -> Result<Value> {
             None => break,
         }
     }
-    Ok(Value::List(Rc::new(RefCell::new(out))))
+    Ok(Value::List(Shared::new(out)))
 }
 
 fn iter_skip(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -940,13 +940,13 @@ fn iter_skip(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let state = value_to_iterator_rc(&args[0])?;
     for _ in 0..n {
         if vm.advance_iterator(&state)?.is_none() {
-            return Ok(Value::List(Rc::new(RefCell::new(Vec::new()))));
+            return Ok(Value::List(Shared::new(Vec::new())));
         }
     }
-    Ok(Value::List(Rc::new(RefCell::new(materialize_iter(
+    Ok(Value::List(Shared::new(materialize_iter(
         vm,
         &Value::Iterator(state),
-    )?))))
+    )?)))
 }
 
 fn iter_next(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -994,9 +994,9 @@ fn iter_repeat(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     } else {
         None
     };
-    Ok(Value::Iterator(Rc::new(RefCell::new(IteratorState {
+    Ok(Value::Iterator(Shared::new(IteratorState {
         kind: IteratorKind::Repeat { value, remaining },
-    }))))
+    })))
 }
 
 fn iter_cycle(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -1004,9 +1004,9 @@ fn iter_cycle(vm: &mut Vm, args: &[Value]) -> Result<Value> {
         return Err(crate::error::RuntimeError::type_err("cycle requires 1 argument"));
     }
     let items = materialize_iter(vm, &args[0])?;
-    Ok(Value::Iterator(Rc::new(RefCell::new(IteratorState {
+    Ok(Value::Iterator(Shared::new(IteratorState {
         kind: IteratorKind::Cycle { items, index: 0 },
-    }))))
+    })))
 }
 
 fn iter_count(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -1080,7 +1080,7 @@ fn dict_keys(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         return Err(crate::error::RuntimeError::type_err("keys requires dict"));
     };
     let keys: Vec<Value> = d.borrow().keys().map(value_key_to_value).collect();
-    Ok(Value::List(Rc::new(RefCell::new(keys))))
+    Ok(Value::List(Shared::new(keys)))
 }
 
 fn dict_values(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -1090,9 +1090,9 @@ fn dict_values(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let Value::Dict(d) = &args[0] else {
         return Err(crate::error::RuntimeError::type_err("values requires dict"));
     };
-    Ok(Value::List(Rc::new(RefCell::new(
+    Ok(Value::List(Shared::new(
         d.borrow().values().cloned().collect(),
-    ))))
+    )))
 }
 
 fn dict_items(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -1106,13 +1106,13 @@ fn dict_items(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         .borrow()
         .iter()
         .map(|(k, v)| {
-            Value::List(Rc::new(RefCell::new(vec![
+            Value::List(Shared::new(vec![
                 value_key_to_value(k),
                 v.clone(),
-            ])))
+            ]))
         })
         .collect();
-    Ok(Value::List(Rc::new(RefCell::new(pairs))))
+    Ok(Value::List(Shared::new(pairs)))
 }
 
 fn dict_get(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -1155,7 +1155,7 @@ fn dict_from_items(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         }
         map.insert(ValueKey::from_value(&pair[0])?, pair[1].clone());
     }
-    Ok(Value::Dict(Rc::new(RefCell::new(map))))
+    Ok(Value::Dict(Shared::new(map)))
 }
 
 fn dict_update(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -1176,7 +1176,7 @@ fn dict_update(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn dict_merge(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.is_empty() {
-        return Ok(Value::Dict(Rc::new(RefCell::new(DictMap::new()))));
+        return Ok(Value::Dict(Shared::new(DictMap::new())));
     }
     let mut out = DictMap::new();
     for arg in args {
@@ -1187,7 +1187,7 @@ fn dict_merge(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
             out.insert(k.clone(), v.clone());
         }
     }
-    Ok(Value::Dict(Rc::new(RefCell::new(out))))
+    Ok(Value::Dict(Shared::new(out)))
 }
 
 fn dict_invert(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -1202,7 +1202,7 @@ fn dict_invert(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         let key = ValueKey::from_value(v)?;
         out.insert(key, value_key_to_value(k));
     }
-    Ok(Value::Dict(Rc::new(RefCell::new(out))))
+    Ok(Value::Dict(Shared::new(out)))
 }
 
 fn dict_setdefault(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -1316,7 +1316,7 @@ fn ast_walk(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     Ok(Value::None)
 }
 
-fn expect_function(name: &str, args: &[Value], idx: usize) -> Result<Rc<crate::opcode::FunctionObject>> {
+fn expect_function(name: &str, args: &[Value], idx: usize) -> Result<Arc<crate::opcode::FunctionObject>> {
     match args.get(idx) {
         Some(Value::Function(f)) => Ok(f.clone()),
         _ => Err(crate::error::RuntimeError::type_err(format!(
@@ -1330,7 +1330,7 @@ fn decos_log(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         return Err(crate::error::RuntimeError::type_err("log requires 1 argument"));
     }
     let inner = expect_function("log", args, 0)?;
-    Ok(Value::Builtin(Rc::new(move |vm, call_args| {
+    Ok(Value::Builtin(Arc::new(move |vm, call_args| {
         eprintln!("log: call({})", call_args.len());
         vm.call_user_function(inner.clone(), call_args.to_vec())
     })))
@@ -1341,9 +1341,9 @@ fn decos_once(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         return Err(crate::error::RuntimeError::type_err("once requires 1 argument"));
     }
     let inner = expect_function("once", args, 0)?;
-    let cached = RefCell::new(None::<Value>);
-    let called = RefCell::new(false);
-    Ok(Value::Builtin(Rc::new(move |vm, call_args| {
+    let cached = SyncCell::new(None::<Value>);
+    let called = SyncCell::new(false);
+    Ok(Value::Builtin(Arc::new(move |vm, call_args| {
         if *called.borrow() {
             return cached
                 .borrow()
@@ -1360,8 +1360,8 @@ fn decos_once(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 fn decos_memoize(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     expect_arity("memoize", args, 1)?;
     let inner = expect_function("memoize", args, 0)?;
-    let cache = RefCell::new(HashMap::<Vec<ValueKey>, Value>::new());
-    Ok(Value::Builtin(Rc::new(move |vm, call_args| {
+    let cache = SyncCell::new(HashMap::<Vec<ValueKey>, Value>::new());
+    Ok(Value::Builtin(Arc::new(move |vm, call_args| {
         let key: Vec<ValueKey> = call_args
             .iter()
             .map(ValueKey::from_value)
@@ -1377,11 +1377,11 @@ fn decos_memoize(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 // --- 其余 std 子模块 ---
 
-fn build_typing_module() -> Rc<RefCell<ModuleObject>> {
+fn build_typing_module() -> Shared<ModuleObject> {
     fn type_ctor(name: &str) -> Value {
         let name = name.to_string();
         let is_form = crate::type_registry::is_type_form(&name);
-        Value::Builtin(Rc::new(move |_vm, args| {
+        Value::Builtin(Arc::new(move |_vm, args| {
             if args.is_empty() {
                 if is_form {
                     return Ok(Value::TypeSpec(crate::value::TypeSpecData::new(
@@ -1402,7 +1402,7 @@ fn build_typing_module() -> Rc<RefCell<ModuleObject>> {
         }))
     }
     fn type_ctor_literal() -> Value {
-        Value::Builtin(Rc::new(move |_vm, args| {
+        Value::Builtin(Arc::new(move |_vm, args| {
             if args.is_empty() {
                 return Err(crate::error::RuntimeError::type_err(
                     "Literal requires at least 1 argument",
@@ -1453,9 +1453,9 @@ fn typing_fields_of(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
             "fields_of expects a struct value or struct type name",
         ));
     };
-    Ok(Value::List(Rc::new(RefCell::new(
+    Ok(Value::List(Shared::new(
         def.fields.iter().map(|f| Value::Text(f.clone())).collect(),
-    ))))
+    )))
 }
 
 /// `std.typing.protocol_of("Name")` → `{name, methods, fields}` 或 none（非协议）。
@@ -1481,25 +1481,25 @@ fn typing_protocol_of(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     out.insert(ValueKey::Text("name".into()), Value::Text(pd.name.clone()));
     out.insert(
         ValueKey::Text("methods".into()),
-        Value::List(Rc::new(RefCell::new(
+        Value::List(Shared::new(
             pd.methods.iter().map(|m| Value::Text(m.clone())).collect(),
-        ))),
+        )),
     );
     out.insert(
         ValueKey::Text("fields".into()),
-        Value::List(Rc::new(RefCell::new(
+        Value::List(Shared::new(
             pd.fields
                 .iter()
                 .map(|(f, m)| {
                     let mut d = DictMap::new();
                     d.insert(ValueKey::Text("name".into()), Value::Text(f.clone()));
                     d.insert(ValueKey::Text("mutable".into()), Value::Bool(*m));
-                    Value::Dict(Rc::new(RefCell::new(d)))
+                    Value::Dict(Shared::new(d))
                 })
                 .collect(),
-        ))),
+        )),
     );
-    Ok(Value::Dict(Rc::new(RefCell::new(out))))
+    Ok(Value::Dict(Shared::new(out)))
 }
 
 /// `std.typing.isinstanceof(value, type)` —— 运行时实例检查，替代 `is_a`。
@@ -1524,7 +1524,7 @@ fn typing_isinstanceof(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     Ok(Value::Bool(ok))
 }
 
-fn build_functional_module() -> Rc<RefCell<ModuleObject>> {
+fn build_functional_module() -> Shared<ModuleObject> {
     submodule(
         "functional",
         &[("map", builtin(func_map)),
@@ -1539,7 +1539,7 @@ fn build_functional_module() -> Rc<RefCell<ModuleObject>> {
     )
 }
 
-fn build_collections_module() -> Rc<RefCell<ModuleObject>> {
+fn build_collections_module() -> Shared<ModuleObject> {
     submodule(
         "collections",
         &[("sorted", builtin(coll_sorted)),
@@ -1560,7 +1560,7 @@ fn build_collections_module() -> Rc<RefCell<ModuleObject>> {
     )
 }
 
-fn build_time_module() -> Rc<RefCell<ModuleObject>> {
+fn build_time_module() -> Shared<ModuleObject> {
     submodule(
         "time",
         &[("now", builtin(time_now)),
@@ -1571,7 +1571,7 @@ fn build_time_module() -> Rc<RefCell<ModuleObject>> {
     )
 }
 
-fn build_sync_module() -> Rc<RefCell<ModuleObject>> {
+fn build_sync_module() -> Shared<ModuleObject> {
     submodule(
         "sync",
         &[
@@ -1597,7 +1597,7 @@ fn sync_yield(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     Ok(Value::None)
 }
 
-fn build_text_module() -> Rc<RefCell<ModuleObject>> {
+fn build_text_module() -> Shared<ModuleObject> {
     submodule(
         "text",
         &[("upper", builtin(text_upper)),
@@ -1622,7 +1622,7 @@ fn build_text_module() -> Rc<RefCell<ModuleObject>> {
     )
 }
 
-fn build_path_module() -> Rc<RefCell<ModuleObject>> {
+fn build_path_module() -> Shared<ModuleObject> {
     submodule(
         "path",
         &[("join", builtin(path_join)),
@@ -1637,7 +1637,7 @@ fn build_path_module() -> Rc<RefCell<ModuleObject>> {
     )
 }
 
-fn build_fs_module() -> Rc<RefCell<ModuleObject>> {
+fn build_fs_module() -> Shared<ModuleObject> {
     submodule(
         "fs",
         &[("exists", builtin(fs_exists)),
@@ -1657,7 +1657,7 @@ fn build_fs_module() -> Rc<RefCell<ModuleObject>> {
     )
 }
 
-fn build_os_module() -> Rc<RefCell<ModuleObject>> {
+fn build_os_module() -> Shared<ModuleObject> {
     submodule(
         "os",
         &[("getenv", builtin(os_getenv)),
@@ -1670,7 +1670,7 @@ fn build_os_module() -> Rc<RefCell<ModuleObject>> {
     )
 }
 
-fn build_json_module() -> Rc<RefCell<ModuleObject>> {
+fn build_json_module() -> Shared<ModuleObject> {
     submodule(
         "json",
         &[("parse", builtin(json_parse)),
@@ -1680,7 +1680,7 @@ fn build_json_module() -> Rc<RefCell<ModuleObject>> {
     )
 }
 
-fn build_test_module() -> Rc<RefCell<ModuleObject>> {
+fn build_test_module() -> Shared<ModuleObject> {
     submodule(
         "test",
         &[("assert_eq", builtin(test_assert_eq)),
@@ -1689,7 +1689,7 @@ fn build_test_module() -> Rc<RefCell<ModuleObject>> {
     )
 }
 
-fn build_debug_module() -> Rc<RefCell<ModuleObject>> {
+fn build_debug_module() -> Shared<ModuleObject> {
     submodule(
         "debug",
         &[
@@ -1703,7 +1703,7 @@ fn build_debug_module() -> Rc<RefCell<ModuleObject>> {
     )
 }
 
-fn build_random_module() -> Rc<RefCell<ModuleObject>> {
+fn build_random_module() -> Shared<ModuleObject> {
     submodule(
         "random",
         &[("randint", builtin(random_randint)),
@@ -1727,7 +1727,7 @@ fn io_read_line(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn decos_timer(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let inner = expect_function("timer", args, 0)?;
-    Ok(Value::Builtin(Rc::new(move |vm, call_args| {
+    Ok(Value::Builtin(Arc::new(move |vm, call_args| {
         let start = std::time::Instant::now();
         let result = vm.call_user_function(inner.clone(), call_args.to_vec())?;
         eprintln!("timer: {:?}", start.elapsed());
@@ -1737,7 +1737,7 @@ fn decos_timer(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn decos_debug(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let inner = expect_function("debug", args, 0)?;
-    Ok(Value::Builtin(Rc::new(move |vm, call_args| {
+    Ok(Value::Builtin(Arc::new(move |vm, call_args| {
         let preview: Vec<String> = call_args.iter().map(|v| v.print_string()).collect();
         eprintln!("debug: call({})", preview.join(", "));
         vm.call_user_function(inner.clone(), call_args.to_vec())
@@ -1751,7 +1751,7 @@ fn decos_retry(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     } else {
         3
     };
-    Ok(Value::Builtin(Rc::new(move |vm, call_args| {
+    Ok(Value::Builtin(Arc::new(move |vm, call_args| {
         let mut last_err = None;
         for _ in 0..attempts {
             match vm.call_user_function(inner.clone(), call_args.to_vec()) {
@@ -1770,7 +1770,7 @@ fn decos_validate(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     } else {
         None
     };
-    Ok(Value::Builtin(Rc::new(move |vm, call_args| {
+    Ok(Value::Builtin(Arc::new(move |vm, call_args| {
         let result = if let Some(f) = &inner {
             vm.call_user_function(f.clone(), call_args.to_vec())?
         } else {
@@ -1791,7 +1791,7 @@ fn decos_catch(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     } else {
         None
     };
-    Ok(Value::Builtin(Rc::new(move |vm, call_args| {
+    Ok(Value::Builtin(Arc::new(move |vm, call_args| {
         match vm.call_user_function(inner.clone(), call_args.to_vec()) {
             Ok(v) => Ok(v),
             Err(_) => {
@@ -1808,16 +1808,16 @@ fn decos_catch(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 fn decos_deprecated(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() == 1 {
         if let Ok(inner) = expect_function("deprecated", args, 0) {
-            return Ok(Value::Builtin(Rc::new(move |vm, call_args| {
+            return Ok(Value::Builtin(Arc::new(move |vm, call_args| {
                 eprintln!("[deprecated]");
                 vm.call_user_function(inner.clone(), call_args.to_vec())
             })));
         }
         let msg = args[0].print_string();
-        return Ok(Value::Builtin(Rc::new(move |_vm, call_args| {
+        return Ok(Value::Builtin(Arc::new(move |_vm, call_args| {
             let inner = expect_function("deprecated", call_args, 0)?;
             let msg = msg.clone();
-            Ok(Value::Builtin(Rc::new(move |vm, args| {
+            Ok(Value::Builtin(Arc::new(move |vm, args| {
                 eprintln!("[deprecated] {msg}");
                 vm.call_user_function(inner.clone(), args.to_vec())
             })))
@@ -1830,7 +1830,7 @@ fn decos_deprecated(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn decos_trace(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let inner = expect_function("trace", args, 0)?;
-    Ok(Value::Builtin(Rc::new(move |vm, call_args| {
+    Ok(Value::Builtin(Arc::new(move |vm, call_args| {
         let shown: Vec<String> = call_args.iter().map(|v| v.print_string()).collect();
         eprintln!("trace: args={}", shown.join(", "));
         let result = vm.call_user_function(inner.clone(), call_args.to_vec())?;
@@ -1841,8 +1841,8 @@ fn decos_trace(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn decos_singleton(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let factory = expect_function("singleton", args, 0)?;
-    let cell = Rc::new(RefCell::new(None::<Value>));
-    Ok(Value::Builtin(Rc::new(move |vm, _call_args| {
+    let cell = Shared::new(None::<Value>);
+    Ok(Value::Builtin(Arc::new(move |vm, _call_args| {
         let mut slot = cell.borrow_mut();
         if let Some(v) = slot.as_ref() {
             return Ok(v.clone());
@@ -1856,7 +1856,7 @@ fn decos_singleton(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 fn materialize_iter(vm: &mut Vm, v: &Value) -> Result<Vec<Value>> {
     let state = match v {
         Value::Iterator(it) => it.clone(),
-        other => Rc::new(RefCell::new(crate::value::value_to_iterable(other)?)),
+        other => Shared::new(crate::value::value_to_iterable(other)?),
     };
     let mut out = Vec::new();
     while let Some(item) = vm.advance_iterator(&state)? {
@@ -1865,10 +1865,10 @@ fn materialize_iter(vm: &mut Vm, v: &Value) -> Result<Vec<Value>> {
     Ok(out)
 }
 
-fn value_to_iterator_rc(v: &Value) -> Result<Rc<RefCell<IteratorState>>> {
+fn value_to_iterator_rc(v: &Value) -> Result<Shared<IteratorState>> {
     match v {
         Value::Iterator(it) => Ok(it.clone()),
-        other => Ok(Rc::new(RefCell::new(crate::value::value_to_iterable(other)?))),
+        other => Ok(Shared::new(crate::value::value_to_iterable(other)?)),
     }
 }
 
@@ -1878,9 +1878,9 @@ fn func_map(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
     let func = expect_function("map", args, 0)?;
     let source = value_to_iterator_rc(&args[1])?;
-    Ok(Value::Iterator(Rc::new(RefCell::new(IteratorState {
+    Ok(Value::Iterator(Shared::new(IteratorState {
         kind: IteratorKind::Map { func, source },
-    }))))
+    })))
 }
 
 fn func_filter(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -1889,9 +1889,9 @@ fn func_filter(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
     let pred = expect_function("filter", args, 0)?;
     let source = value_to_iterator_rc(&args[1])?;
-    Ok(Value::Iterator(Rc::new(RefCell::new(IteratorState {
+    Ok(Value::Iterator(Shared::new(IteratorState {
         kind: IteratorKind::Filter { func: pred, source },
-    }))))
+    })))
 }
 
 fn func_zip(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -1920,7 +1920,7 @@ fn func_compose(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
     let f = expect_function("compose", args, 0)?;
     let g = expect_function("compose", args, 1)?;
-    Ok(Value::Builtin(Rc::new(move |vm, call_args| {
+    Ok(Value::Builtin(Arc::new(move |vm, call_args| {
         let mid = vm.call_user_function(g.clone(), call_args.to_vec())?;
         vm.call_user_function(f.clone(), vec![mid])
     })))
@@ -1932,7 +1932,7 @@ fn func_partial(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
     let func = expect_function("partial", args, 0)?;
     let bound: Vec<Value> = args[1..].to_vec();
-    Ok(Value::Builtin(Rc::new(move |vm, call_args| {
+    Ok(Value::Builtin(Arc::new(move |vm, call_args| {
         let mut full = bound.clone();
         full.extend_from_slice(call_args);
         vm.call_user_function(func.clone(), full)
@@ -1951,12 +1951,12 @@ fn func_const(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         return Err(crate::error::RuntimeError::type_err("const requires 1 argument"));
     }
     let x = args[0].clone();
-    Ok(Value::Builtin(Rc::new(move |_vm, _args| Ok(x.clone()))))
+    Ok(Value::Builtin(Arc::new(move |_vm, _args| Ok(x.clone()))))
 }
 
 fn func_flip(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let func = expect_function("flip", args, 0)?;
-    Ok(Value::Builtin(Rc::new(move |vm, call_args| {
+    Ok(Value::Builtin(Arc::new(move |vm, call_args| {
         if call_args.len() < 2 {
             return Err(crate::error::RuntimeError::type_err(
                 "flipped function requires at least 2 arguments",
@@ -1974,7 +1974,7 @@ fn coll_sorted(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
     let mut items = materialize_iter(vm, &args[0])?;
     items.sort_by_key(|a| a.print_string());
-    Ok(Value::List(Rc::new(RefCell::new(items))))
+    Ok(Value::List(Shared::new(items)))
 }
 
 fn coll_reversed(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -2040,7 +2040,7 @@ fn coll_unique(vm: &mut Vm, args: &[Value]) -> Result<Value> {
             out.push(item);
         }
     }
-    Ok(Value::List(Rc::new(RefCell::new(out))))
+    Ok(Value::List(Shared::new(out)))
 }
 
 fn coll_first(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -2088,7 +2088,7 @@ fn coll_flatten(vm: &mut Vm, args: &[Value]) -> Result<Value> {
             other => out.push(other.clone()),
         }
     }
-    Ok(Value::List(Rc::new(RefCell::new(out))))
+    Ok(Value::List(Shared::new(out)))
 }
 
 fn coll_chunk(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -2106,13 +2106,13 @@ fn coll_chunk(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     for item in items {
         cur.push(item);
         if cur.len() == size {
-            out.push(Value::List(Rc::new(RefCell::new(std::mem::take(&mut cur)))));
+            out.push(Value::List(Shared::new(std::mem::take(&mut cur))));
         }
     }
     if !cur.is_empty() {
-        out.push(Value::List(Rc::new(RefCell::new(cur))));
+        out.push(Value::List(Shared::new(cur)));
     }
-    Ok(Value::List(Rc::new(RefCell::new(out))))
+    Ok(Value::List(Shared::new(out)))
 }
 
 fn coll_count(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -2150,10 +2150,10 @@ fn coll_group_by(vm: &mut Vm, args: &[Value]) -> Result<Value> {
         if let Some(Value::List(list)) = out.get(&key).cloned() {
             list.borrow_mut().push(item);
         } else {
-            out.insert(key, Value::List(Rc::new(RefCell::new(vec![item]))));
+            out.insert(key, Value::List(Shared::new(vec![item])));
         }
     }
-    Ok(Value::Dict(Rc::new(RefCell::new(out))))
+    Ok(Value::Dict(Shared::new(out)))
 }
 
 fn time_now(_vm: &mut Vm, _args: &[Value]) -> Result<Value> {
@@ -2223,7 +2223,7 @@ fn text_split(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         " ".into()
     };
     let parts: Vec<Value> = s.split(&sep).map(|p| Value::Text(p.to_string())).collect();
-    Ok(Value::List(Rc::new(RefCell::new(parts))))
+    Ok(Value::List(Shared::new(parts)))
 }
 
 fn text_contains(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -2349,7 +2349,7 @@ fn text_count(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 fn text_lines(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let s = expect_text("lines", args, 0)?;
     let lines: Vec<Value> = s.lines().map(|l| Value::Text(l.to_string())).collect();
-    Ok(Value::List(Rc::new(RefCell::new(lines))))
+    Ok(Value::List(Shared::new(lines)))
 }
 
 fn text_ord(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -2482,10 +2482,10 @@ fn path_splitext(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     } else {
         (p, String::new())
     };
-    Ok(Value::List(Rc::new(RefCell::new(vec![
+    Ok(Value::List(Shared::new(vec![
         Value::Text(root),
         Value::Text(ext),
-    ]))))
+    ])))
 }
 
 fn fs_exists(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -2515,7 +2515,7 @@ fn fs_list_dir(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
     names.sort_by_key(|a| a.print_string());
     vm.request_cooperative_yield();
-    Ok(Value::List(Rc::new(RefCell::new(names))))
+    Ok(Value::List(Shared::new(names)))
 }
 
 fn fs_mkdir(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -2596,7 +2596,7 @@ fn os_setenv(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn os_args(_vm: &mut Vm, _args: &[Value]) -> Result<Value> {
     let items: Vec<Value> = std::env::args().map(Value::Text).collect();
-    Ok(Value::List(Rc::new(RefCell::new(items))))
+    Ok(Value::List(Shared::new(items)))
 }
 
 fn os_exit(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -2847,7 +2847,7 @@ impl JsonParser {
         let mut items = Vec::new();
         if self.peek() == Some(']') {
             self.bump();
-            return Ok(Value::List(Rc::new(RefCell::new(items))));
+            return Ok(Value::List(Shared::new(items)));
         }
         loop {
             items.push(self.parse_value()?);
@@ -2865,7 +2865,7 @@ impl JsonParser {
                 }
             }
         }
-        Ok(Value::List(Rc::new(RefCell::new(items))))
+        Ok(Value::List(Shared::new(items)))
     }
 
     fn parse_object(&mut self) -> Result<Value> {
@@ -2874,7 +2874,7 @@ impl JsonParser {
         let mut map = DictMap::new();
         if self.peek() == Some('}') {
             self.bump();
-            return Ok(Value::Dict(Rc::new(RefCell::new(map))));
+            return Ok(Value::Dict(Shared::new(map)));
         }
         loop {
             self.skip_ws();
@@ -2898,7 +2898,7 @@ impl JsonParser {
                 }
             }
         }
-        Ok(Value::Dict(Rc::new(RefCell::new(map))))
+        Ok(Value::Dict(Shared::new(map)))
     }
 }
 
@@ -3215,12 +3215,12 @@ fn random_sample(vm: &mut Vm, args: &[Value]) -> Result<Value> {
         let j = i + (rng_next() as usize) % (items.len() - i);
         items.swap(i, j);
     }
-    Ok(Value::List(Rc::new(RefCell::new(
+    Ok(Value::List(Shared::new(
         items.into_iter().take(k).collect(),
-    ))))
+    )))
 }
 
-fn build_re_module() -> Rc<RefCell<ModuleObject>> {
+fn build_re_module() -> Shared<ModuleObject> {
     submodule(
         "re",
         &[("compile", builtin(re_compile)),
@@ -3231,7 +3231,7 @@ fn build_re_module() -> Rc<RefCell<ModuleObject>> {
     )
 }
 
-fn build_hash_module() -> Rc<RefCell<ModuleObject>> {
+fn build_hash_module() -> Shared<ModuleObject> {
     submodule(
         "hash",
         &[("md5", builtin(hash_md5)),
@@ -3240,7 +3240,7 @@ fn build_hash_module() -> Rc<RefCell<ModuleObject>> {
     )
 }
 
-fn build_exceptions_module() -> Rc<RefCell<ModuleObject>> {
+fn build_exceptions_module() -> Shared<ModuleObject> {
     submodule(
         "exceptions",
         &[("bases", builtin(exc_bases)),
@@ -3253,33 +3253,33 @@ fn re_compile(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let pat = expect_text("compile", args, 0)?;
     let re = regex::Regex::new(&pat)
         .map_err(|e| crate::error::RuntimeError::value_err(format!("invalid regex: {e}")))?;
-    let re = Rc::new(re);
+    let re = Arc::new(re);
     let re_m = re.clone();
     let re_f = re.clone();
     let re_s = re.clone();
     let re_p = re.clone();
-    Ok(Value::Module(Rc::new(RefCell::new(ModuleObject {
+    Ok(Value::Module(Shared::new(ModuleObject {
         name: "Pattern".into(),
         full_name: format!("re.Pattern({pat})"),
         exports: exports(&[
             (
                 "match",
-                Value::Builtin(Rc::new(move |vm, a| re_match_impl(vm, &re_m, a))),
+                Value::Builtin(Arc::new(move |vm, a| re_match_impl(vm, &re_m, a))),
             ),
             (
                 "findall",
-                Value::Builtin(Rc::new(move |_vm, a| {
+                Value::Builtin(Arc::new(move |_vm, a| {
                     let text = expect_text("findall", a, 0)?;
                     let out: Vec<Value> = re_f
                         .find_iter(&text)
                         .map(|m| Value::Text(m.as_str().to_string()))
                         .collect();
-                    Ok(Value::List(Rc::new(RefCell::new(out))))
+                    Ok(Value::List(Shared::new(out)))
                 })),
             ),
             (
                 "sub",
-                Value::Builtin(Rc::new(move |_vm, a| {
+                Value::Builtin(Arc::new(move |_vm, a| {
                     if a.len() != 2 {
                         return Err(crate::error::RuntimeError::type_err(
                             "Pattern.sub requires (repl, text)",
@@ -3294,20 +3294,20 @@ fn re_compile(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
             ),
             (
                 "split",
-                Value::Builtin(Rc::new(move |_vm, a| {
+                Value::Builtin(Arc::new(move |_vm, a| {
                     let text = expect_text("split", a, 0)?;
                     let out: Vec<Value> = re_p
                         .split(&text)
                         .map(|s| Value::Text(s.to_string()))
                         .collect();
-                    Ok(Value::List(Rc::new(RefCell::new(out))))
+                    Ok(Value::List(Shared::new(out)))
                 })),
             ),
             ("pattern", Value::Text(pat)),
         ]),
         children: HashMap::new(),
         is_user: false,
-    }))))
+    })))
 }
 
 fn re_match(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -3339,7 +3339,7 @@ fn re_match_impl(_vm: &mut Vm, re: &regex::Regex, args: &[Value]) -> Result<Valu
                 ValueKey::Text("end".into()),
                 Value::Num(Num::Small(mat.end() as i64)),
             );
-            Value::Dict(Rc::new(RefCell::new(d)))
+            Value::Dict(Shared::new(d))
         }
         None => Value::None,
     })
@@ -3357,7 +3357,7 @@ fn re_findall(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         .find_iter(&text)
         .map(|m| Value::Text(m.as_str().to_string()))
         .collect();
-    Ok(Value::List(Rc::new(RefCell::new(out))))
+    Ok(Value::List(Shared::new(out)))
 }
 
 fn re_sub(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -3384,7 +3384,7 @@ fn re_split(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         .split(&text)
         .map(|s| Value::Text(s.to_string()))
         .collect();
-    Ok(Value::List(Rc::new(RefCell::new(out))))
+    Ok(Value::List(Shared::new(out)))
 }
 
 fn hash_md5(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -3454,7 +3454,7 @@ fn exc_chain(vm: &mut Vm, args: &[Value]) -> Result<Value> {
         .into_iter()
         .map(Value::Text)
         .collect();
-    Ok(Value::List(Rc::new(RefCell::new(chain))))
+    Ok(Value::List(Shared::new(chain)))
 }
 
 fn exc_tree(_vm: &mut Vm, _args: &[Value]) -> Result<Value> {
@@ -3466,12 +3466,12 @@ fn exc_tree(_vm: &mut Vm, _args: &[Value]) -> Result<Value> {
                 .unwrap_or(Value::None),
         );
     }
-    Ok(Value::Dict(Rc::new(RefCell::new(out))))
+    Ok(Value::Dict(Shared::new(out)))
 }
 
 // ── std.http ──────────────────────────────────────────────────────────
 
-fn build_http_module() -> Rc<RefCell<ModuleObject>> {
+fn build_http_module() -> Shared<ModuleObject> {
     submodule(
         "http",
         &[
@@ -3570,13 +3570,13 @@ fn response_to_dict(resp: reqwest::blocking::Response) -> Result<Value> {
     let mut out = DictMap::new();
     out.insert(ValueKey::Text("status".into()), Value::Num(Num::Small(status as i64)));
     out.insert(ValueKey::Text("body".into()), Value::Text(body));
-    out.insert(ValueKey::Text("headers".into()), Value::Dict(Rc::new(RefCell::new(header_map))));
+    out.insert(ValueKey::Text("headers".into()), Value::Dict(Shared::new(header_map)));
     out.insert(
         ValueKey::Text("ok".into()),
         Value::Bool((200..300).contains(&status)),
     );
     out.insert(ValueKey::Text("url".into()), Value::Text(url));
-    Ok(Value::Dict(Rc::new(RefCell::new(out))))
+    Ok(Value::Dict(Shared::new(out)))
 }
 
 fn build_client(opts: &Value) -> Result<reqwest::blocking::Client> {
@@ -3829,7 +3829,7 @@ fn enc_base64_decode(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(s.as_bytes())
         .map_err(|e| crate::error::RuntimeError::value_err(format!("base64_decode: {e}")))?;
-    Ok(Value::Bytes(Rc::new(bytes)))
+    Ok(Value::Bytes(Arc::new(bytes)))
 }
 
 fn enc_hex_encode(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -3843,7 +3843,7 @@ fn enc_hex_decode(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let s = expect_text("hex_decode", args, 0)?;
     let bytes = hex::decode(s)
         .map_err(|e| crate::error::RuntimeError::value_err(format!("hex_decode: {e}")))?;
-    Ok(Value::Bytes(Rc::new(bytes)))
+    Ok(Value::Bytes(Arc::new(bytes)))
 }
 
 /// URL 百分号编码：保留 unreserved 字符（A-Za-z0-9-._~），其余 %XX。
@@ -3917,7 +3917,7 @@ fn enc_gzip_encode(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let out = encoder
         .finish()
         .map_err(|e| crate::error::RuntimeError::io_err(format!("gzip_encode: {e}")))?;
-    Ok(Value::Bytes(Rc::new(out)))
+    Ok(Value::Bytes(Arc::new(out)))
 }
 
 fn enc_gzip_decode(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -3929,10 +3929,10 @@ fn enc_gzip_decode(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let mut out = Vec::new();
     dec.read_to_end(&mut out)
         .map_err(|e| crate::error::RuntimeError::io_err(format!("gzip_decode: {e}")))?;
-    Ok(Value::Bytes(Rc::new(out)))
+    Ok(Value::Bytes(Arc::new(out)))
 }
 
-fn build_encoding_module() -> Rc<RefCell<ModuleObject>> {
+fn build_encoding_module() -> Shared<ModuleObject> {
     submodule(
         "encoding",
         &[
@@ -3976,14 +3976,14 @@ fn serde_json_to_optive(v: &serde_json::Value) -> Result<Value> {
         J::String(s) => Value::Text(s.clone()),
         J::Array(a) => {
             let items: Result<Vec<_>> = a.iter().map(serde_json_to_optive).collect();
-            Value::List(Rc::new(RefCell::new(items?)))
+            Value::List(Shared::new(items?))
         }
         J::Object(o) => {
             let mut d = DictMap::new();
             for (k, val) in o.iter() {
                 d.insert(ValueKey::Text(k.clone()), serde_json_to_optive(val)?);
             }
-            Value::Dict(Rc::new(RefCell::new(d)))
+            Value::Dict(Shared::new(d))
         }
     })
 }
@@ -4000,7 +4000,7 @@ fn toml_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     serde_json_to_optive(&jv)
 }
 
-fn build_toml_module() -> Rc<RefCell<ModuleObject>> {
+fn build_toml_module() -> Shared<ModuleObject> {
     submodule("toml", &[("parse", builtin(toml_parse))])
 }
 
@@ -4016,7 +4016,7 @@ fn yaml_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     serde_json_to_optive(&jv)
 }
 
-fn build_yaml_module() -> Rc<RefCell<ModuleObject>> {
+fn build_yaml_module() -> Shared<ModuleObject> {
     submodule("yaml", &[("parse", builtin(yaml_parse))])
 }
 
@@ -4069,26 +4069,26 @@ fn csv_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
                     let v = row.get(i).map(|s| s.as_str()).unwrap_or("");
                     d.insert(ValueKey::Text(h.clone()), Value::Text(v.to_string()));
                 }
-                Value::Dict(Rc::new(RefCell::new(d)))
+                Value::Dict(Shared::new(d))
             })
             .collect();
-        Ok(Value::List(Rc::new(RefCell::new(out))))
+        Ok(Value::List(Shared::new(out)))
     } else {
         let out: Vec<Value> = rows
             .iter()
             .map(|row| {
-                Value::List(Rc::new(RefCell::new(
+                Value::List(Shared::new(
                     row.iter()
                         .map(|s| Value::Text(s.clone()))
                         .collect(),
-                )))
+                ))
             })
             .collect();
-        Ok(Value::List(Rc::new(RefCell::new(out))))
+        Ok(Value::List(Shared::new(out)))
     }
 }
 
-fn build_csv_module() -> Rc<RefCell<ModuleObject>> {
+fn build_csv_module() -> Shared<ModuleObject> {
     submodule("csv", &[("parse", builtin(csv_parse))])
 }
 
@@ -4112,7 +4112,7 @@ fn xml_element_to_value(node: roxmltree::Node) -> Value {
     }
     d.insert(
         ValueKey::Text("attrs".into()),
-        Value::Dict(Rc::new(RefCell::new(attrs))),
+        Value::Dict(Shared::new(attrs)),
     );
     // 直接文本 + 子元素
     let mut text = String::new();
@@ -4135,9 +4135,9 @@ fn xml_element_to_value(node: roxmltree::Node) -> Value {
     );
     d.insert(
         ValueKey::Text("children".into()),
-        Value::List(Rc::new(RefCell::new(children))),
+        Value::List(Shared::new(children)),
     );
-    Value::Dict(Rc::new(RefCell::new(d)))
+    Value::Dict(Shared::new(d))
 }
 
 fn xml_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -4148,6 +4148,6 @@ fn xml_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     Ok(xml_element_to_value(doc.root_element()))
 }
 
-fn build_xml_module() -> Rc<RefCell<ModuleObject>> {
+fn build_xml_module() -> Shared<ModuleObject> {
     submodule("xml", &[("parse", builtin(xml_parse))])
 }

@@ -1,5 +1,6 @@
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::Arc;
+
+use optive::shared::Shared;
 
 use optive::codegen::Generator;
 use optive::debug::{self, DebugState, StepMode, StopReason};
@@ -10,7 +11,7 @@ use optive::vm::Vm;
 fn load(vm: &mut Vm, source: &str) {
     let file = "<test>";
     vm.source_file = file.into();
-    vm.current_source = Some(Rc::from(source));
+    vm.current_source = Some(Arc::from(source));
     let program = Parser::parse(source).expect("parse");
     let mut compiled = Generator::new().compile(&program).expect("compile");
     diagnostics::attach_function_sources(&mut compiled, source, file);
@@ -20,10 +21,10 @@ fn load(vm: &mut Vm, source: &str) {
 #[test]
 fn debug_stops_on_entry() {
     let mut vm = Vm::new();
-    let state = Rc::new(RefCell::new(DebugState {
+    let state = Shared::new(DebugState {
         stop_on_entry: true,
         ..Default::default()
-    }));
+    });
     debug::attach(&mut vm, state.clone());
     load(
         &mut vm,
@@ -40,10 +41,10 @@ x = x + 1
 #[test]
 fn debug_line_breakpoint_and_continue() {
     let mut vm = Vm::new();
-    let state = Rc::new(RefCell::new(DebugState {
+    let state = Shared::new(DebugState {
         stop_on_entry: false,
         ..Default::default()
-    }));
+    });
     state.borrow_mut().add_line_breakpoint("", 3);
     debug::attach(&mut vm, state.clone());
     load(
@@ -62,10 +63,10 @@ fn debug_line_breakpoint_and_continue() {
 #[test]
 fn debug_breakpoint_builtin() {
     let mut vm = Vm::new();
-    let state = Rc::new(RefCell::new(DebugState {
+    let state = Shared::new(DebugState {
         stop_on_entry: false,
         ..Default::default()
-    }));
+    });
     debug::attach(&mut vm, state.clone());
     load(
         &mut vm,
@@ -88,10 +89,10 @@ x = 20
 #[test]
 fn debug_step_over_advances_line() {
     let mut vm = Vm::new();
-    let state = Rc::new(RefCell::new(DebugState {
+    let state = Shared::new(DebugState {
         stop_on_entry: true,
         ..Default::default()
-    }));
+    });
     debug::attach(&mut vm, state.clone());
     load(
         &mut vm,
@@ -110,10 +111,10 @@ fn debug_step_over_advances_line() {
 #[test]
 fn debug_eval_sees_globals() {
     let mut vm = Vm::new();
-    let state = Rc::new(RefCell::new(DebugState {
+    let state = Shared::new(DebugState {
         stop_on_entry: false,
         ..Default::default()
-    }));
+    });
     state.borrow_mut().add_line_breakpoint("", 2);
     debug::attach(&mut vm, state);
     load(&mut vm, "x = 41\ny = x + 1\n");
@@ -127,10 +128,10 @@ fn debug_eval_sees_globals() {
 #[test]
 fn debug_stepi_advances_pc() {
     let mut vm = Vm::new();
-    let state = Rc::new(RefCell::new(DebugState {
+    let state = Shared::new(DebugState {
         stop_on_entry: true,
         ..Default::default()
-    }));
+    });
     debug::attach(&mut vm, state.clone());
     load(&mut vm, "a = 1\nb = 2\n");
     assert!(vm.run_until_debug_break().unwrap().is_none());
@@ -144,10 +145,10 @@ fn debug_stepi_advances_pc() {
 #[test]
 fn debug_function_breakpoint_once() {
     let mut vm = Vm::new();
-    let state = Rc::new(RefCell::new(DebugState {
+    let state = Shared::new(DebugState {
         stop_on_entry: false,
         ..Default::default()
-    }));
+    });
     state.borrow_mut().function_breakpoints.insert("foo".into());
     debug::attach(&mut vm, state.clone());
     load(
@@ -177,10 +178,10 @@ foo(1)
 #[test]
 fn debug_finish_returns_from_call() {
     let mut vm = Vm::new();
-    let state = Rc::new(RefCell::new(DebugState {
+    let state = Shared::new(DebugState {
         stop_on_entry: false,
         ..Default::default()
-    }));
+    });
     state.borrow_mut().function_breakpoints.insert("inner".into());
     debug::attach(&mut vm, state.clone());
     load(
@@ -209,10 +210,10 @@ r = outer()
 #[test]
 fn debug_uncaught_stops() {
     let mut vm = Vm::new();
-    let state = Rc::new(RefCell::new(DebugState {
+    let state = Shared::new(DebugState {
         stop_on_entry: false,
         ..Default::default()
-    }));
+    });
     debug::attach(&mut vm, state.clone());
     load(
         &mut vm,
@@ -230,10 +231,10 @@ throw "boom"
 #[test]
 fn debug_source_window() {
     let mut vm = Vm::new();
-    let state = Rc::new(RefCell::new(DebugState {
+    let state = Shared::new(DebugState {
         stop_on_entry: false,
         ..Default::default()
-    }));
+    });
     state.borrow_mut().add_line_breakpoint("", 3);
     debug::attach(&mut vm, state);
     load(&mut vm, "a = 1\nb = 2\nc = 3\nd = 4\n");
@@ -246,10 +247,10 @@ fn debug_source_window() {
 #[test]
 fn debug_line_breakpoint_refires_each_loop_iteration() {
     let mut vm = Vm::new();
-    let state = Rc::new(RefCell::new(DebugState {
+    let state = Shared::new(DebugState {
         stop_on_entry: false,
         ..Default::default()
-    }));
+    });
     // 在累加行下断；循环每一轮都应再次停住
     state.borrow_mut().add_line_breakpoint("", 5);
     debug::attach(&mut vm, state.clone());
@@ -271,10 +272,10 @@ fn debug_line_breakpoint_refires_each_loop_iteration() {
 #[test]
 fn debug_eval_reads_locals() {
     let mut vm = Vm::new();
-    let state = Rc::new(RefCell::new(DebugState {
+    let state = Shared::new(DebugState {
         stop_on_entry: false,
         ..Default::default()
-    }));
+    });
     state.borrow_mut().add_line_breakpoint("", 5);
     debug::attach(&mut vm, state);
     load(

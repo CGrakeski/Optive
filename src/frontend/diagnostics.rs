@@ -1,6 +1,6 @@
 //! 带源码上下文的词法/语法诊断格式化。
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::error::{LexError, ParseError};
 use crate::vm::ErrorStackFrame;
@@ -168,7 +168,7 @@ pub fn attach_function_sources(
     source: &str,
     file: &str,
 ) {
-    let source_rc: Rc<str> = Rc::from(source);
+    let source_rc: Arc<str> = Arc::from(source);
     let updated: std::collections::HashMap<_, _> = program
         .functions
         .iter()
@@ -178,7 +178,7 @@ pub fn attach_function_sources(
                 func.source = Some(source_rc.clone());
                 func.source_file = file.to_string();
             }
-            (k.clone(), Rc::new(func))
+            (k.clone(), Arc::new(func))
         })
         .collect();
     program.functions = updated;
@@ -192,7 +192,7 @@ pub fn attach_function_sources(
                 template.source = Some(source_rc.clone());
                 template.source_file = file.to_string();
             }
-            (k.clone(), Rc::new(template))
+            (k.clone(), Arc::new(template))
         })
         .collect();
     program.generic_functions = generics;
@@ -220,17 +220,17 @@ pub fn attach_function_sources(
             continue;
         }
         let mut func = (*f).clone();
-        func.body = Rc::new(body);
+        func.body = Arc::new(body);
         func.hot = crate::hot_code::HotCode::encode(&func.body);
-        program.functions.insert(name, Rc::new(func));
+        program.functions.insert(name, Arc::new(func));
     }
 }
 
 fn patch_pushes(
     code: &mut [crate::opcode::Instruction],
-    functions: &std::collections::HashMap<String, Rc<crate::opcode::FunctionObject>>,
-    generics: &std::collections::HashMap<String, Rc<crate::opcode::GenericFunctionTemplate>>,
-    source: &Rc<str>,
+    functions: &std::collections::HashMap<String, Arc<crate::opcode::FunctionObject>>,
+    generics: &std::collections::HashMap<String, Arc<crate::opcode::GenericFunctionTemplate>>,
+    source: &Arc<str>,
     file: &str,
 ) -> bool {
     use crate::opcode::Instruction;
@@ -241,7 +241,7 @@ fn patch_pushes(
             Instruction::Push(Value::Function(f)) => {
                 if f.source.is_some() {
                     if let Some(u) = functions.get(&f.name) {
-                        if !Rc::ptr_eq(f, u) {
+                        if !Arc::ptr_eq(f, u) {
                             *ins = Instruction::Push(Value::Function(u.clone()));
                             changed = true;
                         }
@@ -254,7 +254,7 @@ fn patch_pushes(
                     let mut func = (**f).clone();
                     func.source = Some(source.clone());
                     func.source_file = file.to_string();
-                    Rc::new(func)
+                    Arc::new(func)
                 };
                 *ins = Instruction::Push(Value::Function(replacement));
                 changed = true;
@@ -266,11 +266,11 @@ fn patch_pushes(
                     let mut template = (**t).clone();
                     template.source = Some(source.clone());
                     template.source_file = file.to_string();
-                    Rc::new(template)
+                    Arc::new(template)
                 } else {
                     continue;
                 };
-                if !Rc::ptr_eq(t, &replacement) {
+                if !Arc::ptr_eq(t, &replacement) {
                     *ins = Instruction::Push(Value::GenericFunction(replacement));
                     changed = true;
                 }
@@ -320,21 +320,21 @@ mod tests {
                 file: "<repl>".into(),
                 line: 1,
                 column: 1,
-                source: Some(Rc::from("a()")),
+                source: Some(Arc::from("a()")),
             },
             ErrorStackFrame {
                 func: "a".into(),
                 file: "<repl>".into(),
                 line: 1,
                 column: 12,
-                source: Some(Rc::from("func a() { b() }")),
+                source: Some(Arc::from("func a() { b() }")),
             },
             ErrorStackFrame {
                 func: "b".into(),
                 file: "<repl>".into(),
                 line: 1,
                 column: 12,
-                source: Some(Rc::from("func b() { c }")),
+                source: Some(Arc::from("func b() { c }")),
             },
         ];
         let msg = format_runtime_with_stack("a()", "<repl>", "undefined name: c", &stack);

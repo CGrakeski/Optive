@@ -47,7 +47,7 @@ pub struct CallArg {
 #[derive(Debug, Clone)]
 pub struct MacroCallArg {
     pub is_splat: bool,
-    pub node: std::rc::Rc<crate::runtime_ast::RuntimeAstNode>,
+    pub node: std::sync::Arc<crate::runtime_ast::RuntimeAstNode>,
 }
 
 #[derive(Debug, Clone)]
@@ -239,6 +239,8 @@ pub enum Stmt {
         base: Option<String>,
         fields: Vec<StructField>,
         methods: Vec<StructMethod>,
+        /// 尾部注解，如 `} : C.layout`。
+        layout: Option<TypeExpr>,
     },
     MacroDecl {
         visibility: Visibility,

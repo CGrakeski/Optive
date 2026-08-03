@@ -1,12 +1,12 @@
 //! `Optive debug`：交互式调试器 REPL。
 
-use std::cell::RefCell;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use optive::codegen::Generator;
+use optive::shared::Shared;
 use optive::debug::{
     self, eval_in_paused_vm, format_location, format_source_window, list_fibers, list_locals,
     reason_label, set_local_or_global, stack_frames, DebugState, StepMode, StopReason,
@@ -77,11 +77,11 @@ fn run_debug_session(
     source: &str,
     file: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let state = Rc::new(RefCell::new(DebugState::default()));
+    let state = Shared::new(DebugState::default());
     debug::attach(vm, state.clone());
 
     vm.source_file = file.to_string();
-    vm.current_source = Some(std::rc::Rc::from(source));
+    vm.current_source = Some(Arc::from(source));
     if let Some(parent) = Path::new(file).parent() {
         if !parent.as_os_str().is_empty() {
             vm.import_base = parent.to_path_buf();
@@ -344,7 +344,7 @@ fn run_debug_session(
                 }
             }
             "globals" => {
-                let mut names: Vec<_> = vm.globals.keys().cloned().collect();
+                let mut names = vm.globals.keys();
                 names.sort();
                 for name in names {
                     if name.starts_with("__") {

@@ -1,11 +1,13 @@
 //! Performance benchmarks with statistical reporting.
-//! Run with: cargo test --test benchmarks -- --nocapture
+//! Run with: cargo test --test benchmarks -- --ignored --nocapture
 
 mod common;
 
 use std::time::Instant;
 
 use optive::run_source;
+use optive::run_source_in_vm;
+use optive::vm::Vm;
 
 pub struct BenchStats {
     pub name: String,
@@ -115,6 +117,75 @@ loop (1000) {
 42
 "#;
 
+/// 与 `examples/parallel_primes.tive` 同算法；无 print，返回素数个数。
+const PARALLEL_PRIMES_SRC: &str = r#"
+const let FROM = 2
+const let TO = 50001
+const let WORKERS = 8
+
+func is_prime(n) {
+  if (n < 2) { return false }
+  if (n == 2) { return true }
+  if (n % 2 == 0) { return false }
+  var d = 3
+  loop {
+    if (d * d > n) { break }
+    if (n % d == 0) { return false }
+    d = d + 2
+  }
+  return true
+}
+
+func worker(id, lo, hi, box, wg) {
+  var n = lo
+  var local = 0
+  loop {
+    if (n > hi) { break }
+    if (is_prime(n)) { local = local + 1 }
+    n = n + 1
+  }
+  let g = box.lock()
+  var rows = g.get()
+  rows.append(local)
+  g.set(rows)
+  g.unlock()
+  wg.done()
+}
+
+func start_worker(id, lo, hi, box, wg) {
+  go do { worker(id, lo, hi, box, wg) }
+}
+
+let box = Mutex([])
+let wg = WaitGroup(WORKERS)
+let span = TO - FROM + 1
+let chunk = span / WORKERS
+var wid = 0
+loop (WORKERS) {
+  let lo = FROM + wid * chunk
+  let hi = lo + chunk - 1
+  start_worker(wid, lo, hi, box, wg)
+  wid = wid + 1
+}
+wg.wait()
+let g = box.lock()
+let rows = g.get()
+g.unlock()
+var total = 0
+var i = 0
+loop {
+  if (i >= rows.len()) { break }
+  total = total + rows[i]
+  i = i + 1
+}
+total
+"#;
+
+fn run_parallel_primes(workers: usize) -> optive::value::Value {
+    let mut vm = Vm::with_workers(workers);
+    run_source_in_vm(&mut vm, PARALLEL_PRIMES_SRC, "<bench-primes>").expect("parallel primes")
+}
+
 /// Run ignored benchmarks: `cargo test --test benchmarks -- --ignored --nocapture`
 #[test]
 #[ignore = "slow benchmark; run with --ignored"]
@@ -211,4 +282,36 @@ fn bench_nested_loop_1b_vm_only() {
         elapsed_ms,
         elapsed_ms / 1000.0
     );
+}
+
+/// 并行筛素数：M:1（1 OS worker）vs M:N（4 OS workers），同 8 个 go 任务。
+#[test]
+#[ignore = "slow benchmark; run with --ignored"]
+fn bench_parallel_primes() {
+    const EXPECT: &str = "5133";
+    let m1 = BenchStats::run("parallel_primes workers=1 (M:1)", 3, || {
+        let v = run_parallel_primes(1);
+        assert_eq!(v.display_string(), EXPECT);
+    });
+    m1.report();
+
+    let mn = BenchStats::run("parallel_primes workers=4 (M:N)", 3, || {
+        let v = run_parallel_primes(4);
+        assert_eq!(v.display_string(), EXPECT);
+    });
+    mn.report();
+
+    let mn8 = BenchStats::run("parallel_primes workers=8 (M:N)", 3, || {
+        let v = run_parallel_primes(8);
+        assert_eq!(v.display_string(), EXPECT);
+    });
+    mn8.report();
+
+    if m1.avg_ms() > 0.0 {
+        println!(
+            "parallel_primes speedup (1/4 workers): {:.2}x\nparallel_primes speedup (1/8 workers): {:.2}x",
+            m1.avg_ms() / mn.avg_ms(),
+            m1.avg_ms() / mn8.avg_ms()
+        );
+    }
 }
