@@ -12,7 +12,7 @@ pub use compiler::{
 };
 pub use frontend::{ast, diagnostics, error, fmt, lexer, parser, token};
 pub use runtime::{
-    builtins, caps, concurrency, c_types, debug, enum_variant, exceptions, ffi, ffi_extra, gc, module,
+    builtins, caps, concurrency, c_types, debug, enum_variant, exceptions, ffi, ffi_extra, ffi_pool, gc, module,
     ptr_registry, runtime_ast, scheduler, shared, sized, traceback, type_registry, types, value, vm,
 };
 pub use stdlib as std_modules;

@@ -1,17 +1,19 @@
 //! 动态库加载与 C ABI 调用。
 //!
 //! libffi 的 `Cif`/`CodePtr` 含裸指针，本身非 `Send`/`Sync`。M:N 下 Builtin
-//! 须跨线程持有，故用 `FfiCallable` + 可重入全局锁串行化实际 call。
+//! 须跨线程持有，故用 `FfiCallable` + 调用侧互斥（默认 per-callable；
+//! `OPTIVE_FFI_SERIAL=1` 时回退全局可重入锁）。
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use libffi::middle::{Arg, Cif, CodePtr, Type as FfiType};
 use libloading::Library;
 use parking_lot::ReentrantMutex;
 
-use crate::ast::TypeExpr;
+use crate::ast::Expr;
 use crate::error::RuntimeError;
 use crate::opcode::FunctionObject;
 use crate::sized::SizedNum;
@@ -21,18 +23,93 @@ use crate::Result;
 
 use crate::shared::Shared;
 
-/// 跨线程持有的 FFI 调用描述；真实调用经 `FFI_CALL_LOCK` 串行。
-struct FfiCallable {
+/// 跨线程持有的 FFI 调用描述；默认经 per-callable 锁调用（同符号串行，异符号可并行）。
+pub(crate) struct FfiCallable {
     cif: Cif,
     code: CodePtr,
+    /// 同符号互斥；同步回调重入同一符号时用可重入锁。
+    lock: ReentrantMutex<()>,
 }
 
-// SAFETY: 指针指向已加载库内的稳定符号与 libffi 分配的 CIF；调用侧持全局锁。
+// SAFETY: 指针指向已加载库内的稳定符号与 libffi 分配的 CIF；
+// 调用侧持 per-callable（或全局串行）锁，且不同 CIF 可并行（libffi 惯例）。
 unsafe impl Send for FfiCallable {}
 unsafe impl Sync for FfiCallable {}
 
-/// 可重入：同步回调里再次 `extern` 不会自死锁。
+/// 可重入全局锁：`OPTIVE_FFI_SERIAL=1` 或未开启并行时的保底语义；
+/// 同步回调里再次 `extern` 不会自死锁。
 pub static FFI_CALL_LOCK: ReentrantMutex<()> = ReentrantMutex::new(());
+
+static FFI_SERIAL_ENV: AtomicBool = AtomicBool::new(false);
+static FFI_SERIAL_INIT: AtomicBool = AtomicBool::new(false);
+static FFI_THREADS_ENV: AtomicUsize = AtomicUsize::new(0);
+static FFI_THREADS_INIT: AtomicBool = AtomicBool::new(false);
+
+fn env_truthy(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(s) => {
+            let s = s.trim();
+            !(s.is_empty() || s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("no"))
+        }
+        Err(_) => false,
+    }
+}
+
+/// `OPTIVE_FFI_SERIAL=1` → 强制全局串行（今日语义）。
+pub fn configured_ffi_serial() -> bool {
+    if !FFI_SERIAL_INIT.load(Ordering::Acquire) {
+        FFI_SERIAL_ENV.store(env_truthy("OPTIVE_FFI_SERIAL"), Ordering::Release);
+        FFI_SERIAL_INIT.store(true, Ordering::Release);
+    }
+    FFI_SERIAL_ENV.load(Ordering::Acquire)
+}
+
+/// `OPTIVE_FFI_THREADS`：卸荷池线程数；`0`（默认）= 关闭卸荷，inline 调用。
+pub fn configured_ffi_threads() -> usize {
+    if !FFI_THREADS_INIT.load(Ordering::Acquire) {
+        let n = std::env::var("OPTIVE_FFI_THREADS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        FFI_THREADS_ENV.store(n, Ordering::Release);
+        FFI_THREADS_INIT.store(true, Ordering::Release);
+    }
+    FFI_THREADS_ENV.load(Ordering::Acquire)
+}
+
+/// 每棵 Vm 树（主实例 + helper）共享的 FFI 开关。
+pub struct FfiRuntimeConfig {
+    serial: AtomicBool,
+    threads: AtomicUsize,
+}
+
+impl FfiRuntimeConfig {
+    pub fn from_env() -> Arc<Self> {
+        Arc::new(Self {
+            serial: AtomicBool::new(configured_ffi_serial()),
+            threads: AtomicUsize::new(configured_ffi_threads()),
+        })
+    }
+
+    pub fn serial(&self) -> bool {
+        self.serial.load(Ordering::Acquire)
+    }
+
+    pub fn set_serial(&self, serial: bool) {
+        self.serial.store(serial, Ordering::Release);
+    }
+
+    pub fn threads(&self) -> usize {
+        self.threads.load(Ordering::Acquire)
+    }
+
+    pub fn set_threads(&self, n: usize) {
+        self.threads.store(n, Ordering::Release);
+        if n > 0 {
+            crate::ffi_pool::resize_pool(n);
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct DllHandle {
@@ -70,20 +147,40 @@ pub enum AbiType {
 }
 
 impl AbiType {
-    pub fn from_type_expr(vm: &Vm, ty: &TypeExpr) -> Result<Self> {
-        match ty {
-            TypeExpr::Generic { name, params }
+    pub fn from_type_annotation(vm: &Vm, ty: &Expr) -> Result<Self> {
+        if let Some(val) = crate::types::static_type_value_from_expr(ty) {
+            return Self::from_type_value(vm, &val);
+        }
+        let name = crate::types::resolve_type_name_from_expr(vm, ty)?;
+        if crate::ptr_registry::is_ptr_type_name(&name) {
+            return Ok(Self::Pointer);
+        }
+        if let Some(def) = vm.struct_defs.get(&name) {
+            if def.c_layout.is_some() {
+                return Err(RuntimeError::type_err(format!(
+                    "unsupported C ABI type: {name} (struct by-value not supported; \
+                     use C.types.ptr[{name}] or C.types.void_ptr)"
+                )));
+            }
+        }
+        Self::from_type_name(&name)
+    }
+
+    fn from_type_value(vm: &Vm, val: &Value) -> Result<Self> {
+        match val {
+            Value::TypeSpec(spec) if crate::ptr_registry::is_ptr_type_name(&spec.name) => {
+                Ok(Self::Pointer)
+            }
+            Value::TypeRef(name) | Value::Text(name)
                 if crate::ptr_registry::is_ptr_type_name(name) =>
             {
-                let _ = params;
                 Ok(Self::Pointer)
             }
             _ => {
-                let name = crate::types::resolve_type_expr_name(vm, ty)?;
+                let name = crate::types::type_value_display(val);
                 if crate::ptr_registry::is_ptr_type_name(&name) {
                     return Ok(Self::Pointer);
                 }
-                // `typed struct : C.layout` 不能当 by-value ABI；须显式指针。
                 if let Some(def) = vm.struct_defs.get(&name) {
                     if def.c_layout.is_some() {
                         return Err(RuntimeError::type_err(format!(
@@ -153,8 +250,8 @@ pub fn abi_size_align(abi: AbiType) -> (usize, usize) {
     }
 }
 
-fn type_expr_name(vm: &Vm, ty: &TypeExpr) -> Result<String> {
-    crate::types::resolve_type_expr_name(vm, ty)
+fn type_annotation_name(vm: &Vm, ty: &Expr) -> Result<String> {
+    crate::types::resolve_type_name_from_expr(vm, ty)
 }
 
 pub fn load_library(vm: &mut Vm, path: &str) -> Result<Value> {
@@ -281,19 +378,20 @@ fn bind_extern_function(
                 p.name
             )));
         };
-        arg_abis.push(AbiType::from_type_expr(vm, ty)?);
+        arg_abis.push(AbiType::from_type_annotation(vm, ty)?);
     }
     let ret_abi = match &func.return_type {
-        Some(ty) => AbiType::from_type_expr(vm, ty)?,
+        Some(ty) => AbiType::from_type_annotation(vm, ty)?,
         None => AbiType::Void,
     };
 
     let arg_ffi: Vec<FfiType> = arg_abis.iter().copied().map(AbiType::ffi_type).collect();
     let mut cif = Cif::new(arg_ffi, ret_abi.ffi_type());
-    apply_call_conv(&mut cif, conv);
+    apply_call_conv(&mut cif, conv)?;
     let ffi = Arc::new(FfiCallable {
         cif,
         code: code_ptr,
+        lock: ReentrantMutex::new(()),
     });
 
     let params = func.params.clone();
@@ -319,16 +417,18 @@ fn bind_extern_function(
         for (i, param) in params.iter().enumerate() {
             let mut arg = call_args[i].clone();
             if param.implicit {
-                if let Some(ty) = &param.type_expr {
-                    if !crate::types::type_accepts(vm, &arg, ty) {
-                        let type_name = type_expr_name(vm, ty)?;
+                if let Some(ty_expr) = &param.type_expr {
+                    let ty_val = crate::types::eval_type_annotation(vm, ty_expr)?;
+                    if !crate::types::value_accepts(vm, &arg, &ty_val) {
+                        let type_name = type_annotation_name(vm, ty_expr)?;
                         arg = vm.convert_type(Value::type_ref(type_name), arg)?;
                     }
                 }
-            } else if let Some(ty) = &param.type_expr {
+            } else if let Some(ty_expr) = &param.type_expr {
+                let ty_val = crate::types::eval_type_annotation(vm, ty_expr)?;
                 // 非 implicit 的类型参数：须已匹配（不自动转换）
-                if !crate::types::type_accepts(vm, &arg, ty) {
-                    let expected = type_expr_name(vm, ty)?;
+                if !crate::types::value_accepts(vm, &arg, &ty_val) {
+                    let expected = type_annotation_name(vm, ty_expr)?;
                     let msg = format!(
                         "parameter '{}': expected {}, got {} (use implicit to convert)",
                         param.name,
@@ -341,8 +441,9 @@ fn bind_extern_function(
                 }
             }
             if param.type_strong {
-                if let Some(ty) = &param.type_expr {
-                    if let Some(detail) = crate::types::type_check_error(vm, &arg, ty) {
+                if let Some(ty_expr) = &param.type_expr {
+                    let ty_val = crate::types::eval_type_annotation(vm, ty_expr)?;
+                    if let Some(detail) = crate::types::type_check_error(vm, &arg, &ty_val) {
                         let msg = format!("parameter '{}': {detail}", param.name);
                         let exc = crate::exceptions::make_exception(vm, "TypeError", msg)?;
                         vm.throw_value(exc)?;
@@ -358,21 +459,67 @@ fn bind_extern_function(
             .zip(arg_abis.iter())
             .map(|(v, abi)| value_to_storage(v, *abi))
             .collect::<Result<_>>()?;
-        let ffi_args: Vec<Arg> = storage.iter_mut().map(|s| s.as_arg()).collect();
 
-        let raw = super::ffi_extra::with_active_vm(vm, || {
-            let _guard = FFI_CALL_LOCK.lock();
-            let r = unsafe { call_cif(&ffi.cif, ffi.code, &ffi_args, ret_abi) };
-            super::ffi_extra::sample_error_codes();
-            r
-        })?;
+        // 卸荷完成重入：取回结果，不再调 C。
+        if let Some(pending) = vm.take_ready_ffi_wait() {
+            match pending {
+                Ok((raw, errno)) => {
+                    super::ffi_extra::set_last_errno(errno);
+                    let mut out = abi_to_value(raw, ret_abi)?;
+                    if let Some(ref wrapper_expr) = return_wrapper {
+                        out = eval_wrapper_expr(vm, wrapper_expr, out)?;
+                    }
+                    if return_strong {
+                        if let Some(ref ty_expr) = return_type {
+                            let ty_val = crate::types::eval_type_annotation(vm, ty_expr)?;
+                            if let Some(detail) = crate::types::type_check_error(vm, &out, &ty_val)
+                            {
+                                let msg = format!("return value: {detail}");
+                                let exc = crate::exceptions::make_exception(vm, "TypeError", msg)?;
+                                vm.throw_value(exc)?;
+                                return Ok(Value::None);
+                            }
+                        }
+                    }
+                    return Ok(out);
+                }
+                Err(msg) => return Err(RuntimeError::msg(msg)),
+            }
+        }
+        if vm.ffi_wait_still_pending() {
+            vm.block_suspend = true;
+            return Ok(Value::None);
+        }
+
+        let use_serial = vm.ffi_serial();
+        let offload = vm.ffi_threads() > 0 && vm.can_offload_ffi();
+
+        let raw = if offload {
+            // 卸荷路径：不设 active_vm → 同步回调会失败（首版故意禁止）。
+            let pending = crate::ffi_pool::submit_call(
+                ffi.clone(),
+                storage,
+                ret_abi,
+                use_serial,
+                vm.ffi_threads(),
+            )?;
+            vm.set_ffi_wait(pending);
+            vm.block_suspend = true;
+            return Ok(Value::None);
+        } else {
+            super::ffi_extra::with_active_vm(vm, || {
+                invoke_native_call(&ffi, &mut storage, ret_abi, use_serial)
+            })?
+        };
+
         let mut out = abi_to_value(raw, ret_abi)?;
         if let Some(ref wrapper_expr) = return_wrapper {
             out = eval_wrapper_expr(vm, wrapper_expr, out)?;
         }
         if return_strong {
-            if let Some(ref ty) = return_type {
-                if let Some(detail) = crate::types::type_check_error(vm, &out, ty) {
+            if let Some(ref ty_expr) = return_type {
+                let ty_val = crate::types::eval_type_annotation(vm, ty_expr)?;
+                if let Some(detail) = crate::types::type_check_error(vm, &out, &ty_val) {
                     let msg = format!("return value: {detail}");
                     let exc = crate::exceptions::make_exception(vm, "TypeError", msg)?;
                     vm.throw_value(exc)?;
@@ -386,15 +533,70 @@ fn bind_extern_function(
     Ok(Value::Builtin(wrapper))
 }
 
-fn apply_call_conv(cif: &mut Cif, conv: CallConv) {
+fn apply_call_conv(cif: &mut Cif, conv: CallConv) -> Result<()> {
     use libffi::middle::ffi_abi_FFI_DEFAULT_ABI;
-    // 主流目标（含 win64）上 stdcall 与 default C 约定一致；
-    // 显式传 "stdcall" 仍接受，便于跨平台脚本。
-    let _ = conv;
-    cif.set_abi(ffi_abi_FFI_DEFAULT_ABI);
+    match conv {
+        CallConv::C => {
+            cif.set_abi(ffi_abi_FFI_DEFAULT_ABI);
+            Ok(())
+        }
+        CallConv::Stdcall => {
+            // win64 上 stdcall 与默认 C 约定一致；32 位 Windows 尚未接 FFI_STDCALL。
+            #[cfg(all(windows, target_arch = "x86"))]
+            {
+                let _ = cif;
+                Err(crate::error::RuntimeError::msg(
+                    "stdcall/winapi calling convention is not wired on 32-bit Windows; use 64-bit or C ABI",
+                ))
+            }
+            #[cfg(not(all(windows, target_arch = "x86")))]
+            {
+                cif.set_abi(ffi_abi_FFI_DEFAULT_ABI);
+                Ok(())
+            }
+        }
+    }
 }
 
-enum ArgStorage {
+/// 持锁执行 libffi call，并采样 errno（调用线程 TLS）。
+pub(crate) fn invoke_native_call(
+    ffi: &FfiCallable,
+    storage: &mut [ArgStorage],
+    ret_abi: AbiType,
+    use_serial: bool,
+) -> Result<RetStorage> {
+    let ffi_args: Vec<Arg> = storage.iter_mut().map(|s| s.as_arg()).collect();
+    let raw = if use_serial {
+        let _guard = FFI_CALL_LOCK.lock();
+        unsafe { call_cif(&ffi.cif, ffi.code, &ffi_args, ret_abi) }?
+    } else {
+        let _guard = ffi.lock.lock();
+        unsafe { call_cif(&ffi.cif, ffi.code, &ffi_args, ret_abi) }?
+    };
+    super::ffi_extra::sample_error_codes();
+    Ok(raw)
+}
+
+/// 卸荷线程用：返回 `(结果, errno)`，不依赖调用方 TLS。
+pub(crate) fn invoke_native_call_sampled(
+    ffi: &FfiCallable,
+    storage: &mut [ArgStorage],
+    ret_abi: AbiType,
+    use_serial: bool,
+) -> Result<(RetStorage, i32)> {
+    let ffi_args: Vec<Arg> = storage.iter_mut().map(|s| s.as_arg()).collect();
+    let raw = if use_serial {
+        let _guard = FFI_CALL_LOCK.lock();
+        unsafe { call_cif(&ffi.cif, ffi.code, &ffi_args, ret_abi) }?
+    } else {
+        let _guard = ffi.lock.lock();
+        unsafe { call_cif(&ffi.cif, ffi.code, &ffi_args, ret_abi) }?
+    };
+    let errno = super::ffi_extra::sample_error_codes_value();
+    Ok((raw, errno))
+}
+
+pub(crate) enum ArgStorage {
     I8(i8),
     U8(u8),
     I16(i16),
@@ -506,7 +708,7 @@ fn narrow_i64(v: &Value, min: i64, max: i64, abi_name: &str) -> Result<i64> {
     Ok(n)
 }
 
-enum RetStorage {
+pub(crate) enum RetStorage {
     Void,
     I8(i8),
     U8(u8),

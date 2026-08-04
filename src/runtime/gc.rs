@@ -376,7 +376,7 @@ fn mark_sync_children(inner: &crate::value::SyncInner, worklist: &mut Vec<Value>
     use crate::value::SyncInner;
     match inner {
         SyncInner::RWMutex { value, .. } => worklist.push(value.clone()),
-        SyncInner::Once { value, .. } => worklist.push(value.clone()),
+        SyncInner::Once { value, phase: _ } => worklist.push(value.clone()),
         SyncInner::WaitGroup { .. }
         | SyncInner::Semaphore { .. }
         | SyncInner::Barrier { .. }

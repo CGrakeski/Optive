@@ -602,7 +602,7 @@ impl Formatter {
         self.buf.push('}');
     }
 
-    fn emit_type_params(&mut self, params: &[(String, Option<TypeExpr>)]) {
+    fn emit_type_params(&mut self, params: &[(String, Option<Expr>)]) {
         if params.is_empty() {
             return;
         }
@@ -666,7 +666,7 @@ impl Formatter {
 
     fn emit_return_sig(
         &mut self,
-        return_type: Option<&TypeExpr>,
+        return_type: Option<&Expr>,
         return_strong: bool,
         return_wrapper: Option<&Expr>,
         depth: usize,
@@ -683,26 +683,8 @@ impl Formatter {
         }
     }
 
-    fn emit_type(&mut self, t: &TypeExpr) {
-        match t {
-            TypeExpr::Name(n) => self.buf.push_str(n),
-            TypeExpr::Attr { object, field } => {
-                self.emit_type(object);
-                self.buf.push('.');
-                self.buf.push_str(field);
-            }
-            TypeExpr::Generic { name, params } => {
-                self.buf.push_str(name);
-                self.buf.push('[');
-                for (i, p) in params.iter().enumerate() {
-                    if i > 0 {
-                        self.buf.push_str(", ");
-                    }
-                    self.emit_type(p);
-                }
-                self.buf.push(']');
-            }
-        }
+    fn emit_type(&mut self, t: &Expr) {
+        self.emit_expr(t, 0);
     }
 
     fn emit_module_ref(&mut self, m: &ModuleRef) {
@@ -1112,7 +1094,7 @@ impl Formatter {
                 self.buf.push_str("do");
                 self.emit_param_list(params, depth);
                 self.emit_return_sig(
-                    return_type.as_ref(),
+                    return_type.as_deref(),
                     *return_strong,
                     return_wrapper.as_deref(),
                     depth,

@@ -7,9 +7,8 @@ use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 
-use crate::ast::TypeExpr;
 use crate::error::RuntimeError;
-use crate::value::{BuiltinFn, DictMap, IteratorState, Num, Value, ValueKey};
+use crate::value::{BuiltinFn, DictMap, IteratorState, Num, TypeSpecData, Value, ValueKey};
 use crate::vm::Vm;
 use crate::Result;
 
@@ -96,6 +95,10 @@ pub fn check_primitive_instance(vm: &Vm, val: &Value, type_name: &str) -> Option
         n if n == names::BYTES => matches!(val, Value::Bytes(_)),
         n if n == names::ITERATOR => matches!(val, Value::Iterator(_)),
         n if n == names::TYPE => matches!(val, Value::TypeRef(_) | Value::TypeSpec(_)),
+        "function" => matches!(
+            val,
+            Value::Function(_) | Value::Builtin(_) | Value::GenericFunction(_)
+        ),
         "ptr" => matches!(val, Value::Ptr(_)),
         n if crate::sized::SizedNum::ALL_NAMES.contains(&n) => {
             matches!(val, Value::Sized(s) if s.type_name() == n)
@@ -226,45 +229,41 @@ pub fn sample_value_for_type_name(name: &str) -> Value {
 }
 
 /// 值的运行时类型（作类型表达式，供泛型推断）。
-pub fn value_to_type_expr(_vm: &Vm, val: &Value) -> TypeExpr {
-    if let Some(ty) = primitive_value_to_type_expr(val) {
+pub fn value_to_type_value(_vm: &Vm, val: &Value) -> Value {
+    if let Some(ty) = primitive_value_to_type_value(val) {
         return ty;
     }
     match val {
         Value::Struct(s) => {
             if s.generic_args.is_empty() {
-                TypeExpr::Name(s.def.name.clone())
+                Value::TypeRef(s.def.name.clone())
             } else {
-                TypeExpr::Generic {
-                    name: s.def.name.clone(),
-                    params: s.generic_args.clone(),
-                }
+                Value::TypeSpec(TypeSpecData::new(s.def.name.clone(), s.generic_args.clone(),
+                ))
             }
         }
-        Value::TypeSpec(_) | Value::TypeRef(_) => TypeExpr::Name("type".into()),
-        _ => TypeExpr::Name(val.type_name().to_string()),
+        Value::TypeSpec(_) | Value::TypeRef(_) => Value::TypeRef("type".to_string()),
+        _ => Value::TypeRef(val.type_name().to_string()),
     }
 }
 
-/// 将运行时类型操作数转为 `TypeExpr`（供 `std.typing` 构造）。
-pub fn value_to_type_expr_operand(val: &Value) -> TypeExpr {
+/// 将运行时类型操作数转为 类型值（供 `std.typing` 构造）。
+pub fn value_to_type_value_operand(val: &Value) -> Value {
     match val {
-        Value::TypeRef(s) | Value::Text(s) => TypeExpr::Name(s.clone()),
-        Value::TypeSpec(spec) => TypeExpr::Generic {
-            name: spec.name.clone(),
-            params: spec.args.clone(),
-        },
-        other => TypeExpr::Name(other.type_name().to_string()),
+        Value::TypeRef(s) | Value::Text(s) => Value::TypeRef(s.clone()),
+        Value::TypeSpec(spec) => Value::TypeSpec(TypeSpecData::new(spec.name.clone(), spec.args.clone(),
+        )),
+        other => Value::TypeRef(other.type_name().to_string()),
     }
 }
 
-/// `Literal(...)` 实参：把 num/bool/text 编码进 TypeExpr 名字，供运行时相等比较。
-pub fn literal_operand_to_type_expr(val: &Value) -> crate::Result<TypeExpr> {
+/// `Literal(...)` 实参：把 num/bool/text 编码进 type value 名字，供运行时相等比较。
+pub fn literal_operand_to_type_value(val: &Value) -> crate::Result<Value> {
     match val {
-        Value::Text(s) => Ok(TypeExpr::Name(format!("__lit_text:{s}"))),
-        Value::Bool(b) => Ok(TypeExpr::Name(format!("__lit_bool:{b}"))),
-        Value::Num(n) => Ok(TypeExpr::Name(format!("__lit_num:{}", n))),
-        Value::None => Ok(TypeExpr::Name("__lit_none".into())),
+        Value::Text(s) => Ok(Value::TypeRef(format!("__lit_text:{s}"))),
+        Value::Bool(b) => Ok(Value::TypeRef(format!("__lit_bool:{b}"))),
+        Value::Num(n) => Ok(Value::TypeRef(format!("__lit_num:{}", n))),
+        Value::None => Ok(Value::TypeRef("__lit_none".to_string())),
         other => Err(RuntimeError::msg(format!(
             "Literal does not support {}",
             other.type_name()
@@ -272,9 +271,9 @@ pub fn literal_operand_to_type_expr(val: &Value) -> crate::Result<TypeExpr> {
     }
 }
 
-fn literal_accepts(_vm: &Vm, val: &Value, params: &[TypeExpr]) -> bool {
+fn literal_accepts(_vm: &Vm, val: &Value, params: &[Value]) -> bool {
     params.iter().any(|p| {
-        let TypeExpr::Name(enc) = p else {
+        let Value::TypeRef(enc) = p else {
             return false;
         };
         if enc == "__lit_none" {
@@ -296,7 +295,7 @@ fn literal_accepts(_vm: &Vm, val: &Value, params: &[TypeExpr]) -> bool {
     })
 }
 
-fn literal_match_distance(vm: &Vm, val: &Value, params: &[TypeExpr]) -> Option<usize> {
+fn literal_match_distance(vm: &Vm, val: &Value, params: &[Value]) -> Option<usize> {
     if literal_accepts(vm, val, params) {
         Some(0)
     } else {
@@ -304,7 +303,7 @@ fn literal_match_distance(vm: &Vm, val: &Value, params: &[TypeExpr]) -> Option<u
     }
 }
 
-fn dict_accepts(vm: &Vm, val: &Value, params: &[TypeExpr]) -> bool {
+fn dict_accepts(vm: &Vm, val: &Value, params: &[Value]) -> bool {
     let [kty, vty] = params else {
         return false;
     };
@@ -313,11 +312,11 @@ fn dict_accepts(vm: &Vm, val: &Value, params: &[TypeExpr]) -> bool {
     };
     d.borrow().iter().all(|(k, v)| {
         let kv = crate::value::value_key_to_value(k);
-        crate::types::type_accepts(vm, &kv, kty) && crate::types::type_accepts(vm, v, vty)
+        crate::types::value_accepts(vm, &kv, kty) && crate::types::value_accepts(vm, v, vty)
     })
 }
 
-fn dict_match_distance(vm: &Vm, val: &Value, params: &[TypeExpr]) -> Option<usize> {
+fn dict_match_distance(vm: &Vm, val: &Value, params: &[Value]) -> Option<usize> {
     let [kty, vty] = params else {
         return None;
     };
@@ -327,13 +326,13 @@ fn dict_match_distance(vm: &Vm, val: &Value, params: &[TypeExpr]) -> Option<usiz
     let mut score = 0usize;
     for (k, v) in d.borrow().iter() {
         let kv = crate::value::value_key_to_value(k);
-        score += crate::types::type_expr_match_distance(vm, &kv, kty)?;
-        score += crate::types::type_expr_match_distance(vm, v, vty)?;
+        score += crate::types::type_value_match_distance(vm, &kv, kty)?;
+        score += crate::types::type_value_match_distance(vm, v, vty)?;
     }
     Some(score)
 }
 
-fn set_accepts(vm: &Vm, val: &Value, params: &[TypeExpr]) -> bool {
+fn set_accepts(vm: &Vm, val: &Value, params: &[Value]) -> bool {
     let [elem] = params else {
         return false;
     };
@@ -342,10 +341,10 @@ fn set_accepts(vm: &Vm, val: &Value, params: &[TypeExpr]) -> bool {
     };
     s.borrow()
         .iter()
-        .all(|k| crate::types::type_accepts(vm, &crate::value::value_key_to_value(k), elem))
+        .all(|k| crate::types::value_accepts(vm, &crate::value::value_key_to_value(k), elem))
 }
 
-fn set_match_distance(vm: &Vm, val: &Value, params: &[TypeExpr]) -> Option<usize> {
+fn set_match_distance(vm: &Vm, val: &Value, params: &[Value]) -> Option<usize> {
     let [elem] = params else {
         return None;
     };
@@ -354,7 +353,7 @@ fn set_match_distance(vm: &Vm, val: &Value, params: &[TypeExpr]) -> Option<usize
     };
     let mut score = 0usize;
     for k in s.borrow().iter() {
-        score += crate::types::type_expr_match_distance(
+        score += crate::types::type_value_match_distance(
             vm,
             &crate::value::value_key_to_value(k),
             elem,
@@ -363,71 +362,64 @@ fn set_match_distance(vm: &Vm, val: &Value, params: &[TypeExpr]) -> Option<usize
     Some(score)
 }
 
-pub fn primitive_value_to_type_expr(val: &Value) -> Option<TypeExpr> {
+pub fn primitive_value_to_type_value(val: &Value) -> Option<Value> {
     match val {
-        Value::None => Some(TypeExpr::Name("nonetype".into())),
-        Value::Bool(_) => Some(TypeExpr::Name("bool".into())),
-        Value::Num(_) => Some(TypeExpr::Name("num".into())),
-        Value::Text(_) => Some(TypeExpr::Name("text".into())),
+        Value::None => Some(Value::TypeRef("nonetype".to_string())),
+        Value::Bool(_) => Some(Value::TypeRef("bool".to_string())),
+        Value::Num(_) => Some(Value::TypeRef("num".to_string())),
+        Value::Text(_) => Some(Value::TypeRef("text".to_string())),
         Value::List(lst) => {
-            let elems: Vec<TypeExpr> = lst
+            let elems: Vec<Value> = lst
                 .borrow()
                 .iter()
                 .filter_map(|e| {
-                    primitive_value_to_type_expr(e).or_else(|| {
-                        Some(TypeExpr::Name(e.type_name().to_string()))
+                    primitive_value_to_type_value(e).or_else(|| {
+                        Some(Value::TypeRef(e.type_name().to_string()))
                     })
                 })
                 .collect();
             if elems.is_empty() {
-                Some(TypeExpr::Generic {
-                    name: "list".into(),
-                    params: vec![TypeExpr::Name("num".into())],
-                })
-            } else if elems.windows(2).all(|w| w[0] == w[1]) {
-                Some(TypeExpr::Generic {
-                    name: "list".into(),
-                    params: vec![elems[0].clone()],
-                })
+                Some(Value::TypeSpec(TypeSpecData::new("list", vec![Value::TypeRef("num".to_string())],
+                )))
+            } else if elems
+                .windows(2)
+                .all(|w| crate::types::type_values_equal(&w[0], &w[1]))
+            {
+                Some(Value::TypeSpec(TypeSpecData::new("list", vec![elems[0].clone()],
+                )))
             } else {
-                Some(TypeExpr::Generic {
-                    name: "list".into(),
-                    params: vec![TypeExpr::Generic {
-                        name: "Union".into(),
-                        params: elems,
-                    }],
-                })
+                Some(Value::TypeSpec(TypeSpecData::new(
+                    "list",
+                    vec![Value::TypeSpec(TypeSpecData::new("Union", elems))],
+                )))
             }
         }
-        Value::Dict(_) => Some(TypeExpr::Name("dict".into())),
-        Value::Set(_) => Some(TypeExpr::Name("set".into())),
+        Value::Dict(_) => Some(Value::TypeRef("dict".to_string())),
+        Value::Set(_) => Some(Value::TypeRef("set".to_string())),
         Value::Tuple(t) => {
             if t.is_empty() {
-                Some(TypeExpr::Name("tuple".into()))
+                Some(Value::TypeRef("tuple".to_string()))
             } else {
-                let params: Vec<TypeExpr> = t
+                let params: Vec<Value> = t
                     .iter()
                     .map(|e| {
-                        primitive_value_to_type_expr(e)
-                            .unwrap_or_else(|| TypeExpr::Name(e.type_name().to_string()))
+                        primitive_value_to_type_value(e)
+                            .unwrap_or_else(|| Value::TypeRef(e.type_name().to_string()))
                     })
                     .collect();
-                Some(TypeExpr::Generic {
-                    name: "tuple".into(),
-                    params,
-                })
+                Some(Value::TypeSpec(TypeSpecData::new("tuple", params)))
             }
         }
-        Value::Bytes(_) => Some(TypeExpr::Name("bytes".into())),
-        Value::Iterator(_) => Some(TypeExpr::Name("iterator".into())),
+        Value::Bytes(_) => Some(Value::TypeRef("bytes".to_string())),
+        Value::Iterator(_) => Some(Value::TypeRef("iterator".to_string())),
         _ => None,
     }
 }
 
-type TypeFormMatch = fn(&Vm, &Value, &[TypeExpr]) -> Option<usize>;
-type TypeFormAccepts = fn(&Vm, &Value, &[TypeExpr]) -> bool;
-type TypeFormInfer = fn(&TypeExpr, &TypeExpr, &mut HashMap<String, TypeExpr>) -> bool;
-type TypeFormImplies = fn(&Vm, &TypeExpr, &TypeExpr) -> bool;
+type TypeFormMatch = fn(&Vm, &Value, &[Value]) -> Option<usize>;
+type TypeFormAccepts = fn(&Vm, &Value, &[Value]) -> bool;
+type TypeFormInfer = fn(&Value, &Value, &mut HashMap<String, Value>) -> bool;
+type TypeFormImplies = fn(&Vm, &Value, &Value) -> bool;
 
 struct TypeFormEntry {
     match_distance: TypeFormMatch,
@@ -436,7 +428,7 @@ struct TypeFormEntry {
     implies: Option<TypeFormImplies>,
 }
 
-fn list_match_distance(vm: &Vm, val: &Value, params: &[TypeExpr]) -> Option<usize> {
+fn list_match_distance(vm: &Vm, val: &Value, params: &[Value]) -> Option<usize> {
     let [elem] = params else {
         return None;
     };
@@ -445,12 +437,12 @@ fn list_match_distance(vm: &Vm, val: &Value, params: &[TypeExpr]) -> Option<usiz
     };
     let mut score = 0usize;
     for item in lst.borrow().iter() {
-        score += crate::types::type_expr_match_distance(vm, item, elem)?;
+        score += crate::types::type_value_match_distance(vm, item, elem)?;
     }
     Some(score)
 }
 
-fn list_accepts(vm: &Vm, val: &Value, params: &[TypeExpr]) -> bool {
+fn list_accepts(vm: &Vm, val: &Value, params: &[Value]) -> bool {
     let [elem] = params else {
         return false;
     };
@@ -459,91 +451,87 @@ fn list_accepts(vm: &Vm, val: &Value, params: &[TypeExpr]) -> bool {
     };
     lst.borrow()
         .iter()
-        .all(|item| crate::types::type_accepts(vm, item, elem))
+        .all(|item| crate::types::value_accepts(vm, item, elem))
 }
 
 fn list_infer(
-    field_ty: &TypeExpr,
-    val_ty: &TypeExpr,
-    inferred: &mut HashMap<String, TypeExpr>,
+    field_ty: &Value,
+    val_ty: &Value,
+    inferred: &mut HashMap<String, Value>,
 ) -> bool {
-    let TypeExpr::Generic { name, params } = field_ty else {
+    let Value::TypeSpec(field) = field_ty else {
         return false;
     };
-    if name != "list" || params.len() != 1 {
+    if field.name != "list" || field.args.len() != 1 {
         return false;
     }
-    let TypeExpr::Generic {
-        name: ln,
-        params: lp,
-    } = val_ty
-    else {
+    let Value::TypeSpec(val) = val_ty else {
         return false;
     };
-    if ln != "list" || lp.len() != 1 {
+    if val.name != "list" || val.args.len() != 1 {
         return false;
     }
-    crate::types::infer_from_field_type_inner(&params[0], &lp[0], inferred)
+    crate::types::infer_from_field_type_inner(&field.args[0], &val.args[0], inferred)
 }
 
-fn union_match_distance(vm: &Vm, val: &Value, params: &[TypeExpr]) -> Option<usize> {
+fn union_match_distance(vm: &Vm, val: &Value, params: &[Value]) -> Option<usize> {
     params
         .iter()
-        .filter_map(|p| crate::types::type_expr_match_distance(vm, val, p))
+        .filter_map(|p| crate::types::type_value_match_distance(vm, val, p))
         .min()
 }
 
-fn union_accepts(vm: &Vm, val: &Value, params: &[TypeExpr]) -> bool {
-    params.iter().any(|p| crate::types::type_accepts(vm, val, p))
+fn union_accepts(vm: &Vm, val: &Value, params: &[Value]) -> bool {
+    params.iter().any(|p| crate::types::value_accepts(vm, val, p))
 }
 
-fn maybe_match_distance(vm: &Vm, val: &Value, params: &[TypeExpr]) -> Option<usize> {
+fn maybe_match_distance(vm: &Vm, val: &Value, params: &[Value]) -> Option<usize> {
     let [inner] = params else {
         return None;
     };
     if matches!(val, Value::None) {
         Some(0)
     } else {
-        crate::types::type_expr_match_distance(vm, val, inner)
+        crate::types::type_value_match_distance(vm, val, inner)
     }
 }
 
-fn maybe_accepts(vm: &Vm, val: &Value, params: &[TypeExpr]) -> bool {
+fn maybe_accepts(vm: &Vm, val: &Value, params: &[Value]) -> bool {
     let [inner] = params else {
         return false;
     };
-    matches!(val, Value::None) || crate::types::type_accepts(vm, val, inner)
+    matches!(val, Value::None) || crate::types::value_accepts(vm, val, inner)
 }
 
 /// `Tuple[T1, T2, ...]` —— 定长异构元组：长度与逐元素类型须匹配。
-fn tuple_match_distance(vm: &Vm, val: &Value, params: &[TypeExpr]) -> Option<usize> {
+fn tuple_match_distance(vm: &Vm, val: &Value, params: &[Value]) -> Option<usize> {
     let Value::Tuple(t) = val else { return None };
     if t.len() != params.len() {
         return None;
     }
     let mut sum = 0usize;
     for (v, p) in t.iter().zip(params.iter()) {
-        sum += crate::types::type_expr_match_distance(vm, v, p)?;
+        sum += crate::types::type_value_match_distance(vm, v, p)?;
     }
     Some(sum)
 }
 
-fn tuple_accepts(vm: &Vm, val: &Value, params: &[TypeExpr]) -> bool {
+fn tuple_accepts(vm: &Vm, val: &Value, params: &[Value]) -> bool {
     let Value::Tuple(t) = val else { return false };
     if t.len() != params.len() {
         return false;
     }
     t.iter()
         .zip(params.iter())
-        .all(|(v, p)| crate::types::type_accepts(vm, v, p))
+        .all(|(v, p)| crate::types::value_accepts(vm, v, p))
 }
 
 /// `Callable` —— 任意可调用值（函数/内建/泛型函数）。带参时仅校验可调用性。
-fn callable_match_distance(_vm: &Vm, val: &Value, _params: &[TypeExpr]) -> Option<usize> {
+fn callable_match_distance(_vm: &Vm, val: &Value, _params: &[Value]) -> Option<usize> {
     is_callable_value(val).then_some(0)
 }
 
-fn callable_accepts(_vm: &Vm, val: &Value, _params: &[TypeExpr]) -> bool {
+fn callable_accepts(_vm: &Vm, val: &Value, _params: &[Value]) -> bool {
     is_callable_value(val)
 }
 
@@ -556,29 +544,29 @@ fn is_callable_value(val: &Value) -> bool {
 
 fn variance_implies(
     vm: &Vm,
-    actual: &TypeExpr,
-    bound: &TypeExpr,
+    actual: &Value,
+    bound: &Value,
     variance: &str,
 ) -> bool {
-    let TypeExpr::Generic { name, params } = bound else {
+    let Value::TypeSpec(bound_spec) = bound else {
         return false;
     };
-    if params.len() != 1 {
+    if bound_spec.args.len() != 1 {
         return false;
     }
-    match (variance, name.as_str()) {
+    match (variance, bound_spec.name.as_str()) {
         ("Covariant", "Covariant") => {
-            crate::types::type_expr_implies_inner(vm, actual, &params[0])
+            crate::types::type_value_implies_inner(vm, actual, &bound_spec.args[0])
         }
         ("Contravariant", "Contravariant") => {
-            crate::types::type_expr_implies_inner(vm, &params[0], actual)
+            crate::types::type_value_implies_inner(vm, &bound_spec.args[0], actual)
         }
-        ("Invariant", "Invariant") => actual == &params[0],
+        ("Invariant", "Invariant") => crate::types::type_values_equal(actual, &bound_spec.args[0]),
         _ => false,
     }
 }
 
-fn ptr_form_match_distance(_vm: &Vm, val: &Value, params: &[TypeExpr]) -> Option<usize> {
+fn ptr_form_match_distance(_vm: &Vm, val: &Value, params: &[Value]) -> Option<usize> {
     if params.len() != 1 {
         return None;
     }
@@ -588,7 +576,7 @@ fn ptr_form_match_distance(_vm: &Vm, val: &Value, params: &[TypeExpr]) -> Option
     }
 }
 
-fn ptr_form_accepts(_vm: &Vm, val: &Value, params: &[TypeExpr]) -> bool {
+fn ptr_form_accepts(_vm: &Vm, val: &Value, params: &[Value]) -> bool {
     if params.len() != 1 {
         return false;
     }
@@ -690,13 +678,13 @@ fn lookup_type_form(name: &str) -> Option<&'static TypeFormEntry> {
                     let [inner] = params else {
                         return None;
                     };
-                    crate::types::type_expr_match_distance(vm, val, inner)
+                    crate::types::type_value_match_distance(vm, val, inner)
                 },
                 accepts: |vm, val, params| {
                     let [inner] = params else {
                         return false;
                     };
-                    crate::types::type_accepts(vm, val, inner)
+                    crate::types::value_accepts(vm, val, inner)
                 },
                 infer: None,
                 implies: Some(|vm, actual, bound| variance_implies(vm, actual, bound, "Covariant")),
@@ -709,13 +697,13 @@ fn lookup_type_form(name: &str) -> Option<&'static TypeFormEntry> {
                     let [inner] = params else {
                         return None;
                     };
-                    crate::types::type_expr_match_distance(vm, val, inner)
+                    crate::types::type_value_match_distance(vm, val, inner)
                 },
                 accepts: |vm, val, params| {
                     let [inner] = params else {
                         return false;
                     };
-                    crate::types::type_accepts(vm, val, inner)
+                    crate::types::value_accepts(vm, val, inner)
                 },
                 infer: None,
                 implies: Some(|vm, actual, bound| {
@@ -730,13 +718,13 @@ fn lookup_type_form(name: &str) -> Option<&'static TypeFormEntry> {
                     let [inner] = params else {
                         return None;
                     };
-                    crate::types::type_expr_match_distance(vm, val, inner)
+                    crate::types::type_value_match_distance(vm, val, inner)
                 },
                 accepts: |vm, val, params| {
                     let [inner] = params else {
                         return false;
                     };
-                    crate::types::type_accepts(vm, val, inner)
+                    crate::types::value_accepts(vm, val, inner)
                 },
                 infer: None,
                 implies: Some(|vm, actual, bound| variance_implies(vm, actual, bound, "Invariant")),
@@ -754,60 +742,57 @@ pub fn type_form_match_distance(
     vm: &Vm,
     val: &Value,
     name: &str,
-    params: &[TypeExpr],
+    params: &[Value],
 ) -> Option<usize> {
     lookup_type_form(name).and_then(|f| (f.match_distance)(vm, val, params))
 }
 
-pub fn type_form_accepts(vm: &Vm, val: &Value, name: &str, params: &[TypeExpr]) -> bool {
+pub fn type_form_accepts(vm: &Vm, val: &Value, name: &str, params: &[Value]) -> bool {
     lookup_type_form(name)
         .map(|f| (f.accepts)(vm, val, params))
         .unwrap_or(false)
 }
 
 pub fn type_form_infer(
-    field_ty: &TypeExpr,
-    val_ty: &TypeExpr,
-    inferred: &mut HashMap<String, TypeExpr>,
+    field_ty: &Value,
+    val_ty: &Value,
+    inferred: &mut HashMap<String, Value>,
 ) -> bool {
-    let TypeExpr::Generic { name, params } = field_ty else {
+    let Value::TypeSpec(field) = field_ty else {
         return false;
     };
-    if let Some(form) = lookup_type_form(name) {
+    if let Some(form) = lookup_type_form(&field.name) {
         if let Some(infer) = form.infer {
             return infer(field_ty, val_ty, inferred);
         }
     }
-    let other = name.as_str();
-    let Some(val_name) = crate::types::type_expr_base(val_ty) else {
+    let other = field.name.as_str();
+    let Some(val_name) = crate::types::type_value_base(val_ty) else {
         return false;
     };
     if val_name != other {
         return false;
     }
-    if params.is_empty() {
+    if field.args.is_empty() {
         return true;
     }
-    let TypeExpr::Generic {
-        name: vn,
-        params: vp,
-    } = val_ty
-    else {
+    let Value::TypeSpec(val) = val_ty else {
         return false;
     };
-    vn == other
-        && params.len() == vp.len()
-        && params
+    val.name == other
+        && field.args.len() == val.args.len()
+        && field
+            .args
             .iter()
-            .zip(vp.iter())
+            .zip(val.args.iter())
             .all(|(a, b)| crate::types::infer_from_field_type_inner(a, b, inferred))
 }
 
-pub fn type_form_implies(vm: &Vm, actual: &TypeExpr, bound: &TypeExpr) -> Option<bool> {
-    let TypeExpr::Generic { name, .. } = bound else {
+pub fn type_form_implies(vm: &Vm, actual: &Value, bound: &Value) -> Option<bool> {
+    let Value::TypeSpec(bound_spec) = bound else {
         return None;
     };
-    let form = lookup_type_form(name)?;
+    let form = lookup_type_form(&bound_spec.name)?;
     form.implies.map(|f| f(vm, actual, bound))
 }
 
@@ -2045,6 +2030,9 @@ fn install_primitive_type_globals(vm: &mut Vm) {
         "type", "AST", "Frame", "Traceback", "ptr", "i8", "u8", "i16", "u16", "i32", "u32", "i64",
         "u64", "isize", "usize", "f32", "f64", "Channel", "Mutex",
         "RWMutex", "WaitGroup", "Semaphore", "Once", "Barrier", "Cond",
+        // 类型形态 / 特殊类型名：注解求值走 load_name，必须是全局类型句柄
+        "Union", "Maybe", "Never", "Literal", "Callable", "Tuple",
+        "Covariant", "Contravariant", "Invariant", "function",
     ] {
         vm.globals
             .or_insert_with(ty.into(), || Value::type_ref(ty));

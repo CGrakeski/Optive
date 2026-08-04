@@ -370,6 +370,16 @@ fn parse_param_soft_type() {
 }
 
 #[test]
+fn parse_param_type_call_annotation() {
+    parse_ok("func f(x:: type(do() {})) { return x }");
+}
+
+#[test]
+fn parse_param_multi_type_args() {
+    parse_ok("func f(x:: dict[text, num]) { return x }");
+}
+
+#[test]
 fn parse_do_strong_return() {
     parse_ok("do(x) -> num { return x }");
 }

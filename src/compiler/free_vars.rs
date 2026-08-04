@@ -42,7 +42,15 @@ fn collect_stmt(stmt: &Stmt, locals: &mut HashSet<String>, free: &mut HashSet<St
 
 fn collect_stmt_scoped(stmt: &Stmt, locals: &mut HashMap<String, ()>, free: &mut HashSet<String>) {
     match stmt {
-        Stmt::VarDecl { name, init, .. } => {
+        Stmt::VarDecl {
+            name,
+            init,
+            type_expr,
+            ..
+        } => {
+            if let Some(ty) = type_expr {
+                collect_expr(ty, locals, free);
+            }
             if let Some(e) = init {
                 collect_expr(e, locals, free);
             }
@@ -64,10 +72,24 @@ fn collect_stmt_scoped(stmt: &Stmt, locals: &mut HashMap<String, ()>, free: &mut
             bind_destruct_pattern(pattern, locals);
         }
         Stmt::ProtocolDecl { .. } => {}
-        Stmt::FuncDecl { params, body, .. } => {
+        Stmt::FuncDecl {
+            params,
+            body,
+            return_type,
+            ..
+        } => {
             let mut scoped = locals.clone();
             for p in params {
+                if let Some(ty) = &p.type_expr {
+                    collect_expr(ty, locals, free);
+                }
+                if let Some(d) = &p.default_expr {
+                    collect_expr(d, locals, free);
+                }
                 scoped.insert(p.name.clone(), ());
+            }
+            if let Some(rt) = return_type {
+                collect_expr(rt, locals, free);
             }
             collect_block(body, &mut scoped, free);
         }
@@ -338,10 +360,24 @@ fn collect_expr(expr: &Expr, locals: &HashMap<String, ()>, free: &mut HashSet<St
             }
         }
         ExprKind::Bytes(_) => {}
-        ExprKind::DoFunc { params, body, .. } => {
+        ExprKind::DoFunc {
+            params,
+            body,
+            return_type,
+            ..
+        } => {
             let mut scoped = locals.clone();
             for p in params {
+                if let Some(ty) = &p.type_expr {
+                    collect_expr(ty, locals, free);
+                }
+                if let Some(d) = &p.default_expr {
+                    collect_expr(d, locals, free);
+                }
                 scoped.insert(p.name.clone(), ());
+            }
+            if let Some(rt) = return_type {
+                collect_expr(rt, locals, free);
             }
             collect_block(body, &mut scoped, free);
         }

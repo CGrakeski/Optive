@@ -11,18 +11,15 @@ use crate::protocol::{self, TypeCheckContext};
 use crate::monomorph;
 use crate::runtime_ast;
 use crate::value::{FieldTypeInfo, Num, StructDef, Value};
+use crate::types::{static_type_value_from_expr, type_value_display};
 use crate::Result;
 
 use crate::shared::Shared;
 
-fn is_c_layout_annotation(ty: &TypeExpr) -> bool {
-    match ty {
-        TypeExpr::Attr { object, field } if field == "layout" => {
-            matches!(object.as_ref(), TypeExpr::Name(n) if n == "C")
-        }
-        TypeExpr::Name(n) if n == "C.layout" => true,
-        _ => false,
-    }
+fn is_c_layout_annotation(ty: &Expr) -> bool {
+    static_type_value_from_expr(ty)
+        .map(|v| type_value_display(&v) == "C.layout")
+        .unwrap_or(false)
 }
 
 enum CompKind {
@@ -49,7 +46,7 @@ pub struct Generator {
     loop_owns_stack_counter: Vec<bool>,
     /// 当前词法位置仍打开的 try/with（innermost last）。
     handler_stack: Vec<OpenHandler>,
-    type_env: Vec<HashMap<String, (TypeExpr, bool)>>,
+    type_env: Vec<HashMap<String, (Expr, bool)>>,
     macro_depth: usize,
     match_expr_ends: Vec<usize>,
     local_slots: Option<HashMap<String, usize>>,
@@ -67,7 +64,7 @@ pub struct Generator {
 }
 
 struct CompileFnExtras<'a> {
-    return_type: Option<&'a TypeExpr>,
+    return_type: Option<&'a Expr>,
     return_strong: bool,
     return_wrapper: Option<Expr>,
     captured_names: HashSet<String>,
@@ -215,17 +212,19 @@ impl Generator {
         if default_exprs.is_empty() {
             self.cg
                 .emit(Instruction::Push(Value::Function(Arc::new(func))));
-            return Ok(());
+        } else {
+            for expr in &default_exprs {
+                self.gen_expr(expr)?;
+            }
+            self.cg.emit(Instruction::VecNew(default_exprs.len()));
+            self.cg
+                .emit(Instruction::Push(Value::Function(Arc::new(func))));
+            self.cg
+                .emit(Instruction::Load("__attach_defaults__".into()));
+            self.cg.emit(Instruction::Call { argc: 2 });
         }
-        for expr in &default_exprs {
-            self.gen_expr(expr)?;
-        }
-        self.cg.emit(Instruction::VecNew(default_exprs.len()));
-        self.cg
-            .emit(Instruction::Push(Value::Function(Arc::new(func))));
-        self.cg
-            .emit(Instruction::Load("__attach_defaults__".into()));
-        self.cg.emit(Instruction::Call { argc: 2 });
+        // 定义处绑定类型注解（须为类型；未绑定名在此失败）。
+        self.cg.emit(Instruction::ResolveFuncTypes);
         Ok(())
     }
 
@@ -545,6 +544,31 @@ impl Generator {
         gen.compile(program)
     }
 
+    /// 注解里的 `do () { … }`：编成独立函数对象（不碰当前脚本全局表）。
+    pub fn compile_annot_do(
+        &mut self,
+        name: &str,
+        params: &[FuncParam],
+        return_type: Option<&Expr>,
+        return_strong: bool,
+        return_wrapper: Option<&Expr>,
+        body: &Block,
+    ) -> Result<std::sync::Arc<FunctionObject>> {
+        let func = self.compile_function(
+            name,
+            params,
+            body,
+            CompileFnExtras {
+                return_type,
+                return_strong,
+                return_wrapper: return_wrapper.cloned(),
+                captured_names: HashSet::new(),
+                is_generator: Self::block_has_yield(body),
+            },
+        )?;
+        Ok(std::sync::Arc::new(func))
+    }
+
     fn push_type_scope(&mut self) {
         self.type_env.push(HashMap::new());
     }
@@ -555,13 +579,13 @@ impl Generator {
         }
     }
 
-    fn bind_type(&mut self, name: &str, ty: TypeExpr, strict: bool) {
+    fn bind_type(&mut self, name: &str, ty: Expr, strict: bool) {
         if let Some(scope) = self.type_env.last_mut() {
             scope.insert(name.to_string(), (ty, strict));
         }
     }
 
-    fn lookup_strict_type(&self, name: &str) -> Option<&TypeExpr> {
+    fn lookup_strict_type(&self, name: &str) -> Option<&Expr> {
         for scope in self.type_env.iter().rev() {
             if let Some((ty, strict)) = scope.get(name) {
                 if *strict {
@@ -573,11 +597,13 @@ impl Generator {
         None
     }
 
-    fn emit_type_check(&mut self, ty: &TypeExpr) {
-        self.cg.emit(Instruction::TypeCheck(ty.clone()));
+    fn emit_type_check(&mut self, ty: &Expr) -> Result<()> {
+        self.gen_expr(ty)?;
+        self.cg.emit(Instruction::TypeCheck);
+        Ok(())
     }
 
-    fn field_strict(typed: bool, type_strong: bool, type_expr: &Option<TypeExpr>) -> bool {
+    fn field_strict(typed: bool, type_strong: bool, type_expr: &Option<Expr>) -> bool {
         type_expr.is_some() && (type_strong || typed)
     }
 
@@ -608,7 +634,7 @@ impl Generator {
                         self.gen_expr(init)?;
                         if *type_strong {
                             if let Some(ty) = type_expr {
-                                self.emit_type_check(ty);
+                                self.emit_type_check(ty)?;
                             }
                         }
                     } else {
@@ -628,7 +654,7 @@ impl Generator {
                         self.gen_expr(init)?;
                         if *type_strong {
                             if let Some(ty) = type_expr {
-                                self.emit_type_check(ty);
+                                self.emit_type_check(ty)?;
                             }
                         }
                         self.emit_store_name(name);
@@ -688,7 +714,7 @@ impl Generator {
                 LValue::Name(name) => {
                     self.gen_expr(value)?;
                     if let Some(ty) = self.lookup_strict_type(name).cloned() {
-                        self.emit_type_check(&ty);
+                        self.emit_type_check(&ty)?;
                     }
                     self.emit_store_name(name);
                 }
@@ -834,6 +860,7 @@ impl Generator {
                         .emit(Instruction::Push(Value::Text(name.clone())));
                     self.cg
                         .emit(Instruction::Push(Value::Function(Arc::new(handler))));
+                    self.cg.emit(Instruction::ResolveFuncTypes);
                     self.cg
                         .emit(Instruction::Load("__register_dispatch_handler__".into()));
                     self.cg.emit(Instruction::Call { argc: 2 });
@@ -1793,7 +1820,7 @@ impl Generator {
     fn gen_variant_decl(
         &mut self,
         name: &str,
-        type_params: &[(String, Option<TypeExpr>)],
+        type_params: &[(String, Option<Expr>)],
         cases: &[VariantCaseDecl],
         visibility: Visibility,
         top_level: bool,
@@ -1885,12 +1912,12 @@ impl Generator {
         program
     }
 
-    fn specialization_key(name: &str, type_args: &[TypeExpr]) -> String {
+    fn specialization_key(name: &str, type_args: &[Value]) -> String {
         format!(
             "{name}${}",
             type_args
                 .iter()
-                .map(crate::types::type_expr_display)
+                .map(type_value_display)
                 .collect::<Vec<_>>()
                 .join(",")
         )
@@ -1899,7 +1926,7 @@ impl Generator {
     fn instantiate_generic(
         &mut self,
         name: &str,
-        type_args: Vec<TypeExpr>,
+        type_args: Vec<Value>,
     ) -> Result<Arc<FunctionObject>> {
         let template = self
             .program
@@ -1915,7 +1942,7 @@ impl Generator {
     /// 运行时 / REPL：由模板与类型实参生成单态函数（写入 `cache`）。
     pub fn specialize_generic_template(
         template: &GenericFunctionTemplate,
-        type_args: Vec<TypeExpr>,
+        type_args: Vec<Value>,
         ctx: &TypeCheckContext,
         cache: &mut HashMap<String, Arc<FunctionObject>>,
     ) -> Result<Arc<FunctionObject>> {
@@ -2006,6 +2033,7 @@ impl Generator {
             self.gen_expr(&a.value)?;
         }
         self.cg.emit(Instruction::Push(Value::Function(func)));
+        self.cg.emit(Instruction::ResolveFuncTypes);
         self.cg.emit(Instruction::Call { argc: args.len() });
         Ok(true)
     }
@@ -2014,7 +2042,7 @@ impl Generator {
         &self,
         template: &GenericFunctionTemplate,
         args: &[CallArg],
-    ) -> Result<Vec<TypeExpr>> {
+    ) -> Result<Vec<Value>> {
         if template.type_params.len() != 1 {
             return Err(RuntimeError::msg(format!(
                 "cannot infer {} type parameter(s) for `{}`; use {}[...](...)",
@@ -2043,7 +2071,7 @@ impl Generator {
         Ok(vec![inferred])
     }
 
-    fn infer_type_from_arg(&self, expr: &Expr) -> Option<TypeExpr> {
+    fn infer_type_from_arg(&self, expr: &Expr) -> Option<Value> {
         if let Some(ty) = monomorph::infer_type_from_expr(expr, "x") {
             return Some(ty);
         }
@@ -2051,7 +2079,7 @@ impl Generator {
             ExprKind::Call { callee, .. } => {
                 if let ExprKind::Var(name) = &callee.kind {
                     if self.program.struct_defs.contains_key(name) {
-                        return Some(TypeExpr::Name(name.clone()));
+                        return Some(Value::type_ref(name.clone()));
                     }
                 }
                 None
@@ -2229,6 +2257,9 @@ impl Generator {
             return_type: return_type.cloned(),
             return_strong,
             return_wrapper: wrapper_for_func,
+            param_types: Vec::new(),
+            return_type_value: None,
+            types_resolved: false,
             frame_slots: sub.next_local_slot,
             uses_name_map,
             track_frames,
@@ -2626,6 +2657,7 @@ impl Generator {
                             .map_err(RuntimeError::msg)?;
                         let func = self.instantiate_generic(name, type_args)?;
                         self.cg.emit(Instruction::Push(Value::Function(func)));
+                        self.cg.emit(Instruction::ResolveFuncTypes);
                         return Ok(());
                     }
                 }
@@ -2700,7 +2732,7 @@ impl Generator {
                     params,
                     body,
                     CompileFnExtras {
-                        return_type: return_type.as_ref(),
+                        return_type: return_type.as_deref(),
                         return_strong: *return_strong,
                         return_wrapper: return_wrapper.as_ref().map(|b| *b.clone()),
                         captured_names: captured,

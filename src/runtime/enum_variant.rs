@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{EnumMemberDecl, EnumMethodDecl, Expr, ExprKind, StructField, TypeExpr, VariantCaseDecl};
+use crate::ast::{EnumMemberDecl, EnumMethodDecl, Expr, ExprKind, StructField, VariantCaseDecl};
 use crate::error::RuntimeError;
 use crate::opcode::{FunctionObject, Instruction};
 use crate::shared::Shared;
@@ -87,7 +87,7 @@ pub fn variant_case_fields(case: &VariantCaseDecl) -> Vec<StructField> {
 
 pub fn build_variant_def(
     name: &str,
-    type_params: Vec<(String, Option<TypeExpr>)>,
+    type_params: Vec<(String, Option<Expr>)>,
     cases: &[VariantCaseDecl],
 ) -> (Arc<VariantDef>, Vec<(String, Arc<StructDef>)>) {
     let mut case_defs = Vec::new();
@@ -135,7 +135,7 @@ pub fn build_variant_def(
 pub fn wrap_variant(
     inst_name: &str,
     def: &Arc<VariantDef>,
-    generic_args: Vec<TypeExpr>,
+    generic_args: Vec<Value>,
     case_idx: usize,
     payload: Value,
 ) -> Value {

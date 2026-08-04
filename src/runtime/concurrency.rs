@@ -435,7 +435,7 @@ pub fn construct_once(args: &[Value]) -> Result<Value> {
         return Err(RuntimeError::type_err("Once() takes no arguments"));
     }
     Ok(Value::Sync(Shared::new(SyncInner::Once {
-        done: false,
+        phase: crate::value::OncePhase::Idle,
         value: Value::None,
     })))
 }

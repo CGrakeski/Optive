@@ -3,51 +3,28 @@
 use std::collections::HashMap;
 
 use crate::ast::*;
+use crate::types::{static_type_value_from_expr, type_value_display};
+use crate::value::Value;
 
-pub fn type_args_from_index_expr(index: &Expr) -> Result<Vec<TypeExpr>, String> {
+pub fn type_args_from_index_expr(index: &Expr) -> Result<Vec<Value>, String> {
     match &index.kind {
-        ExprKind::Var(name) => Ok(vec![TypeExpr::Name(name.clone())]),
-        ExprKind::Index { object, index } => {
-            let mut outer = type_args_from_index_expr(object)?;
-            let inner = type_args_from_index_expr(index)?;
-            if outer.len() == 1 {
-                outer[0] = TypeExpr::Generic {
-                    name: type_expr_name(&outer[0]).ok_or_else(|| "invalid type index".to_string())?,
-                    params: inner,
-                };
-                Ok(outer)
-            } else {
-                Err("invalid nested type index".into())
-            }
-        }
         ExprKind::List(elems) => elems
             .iter()
             .map(|e| {
-                type_args_from_index_expr(e).and_then(|mut v| {
-                    v.pop()
-                        .ok_or_else(|| "empty type list element".to_string())
-                })
+                static_type_value_from_expr(e)
+                    .ok_or_else(|| "expected type name in generic index".to_string())
             })
             .collect(),
-        _ => Err("expected type name in generic index".into()),
-    }
-}
-
-fn type_expr_name(ty: &TypeExpr) -> Option<String> {
-    match ty {
-        TypeExpr::Name(n) => Some(n.clone()),
-        TypeExpr::Attr { object, field } => {
-            let base = type_expr_name(object)?;
-            Some(format!("{base}.{field}"))
-        }
-        TypeExpr::Generic { name, .. } => Some(name.clone()),
+        _ => static_type_value_from_expr(index)
+            .map(|v| vec![v])
+            .ok_or_else(|| "expected type name in generic index".into()),
     }
 }
 
 pub fn infer_type_args_from_call_args(
     template: &crate::opcode::GenericFunctionTemplate,
     args: &[CallArg],
-) -> Result<Vec<TypeExpr>, String> {
+) -> Result<Vec<Value>, String> {
     if template.type_params.len() != 1 {
         return Err(format!(
             "cannot infer {} type parameter(s) from arguments; specify explicitly with {}[...](...)",
@@ -65,22 +42,27 @@ pub fn infer_type_args_from_call_args(
     Ok(vec![inferred])
 }
 
-pub fn infer_type_from_expr(expr: &Expr, param_name: &str) -> Option<TypeExpr> {
+pub fn infer_type_from_expr(expr: &Expr, param_name: &str) -> Option<Value> {
     match &expr.kind {
-        ExprKind::Number(_) => Some(TypeExpr::Name("num".into())),
-        ExprKind::String(_) => Some(TypeExpr::Name("text".into())),
-        ExprKind::FString(_) => Some(TypeExpr::Name("text".into())),
-        ExprKind::Bool(_) => Some(TypeExpr::Name("bool".into())),
-        ExprKind::None => Some(TypeExpr::Name("nonetype".into())),
+        ExprKind::Number(_) => Some(Value::type_ref("num")),
+        ExprKind::String(_) => Some(Value::type_ref("text")),
+        ExprKind::FString(_) => Some(Value::type_ref("text")),
+        ExprKind::Bool(_) => Some(Value::type_ref("bool")),
+        ExprKind::None => Some(Value::type_ref("nonetype")),
         ExprKind::Var(name) if name == param_name => None,
         ExprKind::Var(_) => None,
         _ => None,
     }
 }
 
-pub use crate::types::substitute_type_expr;
+pub use crate::types::substitute_type_annotation as substitute_type_expr;
+pub use crate::types::substitute_type_value;
 
-pub fn substitute_func_param(param: &FuncParam, subs: &HashMap<String, TypeExpr>, type_names: &HashMap<String, String>) -> FuncParam {
+pub fn substitute_func_param(
+    param: &FuncParam,
+    subs: &HashMap<String, Value>,
+    type_names: &HashMap<String, String>,
+) -> FuncParam {
     FuncParam {
         name: param.name.clone(),
         is_variadic: param.is_variadic,
@@ -227,7 +209,9 @@ fn substitute_stmt_body(stmt: &Stmt, type_names: &HashMap<String, String>) -> St
             is_const: *is_const,
             is_var: *is_var,
             name: name.clone(),
-            type_expr: type_expr.clone(),
+            type_expr: type_expr
+                .as_ref()
+                .map(|t| substitute_type_operand_expr(t, type_names)),
             type_strong: *type_strong,
             init: init.as_ref().map(|e| substitute_expr(e, type_names)),
         },
@@ -454,7 +438,10 @@ pub fn substitute_expr(expr: &Expr, type_names: &HashMap<String, String>) -> Exp
                     is_variadic: p.is_variadic,
                     is_kwvariadic: p.is_kwvariadic,
                     implicit: p.implicit,
-                    type_expr: p.type_expr.clone(),
+                    type_expr: p
+                        .type_expr
+                        .as_ref()
+                        .map(|t| substitute_type_operand_expr(t, type_names)),
                     type_strong: p.type_strong,
                     default_expr: p
                         .default_expr
@@ -462,7 +449,9 @@ pub fn substitute_expr(expr: &Expr, type_names: &HashMap<String, String>) -> Exp
                         .map(|e| substitute_expr(e, type_names)),
                 })
                 .collect(),
-            return_type: return_type.clone(),
+            return_type: return_type
+                .as_ref()
+                .map(|t| Box::new(substitute_type_operand_expr(t, type_names))),
             return_strong: *return_strong,
             return_wrapper: return_wrapper
                 .as_ref()
@@ -570,25 +559,24 @@ fn substitute_guards(guards: &[Expr], type_names: &HashMap<String, String>) -> V
         .collect()
 }
 
-pub fn type_name_map(type_params: &[(String, Option<TypeExpr>)], type_args: &[TypeExpr]) -> HashMap<String, String> {
+pub fn type_name_map(
+    type_params: &[(String, Option<Expr>)],
+    type_args: &[Value],
+) -> HashMap<String, String> {
     type_params
         .iter()
         .zip(type_args.iter())
-        .map(|((name, _), arg)| (name.clone(), type_expr_display_name(arg)))
+        .map(|((name, _), arg)| (name.clone(), type_value_display(arg)))
         .collect()
 }
 
 pub fn type_substitution_map(
-    type_params: &[(String, Option<TypeExpr>)],
-    type_args: &[TypeExpr],
-) -> HashMap<String, TypeExpr> {
+    type_params: &[(String, Option<Expr>)],
+    type_args: &[Value],
+) -> HashMap<String, Value> {
     type_params
         .iter()
         .zip(type_args.iter())
         .map(|((name, _), arg)| (name.clone(), arg.clone()))
         .collect()
-}
-
-fn type_expr_display_name(ty: &TypeExpr) -> String {
-    crate::types::type_expr_display(ty)
 }

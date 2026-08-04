@@ -557,6 +557,14 @@ impl MutexInner {
     }
 }
 
+/// `Once.run` 生命周期。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OncePhase {
+    Idle,
+    Running,
+    Done,
+}
+
 /// 其余并发原语（RWMutex / WaitGroup / Semaphore / Once / Barrier / Cond）的统一载荷。
 #[derive(Clone)]
 pub enum SyncInner {
@@ -570,8 +578,8 @@ pub enum SyncInner {
     WaitGroup { count: i64 },
     /// 计数信号量：`permits` 为可用许可数。
     Semaphore { permits: i64 },
-    /// 一次性执行：`done` 后 `value` 缓存首次结果。
-    Once { done: bool, value: Value },
+    /// 一次性执行：三态，避免并行下「done 但 value 未写入」。
+    Once { phase: OncePhase, value: Value },
     /// 屏障：凑齐 `n` 个 `wait()` 后全部放行（`generation` 递增）。
     Barrier { n: i64, waiting: usize, generation: u64 },
     /// 条件变量：`signals` 为待消费的唤醒令牌，`waiters` 为当前等待者数。
@@ -638,14 +646,26 @@ pub enum Value {
 }
 
 /// [`Value::TypeSpec`] 的堆载荷 — 移出 `Value` 枚举以保持栈表示紧凑。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct TypeSpecData {
     pub name: String,
-    pub args: Vec<crate::ast::TypeExpr>,
+    pub args: Vec<Value>,
+}
+
+impl PartialEq for TypeSpecData {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.args.len() == other.args.len()
+            && self
+                .args
+                .iter()
+                .zip(other.args.iter())
+                .all(|(a, b)| crate::types::type_values_equal(a, b))
+    }
 }
 
 impl TypeSpecData {
-    pub fn new(name: impl Into<String>, args: Vec<crate::ast::TypeExpr>) -> Arc<Self> {
+    pub fn new(name: impl Into<String>, args: Vec<Value>) -> Arc<Self> {
         Arc::new(Self {
             name: name.into(),
             args,
@@ -675,8 +695,6 @@ impl ValueKey {
     }
 }
 
-use crate::ast::TypeExpr;
-
 #[derive(Clone)]
 pub struct EnumMemberInfo {
     pub name: String,
@@ -705,7 +723,7 @@ pub struct VariantCaseDef {
 #[derive(Clone)]
 pub struct VariantDef {
     pub name: String,
-    pub type_params: Vec<(String, Option<TypeExpr>)>,
+    pub type_params: Vec<(String, Option<crate::ast::Expr>)>,
     pub cases: Vec<VariantCaseDef>,
 }
 
@@ -713,14 +731,14 @@ pub struct VariantDef {
 pub struct VariantInstance {
     pub inst_name: String,
     pub def: Arc<VariantDef>,
-    pub generic_args: Vec<TypeExpr>,
+    pub generic_args: Vec<Value>,
     pub case_idx: usize,
     pub payload: Value,
 }
 
 #[derive(Clone, Default)]
 pub struct FieldTypeInfo {
-    pub type_expr: Option<TypeExpr>,
+    pub type_expr: Option<crate::ast::Expr>,
     pub strict: bool,
 }
 
@@ -732,7 +750,7 @@ pub struct StructDef {
     pub mutable_fields: Vec<bool>,
     pub typed: bool,
     pub field_types: Vec<FieldTypeInfo>,
-    pub type_params: Vec<(String, Option<TypeExpr>)>,
+    pub type_params: Vec<(String, Option<crate::ast::Expr>)>,
     /// `typed struct … : C.layout` 时填充；供 `C.load` / `C.store` / `C.alloc(T)`。
     pub c_layout: Option<std::sync::Arc<crate::ffi_extra::CStructLayout>>,
 }
@@ -741,7 +759,7 @@ pub struct StructDef {
 pub struct StructInstance {
     pub def: Arc<StructDef>,
     pub slots: SyncCell<Vec<Value>>,
-    pub generic_args: Vec<TypeExpr>,
+    pub generic_args: Vec<Value>,
 }
 
 impl Value {
@@ -1163,7 +1181,7 @@ impl Value {
             (Value::Sync(a), Value::Sync(b)) => Ok(Shared::ptr_eq(a, b)),
             (Value::SyncGuard(a), Value::SyncGuard(b)) => Ok(Shared::ptr_eq(a, b)),
             (Value::TypeSpec(a), Value::TypeSpec(b)) => {
-                Ok(a.name == b.name && a.args == b.args)
+                Ok(a.as_ref() == b.as_ref())
             }
             (Value::EnumMember(a), Value::EnumMember(b)) => {
                 Ok(Arc::ptr_eq(&a.def, &b.def) && a.member_index == b.member_index)
@@ -1210,7 +1228,7 @@ pub fn values_identical(a: &Value, b: &Value) -> bool {
         (Value::GenericFunction(x), Value::GenericFunction(y)) => Arc::ptr_eq(x, y),
         (Value::Builtin(x), Value::Builtin(y)) => std::ptr::eq(x, y),
         (Value::Module(x), Value::Module(y)) => Shared::ptr_eq(x, y),
-        (Value::TypeSpec(a), Value::TypeSpec(b)) => a.name == b.name && a.args == b.args,
+        (Value::TypeSpec(a), Value::TypeSpec(b)) => a.as_ref() == b.as_ref(),
         (Value::EnumMember(x), Value::EnumMember(y)) => Arc::ptr_eq(x, y),
         (Value::Variant(x), Value::Variant(y)) => Arc::ptr_eq(x, y),
         _ => false,

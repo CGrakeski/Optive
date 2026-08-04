@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::ast::{
     Block, BinaryOp, CallArg, CatchClause, CatchPattern, Expr, ExprKind, ForItem, LValue,
-    LocatedStmt, MacroCallArg, MatchCase, Pattern, PatternElem, Stmt, TypeExpr, UnaryOp, Visibility,
+    LocatedStmt, MacroCallArg, MatchCase, Pattern, PatternElem, Stmt, UnaryOp, Visibility,
 };
 use crate::codegen::Generator;
 use crate::error::RuntimeError;
@@ -1590,11 +1590,13 @@ pub fn register_ast_struct_types(vm: &mut Vm) {
         .or_insert_with("AST".to_string(), || Value::type_ref("AST"));
 }
 
-pub fn check_macro_param_ast_kind(param_type: &TypeExpr, ast: &RuntimeAstNode) -> Result<()> {
-    let TypeExpr::Name(name) = param_type else {
+pub fn check_macro_param_ast_kind(param_type: &Expr, ast: &RuntimeAstNode) -> Result<()> {
+    let Some(name) = crate::types::static_type_value_from_expr(param_type).and_then(|v| {
+        crate::types::type_value_base(&v).map(str::to_string)
+    }) else {
         return Ok(());
     };
-    let Some(expected) = annotation_to_kind(name) else {
+    let Some(expected) = annotation_to_kind(&name) else {
         return Ok(());
     };
     if ast.kind != expected {

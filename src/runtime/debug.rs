@@ -127,6 +127,9 @@ pub fn normalize_path(p: &str) -> String {
 
 pub fn attach(vm: &mut Vm, state: Shared<DebugState>) {
     vm.debug = Some(state);
+    vm.debug_active = true;
+    // 强制当前热循环退出，以便重新进入时读取新 debug_active。
+    vm.force_debug_recheck();
 }
 
 /// 当前执行位置的文件 / 源文本（优先函数定义处）。

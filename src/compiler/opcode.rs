@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::ast::{FuncParam, TypeExpr};
+use crate::ast::FuncParam;
 use crate::shared::SyncCell;
 use crate::value::Value;
 
@@ -28,6 +28,8 @@ pub enum Instruction {
     /// 已证两侧为 `Num` 的除法。
     DivNumNum,
     Mod,
+    /// 已证两侧为 `Num` 的取模。
+    ModNumNum,
     Pow,
     /// 已证两侧为 `Num` 的幂运算。
     PowNumNum,
@@ -137,7 +139,10 @@ pub enum Instruction {
     /// 将 list/tuple 拆为 `before` + rest(list) + `after`；栈顶为最后一个 after 元素。
     UnpackRest { before: usize, after: usize },
     Rethrow,
-    TypeCheck(TypeExpr),
+    /// 栈：… value, type_val → … value（硬检查；type_val 须为类型）。
+    TypeCheck,
+    /// 栈顶 `Function`：在定义处求值并绑定所有参数/返回类型注解（须为类型值）。
+    ResolveFuncTypes,
     FindMod(String),
     RegisterExport(String),
     /// `go f(args)`：栈为 args… + callee → Task。
@@ -569,10 +574,10 @@ pub struct ModuleGlobalEnv {
 #[derive(Clone)]
 pub struct GenericFunctionTemplate {
     pub name: String,
-    pub type_params: Vec<(String, Option<crate::ast::TypeExpr>)>,
+    pub type_params: Vec<(String, Option<crate::ast::Expr>)>,
     pub params: Vec<FuncParam>,
     pub body: crate::ast::Block,
-    pub return_type: Option<crate::ast::TypeExpr>,
+    pub return_type: Option<crate::ast::Expr>,
     pub return_strong: bool,
     pub return_wrapper: Option<crate::ast::Expr>,
     pub is_generator: bool,
@@ -598,9 +603,15 @@ pub struct FunctionObject {
     /// 与 `params` 等长；有默认值的槽在定义时由 `__attach_defaults__` 填入。
     pub defaults: Vec<Option<Value>>,
     pub captured: Option<HashMap<String, Value>>,
-    pub return_type: Option<TypeExpr>,
+    pub return_type: Option<crate::ast::Expr>,
     pub return_strong: bool,
     pub return_wrapper: Option<crate::ast::Expr>,
+    /// 定义时求值后的参数类型（与 `params` 等长；无注解为 `None`）。
+    pub param_types: Vec<Option<Value>>,
+    /// 定义时求值后的返回类型。
+    pub return_type_value: Option<Value>,
+    /// 是否已在定义处完成注解求值与校验。
+    pub types_resolved: bool,
     /// 局部帧 `Vec` 大小（`max(fast slot index) + 1`）。
     pub frame_slots: usize,
     /// 运行时是否需为本函数维护 name→slot 映射。
@@ -641,6 +652,9 @@ impl FunctionObject {
             return_type: None,
             return_strong: false,
             return_wrapper: None,
+            param_types: Vec::new(),
+            return_type_value: None,
+            types_resolved: false,
             frame_slots: 0,
             uses_name_map: true,
             track_frames: true,

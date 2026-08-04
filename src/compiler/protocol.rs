@@ -3,10 +3,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::ast::{ProtocolMember, TypeExpr};
+use crate::ast::{Expr, ProtocolMember};
 use crate::error::RuntimeError;
 use crate::type_registry;
-use crate::types::{instance_is_a, type_expr_display};
+use crate::types::{
+    self, instance_is_a, static_type_value_from_expr, type_value_base, type_value_display,
+    type_values_equal,
+};
+use crate::value::Value;
 use crate::vm::Vm;
 
 #[derive(Debug, Clone)]
@@ -85,13 +89,13 @@ impl TypeCheckContext {
 
 pub fn type_satisfies_protocol_ctx(
     ctx: &TypeCheckContext,
-    ty: &TypeExpr,
+    ty: &Value,
     protocol_name: &str,
 ) -> bool {
     let Some(def) = ctx.protocols.get(protocol_name) else {
         return false;
     };
-    let type_name = type_expr_base_name(ty);
+    let type_name = type_value_base_name(ty);
     for method in &def.methods {
         if !type_has_method_ctx(ctx, &type_name, method) {
             return false;
@@ -107,67 +111,72 @@ pub fn type_satisfies_protocol_ctx(
 
 pub fn check_type_bound_ctx(
     ctx: &TypeCheckContext,
-    concrete: &TypeExpr,
-    bound: &TypeExpr,
+    concrete: &Value,
+    bound: &Expr,
+) -> Result<(), RuntimeError> {
+    let Some(bound_ty) = static_type_value_from_expr(bound) else {
+        return Err(RuntimeError::msg(format!(
+            "type bound `{}` is not a static type expression",
+            types::type_expr_display(concrete)
+        )));
+    };
+    check_type_bound_value_ctx(ctx, concrete, &bound_ty)
+}
+
+pub fn check_type_bound_value_ctx(
+    ctx: &TypeCheckContext,
+    concrete: &Value,
+    bound: &Value,
 ) -> Result<(), RuntimeError> {
     match bound {
-        TypeExpr::Name(name) if is_protocol(&ctx.protocols, name) => {
+        Value::TypeRef(name) | Value::Text(name) if is_protocol(&ctx.protocols, name) => {
             if type_satisfies_protocol_ctx(ctx, concrete, name) {
                 Ok(())
             } else {
                 Err(RuntimeError::msg(format!(
                     "type `{}` does not satisfy protocol `{name}`",
-                    type_expr_display(concrete)
+                    type_value_display(concrete)
                 )))
             }
         }
-        TypeExpr::Name(name) => {
-            if instance_is_a_type_expr_ctx(ctx, concrete, name) {
+        Value::TypeRef(name) | Value::Text(name) => {
+            if instance_is_a_type_value_ctx(ctx, concrete, name) {
                 Ok(())
             } else {
                 Err(RuntimeError::msg(format!(
                     "type `{}` is not compatible with bound `{name}`",
-                    type_expr_display(concrete)
+                    type_value_display(concrete)
                 )))
             }
         }
-        TypeExpr::Generic { name, params } => {
-            let bound_ty = TypeExpr::Generic {
-                name: name.clone(),
-                params: params.clone(),
-            };
-            if type_expr_same(concrete, &bound_ty) || instance_is_a_type_expr_ctx(ctx, concrete, name) {
+        Value::TypeSpec(spec) => {
+            if type_values_equal(concrete, bound)
+                || instance_is_a_type_value_ctx(ctx, concrete, &spec.name)
+            {
                 Ok(())
             } else {
                 Err(RuntimeError::msg(format!(
                     "type `{}` does not match bound `{}`",
-                    type_expr_display(concrete),
-                    type_expr_display(&bound_ty)
+                    type_value_display(concrete),
+                    type_value_display(bound)
                 )))
             }
         }
-        TypeExpr::Attr { object, field } => {
-            let path = format!("{}.{}", type_expr_base_name(object), field);
-            if instance_is_a_type_expr_ctx(ctx, concrete, &path) {
-                Ok(())
-            } else {
-                Err(RuntimeError::msg(format!(
-                    "type `{}` is not compatible with bound `{path}`",
-                    type_expr_display(concrete)
-                )))
-            }
+        _ => {
+            // 非常规 bound：不做空 Vm 猜测，直接拒绝以免误通过。
+            Err(RuntimeError::msg(format!(
+                "type `{}` is not compatible with bound `{}`",
+                type_value_display(concrete),
+                type_value_display(bound)
+            )))
         }
     }
 }
 
-fn type_expr_base_name(ty: &TypeExpr) -> String {
-    match ty {
-        TypeExpr::Name(n) => n.clone(),
-        TypeExpr::Attr { object, field } => {
-            format!("{}.{}", type_expr_base_name(object), field)
-        }
-        TypeExpr::Generic { name, .. } => name.clone(),
-    }
+fn type_value_base_name(ty: &Value) -> String {
+    type_value_base(ty)
+        .map(str::to_string)
+        .unwrap_or_else(|| type_value_display(ty))
 }
 
 fn type_has_method_ctx(ctx: &TypeCheckContext, type_name: &str, method: &str) -> bool {
@@ -178,22 +187,21 @@ fn type_has_method_ctx(ctx: &TypeCheckContext, type_name: &str, method: &str) ->
     ctx.functions.contains_key(&key)
 }
 
-fn type_has_field_ctx(ctx: &TypeCheckContext, type_name: &str, field: &str, _mutable: bool) -> bool {
-    ctx.struct_defs
-        .get(type_name)
-        .is_some_and(|def| def.fields.iter().any(|f| f == field))
+fn type_has_field_ctx(ctx: &TypeCheckContext, type_name: &str, field: &str, mutable: bool) -> bool {
+    ctx.struct_defs.get(type_name).is_some_and(|def| {
+        def.fields.iter().enumerate().any(|(i, f)| {
+            f == field && (!mutable || def.mutable_fields.get(i).copied().unwrap_or(false))
+        })
+    })
 }
 
-fn instance_is_a_type_expr_ctx(ctx: &TypeCheckContext, ty: &TypeExpr, bound_name: &str) -> bool {
+fn instance_is_a_type_value_ctx(ctx: &TypeCheckContext, ty: &Value, bound_name: &str) -> bool {
     match ty {
-        TypeExpr::Name(n) => type_name_is_a(ctx, n, bound_name),
-        TypeExpr::Attr { object, field } => {
-            let path = format!("{}.{}", type_expr_base_name(object), field);
-            type_name_is_a(ctx, &path, bound_name)
+        Value::TypeRef(n) | Value::Text(n) => type_name_is_a(ctx, n, bound_name),
+        Value::TypeSpec(spec) => {
+            spec.name == bound_name || type_name_is_a(ctx, &spec.name, bound_name)
         }
-        TypeExpr::Generic { name, .. } => {
-            name == bound_name || type_name_is_a(ctx, name, bound_name)
-        }
+        _ => false,
     }
 }
 
@@ -205,37 +213,13 @@ fn type_name_is_a(ctx: &TypeCheckContext, name: &str, bound_name: &str) -> bool 
         if let Some(base) = &def.base {
             return type_name_is_a(ctx, base, bound_name);
         }
+        return false;
     }
-    instance_is_a(&Vm::new(), &type_registry::sample_value_for_type_name(name), bound_name)
-}
-
-fn type_expr_same(a: &TypeExpr, b: &TypeExpr) -> bool {
-    match (a, b) {
-        (TypeExpr::Name(x), TypeExpr::Name(y)) => x == y,
-        (
-            TypeExpr::Attr {
-                object: o1,
-                field: f1,
-            },
-            TypeExpr::Attr {
-                object: o2,
-                field: f2,
-            },
-        ) => f1 == f2 && type_expr_same(o1, o2),
-        (
-            TypeExpr::Generic {
-                name: n1,
-                params: p1,
-            },
-            TypeExpr::Generic {
-                name: n2,
-                params: p2,
-            },
-        ) => {
-            n1 == n2
-                && p1.len() == p2.len()
-                && p1.iter().zip(p2.iter()).all(|(a, b)| type_expr_same(a, b))
-        }
-        _ => false,
+    // 内置类型：用样例值做原始 is-a（不依赖用户 struct_defs）。
+    let sample = type_registry::sample_value_for_type_name(name);
+    if matches!(sample, Value::TypeRef(_)) {
+        return false;
     }
+    let vm = Vm::new();
+    instance_is_a(&vm, &sample, bound_name)
 }

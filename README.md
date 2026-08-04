@@ -132,9 +132,11 @@ src/
 - [`docs/language.md`](docs/language.md) — 语言参考（语法、类型、控制流、泛型、宏；§1.1 含 CLI / `Optive fmt`）
 - [`docs/stdlib.md`](docs/stdlib.md) — 标准库 API（含 `std.http` 等）
 - [`docs/ffi-c.md`](docs/ffi-c.md) — C 互操作
+- [`docs/ffi-parallel.md`](docs/ffi-parallel.md) — 并行 FFI（默认异符号可重叠；可选卸荷池）
 - [`docs/deps-strategy.md`](docs/deps-strategy.md) — 依赖管理设计
 - [`docs/deps-tutorial.md`](docs/deps-tutorial.md) — 依赖管理实操
-- [`docs/concurrency_like_go.md`](docs/concurrency_like_go.md) — 并发模型（`go` / channel / `select`）
+- [`docs/concurrency.md`](docs/concurrency.md) — 并发文档地图与实现状态（M:1 默认 / M:N 可选）
+- [`docs/concurrency_like_go.md`](docs/concurrency_like_go.md) — 并发语言语义（`go` / channel / `select`；权威）
 
 > 文档与实现冲突时，以源码与测试为准。
 

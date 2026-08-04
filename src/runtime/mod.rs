@@ -9,6 +9,7 @@ pub mod enum_variant;
 pub mod exceptions;
 pub mod ffi;
 pub mod ffi_extra;
+pub mod ffi_pool;
 pub mod gc;
 pub mod ptr_registry;
 pub mod module;

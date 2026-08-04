@@ -1,63 +1,43 @@
-//! `::` / `=>` 注解的运行时类型接受检查。
+//! 硬注解运行时检查：注解是 `Expr`，求值得到类型值后再 `is_a`。
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::ast::TypeExpr;
+use crate::ast::{Expr, ExprKind};
 use crate::error::RuntimeError;
 use crate::opcode::FunctionObject;
 use crate::protocol;
 use crate::type_registry;
-use crate::value::Value;
+use crate::value::{TypeSpecData, Value};
 use crate::vm::Vm;
 
-/// `name` 是否支持经运行时索引的 `Name[type_arg]`（泛型结构体构造）。
-pub fn is_generic_type_formable(vm: &Vm, name: &str) -> bool {
-    vm.struct_defs
-        .get(name)
-        .is_some_and(|def| !def.type_params.is_empty())
+/// 值是否为元类型 `type` 的实例（类型句柄 / 类型形态）。
+pub fn value_is_type(t: &Value) -> bool {
+    matches!(t, Value::TypeRef(_) | Value::TypeSpec(_))
 }
 
-/// 将运行时类型索引操作数（`num`、`list[num]`、`[num, text]`）转为类型实参。
-pub fn type_index_operand_to_args(val: &Value) -> crate::Result<Vec<TypeExpr>> {
+/// 将类型索引操作数规范为类型实参列表（每个元素已是类型值）。
+pub fn type_index_operand_to_args(val: &Value) -> crate::Result<Vec<Value>> {
     match val {
-        Value::TypeRef(name) | Value::Text(name) => Ok(vec![TypeExpr::Name(name.clone())]),
-        Value::TypeSpec(spec) => Ok(vec![TypeExpr::Generic {
-            name: spec.name.clone(),
-            params: spec.args.clone(),
-        }]),
+        Value::TypeRef(_) | Value::TypeSpec(_) => Ok(vec![val.clone()]),
+        Value::Text(name) => Ok(vec![Value::type_ref(name.clone())]),
         Value::List(lst) => lst
             .borrow()
             .iter()
-            .map(single_type_index_operand)
+            .map(|v| {
+                let mut args = type_index_operand_to_args(v)?;
+                if args.len() != 1 {
+                    return Err(RuntimeError::msg(
+                        "expected single type argument in this position",
+                    ));
+                }
+                Ok(args.remove(0))
+            })
             .collect(),
-        other => Err(crate::error::RuntimeError::msg(format!(
+        other => Err(RuntimeError::msg(format!(
             "expected type argument, got {}",
             other.type_name()
         ))),
-    }
-}
-
-fn single_type_index_operand(val: &Value) -> crate::Result<TypeExpr> {
-    let mut args = type_index_operand_to_args(val)?;
-    if args.len() != 1 {
-        return Err(crate::error::RuntimeError::msg(
-            "expected single type argument in this position",
-        ));
-    }
-    Ok(args.remove(0))
-}
-
-/// 将运行时 `TypeSpec` 转为 `TypeExpr`。
-/// 无参的类型形态（如 `Callable()`、`Maybe()`）仍走 `Generic`，避免被当成普通类型名。
-pub fn type_spec_to_type_expr(spec: &crate::value::TypeSpecData) -> TypeExpr {
-    if spec.args.is_empty() && !type_registry::is_type_form(&spec.name) {
-        TypeExpr::Name(spec.name.clone())
-    } else {
-        TypeExpr::Generic {
-            name: spec.name.clone(),
-            params: spec.args.clone(),
-        }
     }
 }
 
@@ -87,7 +67,6 @@ pub fn instance_is_a(vm: &Vm, val: &Value, type_name: &str) -> bool {
     }
 }
 
-/// 从 `val` 运行时类型到 `type_name` 的子类型距离；非实例则 `None`。
 pub fn instance_match_distance(vm: &Vm, val: &Value, type_name: &str) -> Option<usize> {
     if !instance_is_a(vm, val, type_name) {
         return None;
@@ -98,27 +77,99 @@ pub fn instance_match_distance(vm: &Vm, val: &Value, type_name: &str) -> Option<
     }
 }
 
-pub fn type_expr_match_distance(vm: &Vm, val: &Value, ty: &TypeExpr) -> Option<usize> {
+/// `val` 是否满足类型值 `ty`（`TypeRef` / `TypeSpec`）。
+pub fn value_accepts(vm: &Vm, val: &Value, ty: &Value) -> bool {
     match ty {
-        TypeExpr::Name(name) => instance_match_distance(vm, val, name),
-        TypeExpr::Attr { .. } => {
-            let name = resolve_type_expr_name(vm, ty).ok()?;
-            instance_match_distance(vm, val, &name)
+        Value::TypeRef(name) if name == "Never" => false,
+        Value::TypeRef(name) if protocol::is_protocol(&vm.protocols, name) => {
+            value_satisfies_protocol(vm, val, name)
         }
-        TypeExpr::Generic { name, params } => {
-            if let Some(score) = type_registry::type_form_match_distance(vm, val, name, params) {
-                Some(score)
-            } else if type_registry::is_type_form(name) {
-                None
+        Value::TypeRef(name) => instance_is_a(vm, val, name),
+        Value::TypeSpec(spec) => {
+            if type_registry::is_type_form(&spec.name) {
+                type_registry::type_form_accepts(vm, val, &spec.name, &spec.args)
+            } else if let Value::Struct(s) = val {
+                type_registry::struct_name_is_a(vm, &s.def.name, &spec.name)
+                    && generic_args_match(&s.generic_args, &spec.args)
             } else {
-                instance_match_distance(vm, val, name)
+                // 无类型实参的规格才允许退化为名字匹配。
+                spec.args.is_empty() && instance_is_a(vm, val, &spec.name)
             }
         }
+        Value::Text(name) => instance_is_a(vm, val, name),
+        _ => false,
     }
 }
 
-/// 分发处理器匹配的总子类型距离分；越小越优先。
-pub fn dispatch_match_score(vm: &Vm, func: &FunctionObject, args: &[Value]) -> Option<usize> {
+pub fn type_value_match_distance(vm: &Vm, val: &Value, ty: &Value) -> Option<usize> {
+    match ty {
+        Value::TypeRef(name) | Value::Text(name) => instance_match_distance(vm, val, name),
+        Value::TypeSpec(spec) => {
+            if let Some(score) =
+                type_registry::type_form_match_distance(vm, val, &spec.name, &spec.args)
+            {
+                Some(score)
+            } else if type_registry::is_type_form(&spec.name) {
+                None
+            } else if let Value::Struct(s) = val {
+                if type_registry::struct_name_is_a(vm, &s.def.name, &spec.name)
+                    && generic_args_match(&s.generic_args, &spec.args)
+                {
+                    type_registry::struct_name_distance(vm, &s.def.name, &spec.name)
+                } else {
+                    None
+                }
+            } else if spec.args.is_empty() {
+                instance_match_distance(vm, val, &spec.name)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// 定义处求值并绑定函数上的全部类型注解；结果必须是类型值。
+/// 之后调用只比对 `param_types` / `return_type_value`，不再求值注解表达式。
+pub fn bind_function_annotations(vm: &mut Vm, func: &mut FunctionObject) -> crate::Result<()> {
+    if func.types_resolved {
+        return Ok(());
+    }
+    let prev = vm.annotation_bind_env.take();
+    vm.annotation_bind_env = func.module_env.clone();
+    let result = (|| {
+        let mut param_types = Vec::with_capacity(func.params.len());
+        for param in &func.params {
+            match &param.type_expr {
+                None => param_types.push(None),
+                Some(ann) => {
+                    let ty = eval_type_annotation(vm, ann).map_err(|e| {
+                        RuntimeError::type_err(format!(
+                            "parameter '{}': {}",
+                            param.name,
+                            e.message()
+                        ))
+                    })?;
+                    param_types.push(Some(ty));
+                }
+            }
+        }
+        let return_type_value = match &func.return_type {
+            None => None,
+            Some(ann) => Some(eval_type_annotation(vm, ann).map_err(|e| {
+                RuntimeError::type_err(format!("return: {}", e.message()))
+            })?),
+        };
+        func.param_types = param_types;
+        func.return_type_value = return_type_value;
+        func.types_resolved = true;
+        Ok(())
+    })();
+    vm.annotation_bind_env = prev;
+    result
+}
+
+pub fn dispatch_match_score(vm: &mut Vm, func: &FunctionObject, args: &[Value]) -> Option<usize> {
     let required = func
         .params
         .iter()
@@ -138,86 +189,39 @@ pub fn dispatch_match_score(vm: &Vm, func: &FunctionObject, args: &[Value]) -> O
         if param.is_variadic || param.is_kwvariadic {
             continue;
         }
-        if let Some(ty) = &param.type_expr {
-            let val = args.get(i)?;
-            score += type_expr_match_distance(vm, val, ty)?;
-        }
+        let Some(ty) = func.param_types.get(i).and_then(|t| t.as_ref()) else {
+            continue;
+        };
+        let val = args.get(i)?;
+        score += type_value_match_distance(vm, val, ty)?;
     }
     Some(score)
 }
 
-/// `val` 是否满足类型表达式 `ty`。
-pub fn type_accepts(vm: &Vm, val: &Value, ty: &TypeExpr) -> bool {
+pub fn type_value_display(ty: &Value) -> String {
     match ty {
-        TypeExpr::Name(name) if name == "Never" => false,
-        TypeExpr::Name(name) if protocol::is_protocol(&vm.protocols, name) => {
-            value_satisfies_protocol(vm, val, name)
-        }
-        TypeExpr::Name(name) => instance_is_a(vm, val, name),
-        TypeExpr::Attr { .. } => match resolve_type_expr_name(vm, ty) {
-            Ok(name) => instance_is_a(vm, val, &name),
-            Err(_) => false,
-        },
-        TypeExpr::Generic { name, params } => {
-            if type_registry::is_type_form(name) {
-                type_registry::type_form_accepts(vm, val, name, params)
+        Value::TypeRef(n) | Value::Text(n) => n.clone(),
+        Value::TypeSpec(spec) => {
+            if spec.args.is_empty() {
+                format!("{}[]", spec.name)
             } else {
-                type_registry::type_form_accepts(vm, val, name, params)
-                    || instance_is_a(vm, val, name)
+                let inner: Vec<String> = spec.args.iter().map(type_value_display).collect();
+                format!("{}[{}]", spec.name, inner.join(", "))
             }
         }
+        other => other.print_string(),
     }
 }
 
-/// 将类型表达式解析为规范类型名（`TypeRef` 字符串或原始名）。
-/// `C.types.int` 通过 getattr 得到模块导出的类型句柄。
-pub fn resolve_type_expr_name(vm: &Vm, ty: &TypeExpr) -> Result<String, RuntimeError> {
-    match resolve_type_expr_value(vm, ty)? {
-        Value::TypeRef(n) | Value::Text(n) => Ok(n),
-        Value::TypeSpec(spec) => Ok(spec.name.clone()),
-        other => Err(RuntimeError::type_err(format!(
-            "type expression resolved to {}, expected a type",
-            other.type_name()
-        ))),
+/// 失败时返回 `expected X, got Y`；成功返回 `None`。
+pub fn type_check_error(vm: &Vm, val: &Value, ty: &Value) -> Option<String> {
+    if !value_is_type(ty) {
+        return Some(format!(
+            "type annotation evaluated to {}, expected a type",
+            ty.type_name()
+        ));
     }
-}
-
-pub fn resolve_type_expr_value(vm: &Vm, ty: &TypeExpr) -> Result<Value, RuntimeError> {
-    match ty {
-        TypeExpr::Name(name) => match vm.load_name(name) {
-            Ok(v) => Ok(v),
-            // 未绑定名字当作裸类型句柄（如 `num`、`i32`）
-            Err(_) => Ok(Value::type_ref(name.clone())),
-        },
-        TypeExpr::Attr { object, field } => {
-            let base = resolve_type_expr_value(vm, object)?;
-            match &base {
-                Value::Module(m) => m
-                    .borrow()
-                    .get_attr(field)
-                    .ok_or_else(|| {
-                        RuntimeError::attr_err(format!(
-                            "module '{}' has no export '{field}'",
-                            m.borrow().full_name
-                        ))
-                    }),
-                Value::TypeRef(n) => Ok(Value::type_ref(format!("{n}.{field}"))),
-                other => Err(RuntimeError::type_err(format!(
-                    "cannot get attribute '{field}' on {}",
-                    other.type_name()
-                ))),
-            }
-        }
-        TypeExpr::Generic { name, params } => Ok(Value::TypeSpec(crate::value::TypeSpecData::new(
-            name.clone(),
-            params.clone(),
-        ))),
-    }
-}
-
-/// 失败时返回带路径的 `expected X, got Y`；成功返回 `None`。
-pub fn type_check_error(vm: &Vm, val: &Value, ty: &TypeExpr) -> Option<String> {
-    if type_accepts(vm, val, ty) {
+    if value_accepts(vm, val, ty) {
         return None;
     }
     Some(explain_mismatch(vm, val, ty, ""))
@@ -231,86 +235,85 @@ fn mismatch_message(expected: &str, got: &str, path: &str) -> String {
     }
 }
 
-fn explain_mismatch(vm: &Vm, val: &Value, ty: &TypeExpr, path: &str) -> String {
+fn explain_mismatch(vm: &Vm, val: &Value, ty: &Value, path: &str) -> String {
     match ty {
-        TypeExpr::Generic { name, params } if name == "list" && params.len() == 1 => {
+        Value::TypeSpec(spec) if spec.name == "list" && spec.args.len() == 1 => {
             if let Value::List(lst) = val {
                 for (i, item) in lst.borrow().iter().enumerate() {
-                    if !type_accepts(vm, item, &params[0]) {
+                    if !value_accepts(vm, item, &spec.args[0]) {
                         let child = format!("{path}[{i}]");
-                        return explain_mismatch(vm, item, &params[0], &child);
+                        return explain_mismatch(vm, item, &spec.args[0], &child);
                     }
                 }
             }
-            mismatch_message(&type_expr_display(ty), val.type_name(), path)
+            mismatch_message(&type_value_display(ty), val.type_name(), path)
         }
-        TypeExpr::Generic { name, params } if name == "dict" && params.len() == 2 => {
+        Value::TypeSpec(spec) if spec.name == "dict" && spec.args.len() == 2 => {
             if let Value::Dict(d) = val {
                 for (k, v) in d.borrow().iter() {
                     let kv = crate::value::value_key_to_value(k);
                     let key_disp = kv.print_string();
-                    if !type_accepts(vm, &kv, &params[0]) {
+                    if !value_accepts(vm, &kv, &spec.args[0]) {
                         let child = format!("{path}[{key_disp}]");
-                        return explain_mismatch(vm, &kv, &params[0], &child);
+                        return explain_mismatch(vm, &kv, &spec.args[0], &child);
                     }
-                    if !type_accepts(vm, v, &params[1]) {
+                    if !value_accepts(vm, v, &spec.args[1]) {
                         let child = format!("{path}[{key_disp}]");
-                        return explain_mismatch(vm, v, &params[1], &child);
+                        return explain_mismatch(vm, v, &spec.args[1], &child);
                     }
                 }
             }
-            mismatch_message(&type_expr_display(ty), val.type_name(), path)
+            mismatch_message(&type_value_display(ty), val.type_name(), path)
         }
-        TypeExpr::Generic { name, params } if name == "set" && params.len() == 1 => {
+        Value::TypeSpec(spec) if spec.name == "set" && spec.args.len() == 1 => {
             if let Value::Set(s) = val {
                 for k in s.borrow().iter() {
                     let elem = crate::value::value_key_to_value(k);
-                    if !type_accepts(vm, &elem, &params[0]) {
+                    if !value_accepts(vm, &elem, &spec.args[0]) {
                         let child = if path.is_empty() {
                             format!("{{{}}}", elem.print_string())
                         } else {
                             format!("{path}{{{}}}", elem.print_string())
                         };
-                        return explain_mismatch(vm, &elem, &params[0], &child);
+                        return explain_mismatch(vm, &elem, &spec.args[0], &child);
                     }
                 }
             }
-            mismatch_message(&type_expr_display(ty), val.type_name(), path)
+            mismatch_message(&type_value_display(ty), val.type_name(), path)
         }
-        TypeExpr::Generic { name, params } if name == "Maybe" && params.len() == 1 => {
+        Value::TypeSpec(spec) if spec.name == "Maybe" && spec.args.len() == 1 => {
             if matches!(val, Value::None) {
-                return mismatch_message(&type_expr_display(ty), val.type_name(), path);
+                return mismatch_message(&type_value_display(ty), val.type_name(), path);
             }
-            if !type_accepts(vm, val, &params[0]) {
-                return explain_mismatch(vm, val, &params[0], path);
+            if !value_accepts(vm, val, &spec.args[0]) {
+                return explain_mismatch(vm, val, &spec.args[0], path);
             }
-            mismatch_message(&type_expr_display(ty), val.type_name(), path)
+            mismatch_message(&type_value_display(ty), val.type_name(), path)
         }
-        _ => mismatch_message(&type_expr_display(ty), val.type_name(), path),
+        _ => mismatch_message(&type_value_display(ty), val.type_name(), path),
     }
 }
 
-/// 强注解成功后，把容器契约挂到对象上（别名共享）。
-pub fn seal_container_contract(vm: &mut Vm, val: &Value, ty: &TypeExpr) {
+pub fn seal_container_contract(vm: &mut Vm, val: &Value, ty: &Value) {
     match ty {
-        TypeExpr::Generic { name, params } if name == "list" && params.len() == 1 => {
+        Value::TypeSpec(spec) if spec.name == "list" && spec.args.len() == 1 => {
             if let Value::List(rc) = val {
                 vm.list_element_contracts
-                    .insert(rc.as_ptr() as usize, params[0].clone());
+                    .insert(rc.as_ptr() as usize, spec.args[0].clone());
             }
         }
-        TypeExpr::Generic { name, params } if name == "dict" && params.len() == 2 => {
+        Value::TypeSpec(spec) if spec.name == "dict" && spec.args.len() == 2 => {
             if let Value::Dict(rc) = val {
                 vm.dict_contracts.insert(
                     rc.as_ptr() as usize,
-                    (params[0].clone(), params[1].clone()),
+                    (spec.args[0].clone(), spec.args[1].clone()),
                 );
             }
         }
-        TypeExpr::Generic { name, params } if name == "set" && params.len() == 1 => {
+        Value::TypeSpec(spec) if spec.name == "set" && spec.args.len() == 1 => {
             if let Value::Set(rc) = val {
                 vm.set_element_contracts
-                    .insert(rc.as_ptr() as usize, params[0].clone());
+                    .insert(rc.as_ptr() as usize, spec.args[0].clone());
             }
         }
         _ => {}
@@ -323,115 +326,164 @@ fn value_satisfies_protocol(vm: &Vm, val: &Value, protocol_name: &str) -> bool {
         other => other.type_name().to_string(),
     };
     let ctx = protocol_ctx_from_vm(vm);
-    protocol::type_satisfies_protocol_ctx(&ctx, &TypeExpr::Name(type_name), protocol_name)
+    protocol::type_satisfies_protocol_ctx(&ctx, &Value::type_ref(type_name), protocol_name)
 }
 
-pub fn type_expr_display(ty: &TypeExpr) -> String {
+/// 值的运行时类型（作类型值，供泛型推断）。
+pub fn value_to_type_value(vm: &Vm, val: &Value) -> Value {
+    type_registry::value_to_type_value(vm, val)
+}
+
+pub fn substitute_type_value(ty: &Value, subs: &HashMap<String, Value>) -> Value {
     match ty {
-        TypeExpr::Name(n) => n.clone(),
-        TypeExpr::Attr { object, field } => format!("{}.{}", type_expr_display(object), field),
-        TypeExpr::Generic { name, params } => {
-            let inner: Vec<String> = params.iter().map(type_expr_display).collect();
-            format!("{name}[{}]", inner.join(", "))
-        }
-    }
-}
-
-/// 值的运行时类型（作类型表达式，供泛型推断）。
-pub fn value_to_type_expr(vm: &Vm, val: &Value) -> TypeExpr {
-    type_registry::value_to_type_expr(vm, val)
-}
-
-pub fn substitute_type_expr(ty: &TypeExpr, subs: &HashMap<String, TypeExpr>) -> TypeExpr {
-    match ty {
-        TypeExpr::Name(n) => subs.get(n).cloned().unwrap_or_else(|| TypeExpr::Name(n.clone())),
-        TypeExpr::Attr { object, field } => TypeExpr::Attr {
-            object: Box::new(substitute_type_expr(object, subs)),
-            field: field.clone(),
-        },
-        TypeExpr::Generic { name, params } => TypeExpr::Generic {
-            name: name.clone(),
-            params: params
+        Value::TypeRef(n) | Value::Text(n) => subs
+            .get(n)
+            .cloned()
+            .unwrap_or_else(|| Value::type_ref(n.clone())),
+        Value::TypeSpec(spec) => Value::TypeSpec(TypeSpecData::new(
+            spec.name.clone(),
+            spec.args
                 .iter()
-                .map(|p| substitute_type_expr(p, subs))
+                .map(|a| substitute_type_value(a, subs))
                 .collect(),
-        },
+        )),
+        other => other.clone(),
     }
 }
 
-fn unify_type_param(
-    inferred: &mut HashMap<String, TypeExpr>,
-    param: &str,
-    ty: TypeExpr,
-) -> bool {
+fn unify_type_param(inferred: &mut HashMap<String, Value>, param: &str, ty: Value) -> bool {
     if let Some(existing) = inferred.get(param) {
-        existing == &ty
+        type_values_equal(existing, &ty)
     } else {
         inferred.insert(param.to_string(), ty);
         true
     }
 }
 
-pub fn type_expr_base(ty: &TypeExpr) -> Option<&str> {
-    match ty {
-        TypeExpr::Name(n) => Some(n),
-        TypeExpr::Attr { .. } => None,
-        TypeExpr::Generic { name, .. } => Some(name),
+fn generic_args_match(actual: &[Value], expected: &[Value]) -> bool {
+    actual.len() == expected.len()
+        && actual
+            .iter()
+            .zip(expected.iter())
+            .all(|(a, e)| type_values_equal(a, e))
+}
+
+pub fn type_values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::TypeRef(x), Value::TypeRef(y)) | (Value::Text(x), Value::Text(y)) => x == y,
+        (Value::TypeRef(x), Value::Text(y)) | (Value::Text(x), Value::TypeRef(y)) => x == y,
+        (Value::TypeSpec(x), Value::TypeSpec(y)) => {
+            x.name == y.name
+                && x.args.len() == y.args.len()
+                && x.args
+                    .iter()
+                    .zip(y.args.iter())
+                    .all(|(u, v)| type_values_equal(u, v))
+        }
+        _ => false,
     }
+}
+
+pub fn type_value_base(ty: &Value) -> Option<&str> {
+    match ty {
+        Value::TypeRef(n) | Value::Text(n) => Some(n.as_str()),
+        Value::TypeSpec(spec) => Some(spec.name.as_str()),
+        _ => None,
+    }
+}
+
+/// 类型名是否可接受 `[T]` 索引（泛型 struct 或 type form）。
+pub fn is_generic_type_formable(vm: &Vm, type_name: &str) -> bool {
+    vm.struct_defs
+        .get(type_name)
+        .is_some_and(|def| !def.type_params.is_empty())
+        || type_registry::is_type_form(type_name)
 }
 
 pub fn infer_from_field_type_inner(
-    field_ty: &TypeExpr,
-    val_ty: &TypeExpr,
-    inferred: &mut HashMap<String, TypeExpr>,
+    field_ty: &Value,
+    val_ty: &Value,
+    inferred: &mut HashMap<String, Value>,
 ) -> bool {
     match field_ty {
-        TypeExpr::Name(p) => unify_type_param(inferred, p, val_ty.clone()),
-        TypeExpr::Attr { .. } => true,
-        TypeExpr::Generic { .. } => {
-            type_registry::type_form_infer(field_ty, val_ty, inferred)
-        }
+        Value::TypeRef(p) | Value::Text(p) => unify_type_param(inferred, p, val_ty.clone()),
+        Value::TypeSpec(_) => type_registry::type_form_infer(field_ty, val_ty, inferred),
+        _ => true,
     }
 }
 
-fn infer_from_field_type(
-    field_ty: &TypeExpr,
-    val_ty: &TypeExpr,
-    inferred: &mut HashMap<String, TypeExpr>,
-) -> bool {
-    infer_from_field_type_inner(field_ty, val_ty, inferred)
-}
-
-/// 由构造实参与字段类型推断泛型类型实参。
 pub fn infer_generic_args(
     vm: &Vm,
     def: &crate::value::StructDef,
     args: &[Value],
-) -> HashMap<String, TypeExpr> {
+) -> HashMap<String, Value> {
     let mut inferred = HashMap::new();
     for (i, val) in args.iter().enumerate() {
         if let Some(info) = def.field_types.get(i) {
-            if let Some(ref field_ty) = info.type_expr {
-                let val_ty = value_to_type_expr(vm, val);
-                let _ = infer_from_field_type(field_ty, &val_ty, &mut inferred);
+            if let Some(ref field_expr) = info.type_expr {
+                // 字段注解是 Expr；推断时只折叠静态类型字面（Var / Index / Member）。
+                if let Some(field_ty) = static_type_value_from_expr(field_expr) {
+                    let val_ty = value_to_type_value(vm, val);
+                    let _ = infer_from_field_type_inner(&field_ty, &val_ty, &mut inferred);
+                }
             }
         }
     }
     inferred
 }
 
+/// 将静态类型字面 Expr 折成类型值（`num`、`list[num]`、`C.types.int` 路径名）。
+pub fn static_type_value_from_expr(expr: &Expr) -> Option<Value> {
+    match &expr.kind {
+        ExprKind::Var(name) => Some(Value::type_ref(name.clone())),
+        ExprKind::Member { object, field } => {
+            let base = static_type_path(object)?;
+            Some(Value::type_ref(format!("{base}.{field}")))
+        }
+        ExprKind::Index { object, index } => {
+            let name = static_type_path(object)?;
+            let args = static_type_args_from_index(index)?;
+            Some(Value::TypeSpec(TypeSpecData::new(name, args)))
+        }
+        _ => None,
+    }
+}
+
+fn static_type_path(expr: &Expr) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Var(name) => Some(name.clone()),
+        ExprKind::Member { object, field } => {
+            Some(format!("{}.{}", static_type_path(object)?, field))
+        }
+        _ => None,
+    }
+}
+
+fn static_type_args_from_index(index: &Expr) -> Option<Vec<Value>> {
+    match &index.kind {
+        ExprKind::List(items) => items.iter().map(static_type_value_from_expr).collect(),
+        other => Some(vec![static_type_value_from_expr(&Expr {
+            loc: index.loc,
+            kind: other.clone(),
+        })?]),
+    }
+}
+
 pub fn check_type_param_bounds(
     vm: &Vm,
-    type_params: &[(String, Option<TypeExpr>)],
-    generic_args: &[TypeExpr],
+    type_params: &[(String, Option<Expr>)],
+    generic_args: &[Value],
 ) -> bool {
     if generic_args.len() != type_params.len() {
         return false;
     }
     for (i, (_, bound)) in type_params.iter().enumerate() {
         let actual = &generic_args[i];
-        if let Some(bound_ty) = bound {
-            if !type_expr_implies(vm, actual, bound_ty) {
+        if let Some(bound_expr) = bound {
+            let Some(bound_ty) = static_type_value_from_expr(bound_expr) else {
+                return false;
+            };
+            if !type_value_implies(vm, actual, &bound_ty) {
                 return false;
             }
         }
@@ -439,58 +491,46 @@ pub fn check_type_param_bounds(
     true
 }
 
-pub fn type_expr_implies(vm: &Vm, actual: &TypeExpr, bound: &TypeExpr) -> bool {
+pub fn type_value_implies(vm: &Vm, actual: &Value, bound: &Value) -> bool {
     if let Some(result) = type_registry::type_form_implies(vm, actual, bound) {
         return result;
     }
-    type_expr_implies_inner(vm, actual, bound)
+    type_value_implies_inner(vm, actual, bound)
 }
 
-pub fn type_expr_implies_inner(vm: &Vm, actual: &TypeExpr, bound: &TypeExpr) -> bool {
+pub fn type_value_implies_inner(vm: &Vm, actual: &Value, bound: &Value) -> bool {
     match (actual, bound) {
-        (TypeExpr::Name(a), TypeExpr::Name(b)) => {
+        (Value::TypeRef(a), Value::TypeRef(b)) | (Value::Text(a), Value::Text(b)) => {
             a == b
                 || type_satisfies_bound_name(vm, actual, b)
                 || type_registry::struct_name_is_a(vm, a, b)
         }
-        (
-            TypeExpr::Generic {
-                name: a,
-                params: ap,
-            },
-            TypeExpr::Generic {
-                name: b,
-                params: bp,
-            },
-        ) => {
-            (a == b || type_registry::struct_name_is_a(vm, a, b))
-                && ap.len() == bp.len()
-                && ap
+        (Value::TypeRef(a), Value::Text(b)) | (Value::Text(a), Value::TypeRef(b)) => {
+            a == b
+                || type_satisfies_bound_name(vm, actual, b)
+                || type_registry::struct_name_is_a(vm, a, b)
+        }
+        (Value::TypeSpec(a), Value::TypeSpec(b)) => {
+            (a.name == b.name || type_registry::struct_name_is_a(vm, &a.name, &b.name))
+                && a.args.len() == b.args.len()
+                && a.args
                     .iter()
-                    .zip(bp.iter())
-                    .all(|(x, y)| type_expr_implies_inner(vm, x, y))
+                    .zip(b.args.iter())
+                    .all(|(x, y)| type_value_implies_inner(vm, x, y))
         }
-        (TypeExpr::Name(a), TypeExpr::Generic { name: b, .. }) => {
-            a == b || type_registry::struct_name_is_a(vm, a, b)
+        (Value::TypeRef(a) | Value::Text(a), Value::TypeSpec(b)) => {
+            a == &b.name || type_registry::struct_name_is_a(vm, a, &b.name)
         }
-        (TypeExpr::Generic { name: a, .. }, TypeExpr::Name(b)) => {
-            a == b
+        (Value::TypeSpec(a), Value::TypeRef(b) | Value::Text(b)) => {
+            a.name == *b
                 || type_satisfies_bound_name(vm, actual, b)
-                || type_registry::struct_name_is_a(vm, a, b)
+                || type_registry::struct_name_is_a(vm, &a.name, b)
         }
-        (TypeExpr::Attr { .. }, _) | (_, TypeExpr::Attr { .. }) => {
-            let Ok(a) = resolve_type_expr_name(vm, actual) else {
-                return false;
-            };
-            let Ok(b) = resolve_type_expr_name(vm, bound) else {
-                return false;
-            };
-            a == b || type_registry::struct_name_is_a(vm, &a, &b)
-        }
+        _ => false,
     }
 }
 
-fn type_satisfies_bound_name(vm: &Vm, actual: &TypeExpr, bound_name: &str) -> bool {
+fn type_satisfies_bound_name(vm: &Vm, actual: &Value, bound_name: &str) -> bool {
     if !protocol::is_protocol(&vm.protocols, bound_name) {
         return false;
     }
@@ -516,4 +556,119 @@ fn protocol_ctx_from_vm(vm: &Vm) -> protocol::TypeCheckContext {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
     }
+}
+
+/// 兼容旧名：显示类型值。
+pub fn type_expr_display(ty: &Value) -> String {
+    type_value_display(ty)
+}
+
+/// 兼容旧名：`value_accepts`。
+pub fn type_accepts(vm: &Vm, val: &Value, ty: &Value) -> bool {
+    value_accepts(vm, val, ty)
+}
+
+/// 将静态类型注解 `Expr` 解析为点分类型名（编译期 / ABI）。
+pub fn resolve_type_name_from_expr(_vm: &Vm, expr: &Expr) -> crate::Result<String> {
+    if let Some(v) = static_type_value_from_expr(expr) {
+        return Ok(type_value_display(&v));
+    }
+    match &expr.kind {
+        ExprKind::Var(name) => Ok(name.clone()),
+        ExprKind::Member { object, field } => Ok(format!(
+            "{}.{}",
+            resolve_type_name_from_expr(_vm, object)?,
+            field
+        )),
+        _ => Err(RuntimeError::type_err("expected type name")),
+    }
+}
+
+/// 运行时求值类型注解：走 VM 真求值（`load_name` / 属性 / 索引 / 调用），结果须为类型值。
+pub fn eval_type_annotation(vm: &mut Vm, expr: &Expr) -> crate::Result<Value> {
+    let v = vm.eval_expr(expr)?;
+    if !value_is_type(&v) {
+        return Err(RuntimeError::type_err(format!(
+            "type annotation evaluated to {}, expected a type",
+            v.type_name()
+        )));
+    }
+    Ok(v)
+}
+
+fn type_value_to_expr(loc: crate::ast::SourceLoc, ty: &Value) -> Expr {
+    match ty {
+        Value::TypeRef(n) | Value::Text(n) => Expr::new(loc, ExprKind::Var(n.clone())),
+        Value::TypeSpec(spec) => {
+            let object = Expr::new(loc, ExprKind::Var(spec.name.clone()));
+            let index = if spec.args.len() == 1 {
+                type_value_to_expr(loc, &spec.args[0])
+            } else {
+                Expr::new(
+                    loc,
+                    ExprKind::List(
+                        spec.args
+                            .iter()
+                            .map(|a| type_value_to_expr(loc, a))
+                            .collect(),
+                    ),
+                )
+            };
+            Expr::new(
+                loc,
+                ExprKind::Index {
+                    object: Box::new(object),
+                    index: Box::new(index),
+                },
+            )
+        }
+        other => Expr::new(loc, ExprKind::Var(other.type_name().to_string())),
+    }
+}
+
+/// 在类型注解 `Expr` 树中替换泛型形参（单态化 AST 用）。
+pub fn substitute_type_annotation(expr: &Expr, subs: &HashMap<String, Value>) -> Expr {
+    match &expr.kind {
+        ExprKind::Var(name) if subs.contains_key(name) => {
+            type_value_to_expr(expr.loc, &subs[name])
+        }
+        ExprKind::Member { object, field } => Expr::new(
+            expr.loc,
+            ExprKind::Member {
+                object: Box::new(substitute_type_annotation(object, subs)),
+                field: field.clone(),
+            },
+        ),
+        ExprKind::Index { object, index } => Expr::new(
+            expr.loc,
+            ExprKind::Index {
+                object: Box::new(substitute_type_annotation(object, subs)),
+                index: Box::new(substitute_type_annotation(index, subs)),
+            },
+        ),
+        ExprKind::List(items) => Expr::new(
+            expr.loc,
+            ExprKind::List(
+                items
+                    .iter()
+                    .map(|e| substitute_type_annotation(e, subs))
+                    .collect(),
+            ),
+        ),
+        _ => expr.clone(),
+    }
+}
+
+/// 替换泛型形参并得到类型值（运行时字段检查用）。
+pub fn substitute_type_expr(expr: &Expr, subs: &HashMap<String, Value>) -> Value {
+    let subbed = substitute_type_annotation(expr, subs);
+    static_type_value_from_expr(&subbed).unwrap_or_else(|| {
+        if let ExprKind::Var(n) = &subbed.kind {
+            return subs
+                .get(n)
+                .cloned()
+                .unwrap_or_else(|| Value::type_ref(n.clone()));
+        }
+        Value::type_ref("object")
+    })
 }

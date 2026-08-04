@@ -8,17 +8,6 @@ pub enum Visibility {
     Internal,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TypeExpr {
-    Name(String),
-    /// `C.types.int` 这类属性链，运行时经 getattr 解析。
-    Attr {
-        object: Box<TypeExpr>,
-        field: String,
-    },
-    Generic { name: String, params: Vec<TypeExpr> },
-}
-
 #[derive(Debug, Clone)]
 pub struct FuncParam {
     pub name: String,
@@ -28,7 +17,8 @@ pub struct FuncParam {
     pub is_kwvariadic: bool,
     /// `implicit a: T`：调用时隐式转换到 `T`。
     pub implicit: bool,
-    pub type_expr: Option<TypeExpr>,
+    /// 类型注解表达式（`: T` / `:: T`）；硬检查时求值，结果须 `is_a(_, type)`。
+    pub type_expr: Option<Expr>,
     pub type_strong: bool,
     pub default_expr: Option<Expr>,
 }
@@ -54,7 +44,7 @@ pub struct MacroCallArg {
 pub struct MacroParam {
     pub name: String,
     pub is_variadic: bool,
-    pub type_expr: Option<TypeExpr>,
+    pub type_expr: Option<Expr>,
     pub type_strong: bool,
 }
 
@@ -154,7 +144,7 @@ pub enum Stmt {
         is_const: bool,
         is_var: bool,
         name: String,
-        type_expr: Option<TypeExpr>,
+        type_expr: Option<Expr>,
         type_strong: bool,
         init: Option<Expr>,
     },
@@ -176,9 +166,9 @@ pub enum Stmt {
         visibility: Visibility,
         decorators: Vec<Expr>,
         name: String,
-        type_params: Vec<(String, Option<TypeExpr>)>,
+        type_params: Vec<(String, Option<Expr>)>,
         params: Vec<FuncParam>,
-        return_type: Option<TypeExpr>,
+        return_type: Option<Expr>,
         return_strong: bool,
         return_wrapper: Option<Expr>,
         body: Block,
@@ -235,12 +225,12 @@ pub enum Stmt {
         visibility: Visibility,
         typed: bool,
         name: String,
-        type_params: Vec<(String, Option<TypeExpr>)>,
+        type_params: Vec<(String, Option<Expr>)>,
         base: Option<String>,
         fields: Vec<StructField>,
         methods: Vec<StructMethod>,
         /// 尾部注解，如 `} : C.layout`。
-        layout: Option<TypeExpr>,
+        layout: Option<Expr>,
     },
     MacroDecl {
         visibility: Visibility,
@@ -252,7 +242,7 @@ pub enum Stmt {
         visibility: Visibility,
         name: String,
         params: Option<Vec<FuncParam>>,
-        return_type: Option<TypeExpr>,
+        return_type: Option<Expr>,
         return_strong: bool,
         return_wrapper: Option<Expr>,
         body: Option<Block>,
@@ -266,7 +256,7 @@ pub enum Stmt {
     VariantDecl {
         visibility: Visibility,
         name: String,
-        type_params: Vec<(String, Option<TypeExpr>)>,
+        type_params: Vec<(String, Option<Expr>)>,
         cases: Vec<VariantCaseDecl>,
     },
     Expr(Expr),
@@ -295,7 +285,7 @@ pub enum ProtocolMember {
 pub struct StructField {
     pub mutable: bool,
     pub name: String,
-    pub type_expr: Option<TypeExpr>,
+    pub type_expr: Option<Expr>,
     pub type_strong: bool,
     pub default_expr: Option<Expr>,
 }
@@ -306,7 +296,7 @@ pub struct StructMethod {
     pub params: Vec<FuncParam>,
     pub outside: bool,
     pub overload: bool,
-    pub return_type: Option<TypeExpr>,
+    pub return_type: Option<Expr>,
     pub return_strong: bool,
     pub return_wrapper: Option<Expr>,
     pub body: Block,
@@ -460,7 +450,8 @@ pub enum ExprKind {
     NamedAssign { name: String, value: Box<Expr> },
     DoFunc {
         params: Vec<FuncParam>,
-        return_type: Option<TypeExpr>,
+        /// 须 `Box`：直接 `Option<Expr>` 会与 `ExprKind` 形成无限大小。
+        return_type: Option<Box<Expr>>,
         return_strong: bool,
         return_wrapper: Option<Box<Expr>>,
         body: Block,

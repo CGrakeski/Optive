@@ -14,7 +14,7 @@ use optive::value::Value;
 fn build_adding_dll() -> PathBuf {
     static DLL: OnceLock<PathBuf> = OnceLock::new();
     DLL.get_or_init(|| {
-        let out_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_test_dll");
+        let out_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_test_dll_v2");
         fs::create_dir_all(&out_dir).expect("create dll dir");
         let src = out_dir.join("adding.rs");
         fs::write(
@@ -55,6 +55,17 @@ pub extern "C" fn apply_binop(
     match cb {
         Some(f) => f(a, b),
         None => 0,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn apply_unary_f64(
+    x: f64,
+    cb: Option<extern "C" fn(f64) -> f64>,
+) -> f64 {
+    match cb {
+        Some(f) => f(x),
+        None => 0.0,
     }
 }
 "#,
@@ -437,6 +448,37 @@ r
 "#
     );
     assert_num(&src, "30");
+}
+
+#[test]
+fn c_callback_unary_f64() {
+    let path = dll_path_literal();
+    let src = format!(
+        r#"
+use std.language.{{ C }}
+func square_cb(x) {{
+  // x 为 f64 sized；转 num 再算
+  let n = num.(x)
+  return f64.(n * n)
+}}
+let pair = C.callback(square_cb, [C.types.double], C.types.double)
+let h = C.frompath({path})
+extern(h, "apply_unary_f64") func apply_unary_f64(
+    implicit x: C.types.double,
+    implicit cb: C.types.void_ptr
+) -> C.types.double : num.(f64.(_)) ...
+let r = apply_unary_f64(3.0, pair[0])
+C.callback_free(pair[1])
+r
+"#
+    );
+    let v = value(&src);
+    let f = match v {
+        Value::Num(n) => n.to_f64_checked().expect("f64"),
+        Value::Sized(optive::sized::SizedNum::F64(x)) => x,
+        other => panic!("expected 9.0, got {other:?}"),
+    };
+    assert!((f - 9.0).abs() < 1e-9, "got {f}");
 }
 
 #[test]

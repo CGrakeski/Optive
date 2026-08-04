@@ -31,6 +31,7 @@ pub const H_STORE_FAST: u8 = 22;
 pub const H_LOOP_COUNTDOWN: u8 = 23;
 pub const H_LOAD_FAST_SUB_IMM: u8 = 24;
 pub const H_LOAD_FAST_LE_IMM: u8 = 25;
+pub const H_MOD_NUM: u8 = 26;
 pub const H_COLD: u8 = 255;
 
 #[derive(Clone, Default)]
@@ -65,6 +66,7 @@ impl HotCode {
                 Instruction::Sub | Instruction::SubNumNum => (H_SUB_NUM, 0),
                 Instruction::MulNumNum => (H_MUL_NUM, 0),
                 Instruction::DivNumNum => (H_DIV_NUM, 0),
+                Instruction::Mod | Instruction::ModNumNum => (H_MOD_NUM, 0),
                 Instruction::Le | Instruction::LeNumNum => (H_LE, 0),
                 Instruction::LtNumNum => (H_LT, 0),
                 Instruction::GtNumNum => (H_GT, 0),

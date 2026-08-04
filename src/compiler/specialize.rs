@@ -6,8 +6,9 @@
 //! 入参：强注解可在编译期播种；无强注解时标签由调用时**访问实参运行时类型**确定，
 //! 单份函数体无法在编译期写下具体 Tag，故不猜测播种——执行期通用算子通过访问类型分发。
 
-use crate::ast::TypeExpr;
+use crate::ast::Expr;
 use crate::opcode::Instruction;
+use crate::types::{static_type_value_from_expr, type_value_base};
 use crate::value::Value;
 
 /// 分析用的粗粒度运行时标签。
@@ -25,28 +26,20 @@ pub(crate) enum Tag {
 }
 
 /// 由强类型注解得到可证入口标签（与 `check_strong_params` 一致）。
-pub(crate) fn tag_from_strong_type(ty: &TypeExpr) -> Option<Tag> {
-    match ty {
-        TypeExpr::Name(n) => match n.as_str() {
-            "num" | "int" | "float" => Some(Tag::Num),
-            "text" | "str" | "string" => Some(Tag::Text),
-            "bool" => Some(Tag::Bool),
-            "none" | "nonetype" => Some(Tag::None),
-            "list" => Some(Tag::List),
-            "dict" => Some(Tag::Dict),
-            "set" => Some(Tag::Set),
-            "tuple" => Some(Tag::Tuple),
-            "bytes" => Some(Tag::Bytes),
-            _ => None,
-        },
-        TypeExpr::Generic { name, .. } => match name.as_str() {
-            "list" => Some(Tag::List),
-            "dict" => Some(Tag::Dict),
-            "set" => Some(Tag::Set),
-            "tuple" => Some(Tag::Tuple),
-            _ => None,
-        },
-        TypeExpr::Attr { .. } => None,
+pub(crate) fn tag_from_strong_type(ty: &Expr) -> Option<Tag> {
+    let val = static_type_value_from_expr(ty)?;
+    let name = type_value_base(&val)?;
+    match name {
+        "num" | "int" | "float" => Some(Tag::Num),
+        "text" | "str" | "string" => Some(Tag::Text),
+        "bool" => Some(Tag::Bool),
+        "none" | "nonetype" => Some(Tag::None),
+        "list" => Some(Tag::List),
+        "dict" => Some(Tag::Dict),
+        "set" => Some(Tag::Set),
+        "tuple" => Some(Tag::Tuple),
+        "bytes" => Some(Tag::Bytes),
+        _ => None,
     }
 }
 
@@ -187,8 +180,16 @@ pub(crate) fn specialize_with_entry(code: &mut [Instruction], entry_env: &[Optio
                     _ => None,
                 });
             }
-            Instruction::Mod
-            | Instruction::BitAnd
+            Instruction::Mod => {
+                let (rb, ra) = pop2(&mut stack);
+                if ra == Some(Tag::Num) && rb == Some(Tag::Num) {
+                    *ins = Instruction::ModNumNum;
+                    stack.push(Some(Tag::Num));
+                } else {
+                    stack.push(None);
+                }
+            }
+            Instruction::BitAnd
             | Instruction::BitOr
             | Instruction::BitXor
             | Instruction::LShift
@@ -348,8 +349,11 @@ pub(crate) fn specialize_with_entry(code: &mut [Instruction], entry_env: &[Optio
                 let _ = stack.pop();
                 stack.push(Some(Tag::Num));
             }
-            Instruction::TypeCheck(_) => {
+            Instruction::TypeCheck => {
                 // 栈顶值保留，类型仍按原标签（检查失败会抛错）。
+            }
+            Instruction::ResolveFuncTypes => {
+                // 栈顶仍为 Function。
             }
             Instruction::FindMod(_) => {
                 stack.push(None);
@@ -395,7 +399,7 @@ pub(crate) fn specialize_with_entry(code: &mut [Instruction], entry_env: &[Optio
             }
             Instruction::DelName(_) | Instruction::DelAttr(_) => {}
             // 已是特化或其余：做保守栈效果
-            Instruction::AddNumNum | Instruction::SubNumNum | Instruction::MulNumNum | Instruction::DivNumNum | Instruction::PowNumNum => {
+            Instruction::AddNumNum | Instruction::SubNumNum | Instruction::MulNumNum | Instruction::DivNumNum | Instruction::ModNumNum | Instruction::PowNumNum => {
                 let _ = stack.pop();
                 let _ = stack.pop();
                 stack.push(Some(Tag::Num));

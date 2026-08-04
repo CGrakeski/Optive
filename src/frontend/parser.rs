@@ -650,7 +650,8 @@ impl Parser {
         Ok(DestructElem::Pat(self.parse_destruct_pattern()?))
     }
 
-    fn parse_optional_type(&mut self) -> Result<(Option<TypeExpr>, bool), ParseError> {
+    /// `: T` / `:: T` — 注解是普通表达式（`num`、`list[num]`、`type(do(){})`、`C.types.int`…）。
+    fn parse_optional_type(&mut self) -> Result<(Option<Expr>, bool), ParseError> {
         let strong = if self.match_kind(TokenKind::ColonColon) {
             true
         } else if self.match_kind(TokenKind::Colon) {
@@ -658,57 +659,12 @@ impl Parser {
         } else {
             return Ok((None, false));
         };
-        Ok((Some(self.parse_type_expr()?), strong))
+        Ok((Some(self.parse_type_annotation_expr()?), strong))
     }
 
-    fn parse_type_expr(&mut self) -> Result<TypeExpr, ParseError> {
-        let name = self.parse_type_name()?;
-        let mut ty = TypeExpr::Name(name);
-        while self.match_kind(TokenKind::Dot) {
-            let field = self
-                .expect(TokenKind::Identifier, "expected attribute after '.'")?
-                .value;
-            ty = TypeExpr::Attr {
-                object: Box::new(ty),
-                field,
-            };
-        }
-        // `ptr[i32]` / `C.types.ptr[i32]`：点链之后的类型实参
-        if self.match_kind(TokenKind::LBracket) {
-            let path = Self::flatten_type_path(&ty).ok_or_else(|| {
-                ParseError::here(
-                    self.current().line,
-                    self.current().column,
-                    "expected type name path before '[...]'",
-                )
-            })?;
-            let mut params = vec![self.parse_type_expr()?];
-            while self.match_kind(TokenKind::Comma) {
-                params.push(self.parse_type_expr()?);
-            }
-            self.expect(TokenKind::RBracket, "expected ']'")?;
-            ty = TypeExpr::Generic {
-                name: path,
-                params,
-            };
-        }
-        Ok(ty)
-    }
-
-    fn flatten_type_path(ty: &TypeExpr) -> Option<String> {
-        match ty {
-            TypeExpr::Name(n) => Some(n.clone()),
-            TypeExpr::Attr { object, field } => {
-                Some(format!("{}.{}", Self::flatten_type_path(object)?, field))
-            }
-            _ => None,
-        }
-    }
-
-    fn parse_type_name(&mut self) -> Result<String, ParseError> {
-        Ok(self
-            .expect(TokenKind::Identifier, "expected type name")?
-            .value)
+    /// 类型注解位置的表达式：与 postfix 同级，覆盖 Call / Index / Member。
+    fn parse_type_annotation_expr(&mut self) -> Result<Expr, ParseError> {
+        self.parse_postfix_no_macro()
     }
 
     fn parse_decorator_expr(&mut self) -> Result<Expr, ParseError> {
@@ -950,7 +906,7 @@ impl Parser {
             loc,
             ExprKind::DoFunc {
                 params,
-                return_type,
+                return_type: return_type.map(Box::new),
                 return_strong,
                 return_wrapper: return_wrapper.map(Box::new),
                 body,
@@ -979,14 +935,14 @@ impl Parser {
         })
     }
 
-    fn parse_type_param_list(&mut self) -> Result<Vec<(String, Option<TypeExpr>)>, ParseError> {
+    fn parse_type_param_list(&mut self) -> Result<Vec<(String, Option<Expr>)>, ParseError> {
         let mut params = Vec::new();
         loop {
             let pname = self
                 .expect(TokenKind::Identifier, "expected type param name")?
                 .value;
             let bound = if self.match_kind(TokenKind::Colon) {
-                Some(self.parse_type_expr()?)
+                Some(self.parse_type_annotation_expr()?)
             } else {
                 None
             };
@@ -1224,12 +1180,12 @@ impl Parser {
 
     fn parse_optional_return(
         &mut self,
-    ) -> Result<(Option<TypeExpr>, bool, Option<Expr>), ParseError> {
+    ) -> Result<(Option<Expr>, bool, Option<Expr>), ParseError> {
         // `-> T` 软返回；`=> T` 强返回；可选 `: Wrap(_)` 包装器（`_` 为返回值洞，先包装再按返回类型检查）。
         let (return_type, return_strong) = if self.match_kind(TokenKind::FatArrow) {
-            (Some(self.parse_type_expr()?), true)
+            (Some(self.parse_type_annotation_expr()?), true)
         } else if self.match_kind(TokenKind::Arrow) {
-            (Some(self.parse_type_expr()?), false)
+            (Some(self.parse_type_annotation_expr()?), false)
         } else {
             (None, false)
         };
@@ -1846,7 +1802,7 @@ impl Parser {
         }
         self.expect(TokenKind::RBrace, "expected '}'")?;
         let layout = if self.match_kind(TokenKind::Colon) {
-            Some(self.parse_type_expr()?)
+            Some(self.parse_type_annotation_expr()?)
         } else {
             None
         };
@@ -2555,10 +2511,24 @@ impl Parser {
                             step,
                         }); }
                     } else {
+                        // `a[i]`；多实参 `dict[text, num]` / `Union[num, text]` 收成 List 下标。
+                        let index = if self.check(TokenKind::Comma) {
+                            let mut items = vec![first];
+                            while self.match_kind(TokenKind::Comma) {
+                                if self.check(TokenKind::RBracket) {
+                                    break;
+                                }
+                                items.push(self.parse_expr()?);
+                            }
+                            let loc = items[0].loc;
+                            Expr::new(loc, ExprKind::List(items))
+                        } else {
+                            first
+                        };
                         self.expect(TokenKind::RBracket, "expected ']'")?;
                         { let __loc = expr.loc; expr = Expr::new(__loc, ExprKind::Index {
                             object: Box::new(expr),
-                            index: Box::new(first),
+                            index: Box::new(index),
                         }); }
                     }
                 }

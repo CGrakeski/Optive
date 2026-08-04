@@ -1391,9 +1391,9 @@ fn build_typing_module() -> Shared<ModuleObject> {
                 }
                 return Ok(Value::type_ref(name.clone()));
             }
-            let params: Vec<crate::ast::TypeExpr> = args
+            let params: Vec<Value> = args
                 .iter()
-                .map(crate::type_registry::value_to_type_expr_operand)
+                .map(crate::type_registry::value_to_type_value_operand)
                 .collect();
             Ok(Value::TypeSpec(crate::value::TypeSpecData::new(
                 name.clone(),
@@ -1408,9 +1408,9 @@ fn build_typing_module() -> Shared<ModuleObject> {
                     "Literal requires at least 1 argument",
                 ));
             }
-            let params: Vec<crate::ast::TypeExpr> = args
+            let params: Vec<Value> = args
                 .iter()
-                .map(crate::type_registry::literal_operand_to_type_expr)
+                .map(crate::type_registry::literal_operand_to_type_value)
                 .collect::<crate::Result<Vec<_>>>()?;
             Ok(Value::TypeSpec(crate::value::TypeSpecData::new(
                 "Literal".to_string(),
@@ -1512,8 +1512,8 @@ fn typing_isinstanceof(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let ok = match &args[1] {
         Value::TypeRef(s) | Value::Text(s) => crate::types::instance_is_a(vm, &args[0], s),
         Value::TypeSpec(spec) => {
-            let ty = crate::types::type_spec_to_type_expr(spec);
-            crate::types::type_accepts(vm, &args[0], &ty)
+            let ty = Value::TypeSpec(spec.clone());
+            crate::types::value_accepts(vm, &args[0], &ty)
         }
         _ => {
             return Err(crate::error::RuntimeError::type_err(

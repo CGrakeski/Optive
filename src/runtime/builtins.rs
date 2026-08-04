@@ -330,8 +330,8 @@ fn builtin_is_a(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let ok = match &args[1] {
         Value::TypeRef(s) | Value::Text(s) => types::instance_is_a(vm, &args[0], s),
         Value::TypeSpec(spec) => {
-            let ty = types::type_spec_to_type_expr(spec);
-            types::type_accepts(vm, &args[0], &ty)
+            let ty = Value::TypeSpec(spec.clone());
+            types::value_accepts(vm, &args[0], &ty)
         }
         _ => {
             return Err(crate::error::RuntimeError::type_err(

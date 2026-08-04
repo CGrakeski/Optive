@@ -16,6 +16,22 @@ try {{
     common::num(&src) == "1"
 }
 
+fn caught_type_or_name_error(source: &str) -> bool {
+    let src = format!(
+        r#"
+try {{
+    {source}
+    0
+}} catch (e: TypeError) {{
+    1
+}} catch (e: NameError) {{
+    1
+}}
+"#
+    );
+    common::num(&src) == "1"
+}
+
 #[test]
 fn soft_var_annotation_allows_mismatch() {
     assert_num(
@@ -514,4 +530,56 @@ help()
 "#,
         "1",
     );
+}
+
+#[test]
+fn strong_param_type_alias_resolves_at_def() {
+    assert_num(
+        r#"
+let T = num
+func f(x:: T) { return x }
+f(3)
+"#,
+        "3",
+    );
+}
+
+#[test]
+fn strong_param_unbound_type_name_errors_at_def() {
+    assert!(caught_type_or_name_error(
+        r#"
+func f(x:: NotAType) { return x }
+"#
+    ));
+}
+
+#[test]
+fn annotation_non_type_errors_at_def() {
+    // `str` 是内建函数，不是类型 → 定义时失败。
+    assert!(caught_type_or_name_error(
+        r#"
+func greet(name: str, greeting:: str) { greeting + " " + name }
+"#
+    ));
+}
+
+#[test]
+fn strong_param_accepts_type_of_function() {
+    assert_num(
+        r#"
+func f(x:: type(do() {})) { return 1 }
+f(do() { return 9 })
+"#,
+        "1",
+    );
+}
+
+#[test]
+fn strong_param_rejects_non_function_for_type_of_function() {
+    assert!(caught_type_error(
+        r#"
+func f(x:: type(do() {})) { return 1 }
+f(3)
+"#
+    ));
 }
