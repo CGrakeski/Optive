@@ -62,40 +62,40 @@ pub fn get_mutex_method(m: &Shared<MutexInner>, field: &str) -> Result<Value> {
     }
 }
 
-pub fn get_mutex_guard_method(m: &Shared<MutexInner>, field: &str) -> Result<Value> {
+pub fn get_mutex_guard_method(g: &Shared<crate::value::MutexGuardInner>, field: &str) -> Result<Value> {
     match field {
-        "get" => method!(m, _vm, |args| {
+        "get" => method!(g, _vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err("MutexGuard.get takes no arguments"));
             }
-            Ok(m.borrow().value.clone())
+            Ok(g.borrow().mutex().borrow().value.clone())
         }),
-        "set" => method!(m, _vm, |args| {
+        "set" => method!(g, _vm, |args| {
             if args.len() != 1 {
                 return Err(RuntimeError::type_err("MutexGuard.set requires 1 argument"));
             }
-            m.borrow_mut().value = args[0].clone();
+            g.borrow().mutex().borrow_mut().value = args[0].clone();
             Ok(Value::None)
         }),
-        "__enter__" => method!(m, _vm, |args| {
+        "__enter__" => method!(g, _vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err("__enter__ takes no arguments"));
             }
-            Ok(Value::MutexGuard(m.clone()))
+            Ok(Value::MutexGuard(g.clone()))
         }),
-        "__exit__" => method!(m, vm, |args| {
+        "__exit__" => method!(g, vm, |args| {
             let _ = args;
-            m.borrow_mut().locked = false;
+            g.borrow().release();
             vm.mn.notify_all();
             Ok(Value::None)
         }),
-        "unlock" => method!(m, vm, |args| {
+        "unlock" => method!(g, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err(
                     "MutexGuard.unlock takes no arguments",
                 ));
             }
-            m.borrow_mut().locked = false;
+            g.borrow().release();
             vm.mn.notify_all();
             Ok(Value::None)
         }),
@@ -113,6 +113,8 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
         SyncInner::Once { .. } => "Once",
         SyncInner::Barrier { .. } => "Barrier",
         SyncInner::Cond { .. } => "Cond",
+        SyncInner::TaskGroup { .. } => "TaskGroup",
+        SyncInner::TimeoutCtx { .. } => "TimeoutCtx",
     };
     match (kind, field) {
         // --- RWMutex ---
@@ -257,6 +259,55 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
             }
             vm.mn.notify_all();
             Ok(Value::None)
+        }),
+        // --- TaskGroup ---
+        ("TaskGroup", "__enter__") => method!(s, _vm, |args| {
+            if !args.is_empty() {
+                return Err(RuntimeError::type_err("__enter__ takes no arguments"));
+            }
+            Ok(Value::Sync(s.clone()))
+        }),
+        ("TaskGroup", "__exit__") => method!(s, vm, |args| {
+            let _ = args;
+            vm.taskgroup_wait(&s)
+        }),
+        ("TaskGroup", "run") => method!(s, vm, |args| {
+            if args.len() != 1 {
+                return Err(RuntimeError::type_err(
+                    "TaskGroup.run requires 1 callable argument",
+                ));
+            }
+            vm.taskgroup_run(&s, args[0].clone())
+        }),
+        ("TaskGroup", "wait") => method!(s, vm, |args| {
+            if !args.is_empty() {
+                return Err(RuntimeError::type_err("TaskGroup.wait takes no arguments"));
+            }
+            vm.taskgroup_wait(&s)
+        }),
+        // --- TimeoutCtx ---
+        ("TimeoutCtx", "__enter__") => method!(s, _vm, |args| {
+            if !args.is_empty() {
+                return Err(RuntimeError::type_err("__enter__ takes no arguments"));
+            }
+            Ok(Value::Sync(s.clone()))
+        }),
+        ("TimeoutCtx", "__exit__") => method!(s, _vm, |args| {
+            let _ = (&s, args);
+            Ok(Value::None)
+        }),
+        ("TimeoutCtx", "expired") | ("TimeoutCtx", "cancelled") => method!(s, _vm, |args| {
+            if !args.is_empty() {
+                return Err(RuntimeError::type_err(
+                    "TimeoutCtx.expired takes no arguments",
+                ));
+            }
+            match &*s.borrow() {
+                SyncInner::TimeoutCtx { deadline } => {
+                    Ok(Value::Bool(std::time::Instant::now() >= *deadline))
+                }
+                _ => unreachable!(),
+            }
         }),
         _ => Err(RuntimeError::attr_err(format!(
             "{kind} has no method {field}"
@@ -469,6 +520,60 @@ pub fn construct_cond(args: &[Value]) -> Result<Value> {
     })))
 }
 
+pub fn construct_taskgroup(args: &[Value]) -> Result<Value> {
+    if !args.is_empty() {
+        return Err(RuntimeError::type_err("taskgroup() takes no arguments"));
+    }
+    Ok(Value::Sync(Shared::new(SyncInner::TaskGroup {
+        count: 0,
+        first_error: None,
+    })))
+}
+
+pub fn construct_timeout_ctx(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(RuntimeError::type_err(
+            "with_timeout() requires 1 numeric seconds argument",
+        ));
+    }
+    let secs = match &args[0] {
+        Value::Num(n) => n.to_f64_checked()?,
+        _ => {
+            return Err(RuntimeError::type_err(
+                "with_timeout() expects num seconds",
+            ))
+        }
+    };
+    if !secs.is_finite() {
+        return Err(RuntimeError::type_err(
+            "with_timeout() expects a finite number of seconds",
+        ));
+    }
+    // 负数视为 0；过大有限值钳到可构造 Duration / Instant 的上界。
+    let secs = secs.max(0.0).min(MAX_TIMEOUT_SECS);
+    let dur = std::time::Duration::from_secs_f64(secs);
+    let now = std::time::Instant::now();
+    let deadline = now.checked_add(dur).unwrap_or(now);
+    Ok(Value::Sync(Shared::new(SyncInner::TimeoutCtx { deadline })))
+}
+
+/// `from_secs_f64` / `Instant` 加法的安全上界（约 100 年）。
+pub(crate) const MAX_TIMEOUT_SECS: f64 = 86400.0 * 365.0 * 100.0;
+
+/// deadline 毫秒值的安全转换：整数直取；超大浮点钳到 i64 端点而非回绕成 0。
+fn num_deadline_ms(n: &Num) -> Result<i64> {
+    if let Some(v) = n.to_i64() {
+        return Ok(v);
+    }
+    let f = n.to_f64_checked().map_err(|_| {
+        RuntimeError::type_err("sleep deadline expects a numeric millisecond value")
+    })?;
+    if f.is_nan() {
+        return Err(RuntimeError::type_err("sleep deadline must not be NaN"));
+    }
+    Ok(f.clamp(i64::MIN as f64, i64::MAX as f64) as i64)
+}
+
 pub fn deadline_from_secs(secs: &Value) -> Result<Value> {
     let secs_f = match secs {
         Value::Num(n) => n.to_f64_checked()?,
@@ -488,19 +593,41 @@ pub fn deadline_from_secs(secs: &Value) -> Result<Value> {
 
 pub fn poll_deadline_ready(deadline: &Value) -> Result<bool> {
     let target = match deadline {
-        Value::Num(n) => n.to_i64().unwrap_or(0),
-        _ => return Ok(false),
+        Value::Num(n) => num_deadline_ms(n)?,
+        _ => {
+            return Err(RuntimeError::type_err(
+                "select sleep deadline expects num milliseconds",
+            ))
+        }
     };
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64;
-    if now_ms >= target {
-        return Ok(true);
+    Ok(now_ms >= target)
+}
+
+/// select 空转：睡到最近截止时间（单次最多 `cap_ms`），便于与通道 case 交错轮询。
+pub fn sleep_until_nearest_deadline(deadlines: &[Value], cap_ms: u64) -> Result<()> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    let mut min_remain: Option<u64> = None;
+    for d in deadlines {
+        let Value::Num(n) = d else {
+            continue;
+        };
+        let target = num_deadline_ms(n)?;
+        if now_ms >= target {
+            return Ok(());
+        }
+        let remain = (target - now_ms) as u64;
+        min_remain = Some(min_remain.map_or(remain, |m| m.min(remain)));
     }
-    let remain_ms = (target - now_ms).clamp(0, 10) as u64;
-    if remain_ms > 0 {
-        std::thread::sleep(std::time::Duration::from_millis(remain_ms));
+    if let Some(remain) = min_remain {
+        let slice = remain.min(cap_ms).max(1);
+        std::thread::sleep(std::time::Duration::from_millis(slice));
     }
-    Ok(false)
+    Ok(())
 }

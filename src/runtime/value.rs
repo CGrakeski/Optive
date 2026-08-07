@@ -13,6 +13,39 @@ use crate::runtime_ast::RuntimeAstNode;
 use crate::shared::{Shared, SyncCell};
 use crate::Result;
 
+/// `Num::{floor,ceil,trunc,round}_num`：整数原样，有理数走 BigRational 对应方法。
+macro_rules! num_rat_round {
+    ($($name:ident => $rat_method:ident),+ $(,)?) => {
+        $(
+            pub fn $name(&self) -> Num {
+                match self {
+                    Num::Small(n) => Num::Small(*n),
+                    Num::Int(n) => Num::Int(n.clone()),
+                    Num::Rat(r) => Num::from_bigint(r.$rat_method().to_integer()),
+                }
+            }
+        )+
+    };
+}
+
+/// `Value` 上仅接受 `Num` 的二元运算包装。
+macro_rules! value_num_binop {
+    ($($name:ident, $helper:ident, $op:literal),+ $(,)?) => {
+        $(
+            pub fn $name(&self, other: &Value) -> Result<Value> {
+                match (self, other) {
+                    (Value::Num(a), Value::Num(b)) => Ok(Value::Num($helper(a, b)?)),
+                    _ => Err(RuntimeError::unsupported(concat!(
+                        "unsupported ",
+                        $op,
+                        " operation"
+                    ))),
+                }
+            }
+        )+
+    };
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Num {
     Small(i64),
@@ -121,36 +154,12 @@ impl Num {
         }
     }
 
-    pub fn floor_num(&self) -> Num {
-        match self {
-            Num::Small(n) => Num::Small(*n),
-            Num::Int(n) => Num::Int(n.clone()),
-            Num::Rat(r) => Num::from_bigint(r.floor().to_integer()),
-        }
-    }
-
-    pub fn ceil_num(&self) -> Num {
-        match self {
-            Num::Small(n) => Num::Small(*n),
-            Num::Int(n) => Num::Int(n.clone()),
-            Num::Rat(r) => Num::from_bigint(r.ceil().to_integer()),
-        }
-    }
-
-    pub fn trunc_num(&self) -> Num {
-        match self {
-            Num::Small(n) => Num::Small(*n),
-            Num::Int(n) => Num::Int(n.clone()),
-            Num::Rat(r) => Num::from_bigint(r.trunc().to_integer()),
-        }
-    }
-
-    pub fn round_num(&self) -> Num {
-        match self {
-            Num::Small(n) => Num::Small(*n),
-            Num::Int(n) => Num::Int(n.clone()),
-            Num::Rat(r) => Num::from_bigint(r.round().to_integer()),
-        }
+    // Small/Int 原样；有理数走 BigRational 的 floor/ceil/trunc/round。
+    num_rat_round! {
+        floor_num => floor,
+        ceil_num => ceil,
+        trunc_num => trunc,
+        round_num => round,
     }
 
     pub fn to_f64_checked(&self) -> crate::Result<f64> {
@@ -469,18 +478,22 @@ pub enum TaskState {
 #[derive(Clone)]
 pub struct TaskInner {
     pub state: TaskState,
+    /// 归属的 `TaskGroup`（若有）：任务结束时自动 `done`。
+    pub task_group: Option<Shared<SyncInner>>,
 }
 
 impl TaskInner {
     pub fn pending(callable: Value, args: Vec<Value>) -> Self {
         Self {
             state: TaskState::Pending { callable, args },
+            task_group: None,
         }
     }
 
     pub fn done(value: Value) -> Self {
         Self {
             state: TaskState::Done(value),
+            task_group: None,
         }
     }
 }
@@ -557,6 +570,49 @@ impl MutexInner {
     }
 }
 
+/// `Mutex.lock()` 的守卫载荷：最后一个 `Shared` 释放时自动 `unlock`，
+/// 避免 `m.lock().get()` 在 GetAttr 丢弃临时守卫后锁泄漏。
+pub struct MutexGuardInner {
+    mutex: Shared<MutexInner>,
+    released: std::sync::atomic::AtomicBool,
+}
+
+impl MutexGuardInner {
+    pub fn new(mutex: Shared<MutexInner>) -> Self {
+        Self {
+            mutex,
+            released: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    pub fn mutex(&self) -> Shared<MutexInner> {
+        self.mutex.clone()
+    }
+
+    /// 幂等释放；`__exit__` / `unlock` / `Drop` 均可调用。
+    pub fn release(&self) {
+        if self
+            .released
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        self.mutex.borrow_mut().locked = false;
+    }
+
+    /// `Cond.wait` 重新获得锁时复活守卫，使后续 Drop/`__exit__` 再次负责 unlock。
+    pub fn clear_released(&self) {
+        self.released
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Drop for MutexGuardInner {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// `Once.run` 生命周期。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OncePhase {
@@ -565,7 +621,7 @@ pub enum OncePhase {
     Done,
 }
 
-/// 其余并发原语（RWMutex / WaitGroup / Semaphore / Once / Barrier / Cond）的统一载荷。
+/// 其余并发原语（RWMutex / WaitGroup / Semaphore / Once / Barrier / Cond / TaskGroup / TimeoutCtx）的统一载荷。
 #[derive(Clone)]
 pub enum SyncInner {
     /// 读写锁：`readers` 为当前活跃读者数，`writer` 为是否有写者持有。
@@ -584,6 +640,15 @@ pub enum SyncInner {
     Barrier { n: i64, waiting: usize, generation: u64 },
     /// 条件变量：`signals` 为待消费的唤醒令牌，`waiters` 为当前等待者数。
     Cond { signals: i64, waiters: i64 },
+    /// `std.async.taskgroup()`：作用域等待组；`run` 跟踪子任务，`__exit__` join。
+    TaskGroup {
+        count: i64,
+        first_error: Option<Value>,
+    },
+    /// `std.async.with_timeout(sec)`：截止时刻；完整取消传播仍待补。
+    TimeoutCtx {
+        deadline: std::time::Instant,
+    },
 }
 
 /// RWMutex 的读/写守卫，支持 `with` 自动释放。
@@ -637,8 +702,8 @@ pub enum Value {
     Channel(Shared<ChannelInner>),
     /// 互斥锁（`Mutex(v)`）。
     Mutex(Shared<MutexInner>),
-    /// `Mutex.lock()` 得到的守卫，可用于 `with`。
-    MutexGuard(Shared<MutexInner>),
+    /// `Mutex.lock()` 得到的守卫，可用于 `with`；最后一个引用释放时自动 unlock。
+    MutexGuard(Shared<MutexGuardInner>),
     /// 其余并发原语（RWMutex/WaitGroup/Semaphore/Once/Barrier/Cond）。
     Sync(Shared<SyncInner>),
     /// RWMutex 读/写守卫。
@@ -821,6 +886,8 @@ impl Value {
                 SyncInner::Once { .. } => "Once",
                 SyncInner::Barrier { .. } => "Barrier",
                 SyncInner::Cond { .. } => "Cond",
+                SyncInner::TaskGroup { .. } => "TaskGroup",
+                SyncInner::TimeoutCtx { .. } => "TimeoutCtx",
             },
             Value::SyncGuard(g) => match &*g.borrow() {
                 SyncGuardInner::Read { .. } => "RWMutexReadGuard",
@@ -964,6 +1031,8 @@ impl Value {
                 SyncInner::Once { .. } => "<Once>".to_string(),
                 SyncInner::Barrier { .. } => "<Barrier>".to_string(),
                 SyncInner::Cond { .. } => "<Cond>".to_string(),
+                SyncInner::TaskGroup { .. } => "<TaskGroup>".to_string(),
+                SyncInner::TimeoutCtx { .. } => "<TimeoutCtx>".to_string(),
             },
             Value::SyncGuard(g) => match &*g.borrow() {
                 SyncGuardInner::Read { .. } => "<RWMutexReadGuard>".to_string(),
@@ -1041,53 +1110,14 @@ impl Value {
         }
     }
 
-    pub fn pow(&self, other: &Value) -> Result<Value> {
-        match (self, other) {
-            (Value::Num(a), Value::Num(b)) => Ok(Value::Num(pow_num(a, b)?)),
-            _ => Err(RuntimeError::unsupported("unsupported ** operation")),
-        }
-    }
-
-    pub fn rem(&self, other: &Value) -> Result<Value> {
-        match (self, other) {
-            (Value::Num(a), Value::Num(b)) => Ok(Value::Num(rem_num(a, b)?)),
-            _ => Err(RuntimeError::unsupported("unsupported % operation")),
-        }
-    }
-
-    pub fn bitand(&self, other: &Value) -> Result<Value> {
-        match (self, other) {
-            (Value::Num(a), Value::Num(b)) => Ok(Value::Num(bitand_num(a, b)?)),
-            _ => Err(RuntimeError::unsupported("unsupported & operation")),
-        }
-    }
-
-    pub fn bitor(&self, other: &Value) -> Result<Value> {
-        match (self, other) {
-            (Value::Num(a), Value::Num(b)) => Ok(Value::Num(bitor_num(a, b)?)),
-            _ => Err(RuntimeError::unsupported("unsupported | operation")),
-        }
-    }
-
-    pub fn bitxor(&self, other: &Value) -> Result<Value> {
-        match (self, other) {
-            (Value::Num(a), Value::Num(b)) => Ok(Value::Num(bitxor_num(a, b)?)),
-            _ => Err(RuntimeError::unsupported("unsupported ^ operation")),
-        }
-    }
-
-    pub fn lshift(&self, other: &Value) -> Result<Value> {
-        match (self, other) {
-            (Value::Num(a), Value::Num(b)) => Ok(Value::Num(lshift_num(a, b)?)),
-            _ => Err(RuntimeError::unsupported("unsupported << operation")),
-        }
-    }
-
-    pub fn rshift(&self, other: &Value) -> Result<Value> {
-        match (self, other) {
-            (Value::Num(a), Value::Num(b)) => Ok(Value::Num(rshift_num(a, b)?)),
-            _ => Err(RuntimeError::unsupported("unsupported >> operation")),
-        }
+    value_num_binop! {
+        pow, pow_num, "**",
+        rem, rem_num, "%",
+        bitand, bitand_num, "&",
+        bitor, bitor_num, "|",
+        bitxor, bitxor_num, "^",
+        lshift, lshift_num, "<<",
+        rshift, rshift_num, ">>",
     }
 
     pub fn neg(&self) -> Result<Value> {

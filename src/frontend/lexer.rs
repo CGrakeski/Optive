@@ -548,8 +548,131 @@ impl Lexer {
 
     fn read_number(&mut self, line: usize, col: usize) -> Token {
         let start = self.pos;
-        if self.peek_char() == Some('-') || self.peek_char() == Some('+') {
+        let negative = if self.peek_char() == Some('-') {
             self.consume_char();
+            true
+        } else if self.peek_char() == Some('+') {
+            self.consume_char();
+            false
+        } else {
+            false
+        };
+        // 0x / 0b 前缀；其它 `0字母` 给出明确词法错误（勿拆成 `0` + 标识符误入装饰器）。
+        if self.peek_char() == Some('0') {
+            let next = self.source[self.pos + 1..].chars().next();
+            match next {
+                Some('x') | Some('X') => {
+                    self.consume_char();
+                    self.consume_char();
+                    let hex_start = self.pos;
+                    while matches!(self.peek_char(), Some(c) if c.is_ascii_hexdigit()) {
+                        self.consume_char();
+                    }
+                    if self.pos == hex_start {
+                        return Token::new(
+                            TokenKind::Mismatch,
+                            "hex literal needs at least one digit after 0x",
+                            line,
+                            col,
+                        );
+                    }
+                    let digits = &self.source[hex_start..self.pos];
+                    return match i64::from_str_radix(digits, 16) {
+                        Ok(n) => {
+                            let n = if negative {
+                                match n.checked_neg() {
+                                    Some(v) => v,
+                                    None => {
+                                        return Token::new(
+                                            TokenKind::Mismatch,
+                                            format!("invalid hex literal: -0x{digits}"),
+                                            line,
+                                            col,
+                                        );
+                                    }
+                                }
+                            } else {
+                                n
+                            };
+                            Token::new(TokenKind::NumLiteral, n.to_string(), line, col)
+                        }
+                        Err(_) => Token::new(
+                            TokenKind::Mismatch,
+                            format!("invalid hex literal: 0x{digits}"),
+                            line,
+                            col,
+                        ),
+                    };
+                }
+                Some('b') | Some('B') => {
+                    self.consume_char();
+                    self.consume_char();
+                    let bin_start = self.pos;
+                    while matches!(self.peek_char(), Some('0' | '1')) {
+                        self.consume_char();
+                    }
+                    if self.pos == bin_start {
+                        return Token::new(
+                            TokenKind::Mismatch,
+                            "binary literal needs at least one digit after 0b",
+                            line,
+                            col,
+                        );
+                    }
+                    let digits = &self.source[bin_start..self.pos];
+                    return match i64::from_str_radix(digits, 2) {
+                        Ok(n) => {
+                            let n = if negative {
+                                match n.checked_neg() {
+                                    Some(v) => v,
+                                    None => {
+                                        return Token::new(
+                                            TokenKind::Mismatch,
+                                            format!("invalid binary literal: -0b{digits}"),
+                                            line,
+                                            col,
+                                        );
+                                    }
+                                }
+                            } else {
+                                n
+                            };
+                            Token::new(TokenKind::NumLiteral, n.to_string(), line, col)
+                        }
+                        Err(_) => Token::new(
+                            TokenKind::Mismatch,
+                            format!("invalid binary literal: 0b{digits}"),
+                            line,
+                            col,
+                        ),
+                    };
+                }
+                Some(c) if c.is_ascii_alphabetic() => {
+                    // `0i32` / `0u64` 等定宽后缀合法；仅拒绝真正的非法前缀（如 `0z`）。
+                    let after_zero = &self.source[self.pos + 1..];
+                    let mut end = 0;
+                    for (i, ch) in after_zero.char_indices() {
+                        if ch.is_ascii_alphanumeric() {
+                            end = i + ch.len_utf8();
+                        } else {
+                            break;
+                        }
+                    }
+                    let candidate = &after_zero[..end];
+                    if !crate::sized::LITERAL_SUFFIXES.contains(&candidate) {
+                        return Token::new(
+                            TokenKind::Mismatch,
+                            format!(
+                                "unsupported numeric prefix '0{c}'; use 0x/0b, a sized suffix like 0i32, or a decimal literal"
+                            ),
+                            line,
+                            col,
+                        );
+                    }
+                    // 合法后缀：落入下方数字体 + 后缀扫描。
+                }
+                _ => {}
+            }
         }
         while matches!(self.peek_char(), Some(c) if c.is_ascii_digit()) {
             self.consume_char();

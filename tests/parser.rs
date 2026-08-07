@@ -482,3 +482,53 @@ fn parse_friend_func() {
 fn parse_in_operator() {
     parse_ok("1 in xs");
 }
+
+#[test]
+fn parse_with_stmt_after_call_not_decorator() {
+    parse_ok(
+        r#"
+func f(stats) {
+  stats.lock()
+  with (stats.lock() as g) {
+    g.set(1)
+  }
+}
+"#,
+    );
+}
+
+#[test]
+fn parse_intern_func_with_mutex() {
+    parse_ok(
+        r#"
+intern func walk_into(dir, stats) {
+  with (stats.lock() as g) {
+    g.set(g.get() + 1)
+  }
+}
+"#,
+    );
+}
+
+#[test]
+fn parse_for_placeholder() {
+    parse_ok("for (_ in xs) { }");
+    parse_ok("let weights = [0 for (_ in std.math.range(64))]");
+}
+
+#[test]
+fn parse_tuple_match_pattern() {
+    parse_ok(
+        r#"
+match (ev) {
+  case ("done", rep) { rep }
+}
+"#,
+    );
+}
+
+#[test]
+fn parse_hex_literal() {
+    parse_ok("let x = 0x10");
+    parse_ok("print(0b1010)");
+}

@@ -54,6 +54,8 @@ pub enum Pattern {
     Bind(String),
     Value(Box<Expr>),
     List(Vec<PatternElem>),
+    /// `(a, b)` / `("done", x)` 元组模式（匹配 tuple 或 list）。
+    Tuple(Vec<PatternElem>),
     Struct { type_name: String, fields: Vec<String> },
     Or(Vec<Pattern>),
     Call { type_name: String, args: Vec<Pattern> },

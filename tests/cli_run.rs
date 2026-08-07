@@ -378,6 +378,125 @@ fn run_inline_code_missing_arg() {
     assert!(stderr.contains("usage") || stderr.contains("-c"), "stderr={stderr}");
 }
 
+#[test]
+fn run_dashdash_uses_cwd_and_passes_script_args() {
+    let root = tempfile_project("run_dashdash");
+    fs::write(
+        root.join("Optive.toml"),
+        r#"
+[package]
+name = "run_dashdash"
+version = "0.1.0"
+entry = "src/main.tive"
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/main.tive"),
+        r#"
+let a = std.os.args()
+print(a[len(a) - 2])
+print(a[len(a) - 1])
+"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["run", "--", "tests/data", "out.json"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(
+        stdout.contains("tests/data") && stdout.contains("out.json"),
+        "expected script args in stdout, got: {stdout}"
+    );
+}
+
+#[test]
+fn run_path_then_dashdash_script_args() {
+    let root = tempfile_project("run_path_dash");
+    fs::write(
+        root.join("Optive.toml"),
+        r#"
+[package]
+name = "run_path_dash"
+version = "0.1.0"
+entry = "src/main.tive"
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/main.tive"),
+        "print(std.os.args()[len(std.os.args()) - 1])\n",
+    )
+    .unwrap();
+
+    // 在独立 cwd 下用绝对项目路径调用，避免依赖隐式 cwd 发现。
+    let cwd = tempfile_project("run_path_dash_cwd");
+    let root_abs = fs::canonicalize(&root).unwrap_or(root.clone());
+    let (code, stdout, stderr) = run_optive(
+        &[
+            "run",
+            root_abs.to_str().expect("utf8 path"),
+            "--",
+            "only_arg",
+        ],
+        &cwd,
+    );
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(stdout.contains("only_arg"), "got: {stdout}");
+}
+
+#[test]
+fn run_sandbox_before_dashdash() {
+    let root = tempfile_project("run_sandbox_dash");
+    fs::write(
+        root.join("Optive.toml"),
+        r#"
+[package]
+name = "run_sandbox_dash"
+version = "0.1.0"
+entry = "src/main.tive"
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/main.tive"),
+        "print(std.os.args()[len(std.os.args()) - 1])\n",
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) =
+        run_optive(&["run", "--sandbox", "--", "sand_arg"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(stdout.contains("sand_arg"), "got: {stdout}");
+}
+
+#[test]
+fn run_rejects_multiple_args_before_dashdash() {
+    let root = tempfile_project("run_multi_pre_dash");
+    fs::write(
+        root.join("Optive.toml"),
+        r#"
+[package]
+name = "run_multi_pre_dash"
+version = "0.1.0"
+entry = "src/main.tive"
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/main.tive"), "print(1)\n").unwrap();
+
+    let (code, _stdout, stderr) =
+        run_optive(&["run", "a", "b", "--", "x"], &root);
+    assert_eq!(code, 2, "stderr={stderr}");
+    assert!(
+        stderr.contains("too many arguments before '--'") || stderr.contains("Error:"),
+        "stderr={stderr}"
+    );
+}
+
 fn tempfile_project(name: &str) -> PathBuf {
     let mut dir = std::env::temp_dir();
     dir.push(format!("optive_test_{name}_{}", std::process::id()));

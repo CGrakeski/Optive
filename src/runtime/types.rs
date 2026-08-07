@@ -46,7 +46,7 @@ pub fn instance_is_a(vm: &Vm, val: &Value, type_name: &str) -> bool {
     if type_name == "Never" {
         return false;
     }
-    if protocol::is_protocol(&vm.protocols, type_name) {
+    if vm.protocols.contains_key(type_name) {
         return value_satisfies_protocol(vm, val, type_name);
     }
     if let Some(is_prim) = type_registry::check_primitive_instance(vm, val, type_name) {
@@ -55,7 +55,7 @@ pub fn instance_is_a(vm: &Vm, val: &Value, type_name: &str) -> bool {
     if let Some(edef) = vm.enum_defs.get(type_name) {
         return matches!(
             val,
-            Value::EnumMember(m) if Arc::ptr_eq(&m.def, edef)
+            Value::EnumMember(m) if Arc::ptr_eq(&m.def, &edef)
         );
     }
     if let Value::Struct(s) = val {
@@ -81,7 +81,7 @@ pub fn instance_match_distance(vm: &Vm, val: &Value, type_name: &str) -> Option<
 pub fn value_accepts(vm: &Vm, val: &Value, ty: &Value) -> bool {
     match ty {
         Value::TypeRef(name) if name == "Never" => false,
-        Value::TypeRef(name) if protocol::is_protocol(&vm.protocols, name) => {
+        Value::TypeRef(name) if vm.protocols.contains_key(name) => {
             value_satisfies_protocol(vm, val, name)
         }
         Value::TypeRef(name) => instance_is_a(vm, val, name),
@@ -531,7 +531,7 @@ pub fn type_value_implies_inner(vm: &Vm, actual: &Value, bound: &Value) -> bool 
 }
 
 fn type_satisfies_bound_name(vm: &Vm, actual: &Value, bound_name: &str) -> bool {
-    if !protocol::is_protocol(&vm.protocols, bound_name) {
+    if !vm.protocols.contains_key(bound_name) {
         return false;
     }
     let ctx = protocol_ctx_from_vm(vm);
@@ -540,21 +540,9 @@ fn type_satisfies_bound_name(vm: &Vm, actual: &Value, bound_name: &str) -> bool 
 
 fn protocol_ctx_from_vm(vm: &Vm) -> protocol::TypeCheckContext {
     protocol::TypeCheckContext {
-        struct_defs: vm
-            .struct_defs
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
-        functions: vm
-            .functions
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
-        protocols: vm
-            .protocols
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
+        struct_defs: vm.struct_defs.snapshot_map().into_iter().collect(),
+        functions: vm.functions.snapshot_map().into_iter().collect(),
+        protocols: vm.protocols.snapshot_map().into_iter().collect(),
     }
 }
 

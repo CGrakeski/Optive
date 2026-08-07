@@ -47,11 +47,9 @@ fn traceback_def() -> Arc<StructDef> {
 
 pub fn install(vm: &mut Vm) {
     vm.struct_defs
-        .entry(FRAME_TYPE.into())
-        .or_insert_with(frame_def);
+        .entry_or_insert_with(FRAME_TYPE.into(), frame_def);
     vm.struct_defs
-        .entry(TRACEBACK_TYPE.into())
-        .or_insert_with(traceback_def);
+        .entry_or_insert_with(TRACEBACK_TYPE.into(), traceback_def);
     vm.globals
         .or_insert_with(FRAME_TYPE.into(), || Value::type_ref(FRAME_TYPE));
     vm.globals

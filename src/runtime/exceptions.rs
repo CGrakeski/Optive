@@ -25,8 +25,7 @@ pub fn install(vm: &mut Vm) {
         let name = kind.type_name();
         let base = kind.parent().map(|p| p.type_name().to_string());
         vm.struct_defs
-            .entry(name.to_string())
-            .or_insert_with(|| exc_def(name, base.as_deref()));
+            .entry_or_insert_with(name.to_string(), || exc_def(name, base.as_deref()));
         vm.globals
             .or_insert_with(name.to_string(), || Value::type_ref(name));
     }
@@ -40,15 +39,12 @@ pub fn struct_is_a(vm: &Vm, val: &Value, type_name: &str) -> bool {
     let Value::Struct(s) = val else {
         return false;
     };
-    let mut current = Some(s.def.name.as_str());
+    let mut current = Some(s.def.name.clone());
     while let Some(name) = current {
         if name == type_name {
             return true;
         }
-        current = vm
-            .struct_defs
-            .get(name)
-            .and_then(|d| d.base.as_deref());
+        current = vm.struct_defs.get(&name).and_then(|d| d.base.clone());
     }
     false
 }
@@ -90,7 +86,6 @@ pub fn make_exception(vm: &Vm, type_name: &str, message: impl Into<String>) -> c
     let def = vm
         .struct_defs
         .get(type_name)
-        .cloned()
         .ok_or_else(|| crate::error::RuntimeError::msg(format!("unknown exception: {type_name}")))?;
     Ok(Value::Struct(Arc::new(crate::value::StructInstance {
         def,

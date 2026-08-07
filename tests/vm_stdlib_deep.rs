@@ -91,6 +91,22 @@ extension("a/b.c") + stem("a/b.c") + str(splitext("a/b.c"))
 }
 
 #[test]
+fn std_path_abspath_join_roundtrip() {
+    // B13：abspath 不应带 `\\?\`；join 后 is_dir/exists 在 Windows 上可用。
+    assert_bool(
+        r#"
+use std.path.{ abspath, join, is_absolute }
+use std.fs.{ is_dir, exists }
+use std.text.{ startswith }
+let r = abspath("tests")
+let full = join(r, "import_fixtures")
+is_absolute(r) and is_dir(full) and exists(full) and not startswith(r, "\\\\?\\")
+"#,
+        true,
+    );
+}
+
+#[test]
 fn std_os_name() {
     assert_bool(
         r#"

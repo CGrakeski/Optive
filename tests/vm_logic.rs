@@ -38,6 +38,15 @@ fn ge_equal() {
 }
 
 #[test]
+fn text_lexicographic_cmp() {
+    // B18：text 支持字典序关系比较。
+    assert_bool(r#""a" >= "0""#, true);
+    assert_bool(r#""0" < "a""#, true);
+    assert_bool(r#""ab" <= "ab""#, true);
+    assert_bool(r#""b" > "a""#, true);
+}
+
+#[test]
 fn bang_true() {
     assert_bool("!false", true);
 }

@@ -231,3 +231,15 @@ c.bump()
         "2",
     );
 }
+
+/// B10：被导入模块里 `use ….{ C }` 的绑定在跨模块调用时仍可见。
+#[test]
+fn imported_use_c_binding_visible() {
+    assert_num(
+        r#"
+import "tests/import_fixtures/use_c_export.tive" as m
+m.probe_c()
+"#,
+        "1",
+    );
+}

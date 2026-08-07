@@ -130,10 +130,12 @@ fn run_module_source(
     let module_env = Arc::new(vm.snapshot_module_global_env());
     let new_functions: HashMap<String, Arc<FunctionObject>> = vm
         .functions
-        .iter()
-        .filter(|(k, _)| !snap.functions.contains_key(*k))
-        .map(|(k, v)| (k.clone(), function_with_module_env(v, &module_env)))
-        .collect();
+        .with_ref(|m| {
+            m.iter()
+                .filter(|(k, _)| !snap.functions.contains_key(*k))
+                .map(|(k, v)| (k.clone(), function_with_module_env(v, &module_env)))
+                .collect()
+        });
     for (k, v) in &new_functions {
         vm.functions.insert(k.clone(), v.clone());
     }
@@ -191,16 +193,20 @@ fn run_module_source(
     }
     let new_macros: HashMap<_, _> = vm
         .macros
-        .iter()
-        .filter(|(k, _)| !snap.macros.contains_key(*k))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+        .with_ref(|m| {
+            m.iter()
+                .filter(|(k, _)| !snap.macros.contains_key(*k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        });
     let new_struct_defs: HashMap<_, _> = vm
         .struct_defs
-        .iter()
-        .filter(|(k, _)| !snap.struct_defs.contains_key(*k))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+        .with_ref(|m| {
+            m.iter()
+                .filter(|(k, _)| !snap.struct_defs.contains_key(*k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        });
     vm.finish_module_init(
         snap,
         new_functions,

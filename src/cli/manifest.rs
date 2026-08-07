@@ -58,25 +58,23 @@ pub struct Dependency {
 }
 
 impl Dependency {
-    pub fn pinned_commit(git: impl Into<String>, sha: impl Into<String>) -> Self {
+    fn with_rev(git: impl Into<String>, rev: RevSpec) -> Self {
         Self {
             git: git.into(),
-            rev: RevSpec::Commit(sha.into()),
+            rev,
         }
+    }
+
+    pub fn pinned_commit(git: impl Into<String>, sha: impl Into<String>) -> Self {
+        Self::with_rev(git, RevSpec::Commit(sha.into()))
     }
 
     pub fn with_branch(git: impl Into<String>, branch: impl Into<String>) -> Self {
-        Self {
-            git: git.into(),
-            rev: RevSpec::Branch(branch.into()),
-        }
+        Self::with_rev(git, RevSpec::Branch(branch.into()))
     }
 
     pub fn with_tag(git: impl Into<String>, tag: impl Into<String>) -> Self {
-        Self {
-            git: git.into(),
-            rev: RevSpec::Tag(tag.into()),
-        }
+        Self::with_rev(git, RevSpec::Tag(tag.into()))
     }
 }
 

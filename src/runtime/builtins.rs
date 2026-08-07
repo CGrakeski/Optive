@@ -173,62 +173,29 @@ fn builtin_quote(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 }
 
 fn builtin_ast_struct(vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("ast_struct requires 1 argument"));
-    }
-    runtime_ast::ast_struct_value(vm, &args[0])
+    runtime_ast::with_arity1("ast_struct", args, |v| runtime_ast::ast_struct_value(vm, v))
 }
 
 fn builtin_ast_clone(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("__ast_clone__ requires 1 argument"));
-    }
-    runtime_ast::clone_ast_value(&args[0])
+    runtime_ast::with_arity1("__ast_clone__", args, runtime_ast::clone_ast_value)
 }
 
-fn builtin_ast_type_convert(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err(
-            "__ast_type_convert__ requires 2 arguments",
-        ));
-    }
-    runtime_ast::compose_ast_type_convert(&args[1], &args[0])
+macro_rules! builtin_ast_flip2 {
+    ($(($name:ident, $api:literal, $compose:path)),+ $(,)?) => {
+        $(
+            fn $name(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+                runtime_ast::with_arity2_flip($api, args, $compose)
+            }
+        )+
+    };
 }
 
-fn builtin_ast_func_call(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err(
-            "__ast_func_call__ requires 2 arguments",
-        ));
-    }
-    runtime_ast::compose_ast_func_call(&args[1], &args[0])
-}
-
-fn builtin_ast_macro_call(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err(
-            "__ast_macro_call__ requires 2 arguments",
-        ));
-    }
-    runtime_ast::compose_ast_macro_call(&args[1], &args[0])
-}
-
-fn builtin_ast_vec_push(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err(
-            "__ast_vec_push__ requires 2 arguments",
-        ));
-    }
-    runtime_ast::ast_vec_push(&args[1], &args[0])
-}
-
-fn builtin_ast_vec_extend(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err(
-            "__ast_vec_extend__ requires 2 arguments",
-        ));
-    }
-    runtime_ast::ast_vec_extend(&args[1], &args[0])
+builtin_ast_flip2! {
+    (builtin_ast_type_convert, "__ast_type_convert__", runtime_ast::compose_ast_type_convert),
+    (builtin_ast_func_call, "__ast_func_call__", runtime_ast::compose_ast_func_call),
+    (builtin_ast_macro_call, "__ast_macro_call__", runtime_ast::compose_ast_macro_call),
+    (builtin_ast_vec_push, "__ast_vec_push__", runtime_ast::ast_vec_push),
+    (builtin_ast_vec_extend, "__ast_vec_extend__", runtime_ast::ast_vec_extend),
 }
 
 fn builtin_register_dispatch_handler(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -320,7 +287,14 @@ fn builtin_with_exit(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     } else {
         (Value::None, Value::None, Value::None)
     };
-    vm.call_method(ctx, "__exit__", vec![exc_type, exc_val, exc_tb])
+    let exit_args = vec![exc_type, exc_val, exc_tb];
+    // 直接调 Builtin，保留 `block_suspend`，让外层 `__with_exit__` Call 重试。
+    // 若走 `call_method`→`call_value`，内层会清掉 suspend 并错误地 arm 内层方法。
+    let method = vm.get_attr_value(ctx, "__exit__")?;
+    match method {
+        Value::Builtin(f) => f(vm, &exit_args),
+        other => vm.call_value(other, exit_args),
+    }
 }
 
 fn builtin_is_a(vm: &mut Vm, args: &[Value]) -> Result<Value> {

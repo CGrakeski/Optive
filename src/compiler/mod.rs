@@ -7,3 +7,4 @@ pub mod monomorph;
 pub mod opcode;
 pub mod protocol;
 pub mod specialize;
+pub mod stack_effect;

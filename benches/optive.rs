@@ -92,31 +92,25 @@ fn run_primes(workers: usize) {
     black_box(v);
 }
 
-fn bench_fib(c: &mut Criterion) {
-    c.bench_function("fib(30)", |b| {
+fn bench_run_source(c: &mut Criterion, name: &str, src: &'static str) {
+    c.bench_function(name, |b| {
         b.iter(|| {
-            let v = run_source(FIB).unwrap();
+            let v = run_source(src).unwrap();
             black_box(v);
         });
     });
+}
+
+fn bench_fib(c: &mut Criterion) {
+    bench_run_source(c, "fib(30)", FIB);
 }
 
 fn bench_empty_loop(c: &mut Criterion) {
-    c.bench_function("empty_loop(1_000_000)", |b| {
-        b.iter(|| {
-            let v = run_source(EMPTY_LOOP).unwrap();
-            black_box(v);
-        });
-    });
+    bench_run_source(c, "empty_loop(1_000_000)", EMPTY_LOOP);
 }
 
 fn bench_arith_loop(c: &mut Criterion) {
-    c.bench_function("arith_loop(100_000)", |b| {
-        b.iter(|| {
-            let v = run_source(ARITH_LOOP).unwrap();
-            black_box(v);
-        });
-    });
+    bench_run_source(c, "arith_loop(100_000)", ARITH_LOOP);
 }
 
 fn bench_parallel_primes(c: &mut Criterion) {

@@ -1,0 +1,7 @@
+// B10：`use ….{ C }` 必须写入模块全局，跨模块调用时仍可解析。
+use std.language.{ C }
+
+export func probe_c() {
+    // 触碰绑定即可；若 C 未进 module global 会 NameError。
+    return if (C is none) then 0 else 1
+}

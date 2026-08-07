@@ -1,0 +1,7 @@
+# cargo-dupes ignore list — intentional / low-value duplicates
+# Re-evaluate after major refactors: cargo dupes report --min-lines 3 --min-nodes 20
+#
+# Closures / magic-method registration (context-bound, not worth extracting)
+38131c4565429e82
+# Keep unused fingerprints commented; regenerate with:
+#   cargo dupes report --min-lines 3 --min-nodes 20

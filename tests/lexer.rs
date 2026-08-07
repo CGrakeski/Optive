@@ -333,3 +333,33 @@ fn lex_longest_match_pipe() {
 fn lex_longest_match_coloncolon() {
     assert_kinds!("::", ColonColon);
 }
+
+#[test]
+fn lex_zero_sized_suffix() {
+    // B1：`0i32` 是合法定宽字面量，不是非法 `0i` 前缀。
+    assert_kinds!("0i32", NumLiteral);
+    assert_kinds!("0u64", NumLiteral);
+    assert_kinds!("8i32", NumLiteral);
+}
+
+#[test]
+fn lex_signed_hex_and_binary() {
+    let toks = tokenize("-0x10").expect("lex");
+    let lit = toks
+        .iter()
+        .find(|t| t.kind == TokenKind::NumLiteral)
+        .expect("num");
+    assert_eq!(lit.value, "-16");
+    let toks = tokenize("-0b1010").expect("lex");
+    let lit = toks
+        .iter()
+        .find(|t| t.kind == TokenKind::NumLiteral)
+        .expect("num");
+    assert_eq!(lit.value, "-10");
+    let toks = tokenize("0x10").expect("lex");
+    let lit = toks
+        .iter()
+        .find(|t| t.kind == TokenKind::NumLiteral)
+        .expect("num");
+    assert_eq!(lit.value, "16");
+}

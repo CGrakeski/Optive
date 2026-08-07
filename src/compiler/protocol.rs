@@ -68,21 +68,9 @@ impl TypeCheckContext {
 
     pub fn from_vm(vm: &crate::vm::Vm) -> Self {
         Self {
-            struct_defs: vm
-                .struct_defs
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-            functions: vm
-                .functions
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-            protocols: vm
-                .protocols
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
+            struct_defs: vm.struct_defs.snapshot_map().into_iter().collect(),
+            functions: vm.functions.snapshot_map().into_iter().collect(),
+            protocols: vm.protocols.snapshot_map().into_iter().collect(),
         }
     }
 }

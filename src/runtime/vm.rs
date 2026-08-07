@@ -16,7 +16,7 @@ use crate::value::{BuiltinFn, ChannelInner, DictMap, DispatchTable, IteratorKind
 use crate::Result;
 
 use crate::scheduler::{self, MnScheduler};
-use crate::shared::{Shared, SharedMap, SyncCell};
+use crate::shared::{Shared, SharedMap, SharedTable, SyncCell};
 use crossbeam_deque::Worker;
 /// 运行时可见的已安装依赖包。
 #[derive(Debug, Clone)]
@@ -116,6 +116,10 @@ pub(crate) struct TaskFiber {
 enum SyncWaitResume {
     Barrier { id: usize, generation: u64 },
     Cond { id: usize },
+    /// Cond 已收到信号，正在重新获取 mutex；挂起后勿再次登记 waiter / unlock。
+    CondRelock { id: usize },
+    /// `std.time.sleep` 协作切片：截止时刻，随纤程迁移。
+    Sleep { until: std::time::Instant },
 }
 
 /// 辅助宏：从环境变量读取正的 usize，带缓存或不带缓存。
@@ -153,6 +157,12 @@ const CALL_ARGS_BUF_INIT_CAP: usize = 8;
 const FAST_RET_PCS_INIT_CAP: usize = 128;
 const LW_SLOTS_INIT_CAP: usize = 1024;
 const LW_BASES_INIT_CAP: usize = 128;
+/// M:N 死锁检测：连续「全局静默」轮次阈值（每轮 ≈ `wait_brief` 2ms）。
+const MN_DEADLOCK_IDLE_ROUNDS: u32 = 50;
+/// 任务内协作 sleep 的单次切片上限。
+const COOP_SLEEP_SLICE: std::time::Duration = std::time::Duration::from_millis(10);
+/// select 空转时单次睡到最近截止时间的上限。
+const SELECT_IDLE_CAP_MS: u64 = 10;
 
 impl StackVal {
     #[inline]
@@ -325,11 +335,11 @@ pub struct Vm {
     pub pc: usize,
     pub active_line_map: Arc<Vec<usize>>,
     pub active_column_map: Arc<Vec<usize>>,
-    pub struct_defs: FxHashMap<String, Arc<crate::value::StructDef>>,
-    pub enum_defs: FxHashMap<String, Arc<crate::value::EnumDef>>,
-    pub variant_defs: FxHashMap<String, Arc<crate::value::VariantDef>>,
-    pub functions: FxHashMap<String, Arc<FunctionObject>>,
-    pub macros: FxHashMap<String, Arc<MacroObject>>,
+    pub struct_defs: SharedTable<Arc<crate::value::StructDef>>,
+    pub enum_defs: SharedTable<Arc<crate::value::EnumDef>>,
+    pub variant_defs: SharedTable<Arc<crate::value::VariantDef>>,
+    pub functions: SharedTable<Arc<FunctionObject>>,
+    pub macros: SharedTable<Arc<MacroObject>>,
     pub(crate) try_stack: Vec<TryFrame>,
     pub(crate) active_exception: Option<Value>,
     pub(crate) iterators: Vec<ActiveIter>,
@@ -353,7 +363,7 @@ pub struct Vm {
     pub current_package_id: String,
     /// 当前包根目录（依赖包内模块解析用）
     pub package_root: Option<std::path::PathBuf>,
-    pub overload_tables: FxHashMap<String, Vec<Arc<FunctionObject>>>,
+    pub overload_tables: SharedTable<Vec<Arc<FunctionObject>>>,
     pub(crate) primitive_methods: FxHashMap<String, FxHashMap<String, BuiltinFn>>,
     user_call_frames: Vec<UserCallFrame>,
     user_call_deferred: bool,
@@ -397,7 +407,7 @@ pub struct Vm {
     pub(crate) dict_contracts: FxHashMap<usize, (Value, Value)>,
     pub(crate) set_element_contracts: FxHashMap<usize, Value>,
     /// 已编译程序中的协议定义（供运行时 `is_a` / `:: Protocol`）。
-    pub(crate) protocols: FxHashMap<String, Arc<crate::protocol::ProtocolDef>>,
+    pub(crate) protocols: SharedTable<Arc<crate::protocol::ProtocolDef>>,
     /// M:1 协作调度就绪队列（`OPTIVE_WORKERS<=1` 时使用，保留确定性顺序）。
     pub(crate) ready_tasks: VecDeque<Shared<TaskInner>>,
     /// 挂起任务的纤程快照（M:1 本地）；M:N 时改走 `mn.fibers`。
@@ -410,10 +420,19 @@ pub struct Vm {
     mn_parallel: bool,
     /// `Vm::new` 主实例为 true；helper fork 为 false（仅主实例负责 shutdown）。
     mn_primary: bool,
+    /// M:N 死锁检测：连续「全局静默」轮次计数（仅主实例使用）。
+    mn_idle_rounds: u32,
+    /// STW 失败后的自动 GC 冷却：在此之前且 tracked_count 未超过记录值时跳过。
+    gc_auto_cooldown_until: Option<std::time::Instant>,
+    /// 冷却期内允许提前重试的下限：仅当 `tracked_count >` 此值时才无视时间冷却。
+    gc_auto_cooldown_hold_count: usize,
     /// `scheduler_run_task` 嵌套深度；>0 时阻塞应挂起当前任务而非再入调度。
     sched_depth: u32,
     /// 同步原语请求「挂起并重试当前 Call」（由 `call_value` 武装栈/PC）。
     pub(crate) block_suspend: bool,
+    /// `arm_call_retry` 已把 callee/args 压回并回绕 PC；Call 勿再压返回值。
+    /// 与 `request_cooperative_yield` 区分：后者挂起前仍须压入本次真实返回值。
+    call_retry_armed: bool,
     /// 与 helper worker 共享的 FFI 运行时开关（串行 / 卸荷线程数）。
     ffi_cfg: std::sync::Arc<crate::ffi::FfiRuntimeConfig>,
     /// 卸荷中的 pending（任务重试 Builtin 时取回）。
@@ -444,6 +463,8 @@ pub struct Vm {
     pub(crate) has_const_names: bool,
     /// 运行时能力隔离：网络 / 文件系统 / 环境变量网关。默认全开。
     pub caps: crate::caps::Capabilities,
+    /// 若设置，`std.os.args()` 返回此列表（`run`/`up` 注入入口可见 argv）。
+    pub argv_override: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -587,6 +608,7 @@ enum StepAction {
     SelectPollTask,
     MakeDeadline,
     SelectPollDeadline,
+    SelectIdle(usize),
 }
 
 pub struct ModuleInitSnapshot {
@@ -625,11 +647,11 @@ impl Vm {
             pc: 0,
             active_line_map: Arc::new(Vec::new()),
             active_column_map: Arc::new(Vec::new()),
-            struct_defs: FxHashMap::default(),
-            enum_defs: FxHashMap::default(),
-            variant_defs: FxHashMap::default(),
-            functions: FxHashMap::default(),
-            macros: FxHashMap::default(),
+            struct_defs: SharedTable::new(),
+            enum_defs: SharedTable::new(),
+            variant_defs: SharedTable::new(),
+            functions: SharedTable::new(),
+            macros: SharedTable::new(),
             try_stack: Vec::new(),
             active_exception: None,
             iterators: Vec::new(),
@@ -647,7 +669,7 @@ impl Vm {
             dep_map: std::collections::HashMap::new(),
             current_package_id: "__root__".into(),
             package_root: None,
-            overload_tables: FxHashMap::default(),
+            overload_tables: SharedTable::new(),
             primitive_methods: FxHashMap::default(),
             user_call_frames: Vec::new(),
             user_call_deferred: false,
@@ -674,7 +696,7 @@ impl Vm {
             list_element_contracts: FxHashMap::default(),
             dict_contracts: FxHashMap::default(),
             set_element_contracts: FxHashMap::default(),
-            protocols: FxHashMap::default(),
+            protocols: SharedTable::new(),
             ready_tasks: VecDeque::new(),
             task_fibers: FxHashMap::default(),
             mn: {
@@ -684,8 +706,12 @@ impl Vm {
             local_worker: scheduler::new_local_worker(),
             mn_parallel: false,
             mn_primary: true,
+            mn_idle_rounds: 0,
+            gc_auto_cooldown_until: None,
+            gc_auto_cooldown_hold_count: 0,
             sched_depth: 0,
             block_suspend: false,
+            call_retry_armed: false,
             ffi_cfg: crate::ffi::FfiRuntimeConfig::from_env(),
             ffi_wait: None,
             sync_wait_resume: None,
@@ -701,6 +727,7 @@ impl Vm {
             debug_active: false,
             has_const_names: false,
             caps: crate::caps::Capabilities::full(),
+            argv_override: None,
         };
         let mn = MnScheduler::new(workers);
         mn.register_stealer(vm.local_worker.stealer());
@@ -710,7 +737,19 @@ impl Vm {
         type_registry::install_core_types(&mut vm);
         module::install_std(&mut vm);
         if vm.mn_parallel {
-            vm.spawn_helper_workers();
+            let started = vm.spawn_helper_workers();
+            if started + 1 < workers {
+                eprintln!(
+                    "optive: 仅 {started}/{} 个 helper worker 启动成功，并行能力下降",
+                    workers.saturating_sub(1)
+                );
+            }
+            if started == 0 {
+                // 一个 helper 都起不来：回退 M:1，避免任务无人执行。
+                eprintln!("optive: helper worker 全部启动失败，回退为单 worker（M:1）");
+                vm.mn.shrink_to_single();
+                vm.mn_parallel = false;
+            }
         }
         vm
     }
@@ -779,14 +818,26 @@ impl Vm {
 
     /// 跟踪表过大时自动清扫环，避免无人调用 `gc()` 时 Weak 表无限增长。
     fn maybe_auto_gc(&mut self) {
-        if self.gc.tracked_count() >= gc_auto_threshold() {
-            self.gc_collect();
+        let count = self.gc.tracked_count();
+        if count < gc_auto_threshold() {
+            return;
         }
+        // STW 失败后冷却：避免 tracked_count 仍超阈时反复打满 begin_stw 超时。
+        if let Some(until) = self.gc_auto_cooldown_until {
+            if std::time::Instant::now() < until && count <= self.gc_auto_cooldown_hold_count {
+                return;
+            }
+        }
+        self.gc_collect();
     }
 
     /// 标记-清扫环收集：从根出发标记可达堆对象，再清空不可达容器内部。
     /// M:N 下先请求 stop-the-world，再在安全点清空。
     pub fn gc_collect(&mut self) -> usize {
+        if self.mn_parallel && !self.mn_primary {
+            // Helper 不发起 STW；仅修剪已死 Weak，避免跟踪表无限增长。
+            return self.gc.prune_dead();
+        }
         let stw = if self.mn_parallel {
             self.mn.begin_stw()
         } else {
@@ -794,6 +845,16 @@ impl Vm {
         };
         if self.mn_parallel && !stw {
             // 未能在限时内停住全部 helper：跳过本轮收集，避免带活线程扫堆。
+            // 记录并周期性告警，防止高负载下 GC 永远收不到而无人察觉。
+            let n = self.mn.note_stw_failure();
+            if n == 1 || n % 64 == 0 {
+                eprintln!("optive: GC stop-the-world 超时（累计 {n} 次），本轮收集已跳过");
+            }
+            // 冷却：至少等一轮 STW 超时量级，且 count 未继续增长时不再重试。
+            let hold = self.gc.tracked_count();
+            self.gc_auto_cooldown_hold_count = hold;
+            self.gc_auto_cooldown_until =
+                Some(std::time::Instant::now() + Self::gc_stw_cooldown());
             return 0;
         }
         // 先将 tracker 移出 self（collect 需要 &Vm），处理完再挂回。
@@ -803,7 +864,19 @@ impl Vm {
         if self.mn_parallel {
             self.mn.end_stw();
         }
+        self.gc_auto_cooldown_until = None;
+        self.gc_auto_cooldown_hold_count = 0;
         cleared
+    }
+
+    fn gc_stw_cooldown() -> std::time::Duration {
+        // 与 STW 超时同量级，避免失败后立即再次阻塞同等时长。
+        std::env::var("OPTIVE_STW_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n: &u64| n > 0)
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(std::time::Duration::from_millis(2_000))
     }
 
     /// 将 VM 中所有 GC 根加入工作表并标记到 marked。
@@ -840,7 +913,7 @@ impl Vm {
             }
         };
         for f in self.functions.values() {
-            push_func(&mut worklist, f);
+            push_func(&mut worklist, &f);
         }
         for f in &self.func_stack {
             push_func(&mut worklist, f);
@@ -860,7 +933,7 @@ impl Vm {
         // 重载分发表
         for fns in self.overload_tables.values() {
             for f in fns {
-                push_func(&mut worklist, f);
+                push_func(&mut worklist, &f);
             }
         }
         // 已加载模块
@@ -918,10 +991,10 @@ impl Vm {
     pub(crate) fn snapshot_for_module_init(&self) -> ModuleInitSnapshot {
         ModuleInitSnapshot {
             globals: self.globals.clone(),
-            functions: self.functions.clone(),
-            macros: self.macros.clone(),
-            struct_defs: self.struct_defs.clone(),
-            overload_tables: self.overload_tables.clone(),
+            functions: self.functions.snapshot_map(),
+            macros: self.macros.snapshot_map(),
+            struct_defs: self.struct_defs.snapshot_map(),
+            overload_tables: self.overload_tables.snapshot_map(),
             const_names: self.const_names.clone(),
             module_init_exports: self.module_init_exports.clone(),
             code: self.code.clone(),
@@ -962,10 +1035,10 @@ impl Vm {
         let exports = Shared::new(HashMap::new());
         self.module_init_exports = Some(exports.clone());
 
-        self.functions = snap.functions.clone();
-        self.macros = snap.macros.clone();
-        self.struct_defs = snap.struct_defs.clone();
-        self.overload_tables = snap.overload_tables.clone();
+        self.functions.replace_with(snap.functions.clone());
+        self.macros.replace_with(snap.macros.clone());
+        self.struct_defs.replace_with(snap.struct_defs.clone());
+        self.overload_tables.replace_with(snap.overload_tables.clone());
         exports
     }
 
@@ -978,10 +1051,10 @@ impl Vm {
         new_overloads: FxHashMap<String, Vec<Arc<FunctionObject>>>,
     ) {
         self.globals = snap.globals;
-        self.functions = snap.functions;
-        self.macros = snap.macros;
-        self.struct_defs = snap.struct_defs;
-        self.overload_tables = snap.overload_tables;
+        self.functions.replace_with(snap.functions);
+        self.macros.replace_with(snap.macros);
+        self.struct_defs.replace_with(snap.struct_defs);
+        self.overload_tables.replace_with(snap.overload_tables);
         self.const_names = snap.const_names;
         self.has_const_names = !self.const_names.is_empty();
         self.module_init_exports = snap.module_init_exports;
@@ -1736,7 +1809,12 @@ impl Vm {
                             std::cmp::Ordering::Equal
                         })
                     }
-                    _ => return Err(RuntimeError::type_err("comparison requires num")),
+                    (Value::Text(x), Value::Text(y)) => pred(x.as_str().cmp(y.as_str())),
+                    _ => {
+                        return Err(RuntimeError::type_err(
+                            "comparison requires num or text (lexicographic)",
+                        ))
+                    }
                 }
             }
         };
@@ -1952,9 +2030,11 @@ impl Vm {
                 let av = a.to_value();
                 let bv = b.to_value();
                 let result = match (&av, &bv) {
-                    (Value::Num(_), Value::Num(_)) => compare_num(&av, &bv).map(|c| c <= 0),
+                    (Value::Num(_), Value::Num(_)) | (Value::Text(_), Value::Text(_)) => {
+                        compare_values(&av, &bv).map(|c| c != std::cmp::Ordering::Greater)
+                    }
                     _ => self.dispatch_compare(&av, &bv, "__le__", |x, y| {
-                        Ok(compare_num(x, y)? <= 0)
+                        Ok(compare_values(x, y)? != std::cmp::Ordering::Greater)
                     }),
                 };
                 match result {
@@ -2473,15 +2553,24 @@ impl Vm {
     }
 
     fn dispatch_to_handler(&mut self) -> Result<bool> {
+        // 任务纤程内不得跳到宿主 try（否则 leave_scope 会卸掉 stop_* 以下的帧）。
+        let stop_try = self.task_ctx.as_ref().map(|c| c.stop_try).unwrap_or(0);
+        if self.try_stack.len() <= stop_try {
+            return Ok(false);
+        }
         let Some(frame) = self.try_stack.last().cloned() else {
             return Ok(false);
         };
+        let stop_ucf = self.task_ctx.as_ref().map(|c| c.stop_ucf).unwrap_or(0);
+        let stop_fast_ret = self.task_ctx.as_ref().map(|c| c.stop_fast_ret).unwrap_or(0);
         // 先展开轻量 CallSelf，再展开完整用户调用帧，恢复 try 所在代码对象。
-        while self.fast_ret_sp > frame.fast_ret_sp {
+        let fast_floor = frame.fast_ret_sp.max(stop_fast_ret);
+        while self.fast_ret_sp > fast_floor {
             self.fast_ret_sp -= 1;
             self.pop_lightweight_frame();
         }
-        while self.user_call_frames.len() > frame.user_call_depth {
+        let ucf_floor = frame.user_call_depth.max(stop_ucf);
+        while self.user_call_frames.len() > ucf_floor {
             let Some(ucf) = self.user_call_frames.pop() else {
                 break;
             };
@@ -2494,8 +2583,10 @@ impl Vm {
             }
             self.restore_user_call_frame(ucf)?;
         }
-        self.op_truncate(frame.stack_sp);
-        self.iterators.truncate(frame.iterators_len);
+        let stop_stack = self.task_ctx.as_ref().map(|c| c.stop_stack).unwrap_or(0);
+        let stop_iters = self.task_ctx.as_ref().map(|c| c.stop_iters).unwrap_or(0);
+        self.op_truncate(frame.stack_sp.max(stop_stack));
+        self.iterators.truncate(frame.iterators_len.max(stop_iters));
         self.user_call_deferred = false;
         self.pending_ret = None;
         self.jump_to_pc(frame.catch_pc);
@@ -2656,6 +2747,7 @@ impl Vm {
             I::SelectPollTask => StepAction::SelectPollTask,
             I::MakeDeadline => StepAction::MakeDeadline,
             I::SelectPollDeadline => StepAction::SelectPollDeadline,
+            I::SelectIdle(n) => StepAction::SelectIdle(*n),
         }
     }
 
@@ -2871,23 +2963,21 @@ impl Vm {
             StepAction::Lt => {
                 let b = self.pop()?;
                 let a = self.pop()?;
-                let result = if matches!((&a, &b), (Value::Num(_), Value::Num(_))) {
-                    compare_num(&a, &b)? < 0
-                } else {
-                    self.dispatch_compare(&a, &b, "__lt__", |x, y| {
-                        Ok(compare_num(x, y)? < 0)
-                    })?
+                let result = match compare_values(&a, &b) {
+                    Ok(ord) => ord == std::cmp::Ordering::Less,
+                    Err(_) => self.dispatch_compare(&a, &b, "__lt__", |x, y| {
+                        Ok(compare_values(x, y)? == std::cmp::Ordering::Less)
+                    })?,
                 };
                 self.push_bool(result);
             }
             StepAction::Le => {
                 let b = self.pop()?;
                 let a = self.pop()?;
-                let result = match (&a, &b) {
-                    (Value::Num(Num::Small(x)), Value::Num(Num::Small(y))) => x <= y,
-                    (Value::Num(_), Value::Num(_)) => compare_num(&a, &b)? <= 0,
-                    _ => self.dispatch_compare(&a, &b, "__le__", |x, y| {
-                        Ok(compare_num(x, y)? <= 0)
+                let result = match compare_values(&a, &b) {
+                    Ok(ord) => ord != std::cmp::Ordering::Greater,
+                    Err(_) => self.dispatch_compare(&a, &b, "__le__", |x, y| {
+                        Ok(compare_values(x, y)? != std::cmp::Ordering::Greater)
                     })?,
                 };
                 self.push_bool(result);
@@ -2895,24 +2985,22 @@ impl Vm {
             StepAction::Gt => {
                 let b = self.pop()?;
                 let a = self.pop()?;
-                let result = if matches!((&a, &b), (Value::Num(_), Value::Num(_))) {
-                    compare_num(&a, &b)? > 0
-                } else {
-                    self.dispatch_compare(&a, &b, "__gt__", |x, y| {
-                        Ok(compare_num(x, y)? > 0)
-                    })?
+                let result = match compare_values(&a, &b) {
+                    Ok(ord) => ord == std::cmp::Ordering::Greater,
+                    Err(_) => self.dispatch_compare(&a, &b, "__gt__", |x, y| {
+                        Ok(compare_values(x, y)? == std::cmp::Ordering::Greater)
+                    })?,
                 };
                 self.push_bool(result);
             }
             StepAction::Ge => {
                 let b = self.pop()?;
                 let a = self.pop()?;
-                let result = if matches!((&a, &b), (Value::Num(_), Value::Num(_))) {
-                    compare_num(&a, &b)? >= 0
-                } else {
-                    self.dispatch_compare(&a, &b, "__ge__", |x, y| {
-                        Ok(compare_num(x, y)? >= 0)
-                    })?
+                let result = match compare_values(&a, &b) {
+                    Ok(ord) => ord != std::cmp::Ordering::Less,
+                    Err(_) => self.dispatch_compare(&a, &b, "__ge__", |x, y| {
+                        Ok(compare_values(x, y)? != std::cmp::Ordering::Less)
+                    })?,
                 };
                 self.push_bool(result);
             }
@@ -3206,12 +3294,17 @@ impl Vm {
                 self.call_args_buf.reverse();
                 let args = std::mem::take(&mut self.call_args_buf);
                 let result = self.call_value(callee, args)?;
-                if self.pending_suspend {
-                    // arm_call_retry 已回绕栈与 PC，勿压返回值。
+                if self.call_retry_armed {
+                    // arm_call_retry：栈上已是 callee/args，PC 已回绕；勿压返回值。
+                    self.call_retry_armed = false;
                     return Ok(());
                 }
                 if !self.user_call_deferred && self.active_exception.is_none() {
                     self.push_value(result);
+                }
+                // 协作让出：返回值已入栈，随后挂起纤程。
+                if self.pending_suspend {
+                    return Ok(());
                 }
             }
             StepAction::CallSelf { argc } => {
@@ -3243,11 +3336,15 @@ impl Vm {
                     _ => return Err(RuntimeError::type_err("CallList requires arg list")),
                 };
                 let result = self.call_value(callee, args)?;
-                if self.pending_suspend {
+                if self.call_retry_armed {
+                    self.call_retry_armed = false;
                     return Ok(());
                 }
                 if !self.user_call_deferred && self.active_exception.is_none() {
                     self.push_value(result);
+                }
+                if self.pending_suspend {
+                    return Ok(());
                 }
             }
             StepAction::CallEx => {
@@ -3263,11 +3360,15 @@ impl Vm {
                     _ => return Err(RuntimeError::type_err("CallEx requires kwargs dict")),
                 };
                 let result = self.call_value_ex(callee, positional, kwargs)?;
-                if self.pending_suspend {
+                if self.call_retry_armed {
+                    self.call_retry_armed = false;
                     return Ok(());
                 }
                 if !self.user_call_deferred && self.active_exception.is_none() {
                     self.push_value(result);
+                }
+                if self.pending_suspend {
+                    return Ok(());
                 }
             }
             StepAction::MacroCall { argc } => {
@@ -3439,10 +3540,27 @@ impl Vm {
                     .clone();
                 match self.advance_iterator(&state) {
                     Ok(Some(val)) => {
+                        // Channel.recv 等在任务内阻塞：挂起并重试 IterNext，勿把哨兵 none 当元素。
+                        if self.block_suspend {
+                            self.block_suspend = false;
+                            if self.pc > 0 {
+                                self.pc -= 1;
+                            }
+                            self.pending_suspend = true;
+                            return Ok(());
+                        }
                         self.push_value(val);
                         self.push_bool(true);
                     }
                     Ok(None) => {
+                        if self.block_suspend {
+                            self.block_suspend = false;
+                            if self.pc > 0 {
+                                self.pc -= 1;
+                            }
+                            self.pending_suspend = true;
+                            return Ok(());
+                        }
                         self.push_bool(false);
                     }
                     Err(e) => {
@@ -3511,13 +3629,18 @@ impl Vm {
             }
             StepAction::IsList => {
                 let v = self.pop()?;
-                self.push_bool(matches!(v, Value::List(_)));
+                self.push_bool(matches!(v, Value::List(_) | Value::Tuple(_)));
             }
             StepAction::ListLen => {
                 let v = self.pop()?;
                 let n = match &v {
                     Value::List(lst) => lst.borrow().len(),
-                    _ => return Err(RuntimeError::type_err("ListLen requires list")),
+                    Value::Tuple(t) => t.len(),
+                    _ => {
+                        return Err(RuntimeError::type_err(
+                            "ListLen requires list or tuple",
+                        ))
+                    }
                 };
                 self.push_int(n as i64);
             }
@@ -3742,6 +3865,16 @@ impl Vm {
                 let ready = crate::concurrency::poll_deadline_ready(&dl)?;
                 self.push_value(Value::Bool(ready));
             }
+            StepAction::SelectIdle(n) => {
+                let mut deadlines = Vec::with_capacity(n);
+                for _ in 0..n {
+                    deadlines.push(self.pop()?);
+                }
+                deadlines.reverse();
+                // 先推进墙钟（最近 sleep），再让其它任务跑；任务内 sleep 已协作切片，不会长时间霸住。
+                crate::concurrency::sleep_until_nearest_deadline(&deadlines, SELECT_IDLE_CAP_MS)?;
+                self.scheduler_yield()?;
+            }
         }
         Ok(())
     }
@@ -3785,6 +3918,15 @@ impl Vm {
                         });
                     }
                 }
+            }
+        }
+        // 模块函数体内的裸 Load：优先定义模块快照（use/import 绑定落于此）。
+        if let Some(env) = self.active_module_global_env() {
+            if let Some(v) = env.globals.borrow().get(name) {
+                return Ok(match v {
+                    Value::Cell(c) => c.borrow().clone(),
+                    other => other.clone(),
+                });
             }
         }
         match self.globals.get(name) {
@@ -4037,18 +4179,14 @@ impl Vm {
         let func = self
             .functions
             .get(&method_name)
-            .cloned()
             .ok_or_else(|| RuntimeError::attr_err(format!("no method {method_name}")))?;
         let mut full_args = vec![obj.clone()];
         full_args.extend(args);
         self.call_user_function(func, full_args)
     }
 
-    pub(crate) fn call_method(&mut self, obj: &Value, method: &str, args: Vec<Value>) -> Result<Value> {
-        // `get_attr` 对实例方法返回已绑定 self 的闭包（与字节码 GetAttr+Call 一致），
-        // 不可再前置 self，否则会变成「5 个参数」。
-        let method_val = get_attr(self, obj, method)?;
-        self.call_value(method_val, args)
+    pub(crate) fn get_attr_value(&mut self, obj: &Value, field: &str) -> Result<Value> {
+        get_attr(self, obj, field)
     }
 
     pub(crate) fn call_value(&mut self, callee: Value, args: Vec<Value>) -> Result<Value> {
@@ -4622,11 +4760,11 @@ impl Vm {
             active_column_map: self.active_column_map.clone(),
             pc: self.pc,
             stack: self.stack.get(..self.stack_sp).unwrap_or(&[]).to_vec(),
-            functions: self.functions.clone(),
-            macros: self.macros.clone(),
-            struct_defs: self.struct_defs.clone(),
-            enum_defs: self.enum_defs.clone(),
-            variant_defs: self.variant_defs.clone(),
+            functions: self.functions.snapshot_map(),
+            macros: self.macros.snapshot_map(),
+            struct_defs: self.struct_defs.snapshot_map(),
+            enum_defs: self.enum_defs.snapshot_map(),
+            variant_defs: self.variant_defs.snapshot_map(),
             script_global_names: self.script_global_names.clone(),
             script_globals: self.script_globals.clone(),
         }
@@ -4644,11 +4782,11 @@ impl Vm {
         self.pc = snap.pc;
         self.stack = snap.stack;
         self.stack_sp = self.stack.len();
-        self.functions = snap.functions;
-        self.macros = snap.macros;
-        self.struct_defs = snap.struct_defs;
-        self.enum_defs = snap.enum_defs;
-        self.variant_defs = snap.variant_defs;
+        self.functions.replace_with(snap.functions);
+        self.macros.replace_with(snap.macros);
+        self.struct_defs.replace_with(snap.struct_defs);
+        self.enum_defs.replace_with(snap.enum_defs);
+        self.variant_defs.replace_with(snap.variant_defs);
         self.script_global_names = snap.script_global_names;
         self.script_globals = snap.script_globals;
     }
@@ -5117,6 +5255,11 @@ impl Vm {
     }
 
     fn unwind_user_calls_on_error(&mut self) -> Result<()> {
+        // 任务失败：保留纤程状态，由 scheduler 的 capture_fiber 按 stop_* 裁剪；
+        // 若此处 restore 任务帧会先把 code/pc 搅成宿主再 capture，状态损坏。
+        if self.task_ctx.is_some() {
+            return Ok(());
+        }
         while self.fast_ret_sp > 0 {
             self.fast_ret_sp -= 1;
             self.pop_lightweight_frame();
@@ -5998,7 +6141,12 @@ impl Vm {
 
     fn take_ready_task(&mut self) -> Option<Shared<TaskInner>> {
         if self.mn_parallel {
-            self.mn.steal_task(&self.local_worker)
+            let task = self.mn.steal_task(&self.local_worker);
+            if task.is_some() {
+                // 与 scheduler_run_task 末尾的 note_task_done 配对（死锁检测）。
+                self.mn.note_task_taken();
+            }
+            task
         } else {
             self.ready_tasks.pop_front()
         }
@@ -6094,8 +6242,12 @@ impl Vm {
             local_worker,
             mn_parallel: true,
             mn_primary: false,
+            mn_idle_rounds: 0,
+            gc_auto_cooldown_until: None,
+            gc_auto_cooldown_hold_count: 0,
             sched_depth: 0,
             block_suspend: false,
+            call_retry_armed: false,
             ffi_cfg: self.ffi_cfg.clone(),
             ffi_wait: None,
             sync_wait_resume: None,
@@ -6111,18 +6263,20 @@ impl Vm {
             debug_active: self.debug_active,
             has_const_names: self.has_const_names,
             caps: self.caps.clone(),
+            argv_override: self.argv_override.clone(),
         }
     }
 
-    fn spawn_helper_workers(&self) {
-        let n = self.mn.worker_count;
+    /// 返回成功启动的 helper 数；单个失败仅告警，由调用方决定是否降级。
+    fn spawn_helper_workers(&self) -> usize {
+        let n = self.mn.worker_count();
+        let mut started = 0usize;
         for i in 1..n {
             let mut worker_vm = self.fork_worker();
             let mn = self.mn.clone();
             match std::thread::Builder::new()
                 .name(format!("optive-w{i}"))
                 .spawn(move || {
-                    mn.mark_helper_started();
                     while !mn.is_shutdown() {
                         match worker_vm.take_ready_task() {
                             Some(task) => {
@@ -6132,19 +6286,24 @@ impl Vm {
                         }
                     }
                 }) {
-                Ok(_) => {}
+                Ok(_) => {
+                    // 在父线程登记：避免 STW 在 helper 尚未执行 mark 前按 need=0 误判成功。
+                    self.mn.mark_helper_started();
+                    started += 1;
+                }
                 Err(e) => {
                     eprintln!("optive: failed to spawn helper worker {i}: {e}");
                 }
             }
         }
+        started
     }
 
     /// 阻塞等待时：
     /// - 已在任务纤程内（`sched_depth>0`）：**禁止再入** `scheduler_run_one`
     ///   （嵌套 capture 会破坏外层栈）；改为挂起本任务，让外层调度器继续；
     /// - 否则先跑就绪队列；M:N 下再短等。
-    fn wait_or_deadlock(&mut self, msg: &str) -> Result<()> {
+    pub(crate) fn wait_or_deadlock(&mut self, msg: &str) -> Result<()> {
         self.mn.poll_safepoint();
         // 任务内阻塞：立即挂起并回绕 Call，由外层（主纤程/其它 worker）推进。
         if self.sched_depth > 0 && self.task_ctx.is_some() {
@@ -6156,8 +6315,21 @@ impl Vm {
         }
         if self.mn_parallel {
             // 其它 OS worker 可能正在跑 CPU 任务；不能仅凭「本线程无就绪」判死锁。
-            // M:N 下死锁检测需全局 idle 计数（尚未实现）；此处保持短等。
-            let _ = msg;
+            // 静默判据：无任何线程在执行任务（busy==0）且各级队列均为空。
+            // sleep / FFI / 定时等待的任务会持续在就绪队列自旋或处于执行中，
+            // 故不会造成全局静默；连续静默若干轮（覆盖取任务瞬间的竞态窗口）
+            // 后才报死锁。
+            let quiescent =
+                !self.mn.is_shutdown() && self.mn.busy() == 0 && self.mn.queues_empty();
+            if quiescent {
+                self.mn_idle_rounds += 1;
+                if self.mn_idle_rounds >= MN_DEADLOCK_IDLE_ROUNDS {
+                    self.mn_idle_rounds = 0;
+                    return Err(RuntimeError::deadlock(msg));
+                }
+            } else {
+                self.mn_idle_rounds = 0;
+            }
             self.mn.wait_brief();
             return Ok(());
         }
@@ -6174,6 +6346,7 @@ impl Vm {
             self.pc -= 1;
         }
         self.pending_suspend = true;
+        self.call_retry_armed = true;
     }
 
     pub(crate) fn task_from_value(&mut self, value: Value) -> Value {
@@ -6240,13 +6413,33 @@ impl Vm {
         } else {
             Vec::new()
         };
-        let locals_stack = self.locals_stack.split_off(ctx.stop_locals);
-        let name_to_slot = self.name_to_slot.split_off(ctx.stop_nts);
-        let user_call_frames = self.user_call_frames.split_off(ctx.stop_ucf);
-        let func_stack = self.func_stack.split_off(ctx.stop_func_stack);
-        let func_frames = self.func_frames.split_off(ctx.stop_func_frames);
+        // 防御：若错误路径已卸到 stop 以下，勿 panic（debug 仍断言）。
+        fn split_at_or_empty<T>(v: &mut Vec<T>, stop: usize) -> Vec<T> {
+            if v.len() >= stop {
+                v.split_off(stop)
+            } else {
+                debug_assert!(
+                    false,
+                    "capture_fiber: len {} < stop {}",
+                    v.len(),
+                    stop
+                );
+                // release 下不变量被破坏会导致静默空帧；至少留可观测痕迹。
+                eprintln!(
+                    "optive internal: capture_fiber invariant broken (len {} < stop {})",
+                    v.len(),
+                    stop
+                );
+                Vec::new()
+            }
+        }
+        let locals_stack = split_at_or_empty(&mut self.locals_stack, ctx.stop_locals);
+        let name_to_slot = split_at_or_empty(&mut self.name_to_slot, ctx.stop_nts);
+        let user_call_frames = split_at_or_empty(&mut self.user_call_frames, ctx.stop_ucf);
+        let func_stack = split_at_or_empty(&mut self.func_stack, ctx.stop_func_stack);
+        let func_frames = split_at_or_empty(&mut self.func_frames, ctx.stop_func_frames);
         let try_stack = {
-            let mut ts = self.try_stack.split_off(ctx.stop_try);
+            let mut ts = split_at_or_empty(&mut self.try_stack, ctx.stop_try);
             for f in &mut ts {
                 f.user_call_depth = f.user_call_depth.saturating_sub(ctx.stop_ucf);
                 f.stack_sp = f.stack_sp.saturating_sub(ctx.stop_stack);
@@ -6255,7 +6448,7 @@ impl Vm {
             }
             ts
         };
-        let iterators = self.iterators.split_off(ctx.stop_iters);
+        let iterators = split_at_or_empty(&mut self.iterators, ctx.stop_iters);
 
         let fast_ret_pcs = if self.fast_ret_sp > ctx.stop_fast_ret {
             self.fast_ret_pcs[ctx.stop_fast_ret..self.fast_ret_sp].to_vec()
@@ -6427,6 +6620,18 @@ impl Vm {
     }
 
     fn scheduler_run_task(&mut self, task: Shared<TaskInner>) -> Result<bool> {
+        // 与 take_ready_task 的 note_task_taken 配对；所有出口统一 -1。
+        struct BusyGuard(Arc<MnScheduler>);
+        impl Drop for BusyGuard {
+            fn drop(&mut self) {
+                self.0.note_task_done();
+            }
+        }
+        let _busy = if self.mn_parallel {
+            Some(BusyGuard(self.mn.clone()))
+        } else {
+            None
+        };
         let key = Self::task_ptr_key(&task);
         // 认领：仅 Pending/Suspended 可进入 Running。重复入队的副本直接跳过。
         let state = {
@@ -6445,10 +6650,17 @@ impl Vm {
         let saved_budget = self.budget_left;
         let saved_pending = self.pending_suspend;
         let saved_block_suspend = self.block_suspend;
+        let saved_call_retry = self.call_retry_armed;
+        let saved_ucd = self.user_call_deferred;
         self.pending_suspend = false;
         // 任务内阻塞挂起不得泄漏到调用方（主 fiber 的 Channel.recv 等），
         // 否则调用方会误走 arm_call_retry / 把栈上残留的 Task 当成 recv 结果。
         self.block_suspend = false;
+        // 任务内 Call 重试 / 延迟返回标志同样不得泄漏：任务体内 `arm_call_retry`
+        // 留下的 `call_retry_armed`/`user_call_deferred` 会让宿主下一次 `Call`
+        // 跳过压栈返回值（如 `ch.recv()` 结果），栈顶残留值被误绑定。
+        self.call_retry_armed = false;
+        self.user_call_deferred = false;
         self.sched_depth = self.sched_depth.saturating_add(1);
 
         let run_result = (|| -> Result<Option<Value>> {
@@ -6513,6 +6725,7 @@ impl Vm {
             Ok(Some(v)) => {
                 if matches!(task.borrow().state, TaskState::Running) {
                     task.borrow_mut().state = TaskState::Done(v);
+                    self.taskgroup_notify_finished(&task, None);
                 }
             }
             Ok(None) => {}
@@ -6526,7 +6739,8 @@ impl Vm {
                     Ok(v) => v,
                     Err(_) => Value::Text(e.message().to_string()),
                 };
-                task.borrow_mut().state = TaskState::Failed(exc);
+                task.borrow_mut().state = TaskState::Failed(exc.clone());
+                self.taskgroup_notify_finished(&task, Some(exc));
             }
         }
 
@@ -6535,14 +6749,19 @@ impl Vm {
         self.budget_left = saved_budget;
         self.pending_suspend = saved_pending;
         self.block_suspend = saved_block_suspend;
+        self.call_retry_armed = saved_call_retry;
+        self.user_call_deferred = saved_ucd;
         self.mn.notify_all();
         Ok(true)
     }
 
     pub(crate) fn scheduler_yield(&mut self) -> Result<()> {
         if self.mn_parallel {
-            // 并行：尽量抽干本地/全局一小批任务。
-            for _ in 0..64 {
+            // 并行：与 M:1 一致，以「进入时本地队列长度」为上界跑一轮就绪任务。
+            // 固定 64 次会让单个 sleep/IO 切片任务重入队后被反复抽干，
+            // 饿死 select 主纤程的 deadline poll（tick 截止被拖到 channel 就绪之后）。
+            let n = self.local_worker.len().max(1);
+            for _ in 0..n {
                 if !self.scheduler_run_one()? {
                     break;
                 }
@@ -6570,6 +6789,54 @@ impl Vm {
         }
     }
 
+    /// 任务纤程内的协作式 sleep：每次最多睡一小片并 `block_suspend`，让 select/其它任务推进。
+    /// 主纤程仍用整段 `thread::sleep`（无调度对象可让出）。
+    pub(crate) fn coop_sleep_secs(&mut self, secs: f64) -> Result<Value> {
+        let secs = sanitize_coop_sleep_secs(secs);
+        self.coop_sleep_duration(std::time::Duration::from_secs_f64(secs))
+    }
+
+    pub(crate) fn coop_sleep_ms(&mut self, ms: u64) -> Result<Value> {
+        self.coop_sleep_duration(std::time::Duration::from_millis(ms))
+    }
+
+    fn coop_sleep_duration(&mut self, total: std::time::Duration) -> Result<Value> {
+        if total.is_zero() {
+            return Ok(Value::None);
+        }
+        let in_task = self.task_ctx.is_some() || self.sched_depth > 0;
+        if !in_task {
+            std::thread::sleep(total);
+            return Ok(Value::None);
+        }
+        let until = match self.sync_wait_resume {
+            Some(SyncWaitResume::Sleep { until }) => until,
+            _ => match std::time::Instant::now().checked_add(total) {
+                Some(t) => t,
+                None => {
+                    // 溢出：睡完本切片后视为到期，避免 Instant 加法 panic。
+                    std::thread::sleep(total.min(COOP_SLEEP_SLICE));
+                    self.sync_wait_resume = None;
+                    return Ok(Value::None);
+                }
+            },
+        };
+        let now = std::time::Instant::now();
+        if now >= until {
+            self.sync_wait_resume = None;
+            return Ok(Value::None);
+        }
+        let slice = (until - now).min(COOP_SLEEP_SLICE);
+        std::thread::sleep(slice);
+        if std::time::Instant::now() >= until {
+            self.sync_wait_resume = None;
+            return Ok(Value::None);
+        }
+        self.sync_wait_resume = Some(SyncWaitResume::Sleep { until });
+        self.block_suspend = true;
+        Ok(Value::None)
+    }
+
     pub(crate) fn await_value(&mut self, value: Value) -> Result<Value> {
         let Value::Task(task) = value else {
             return Ok(value);
@@ -6583,11 +6850,7 @@ impl Vm {
                     return Ok(Value::None);
                 }
                 TaskState::Pending { .. } | TaskState::Suspended => {
-                    if self.mn_parallel {
-                        self.enqueue_task(task.clone());
-                    } else if !self.ready_tasks.iter().any(|t| Shared::ptr_eq(t, &task)) {
-                        self.ready_tasks.push_back(task.clone());
-                    }
+                    self.ensure_task_runnable(&task);
                     self.wait_or_deadlock(
                         "no runnable tasks while awaiting",
                     )?;
@@ -6603,6 +6866,21 @@ impl Vm {
                         return Ok(Value::None);
                     }
                 }
+            }
+        }
+    }
+
+    /// 确保任务在就绪队列中（不阻塞等待完成）。
+    pub(crate) fn ensure_task_runnable(&mut self, task: &Shared<TaskInner>) {
+        let state = task.borrow().state.clone();
+        if matches!(
+            state,
+            TaskState::Pending { .. } | TaskState::Suspended
+        ) {
+            if self.mn_parallel {
+                self.enqueue_task(task.clone());
+            } else if !self.ready_tasks.iter().any(|t| Shared::ptr_eq(t, task)) {
+                self.ready_tasks.push_back(task.clone());
             }
         }
     }
@@ -6705,7 +6983,9 @@ impl Vm {
                 let mut inner = m.borrow_mut();
                 if !inner.locked {
                     inner.locked = true;
-                    return Ok(Value::MutexGuard(m.clone()));
+                    return Ok(Value::MutexGuard(Shared::new(
+                        crate::value::MutexGuardInner::new(m.clone()),
+                    )));
                 }
             }
             self.wait_or_deadlock("mutex lock blocked")?;
@@ -6793,6 +7073,86 @@ impl Vm {
             if self.block_suspend {
                 return Ok(Value::None);
             }
+        }
+    }
+
+    pub(crate) fn taskgroup_run(
+        &mut self,
+        s: &Shared<crate::value::SyncInner>,
+        callable: Value,
+    ) -> Result<Value> {
+        use crate::value::{SyncInner, TaskInner};
+        {
+            let mut inner = s.borrow_mut();
+            let SyncInner::TaskGroup { count, .. } = &mut *inner else {
+                return Err(RuntimeError::type_err("expected TaskGroup"));
+            };
+            *count = count.saturating_add(1);
+        }
+        // 必须在入队前挂上 task_group，避免 M:N 下竞态漏记 done。
+        let mut pending = TaskInner::pending(callable, vec![]);
+        pending.task_group = Some(s.clone());
+        let task = Shared::new(pending);
+        self.enqueue_task(task.clone());
+        Ok(Value::Task(task))
+    }
+
+    pub(crate) fn taskgroup_wait(
+        &mut self,
+        s: &Shared<crate::value::SyncInner>,
+    ) -> Result<Value> {
+        use crate::value::SyncInner;
+        loop {
+            let first_error = {
+                let mut inner = s.borrow_mut();
+                let SyncInner::TaskGroup { count, first_error } = &mut *inner else {
+                    return Err(RuntimeError::type_err("expected TaskGroup"));
+                };
+                if *count == 0 {
+                    first_error.take()
+                } else {
+                    drop(inner);
+                    self.wait_or_deadlock("TaskGroup.wait blocked")?;
+                    if self.block_suspend {
+                        return Ok(Value::None);
+                    }
+                    continue;
+                }
+            };
+            if let Some(err) = first_error {
+                self.throw_value(err)?;
+            }
+            return Ok(Value::None);
+        }
+    }
+
+    fn taskgroup_notify_finished(
+        &mut self,
+        task: &Shared<crate::value::TaskInner>,
+        failed: Option<Value>,
+    ) {
+        use crate::value::SyncInner;
+        let Some(group) = task.borrow().task_group.clone() else {
+            return;
+        };
+        // 只通知一次：清掉归属，避免重复 done。
+        task.borrow_mut().task_group = None;
+        let hit_zero = match &mut *group.borrow_mut() {
+            SyncInner::TaskGroup { count, first_error } => {
+                if let Some(err) = failed {
+                    if first_error.is_none() {
+                        *first_error = Some(err);
+                    }
+                }
+                if *count > 0 {
+                    *count -= 1;
+                }
+                *count == 0
+            }
+            _ => false,
+        };
+        if hit_zero {
+            self.mn.notify_all();
         }
     }
 
@@ -6994,17 +7354,22 @@ impl Vm {
     pub(crate) fn cond_wait(
         &mut self,
         cond: &Shared<crate::value::SyncInner>,
-        guard: &Shared<MutexInner>,
+        guard: &Shared<crate::value::MutexGuardInner>,
     ) -> Result<Value> {
         use crate::value::SyncInner;
         let id = cond.as_ptr() as usize;
-        let resume = matches!(
+        let resume_wait = matches!(
             self.sync_wait_resume,
             Some(SyncWaitResume::Cond { id: rid }) if rid == id
         );
-        if resume {
+        let resume_relock = matches!(
+            self.sync_wait_resume,
+            Some(SyncWaitResume::CondRelock { id: rid }) if rid == id
+        );
+        if resume_wait || resume_relock {
             self.sync_wait_resume = None;
-        } else {
+        }
+        if !resume_wait && !resume_relock {
             // 登记 waiter，释放锁
             {
                 let mut inner = cond.borrow_mut();
@@ -7013,47 +7378,67 @@ impl Vm {
                 };
                 *waiters += 1;
             }
-            guard.borrow_mut().locked = false;
+            guard.borrow().release();
         }
 
-        // 等待信号
-        loop {
-            let got = {
-                let mut inner = cond.borrow_mut();
-                let SyncInner::Cond { signals, waiters } = &mut *inner else {
-                    return Err(RuntimeError::type_err("expected Cond"));
+        // CondRelock：信号已消耗，直接重新加锁。
+        if !resume_relock {
+            // 等待信号
+            loop {
+                let got = {
+                    let mut inner = cond.borrow_mut();
+                    let SyncInner::Cond { signals, waiters } = &mut *inner else {
+                        return Err(RuntimeError::type_err("expected Cond"));
+                    };
+                    if *signals > 0 {
+                        *signals -= 1;
+                        *waiters -= 1;
+                        true
+                    } else {
+                        false
+                    }
                 };
-                if *signals > 0 {
-                    *signals -= 1;
-                    *waiters -= 1;
-                    true
-                } else {
-                    false
+                if got {
+                    break;
                 }
-            };
-            if got {
-                break;
-            }
-            match self.wait_or_deadlock("Cond.wait blocked") {
-                Ok(()) => {
-                    if self.block_suspend {
-                        // 保持 waiter 登记；恢复后跳过再次 +1 / unlock。
-                        self.sync_wait_resume = Some(SyncWaitResume::Cond { id });
-                        return Ok(Value::None);
+                match self.wait_or_deadlock("Cond.wait blocked") {
+                    Ok(()) => {
+                        if self.block_suspend {
+                            // 保持 waiter 登记；恢复后跳过再次 +1 / unlock。
+                            self.sync_wait_resume = Some(SyncWaitResume::Cond { id });
+                            return Ok(Value::None);
+                        }
                     }
-                }
-                Err(e) => {
-                    if let SyncInner::Cond { waiters, .. } = &mut *cond.borrow_mut() {
-                        *waiters = (*waiters - 1).max(0);
+                    Err(e) => {
+                        if let SyncInner::Cond { waiters, .. } = &mut *cond.borrow_mut() {
+                            *waiters = (*waiters - 1).max(0);
+                        }
+                        self.sync_wait_resume = None;
+                        return Err(e);
                     }
-                    self.sync_wait_resume = None;
-                    return Err(e);
                 }
             }
         }
 
-        // 重新加锁
-        self.mutex_lock(guard)?;
+        // 重新加锁并复活当前守卫（勿新建 Guard 再立刻 Drop，否则会再次 unlock）。
+        loop {
+            {
+                let mutex = guard.borrow().mutex();
+                let mut inner = mutex.borrow_mut();
+                if !inner.locked {
+                    inner.locked = true;
+                    drop(inner);
+                    guard.borrow().clear_released();
+                    self.sync_wait_resume = None;
+                    break;
+                }
+            }
+            self.wait_or_deadlock("mutex lock blocked")?;
+            if self.block_suspend {
+                self.sync_wait_resume = Some(SyncWaitResume::CondRelock { id });
+                return Ok(Value::None);
+            }
+        }
         Ok(Value::None)
     }
 
@@ -7073,6 +7458,18 @@ impl Drop for Vm {
             self.mn.shutdown();
         }
     }
+}
+
+/// 协作 sleep 秒数：NaN / 负 → 0；+Inf 与过大有限值钳到上界（可安全 `from_secs_f64`）。
+fn sanitize_coop_sleep_secs(secs: f64) -> f64 {
+    const MAX_SECS: f64 = crate::concurrency::MAX_TIMEOUT_SECS;
+    if secs.is_nan() || secs <= 0.0 {
+        return 0.0;
+    }
+    if !secs.is_finite() {
+        return MAX_SECS;
+    }
+    secs.min(MAX_SECS)
 }
 
 fn unpack_genexpr_args_vm(item: Value, arity: usize) -> Result<Vec<Value>> {
@@ -7106,13 +7503,20 @@ fn unpack_genexpr_args_vm(item: Value, arity: usize) -> Result<Vec<Value>> {
 }
 
 fn compare_num(a: &Value, b: &Value) -> Result<i32> {
+    match compare_values(a, b)? {
+        std::cmp::Ordering::Less => Ok(-1),
+        std::cmp::Ordering::Equal => Ok(0),
+        std::cmp::Ordering::Greater => Ok(1),
+    }
+}
+
+fn compare_values(a: &Value, b: &Value) -> Result<std::cmp::Ordering> {
     match (a, b) {
-        (Value::Num(x), Value::Num(y)) => Ok(match x.cmp_num(y) {
-            std::cmp::Ordering::Less => -1,
-            std::cmp::Ordering::Equal => 0,
-            std::cmp::Ordering::Greater => 1,
-        }),
-        _ => Err(RuntimeError::type_err("comparison requires num")),
+        (Value::Num(x), Value::Num(y)) => Ok(x.cmp_num(y)),
+        (Value::Text(x), Value::Text(y)) => Ok(x.as_str().cmp(y.as_str())),
+        _ => Err(RuntimeError::type_err(
+            "comparison requires num or text (lexicographic)",
+        )),
     }
 }
 
@@ -7431,6 +7835,7 @@ fn try_variant_case_convert(vm: &Vm, case_struct_name: &str, value: &Value) -> O
     let parent_variant = vm
         .variant_defs
         .values()
+        .into_iter()
         .find(|vdef| vdef.cases.iter().any(|c| c.struct_name == case_struct_name))?;
     let Value::Variant(v) = value else {
         return Some(Err(type_registry::type_convert_error(case_struct_name, value)));
@@ -7467,7 +7872,6 @@ fn wrap_variant_payload(
     let vdef = vm
         .variant_defs
         .get(inst_name)
-        .cloned()
         .ok_or_else(|| RuntimeError::msg(format!("unknown variant: {inst_name}")))?;
     let case_idx = match &payload {
         Value::Struct(s) => vdef
@@ -7500,7 +7904,6 @@ fn variant_type_attr(vm: &mut Vm, variant_name: &str, field: &str) -> Result<Val
     let vdef = vm
         .variant_defs
         .get(variant_name)
-        .cloned()
         .ok_or_else(|| RuntimeError::msg(format!("unknown variant: {variant_name}")))?;
     if let Some(case) = vdef.cases.iter().find(|c| c.name == field) {
         let struct_name = case.struct_name.clone();
@@ -7517,7 +7920,6 @@ fn enum_type_attr(vm: &mut Vm, enum_name: &str, field: &str) -> Result<Value> {
     let def = vm
         .enum_defs
         .get(enum_name)
-        .cloned()
         .ok_or_else(|| RuntimeError::msg(format!("unknown enum: {enum_name}")))?;
     let method_name = format!("{enum_name}.{field}");
     if let Some(func) = vm.functions.get(&method_name) {
@@ -7687,7 +8089,6 @@ fn make_struct(
     let def = vm
         .struct_defs
         .get(name)
-        .cloned()
         .ok_or_else(|| RuntimeError::msg(format!("unknown struct: {name}")))?;
     let allow_partial = def.fields.len() == 2
         && def.fields.get(1).map(|f| f.as_str()) == Some("traceback")
@@ -7868,20 +8269,19 @@ fn specialize_generic_runtime(
     type_args: Vec<Value>,
 ) -> Result<Arc<FunctionObject>> {
     let ctx = crate::protocol::TypeCheckContext::from_vm(vm);
-    let mut cache: HashMap<String, Arc<FunctionObject>> = vm
-        .functions
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let mut cache: HashMap<String, Arc<FunctionObject>> =
+        vm.functions.snapshot_map().into_iter().collect();
     let func = crate::codegen::Generator::specialize_generic_template(
         template,
         type_args,
         &ctx,
         &mut cache,
     )?;
-    for (k, v) in cache {
-        vm.functions.entry(k).or_insert(v);
-    }
+    vm.functions.with_mut(|m| {
+        for (k, v) in cache {
+            m.entry(k).or_insert(v);
+        }
+    });
     Ok(func)
 }
 

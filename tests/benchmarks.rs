@@ -187,14 +187,18 @@ fn run_parallel_primes(workers: usize) -> optive::value::Value {
 }
 
 /// Run ignored benchmarks: `cargo test --test benchmarks -- --ignored --nocapture`
+fn run_assert_bench(name: &str, runs: usize, src: &str, expect: &str) {
+    let stats = BenchStats::run(name, runs, || {
+        let v = run_source(src).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(v.display_string(), expect, "{name}");
+    });
+    stats.report();
+}
+
 #[test]
 #[ignore = "slow benchmark; run with --ignored"]
 fn bench_fib_30() {
-    let stats = BenchStats::run("fib(30)", 20, || {
-        let v = run_source(FIB_SRC).expect("fib");
-        assert_eq!(v.display_string(), "832040");
-    });
-    stats.report();
+    run_assert_bench("fib(30)", 20, FIB_SRC, "832040");
 }
 
 #[test]
@@ -214,31 +218,19 @@ fn bench_fib_30_vm_only() {
 #[test]
 #[ignore = "slow benchmark; run with --ignored"]
 fn bench_empty_loop_1m() {
-    let stats = BenchStats::run("empty_loop(1_000_000)", 10, || {
-        let v = run_source(EMPTY_LOOP_SRC).expect("loop");
-        assert_eq!(v.display_string(), "42");
-    });
-    stats.report();
+    run_assert_bench("empty_loop(1_000_000)", 10, EMPTY_LOOP_SRC, "42");
 }
 
 #[test]
 #[ignore = "slow benchmark; run with --ignored"]
 fn bench_arith_loop_100k() {
-    let stats = BenchStats::run("arith_loop(100_000)", 15, || {
-        let v = run_source(ARITH_LOOP_SRC).expect("arith");
-        assert_eq!(v.display_string(), "100000");
-    });
-    stats.report();
+    run_assert_bench("arith_loop(100_000)", 15, ARITH_LOOP_SRC, "100000");
 }
 
 #[test]
 #[ignore = "slow benchmark; run with --ignored"]
 fn bench_function_call_50k() {
-    let stats = BenchStats::run("function_call_loop(50_000)", 15, || {
-        let v = run_source(CALL_LOOP_SRC).expect("calls");
-        assert_eq!(v.display_string(), "50000");
-    });
-    stats.report();
+    run_assert_bench("function_call_loop(50_000)", 15, CALL_LOOP_SRC, "50000");
 }
 
 #[test]

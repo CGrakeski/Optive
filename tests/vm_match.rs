@@ -87,3 +87,23 @@ match (99) {
     );
     assert_eq!(v.display_string(), "none");
 }
+
+#[test]
+fn match_tuple_literal_and_bind() {
+    assert_num(
+        r#"
+let ev = ("done", 42)
+match (ev) {
+  case ("done", rep) { rep }
+} else {
+  0
+}
+"#,
+        "42",
+    );
+}
+
+#[test]
+fn hex_and_binary_literals() {
+    assert_num("0x10 + 0b1010", "26");
+}

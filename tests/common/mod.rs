@@ -80,6 +80,54 @@ pub fn assert_num(source: &str, expected: &str) {
     assert_eq!(num(source), expected, "source: {source}");
 }
 
+/// 固定 workers=1（M:1）的数值断言：协作顺序/挂起让出类断言专用，
+/// 不受 OPTIVE_WORKERS 环境影响（M:N 真并行下此类顺序保证不成立）。
+pub fn assert_num_w1(source: &str, expected: &str) {
+    let mut vm = optive::vm::Vm::with_workers(1);
+    let v = optive::run_source_in_vm(&mut vm, source, "<test>").expect("run");
+    match v {
+        Value::Num(n) => assert_eq!(n.to_string(), expected, "source: {source}"),
+        other => panic!("expected num {expected}, got {other:?}; source: {source}"),
+    }
+}
+
+/// 固定 workers=1 跑源码（M:1 协作语义）。
+pub fn value_w1(source: &str) -> Value {
+    let mut vm = optive::vm::Vm::with_workers(1);
+    optive::run_source_in_vm(&mut vm, source, "<test>").expect("run")
+}
+
+pub fn assert_text_w1(source: &str, expected: &str) {
+    let v = value_w1(source);
+    match &v {
+        Value::Text(s) => assert_eq!(s, expected, "source: {source}"),
+        Value::TypeRef(s) => assert_eq!(s, expected, "source: {source}"),
+        Value::TypeSpec(_) => assert_eq!(v.display_string(), expected, "source: {source}"),
+        other => panic!(
+            "expected text {expected:?}, got {}; source: {source}",
+            other.display_string()
+        ),
+    }
+}
+
+pub fn assert_bool_w1(source: &str, expected: bool) {
+    match value_w1(source) {
+        Value::Bool(b) => assert_eq!(b, expected, "source: {source}"),
+        other => panic!(
+            "expected bool {expected}, got {}; source: {source}",
+            other.display_string()
+        ),
+    }
+}
+
+pub fn run_err_w1(source: &str) {
+    let mut vm = optive::vm::Vm::with_workers(1);
+    assert!(
+        optive::run_source_in_vm(&mut vm, source, "<test>").is_err(),
+        "expected runtime error for: {source}"
+    );
+}
+
 pub fn assert_bool(source: &str, expected: bool) {
     assert_eq!(bool_val(source), expected, "source: {source}");
 }

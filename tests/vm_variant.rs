@@ -97,3 +97,23 @@ run()
         "9",
     );
 }
+
+#[test]
+fn match_typed_variant_direct() {
+    // B9：`ParseOutcome.Ok(...)` 应直接用 `case ParseOutcome.Ok(v)`，无需外层再包一层。
+    assert_text(
+        r#"
+variant ParseOutcome {
+    typed Ok(value: text)
+    typed Err(msg: text)
+}
+let o = ParseOutcome.Ok("ok")
+match (o) {
+    case ParseOutcome.Ok(v) { v }
+} else {
+    "other"
+}
+"#,
+        "ok",
+    );
+}

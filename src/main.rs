@@ -7,15 +7,16 @@ use std::process;
 
 use std::borrow::Cow;
 
-use optive::{repl_needs_continuation, run_source_in_vm, vm::DepPackage, vm::Vm};
+use optive::{repl_needs_continuation, run_source_in_vm, vm::Vm};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
 use rustyline::history::DefaultHistory;
 use rustyline::{Completer, Editor, Helper, Hinter, Validator};
 
 use cli::color;
-use cli::lock::ROOT_PARENT;
-use cli::resolve::{DepBinding, EnsureResult};
+use cli::resolve::{EnsureResult};
+use optive::caps::Capabilities;
+use crate::cli::debug_cmd::inject_dep_map;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const REPL_PRIMARY: &str = ">>> ";
@@ -99,24 +100,30 @@ fn main() {
                 return;
             }
             "up" => {
-                let (caps, rest) = match cli::caps::parse_caps(&args[2..]) {
+                let (caps, rest) = parse_caps_or_exit(&args);
+                let (path, script_args) = match split_project_and_script_args(&rest) {
                     Ok(v) => v,
-                    Err(e) => { color::eprint_error(format!("Error: {e}")); process::exit(2); }
+                    Err(e) => {
+                        color::eprint_error(format!("Error: {e}"));
+                        process::exit(2);
+                    }
                 };
-                let path = rest.first().map(Path::new);
-                if let Err(e) = cmd_up(path, caps) {
+                if let Err(e) = cmd_up(path.as_deref(), caps, &script_args) {
                     color::eprint_error(format!("Error: {e}"));
                     process::exit(1);
                 }
                 return;
             }
             "run" => {
-                let (caps, rest) = match cli::caps::parse_caps(&args[2..]) {
+                let (caps, rest) = parse_caps_or_exit(&args);
+                let (path, script_args) = match split_project_and_script_args(&rest) {
                     Ok(v) => v,
-                    Err(e) => { color::eprint_error(format!("Error: {e}")); process::exit(2); }
+                    Err(e) => {
+                        color::eprint_error(format!("Error: {e}"));
+                        process::exit(2);
+                    }
                 };
-                let path = rest.first().map(Path::new);
-                if let Err(e) = cmd_run(path, caps) {
+                if let Err(e) = cmd_run(path.as_deref(), caps, &script_args) {
                     color::eprint_error(format!("Error: {e}"));
                     process::exit(1);
                 }
@@ -174,10 +181,7 @@ fn main() {
             }
             path => {
                 if path.ends_with(".tive") || Path::new(path).is_file() {
-                    let (caps, _rest) = match cli::caps::parse_caps(&args[2..]) {
-                        Ok(v) => v,
-                        Err(e) => { color::eprint_error(format!("Error: {e}")); process::exit(2); }
-                    };
+                    let (caps, _rest) = parse_caps_or_exit(&args);
                     run_script_file(path, caps);
                     return;
                 }
@@ -189,6 +193,17 @@ fn main() {
     }
 
     repl();
+}
+
+fn parse_caps_or_exit(args: &Vec<String>) -> (Capabilities, Vec<String>) {
+    let (caps, rest) = match cli::caps::parse_caps(&args[2..]) {
+        Ok(v) => v,
+        Err(e) => {
+            color::eprint_error(format!("Error: {e}"));
+            process::exit(2);
+        }
+    };
+    (caps, rest)
 }
 
 fn cmd_new(name: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -244,7 +259,11 @@ fn cmd_fmt(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn cmd_run(path: Option<&Path>, caps: optive::caps::Capabilities) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_run(
+    path: Option<&Path>,
+    caps: Capabilities,
+    script_args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
     let project = cli::manifest::find_project(path)?;
     print_project_header(&project);
     let ensured = cli::deps::ensure_for_run(&project)?;
@@ -257,11 +276,21 @@ fn cmd_run(path: Option<&Path>, caps: optive::caps::Capabilities) -> Result<(), 
         .display()
         .to_string();
     color::status_line(&format!("Running {entry_display}"));
-    run_script_path_with_deps(&entry, &project.root, &ensured, caps)?;
+    run_script_path_with_deps(
+        &entry,
+        &project.root,
+        &ensured,
+        caps,
+        Some(build_script_argv(&entry_display, script_args)),
+    )?;
     Ok(())
 }
 
-fn cmd_up(path: Option<&Path>, caps: optive::caps::Capabilities) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_up(
+    path: Option<&Path>,
+    caps: Capabilities,
+    script_args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
     let project = cli::manifest::find_project(path)?;
     print_project_header(&project);
     color::status_line("Updating dependencies…");
@@ -275,8 +304,60 @@ fn cmd_up(path: Option<&Path>, caps: optive::caps::Capabilities) -> Result<(), B
         .display()
         .to_string();
     color::status_line(&format!("Running {entry_display}"));
-    run_script_path_with_deps(&entry, &project.root, &ensured, caps)?;
+    run_script_path_with_deps(
+        &entry,
+        &project.root,
+        &ensured,
+        caps,
+        Some(build_script_argv(&entry_display, script_args)),
+    )?;
     Ok(())
+}
+
+/// 拆分 `run`/`up` 剩余参数：可选项目路径 + `--` 后的脚本参数。
+///
+/// - `Optive run -- a b` → path=None（cwd），script_args=[a,b]
+/// - `Optive run . -- a` → path=Some(.), script_args=[a]
+/// - `Optive run .` → path=Some(.), script_args=[]
+/// - `--` 前多于一个操作数 → 用法错误
+fn split_project_and_script_args(
+    rest: &[String],
+) -> Result<(Option<PathBuf>, Vec<String>), String> {
+    if let Some(dash) = rest.iter().position(|a| a == "--") {
+        if dash > 1 {
+            return Err(format!(
+                "too many arguments before '--' (expected at most one project path); got: {}",
+                rest[..dash].join(" ")
+            ));
+        }
+        let path = if dash == 0 {
+            None
+        } else {
+            Some(PathBuf::from(&rest[0]))
+        };
+        let script_args = rest[dash + 1..].to_vec();
+        Ok((path, script_args))
+    } else if rest.is_empty() {
+        Ok((None, Vec::new()))
+    } else if rest.len() == 1 {
+        Ok((Some(PathBuf::from(&rest[0])), Vec::new()))
+    } else {
+        Err(format!(
+            "too many arguments (expected project path or 'run -- <script args>'); got: {}",
+            rest.join(" ")
+        ))
+    }
+}
+
+fn build_script_argv(entry_display: &str, script_args: &[String]) -> Vec<String> {
+    let exe = env::args()
+        .next()
+        .unwrap_or_else(|| "Optive".to_string());
+    let mut argv = Vec::with_capacity(2 + script_args.len());
+    argv.push(exe);
+    argv.push(entry_display.to_string());
+    argv.extend(script_args.iter().cloned());
+    argv
 }
 
 fn cmd_update(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -461,60 +542,52 @@ fn print_ensure_report(ensured: &EnsureResult) {
     }
 }
 
-fn inject_dep_map(vm: &mut Vm, ensured: &EnsureResult, project_root: &Path) {
-    vm.dep_map.clear();
-    for ((parent, name), DepBinding { path, id }) in &ensured.dep_map {
-        vm.dep_map.insert(
-            (parent.clone(), name.clone()),
-            DepPackage {
-                path: path.clone(),
-                id: id.clone(),
-            },
-        );
-    }
-    vm.current_package_id = ROOT_PARENT.to_string();
-    vm.package_root = Some(project_root.to_path_buf());
-}
+
 
 fn run_script_path_with_deps(
     path: &Path,
     project_root: &Path,
     ensured: &EnsureResult,
-    caps: optive::caps::Capabilities,
+    caps: Capabilities,
+    argv_override: Option<Vec<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let source = fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let file = path.to_string_lossy().to_string();
-    run_in_vm(&source, &file, caps, |vm| inject_dep_map(vm, ensured, project_root))
+    run_in_vm(&source, &file, caps, argv_override, |vm| {
+        inject_dep_map(vm, ensured, project_root)
+    })
 }
 
-fn run_script_file(path: &str, caps: optive::caps::Capabilities) {
+fn run_script_file(path: &str, caps: Capabilities) {
     if let Err(e) = run_script_path(Path::new(path), caps) {
         color::eprint_error(e.to_string());
         process::exit(1);
     }
 }
 
-fn run_script_path(path: &Path, caps: optive::caps::Capabilities) -> Result<(), Box<dyn std::error::Error>> {
+fn run_script_path(path: &Path, caps: Capabilities) -> Result<(), Box<dyn std::error::Error>> {
     let source = fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let file = path.to_string_lossy().to_string();
-    run_in_vm(&source, &file, caps, |_| {})
+    run_in_vm(&source, &file, caps, None, |_| {})
 }
 
-fn run_inline_source(source: &str, caps: optive::caps::Capabilities) -> Result<(), Box<dyn std::error::Error>> {
-    run_in_vm(source, "<string>", caps, |_| {})
+fn run_inline_source(source: &str, caps: Capabilities) -> Result<(), Box<dyn std::error::Error>> {
+    run_in_vm(source, "<string>", caps, None, |_| {})
 }
 
 /// 公共 VM 执行入口：创建 VM、设置能力、运行源码、打印非 None 结果。
 fn run_in_vm(
     source: &str,
     file: &str,
-    caps: optive::caps::Capabilities,
+    caps: Capabilities,
+    argv_override: Option<Vec<String>>,
     setup: impl FnOnce(&mut Vm),
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut vm = Vm::new();
     vm.caps = caps;
+    vm.argv_override = argv_override;
     setup(&mut vm);
     match run_source_in_vm(&mut vm, source, file) {
         Ok(v) => {
@@ -535,8 +608,8 @@ fn print_help() {
     println!("  Optive <script.tive>           Run a script");
     println!("  Optive -c <code>               Run code from argument (multi-line OK)");
     println!("  Optive new <ProjectName>       Create a new project");
-    println!("  Optive run [path]              Ensure deps (strict lock) + run entry");
-    println!("  Optive up [path]               update + run");
+    println!("  Optive run [path] [-- args…]   Ensure deps (strict lock) + run entry");
+    println!("  Optive up [path] [-- args…]    update + run");
     println!("  Optive add <git-url> […]       Add dependency (default: pin tip commit)");
     println!("  Optive remove <name>           Remove dependency");
     println!("  Optive update [name] [--dry-run] [-v]");

@@ -67,7 +67,7 @@ Optive up                                 # update + run（跟随 tip）
 |------|------|:---:|
 | `Optive.toml` | **意图**：声明依赖（URL、版本约束、是否跟随 tip） | ✅ |
 | `optive.lock` | **复现**：锁定每个依赖到具体 commit，全平台一致 | ✅ |
-| `Optive.cache` | **本地**：路径指针 + 校验和，加速冷启动 | ❌（加入 `.gitignore`） |
+| `Optive.cache` | **本地**：依赖 tip/id 小抄（**不是**源码/字节码缓存；改 `src/*.tive` 下次 `run` 会重新读盘编译） | ❌（加入 `.gitignore`） |
 
 依赖本体存在全局 `pack/` 目录（内容寻址），由 `index.db`（SQLite）索引，多个项目共享。详见 [`docs/deps-strategy.md`](docs/deps-strategy.md) 与 [`docs/deps-tutorial.md`](docs/deps-tutorial.md)。
 

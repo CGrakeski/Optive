@@ -579,6 +579,31 @@ fn pattern_to_ast(pat: &Pattern) -> RuntimeAstNode {
             }
             node
         }
+        Pattern::Tuple(elems) => {
+            let mut node = RuntimeAstNode {
+                kind: AstNodeKind::MatchPattern,
+                text: "Tuple".into(),
+                ..default_node()
+            };
+            for el in elems {
+                node.children.push(match el {
+                    PatternElem::Bind(n) => RuntimeAstNode {
+                        kind: AstNodeKind::MatchPattern,
+                        text: "Bind".into(),
+                        binding_names: vec![n.clone()],
+                        ..default_node()
+                    },
+                    PatternElem::Nested(p) => pattern_to_ast(p),
+                    PatternElem::Value(e) => RuntimeAstNode {
+                        kind: AstNodeKind::MatchPattern,
+                        text: "Expr".into(),
+                        slot_a: Some(Box::new(ast_from_expr(e))),
+                        ..default_node()
+                    },
+                });
+            }
+            node
+        }
         Pattern::Struct { type_name, fields } => RuntimeAstNode {
             kind: AstNodeKind::MatchPattern,
             text: "Struct".into(),
@@ -1128,6 +1153,20 @@ fn ast_to_pattern(node: &RuntimeAstNode) -> Result<Pattern> {
                 })
                 .collect::<Result<_>>()?,
         )),
+        "Tuple" => Ok(Pattern::Tuple(
+            node.children
+                .iter()
+                .map(|c| match c.text.as_str() {
+                    "Bind" => Ok(PatternElem::Bind(
+                        c.binding_names.first().cloned().unwrap_or_default(),
+                    )),
+                    "Expr" => Ok(PatternElem::Value(Box::new(ast_to_expr(
+                        c.slot_a.as_deref().ok_or_else(|| RuntimeError::msg("pattern"))?,
+                    )?))),
+                    _ => Ok(PatternElem::Nested(ast_to_pattern(c)?)),
+                })
+                .collect::<Result<_>>()?,
+        )),
         "Struct" => Ok(Pattern::Struct {
             type_name: node.hygienic_names.first().cloned().unwrap_or_default(),
             fields: node.binding_names.clone(),
@@ -1331,6 +1370,46 @@ pub fn clone_ast_value(v: &Value) -> Result<Value> {
     Ok(Value::RuntimeAst(Arc::new(value_as_ast(v)?)))
 }
 
+/// 一元 AST 包装：校验 arity 后调用。
+pub fn with_arity1(
+    name: &str,
+    args: &[Value],
+    f: impl FnOnce(&Value) -> Result<Value>,
+) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(RuntimeError::type_err(format!("{name} requires 1 argument")));
+    }
+    f(&args[0])
+}
+
+/// 二元 AST 包装：`(args[0], args[1])` 自然顺序。
+pub fn with_arity2(
+    name: &str,
+    args: &[Value],
+    f: impl FnOnce(&Value, &Value) -> Result<Value>,
+) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(RuntimeError::type_err(format!(
+            "{name} requires 2 arguments"
+        )));
+    }
+    f(&args[0], &args[1])
+}
+
+/// 二元 AST 包装：管道风格，实参顺序翻转 `(args[1], args[0])`。
+pub fn with_arity2_flip(
+    name: &str,
+    args: &[Value],
+    f: impl FnOnce(&Value, &Value) -> Result<Value>,
+) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(RuntimeError::type_err(format!(
+            "{name} requires 2 arguments"
+        )));
+    }
+    f(&args[1], &args[0])
+}
+
 pub fn compose_ast_type_convert(type_ast: &Value, value_ast: &Value) -> Result<Value> {
     let mut node = RuntimeAstNode {
         kind: AstNodeKind::TypeConvert,
@@ -1508,7 +1587,6 @@ fn make_struct_instance(vm: &Vm, name: &str, slots: Vec<Value>) -> Result<Value>
     let def = vm
         .struct_defs
         .get(name)
-        .cloned()
         .ok_or_else(|| RuntimeError::msg(format!("unknown struct type: {name}")))?;
     Ok(Value::Struct(Arc::new(StructInstance {
         def,
@@ -1568,7 +1646,7 @@ pub fn register_ast_struct_types(vm: &mut Vm) {
     ];
 
     for (name, base, fields) in defs {
-        vm.struct_defs.entry(name.to_string()).or_insert_with(|| {
+        vm.struct_defs.entry_or_insert_with(name.to_string(), || {
             Arc::new(StructDef {
                 name: name.to_string(),
                 base: base.map(str::to_string),

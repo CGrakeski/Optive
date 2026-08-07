@@ -151,7 +151,8 @@ pub enum Instruction {
     GoValue,
     /// 若为 Task 则 join；否则原样留下。
     Await,
-    /// 协作式挂起（`suspend` / 调度器预算）。
+    /// 协作式挂起（净效应 0）。表达式位须由 codegen `emit_suspend_expr` 补 `Push(None)`；
+    /// select idle 等控制流位用裸 `Suspend`（`emit_suspend_idle`），见 `stack_effect`。
     Suspend,
     /// 生成器产出：弹出栈顶作为下一迭代值并挂起。
     Yield,
@@ -165,8 +166,10 @@ pub enum Instruction {
     SelectPollTask,
     /// 秒数 → 截止时间戳（毫秒）。
     MakeDeadline,
-    /// 截止时间戳 → ready:bool。
+    /// 截止时间戳 → ready:bool（纯轮询，不 sleep）。
     SelectPollDeadline,
+    /// 栈上 N 个截止时间：让出调度后，睡到最近截止（有上限），避免挂起饿死 sleep case。
+    SelectIdle(usize),
 }
 
 /// 将跳转指令中的标签 id 就地解析为绝对 PC。

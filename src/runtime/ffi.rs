@@ -106,7 +106,10 @@ impl FfiRuntimeConfig {
     pub fn set_threads(&self, n: usize) {
         self.threads.store(n, Ordering::Release);
         if n > 0 {
-            crate::ffi_pool::resize_pool(n);
+            // 预热失败仅告警；真正提交调用时 submit_call 会重试并向上报错。
+            if let Err(e) = crate::ffi_pool::resize_pool(n) {
+                eprintln!("optive: FFI 线程池预热失败：{}", e.message());
+            }
         }
     }
 }
@@ -845,6 +848,19 @@ fn eval_wrapper_expr(vm: &mut Vm, expr: &crate::ast::Expr, raw: Value) -> Result
                 call_args.push(eval_wrapper_expr(vm, &a.value, raw.clone())?);
             }
             vm.call_value(c, call_args)
+        }
+        ExprKind::Member { object, field } => {
+            let base = eval_wrapper_expr(vm, object, raw.clone())?;
+            match base {
+                Value::Module(m) => m
+                    .borrow()
+                    .get_attr(field)
+                    .ok_or_else(|| {
+                        RuntimeError::attr_err(format!("module has no export '{field}'"))
+                    }),
+                Value::TypeRef(n) => Ok(Value::type_ref(format!("{n}.{field}"))),
+                other => vm.get_attr_value(&other, field),
+            }
         }
         other => Err(RuntimeError::type_err(format!(
             "unsupported extern return wrapper expression: {other:?}"

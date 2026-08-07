@@ -742,7 +742,22 @@ impl Parser {
         }
         loop {
             match self.tokens.get(i).map(|t| t.kind) {
-                Some(TokenKind::KwFunc | TokenKind::KwDo | TokenKind::KwWith) => return true,
+                Some(TokenKind::KwFunc | TokenKind::KwDo) => return true,
+                Some(TokenKind::KwWith) => {
+                    // 仅 `with make` 是装饰器目标；`with (` 是 with 语句。
+                    let mut j = i + 1;
+                    while matches!(
+                        self.tokens.get(j).map(|t| t.kind),
+                        Some(
+                            TokenKind::Newline
+                                | TokenKind::LineComment
+                                | TokenKind::BlockComment
+                        )
+                    ) {
+                        j += 1;
+                    }
+                    return self.tokens.get(j).map(|t| t.kind) == Some(TokenKind::KwMake);
+                }
                 Some(TokenKind::Identifier) => {
                     if self.is_stmt_keyword_token_at(i) {
                         return false;
@@ -1067,20 +1082,31 @@ impl Parser {
         })
     }
 
-    fn parse_macro_param_list(&mut self) -> Result<Vec<MacroParam>, ParseError> {
+    /// 逗号分隔列表，允许尾逗号；在 `end` token 处结束。
+    fn parse_comma_list_until<T>(
+        &mut self,
+        end: TokenKind,
+        parse_item: fn(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<Vec<T>, ParseError> {
         self.skip_newlines();
-        if self.check(TokenKind::RParen) {
+        if self.check(end) {
             return Ok(Vec::new());
         }
-        let mut params = vec![self.parse_macro_param()?];
+        let mut items = vec![parse_item(self)?];
         while self.match_kind(TokenKind::Comma) {
             self.skip_newlines();
-            if self.check(TokenKind::RParen) {
+            if self.check(end) {
                 break;
             }
-            params.push(self.parse_macro_param()?);
+            items.push(parse_item(self)?);
         }
-        Ok(params)
+        // 无尾逗号时也跳过换行，允许右括号/结束符落在下一行。
+        self.skip_newlines();
+        Ok(items)
+    }
+
+    fn parse_macro_param_list(&mut self) -> Result<Vec<MacroParam>, ParseError> {
+        self.parse_comma_list_until(TokenKind::RParen, Self::parse_macro_param)
     }
 
     fn parse_macro_param(&mut self) -> Result<MacroParam, ParseError> {
@@ -1368,9 +1394,12 @@ impl Parser {
         self.expect(TokenKind::LParen, "expected '(' after for")?;
         let mut items = Vec::new();
         loop {
-            let name = self
-                .expect(TokenKind::Identifier, "expected loop variable")?
-                .value;
+            let name = if self.match_kind(TokenKind::Placeholder) {
+                "_".into()
+            } else {
+                self.expect(TokenKind::Identifier, "expected loop variable")?
+                    .value
+            };
             self.expect(TokenKind::KwIn, "expected 'in'")?;
             let iterable = self.parse_expr()?;
             items.push(ForItem { name, iterable });
@@ -1525,15 +1554,55 @@ impl Parser {
                     fields,
                 });
             }
-            if self.tokens.get(self.pos + 1).map(|t| t.kind) == Some(TokenKind::LParen) {
+            if matches!(
+                self.tokens.get(self.pos + 1).map(|t| t.kind),
+                Some(TokenKind::LParen | TokenKind::Dot)
+            ) {
                 let expr = self.parse_postfix_no_macro()?;
                 return expr_to_pattern(expr);
             }
+            // 裸名字：值比较（与当前绑定比较），不是字段 Bind。
+            self.advance();
+            return Ok(Pattern::Value(Box::new(Expr::new(
+                self.loc_here(),
+                ExprKind::Var(name),
+            ))));
         }
         if self.match_kind(TokenKind::LParen) {
-            let expr = self.parse_expr()?;
-            self.expect(TokenKind::RParen, "expected ')' in value pattern")?;
-            return expr_to_pattern(expr);
+            self.skip_newlines();
+            if self.match_kind(TokenKind::RParen) {
+                return Ok(Pattern::Tuple(vec![]));
+            }
+            let mut elems = Vec::new();
+            let mut saw_comma = false;
+            loop {
+                elems.push(self.parse_pattern_elem()?);
+                self.skip_newlines();
+                if !self.match_kind(TokenKind::Comma) {
+                    break;
+                }
+                saw_comma = true;
+                self.skip_newlines();
+                if self.check(TokenKind::RParen) {
+                    break;
+                }
+            }
+            self.skip_newlines();
+            self.expect(TokenKind::RParen, "expected ')' in tuple pattern")?;
+            // 单元素无逗号：`(x)` 仍按值模式（与表达式一致）；`(x,)` 为一元组。
+            if elems.len() == 1 && !saw_comma {
+                match elems.into_iter().next().unwrap() {
+                    PatternElem::Bind(name) => {
+                        return Ok(Pattern::Value(Box::new(Expr::new(
+                            self.loc_here(),
+                            ExprKind::Var(name),
+                        ))));
+                    }
+                    PatternElem::Nested(p) => return Ok(p),
+                    PatternElem::Value(e) => return Ok(Pattern::Value(e)),
+                }
+            }
+            return Ok(Pattern::Tuple(elems));
         }
         Err(self.error("expected match pattern"))
     }
@@ -1545,6 +1614,19 @@ impl Parser {
             || self.check(TokenKind::LParen)
         {
             return Ok(PatternElem::Nested(self.parse_pattern_unit()?));
+        }
+        // 点访问 / 调用（`Color.Green`、`Some(1)`）：按值/构造模式解析，而非 Bind。
+        if self.check(TokenKind::Identifier)
+            && matches!(
+                self.tokens.get(self.pos + 1).map(|t| t.kind),
+                Some(TokenKind::Dot | TokenKind::LParen)
+            )
+        {
+            let expr = self.parse_postfix_no_macro()?;
+            return match expr_to_pattern(expr)? {
+                Pattern::Value(e) => Ok(PatternElem::Value(e)),
+                p => Ok(PatternElem::Nested(p)),
+            };
         }
         if self.check(TokenKind::Identifier) {
             return Ok(PatternElem::Bind(self.advance().value));
@@ -1673,19 +1755,7 @@ impl Parser {
     }
 
     fn parse_variant_field_list(&mut self) -> Result<Vec<StructField>, ParseError> {
-        self.skip_newlines();
-        if self.check(TokenKind::RParen) {
-            return Ok(Vec::new());
-        }
-        let mut fields = vec![self.parse_variant_field()?];
-        while self.match_kind(TokenKind::Comma) {
-            self.skip_newlines();
-            if self.check(TokenKind::RParen) {
-                break;
-            }
-            fields.push(self.parse_variant_field()?);
-        }
-        Ok(fields)
+        self.parse_comma_list_until(TokenKind::RParen, Self::parse_variant_field)
     }
 
     fn parse_variant_field_list_in_brace(&mut self) -> Result<Vec<StructField>, ParseError> {
@@ -2087,27 +2157,11 @@ impl Parser {
     }
 
     fn parse_or(&mut self) -> Result<Expr, ParseError> {
-        let mut expr = self.parse_and()?;
-        while self.match_kind(TokenKind::KwOr) {
-            { let __loc = expr.loc; expr = Expr::new(__loc, ExprKind::Binary {
-                op: BinaryOp::Or,
-                left: Box::new(expr),
-                right: Box::new(self.parse_and()?),
-            }); }
-        }
-        Ok(expr)
+        self.parse_left_assoc_simple(TokenKind::KwOr, BinaryOp::Or, Self::parse_and)
     }
 
     fn parse_and(&mut self) -> Result<Expr, ParseError> {
-        let mut expr = self.parse_not()?;
-        while self.match_kind(TokenKind::KwAnd) {
-            { let __loc = expr.loc; expr = Expr::new(__loc, ExprKind::Binary {
-                op: BinaryOp::And,
-                left: Box::new(expr),
-                right: Box::new(self.parse_not()?),
-            }); }
-        }
-        Ok(expr)
+        self.parse_left_assoc_simple(TokenKind::KwAnd, BinaryOp::And, Self::parse_not)
     }
 
     fn parse_not(&mut self) -> Result<Expr, ParseError> {
@@ -2126,13 +2180,28 @@ impl Parser {
     }
 
     fn parse_membership(&mut self) -> Result<Expr, ParseError> {
-        let mut expr = self.parse_is()?;
-        while self.match_kind(TokenKind::KwIn) {
-            { let __loc = expr.loc; expr = Expr::new(__loc, ExprKind::Binary {
-                op: BinaryOp::In,
-                left: Box::new(expr),
-                right: Box::new(self.parse_is()?),
-            }); }
+        self.parse_left_assoc_simple(TokenKind::KwIn, BinaryOp::In, Self::parse_is)
+    }
+
+    /// 左结合二元：`a OP b OP c`，无跳过换行。
+    fn parse_left_assoc_simple(
+        &mut self,
+        token: TokenKind,
+        op: BinaryOp,
+        next: fn(&mut Self) -> Result<Expr, ParseError>,
+    ) -> Result<Expr, ParseError> {
+        let mut expr = next(self)?;
+        while self.match_kind(token) {
+            let loc = expr.loc;
+            let right = next(self)?;
+            expr = Expr::new(
+                loc,
+                ExprKind::Binary {
+                    op,
+                    left: Box::new(expr),
+                    right: Box::new(right),
+                },
+            );
         }
         Ok(expr)
     }
@@ -2180,55 +2249,58 @@ impl Parser {
 
     /// `|` 按位或（表达式中复用 `TokenKind::Bar`；模式解析不走此层）。
     fn parse_bitor_ex(&mut self, allow_macro: bool) -> Result<Expr, ParseError> {
-        let mut expr = self.parse_bitxor_ex(allow_macro)?;
-        loop {
-            self.skip_newlines();
-            if !self.check(TokenKind::Bar) {
-                break;
-            }
-            self.advance();
-            self.skip_newlines();
-            { let __loc = expr.loc; expr = Expr::new(__loc, ExprKind::Binary {
-                op: BinaryOp::BitOr,
-                left: Box::new(expr),
-                right: Box::new(self.parse_bitxor_ex(allow_macro)?),
-            }); }
-        }
-        Ok(expr)
+        self.parse_left_assoc_token_skip_nl(
+            TokenKind::Bar,
+            BinaryOp::BitOr,
+            allow_macro,
+            Self::parse_bitxor_ex,
+        )
     }
 
     fn parse_bitxor_ex(&mut self, allow_macro: bool) -> Result<Expr, ParseError> {
-        let mut expr = self.parse_bitand_ex(allow_macro)?;
-        loop {
-            self.skip_newlines();
-            if !self.check(TokenKind::Caret) {
-                break;
-            }
-            self.advance();
-            self.skip_newlines();
-            { let __loc = expr.loc; expr = Expr::new(__loc, ExprKind::Binary {
-                op: BinaryOp::BitXor,
-                left: Box::new(expr),
-                right: Box::new(self.parse_bitand_ex(allow_macro)?),
-            }); }
-        }
-        Ok(expr)
+        self.parse_left_assoc_token_skip_nl(
+            TokenKind::Caret,
+            BinaryOp::BitXor,
+            allow_macro,
+            Self::parse_bitand_ex,
+        )
     }
 
     fn parse_bitand_ex(&mut self, allow_macro: bool) -> Result<Expr, ParseError> {
-        let mut expr = self.parse_shift_ex(allow_macro)?;
+        self.parse_left_assoc_token_skip_nl(
+            TokenKind::Ampersand,
+            BinaryOp::BitAnd,
+            allow_macro,
+            Self::parse_shift_ex,
+        )
+    }
+
+    /// 左结合二元：跳过换行后匹配单一 token。
+    fn parse_left_assoc_token_skip_nl(
+        &mut self,
+        token: TokenKind,
+        op: BinaryOp,
+        allow_macro: bool,
+        next: fn(&mut Self, bool) -> Result<Expr, ParseError>,
+    ) -> Result<Expr, ParseError> {
+        let mut expr = next(self, allow_macro)?;
         loop {
             self.skip_newlines();
-            if !self.check(TokenKind::Ampersand) {
+            if !self.check(token) {
                 break;
             }
             self.advance();
             self.skip_newlines();
-            { let __loc = expr.loc; expr = Expr::new(__loc, ExprKind::Binary {
-                op: BinaryOp::BitAnd,
-                left: Box::new(expr),
-                right: Box::new(self.parse_shift_ex(allow_macro)?),
-            }); }
+            let loc = expr.loc;
+            let right = next(self, allow_macro)?;
+            expr = Expr::new(
+                loc,
+                ExprKind::Binary {
+                    op,
+                    left: Box::new(expr),
+                    right: Box::new(right),
+                },
+            );
         }
         Ok(expr)
     }
@@ -2540,19 +2612,7 @@ impl Parser {
     }
 
     fn parse_macro_call_args(&mut self) -> Result<Vec<MacroCallArg>, ParseError> {
-        self.skip_newlines();
-        if self.check(TokenKind::RBrace) {
-            return Ok(Vec::new());
-        }
-        let mut args = vec![self.parse_macro_call_arg()?];
-        while self.match_kind(TokenKind::Comma) {
-            self.skip_newlines();
-            if self.check(TokenKind::RBrace) {
-                break;
-            }
-            args.push(self.parse_macro_call_arg()?);
-        }
-        Ok(args)
+        self.parse_comma_list_until(TokenKind::RBrace, Self::parse_macro_call_arg)
     }
 
     fn parse_macro_call_arg(&mut self) -> Result<MacroCallArg, ParseError> {
@@ -2906,10 +2966,15 @@ impl Parser {
                 let event = self.parse_expr()?;
                 self.skip_newlines();
                 let bind = if self.match_kind(TokenKind::KwAs) {
-                    let name = self
-                        .expect(TokenKind::Identifier, "expected name after 'as'")?
-                        .value;
-                    Some(name)
+                    // `_` 是 Placeholder token，不是 Identifier；codegen 对 `_` 丢弃绑定值。
+                    if self.match_kind(TokenKind::Placeholder) {
+                        Some("_".into())
+                    } else {
+                        let name = self
+                            .expect(TokenKind::Identifier, "expected name after 'as'")?
+                            .value;
+                        Some(name)
+                    }
                 } else {
                     None
                 };

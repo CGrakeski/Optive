@@ -29,7 +29,6 @@ hmac = "0.12"
 gix = { version = "0.85", features = ["blocking-network-client", "worktree-mutation", "blocking-http-transport-reqwest-rust-tls"] }
 reqwest = { version = "0.11", features = ["rustls-tls-native-roots", "blocking"] }
 indicatif = "0"
-#log = "0.4.33"
 libloading = "0.8"
 libffi = "3.2"
 toml = "0.8"
@@ -45,11 +44,9 @@ roxmltree = "0.20"
 csv = "1"
 parking_lot = "0.12"
 crossbeam-deque = "0.8"
-#crossbeam-channel = "0.5"
 num_cpus = "1"
 
 [dev-dependencies]
-#pretty_assertions = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]

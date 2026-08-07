@@ -57,7 +57,7 @@ fn debug_script_file(path: &Path, caps: optive::caps::Capabilities) -> Result<()
     run_debug_session(&mut vm, &source, &file)
 }
 
-fn inject_dep_map(vm: &mut Vm, ensured: &EnsureResult, project_root: &Path) {
+pub fn inject_dep_map(vm: &mut Vm, ensured: &EnsureResult, project_root: &Path) {
     vm.dep_map.clear();
     for ((parent, name), DepBinding { path, id }) in &ensured.dep_map {
         vm.dep_map.insert(
@@ -114,6 +114,44 @@ fn run_debug_session(
     }
 
     let stdin = io::stdin();
+
+    // --- 宏定义 ---
+    macro_rules! resume_continue {
+        ($vm:expr, $state:expr, $finished:ident, $last_value:ident) => {{
+            if $state.borrow().is_uncaught_stop() {
+                println!("[session ended after uncaught exception]");
+                $finished = true;
+                continue;
+            }
+            $state.borrow_mut().step = None;
+            match resume($vm)? {
+                Resume::Paused => print_stop($vm, &$state.borrow()),
+                Resume::Done(v) => {
+                    $finished = true;
+                    $last_value = Some(v);
+                }
+            }
+        }};
+    }
+
+    macro_rules! resume_step {
+        ($vm:expr, $state:expr, $step:expr, $finished:ident, $last_value:ident, $on_paused:block) => {{
+            if $state.borrow().is_uncaught_stop() {
+                println!("cannot step after uncaught exception; use quit");
+                continue;
+            }
+            $state.borrow_mut().step = Some($step);
+            match resume($vm)? {
+                Resume::Paused => $on_paused,
+                Resume::Done(v) => {
+                    $finished = true;
+                    $last_value = Some(v);
+                }
+            }
+        }};
+    }
+
+
     loop {
         if finished {
             if let Some(v) = &last_value {
@@ -144,84 +182,38 @@ fn run_debug_session(
         match cmd {
             "h" | "help" | "?" => print_help(),
             "q" | "quit" | "exit" => break,
+
             "c" | "continue" | "cont" => {
-                if state.borrow().is_uncaught_stop() {
-                    println!("[session ended after uncaught exception]");
-                    finished = true;
-                    continue;
-                }
-                state.borrow_mut().step = None;
-                match resume(vm)? {
-                    Resume::Paused => print_stop(vm, &state.borrow()),
-                    Resume::Done(v) => {
-                        finished = true;
-                        last_value = Some(v);
-                    }
-                }
+                resume_continue!(vm, state, finished, last_value);
             }
+
             "s" | "step" => {
-                if state.borrow().is_uncaught_stop() {
-                    println!("cannot step after uncaught exception; use quit");
-                    continue;
-                }
-                state.borrow_mut().step = Some(StepMode::In);
-                match resume(vm)? {
-                    Resume::Paused => print_stop(vm, &state.borrow()),
-                    Resume::Done(v) => {
-                        finished = true;
-                        last_value = Some(v);
-                    }
-                }
-            }
-            "si" | "stepi" => {
-                if state.borrow().is_uncaught_stop() {
-                    println!("cannot step after uncaught exception; use quit");
-                    continue;
-                }
-                state.borrow_mut().step = Some(StepMode::Insn);
-                match resume(vm)? {
-                    Resume::Paused => {
-                        print_stop(vm, &state.borrow());
-                        print_disasm_here(vm);
-                    }
-                    Resume::Done(v) => {
-                        finished = true;
-                        last_value = Some(v);
-                    }
-                }
-            }
-            "n" | "next" => {
-                if state.borrow().is_uncaught_stop() {
-                    println!("cannot step after uncaught exception; use quit");
-                    continue;
-                }
-                let depth = vm.debug_call_depth();
-                state.borrow_mut().step = Some(StepMode::Over { max_depth: depth });
-                match resume(vm)? {
-                    Resume::Paused => print_stop(vm, &state.borrow()),
-                    Resume::Done(v) => {
-                        finished = true;
-                        last_value = Some(v);
-                    }
-                }
-            }
-            "finish" | "out" => {
-                if state.borrow().is_uncaught_stop() {
-                    println!("cannot step after uncaught exception; use quit");
-                    continue;
-                }
-                let depth = vm.debug_call_depth();
-                state.borrow_mut().step = Some(StepMode::Out {
-                    target_depth: depth,
+                resume_step!(vm, state, StepMode::In, finished, last_value, {
+                    print_stop(vm, &state.borrow());
                 });
-                match resume(vm)? {
-                    Resume::Paused => print_stop(vm, &state.borrow()),
-                    Resume::Done(v) => {
-                        finished = true;
-                        last_value = Some(v);
-                    }
-                }
             }
+
+            "si" | "stepi" => {
+                resume_step!(vm, state, StepMode::Insn, finished, last_value, {
+                    print_stop(vm, &state.borrow());
+                    print_disasm_here(vm);
+                });
+            }
+
+            "n" | "next" => {
+                let depth = vm.debug_call_depth();
+                resume_step!(vm, state, StepMode::Over { max_depth: depth }, finished, last_value, {
+                    print_stop(vm, &state.borrow());
+                });
+            }
+
+            "finish" | "out" => {
+                let depth = vm.debug_call_depth();
+                resume_step!(vm, state, StepMode::Out { target_depth: depth }, finished, last_value, {
+                    print_stop(vm, &state.borrow());
+                });
+            }
+
             "b" | "break" => {
                 if rest.is_empty() {
                     let st = state.borrow();
@@ -258,6 +250,7 @@ fn run_debug_session(
                     }
                 }
             }
+
             "d" | "delete" | "clear" => {
                 if rest.is_empty() {
                     state.borrow_mut().clear_breakpoints();
@@ -289,6 +282,7 @@ fn run_debug_session(
                     }
                 }
             }
+
             "bt" | "backtrace" | "where" => {
                 let frames = stack_frames(vm);
                 for (i, fr) in frames.iter().enumerate().rev() {
@@ -303,6 +297,7 @@ fn run_debug_session(
                     );
                 }
             }
+
             "frame" => {
                 if rest.is_empty() {
                     let frames = stack_frames(vm);
@@ -321,6 +316,7 @@ fn run_debug_session(
                     }
                 }
             }
+
             "p" | "print" | "eval" => {
                 let expr = if cmd == "eval" || cmd == "print" || cmd == "p" {
                     line.split_once(char::is_whitespace)
@@ -338,11 +334,13 @@ fn run_debug_session(
                     }
                 }
             }
+
             "locals" => {
                 for (name, val) in list_locals(vm) {
                     println!("  {name} = {}", val.display_string());
                 }
             }
+
             "globals" => {
                 let mut names = vm.globals.keys();
                 names.sort();
@@ -355,8 +353,8 @@ fn run_debug_session(
                     }
                 }
             }
+
             "set" => {
-                // set name = expr
                 let body = line.strip_prefix("set").unwrap_or("").trim();
                 if let Some((name, expr)) = body.split_once('=') {
                     let name = name.trim();
@@ -372,6 +370,7 @@ fn run_debug_session(
                     println!("usage: set name = expr");
                 }
             }
+
             "fibers" => {
                 let list = list_fibers(vm);
                 if list.is_empty() {
@@ -386,9 +385,11 @@ fn run_debug_session(
                     }
                 }
             }
+
             "fiber" => {
                 println!("fiber switch for stepping is deferred; use `fibers` to inspect");
             }
+
             "l" | "list" => {
                 let ctx = rest
                     .first()
@@ -401,6 +402,7 @@ fn run_debug_session(
                     println!("{mark}{n:>5} | {text}");
                 }
             }
+
             "disasm" => print_disasm_here(vm),
             other => println!("unknown command: {other} (try help)"),
         }

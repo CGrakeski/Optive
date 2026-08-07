@@ -493,6 +493,20 @@ fn substitute_pattern(pat: &Pattern, type_names: &HashMap<String, String>) -> Pa
                 })
                 .collect(),
         ),
+        Pattern::Tuple(elems) => Pattern::Tuple(
+            elems
+                .iter()
+                .map(|el| match el {
+                    PatternElem::Bind(n) => PatternElem::Bind(n.clone()),
+                    PatternElem::Nested(p) => {
+                        PatternElem::Nested(substitute_pattern(p, type_names))
+                    }
+                    PatternElem::Value(e) => {
+                        PatternElem::Value(Box::new(substitute_expr(e, type_names)))
+                    }
+                })
+                .collect(),
+        ),
         Pattern::Struct { type_name, fields } => Pattern::Struct {
             type_name: type_name.clone(),
             fields: fields.clone(),

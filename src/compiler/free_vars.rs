@@ -212,7 +212,7 @@ fn bind_pattern(pat: &Pattern, locals: &mut HashMap<String, ()>, free: &mut Hash
             locals.insert(n.clone(), ());
         }
         Pattern::Value(e) => collect_expr(e, locals, free),
-        Pattern::List(elems) => {
+        Pattern::List(elems) | Pattern::Tuple(elems) => {
             for el in elems {
                 match el {
                     PatternElem::Bind(n) => {

@@ -32,6 +32,17 @@ pub struct GcTracker {
     addrs: FxHashSet<usize>,
 }
 
+fn track_shared_into<T>(
+    tracker: &mut GcTracker,
+    rc: &Shared<T>,
+    wrap: impl FnOnce(WeakShared<T>) -> TrackedWeak,
+) {
+    let addr = rc.as_ptr() as usize;
+    if tracker.track_addr(addr) {
+        tracker.weaks.push(wrap(rc.downgrade()));
+    }
+}
+
 impl GcTracker {
     pub fn new() -> Self {
         Self {
@@ -45,38 +56,23 @@ impl GcTracker {
     }
 
     pub fn track_list(&mut self, rc: &Shared<Vec<Value>>) {
-        let addr = rc.as_ptr() as usize;
-        if self.track_addr(addr) {
-            self.weaks.push(TrackedWeak::List(rc.downgrade()));
-        }
+        track_shared_into(self, rc, TrackedWeak::List);
     }
 
     pub fn track_dict(&mut self, rc: &Shared<DictMap>) {
-        let addr = rc.as_ptr() as usize;
-        if self.track_addr(addr) {
-            self.weaks.push(TrackedWeak::Dict(rc.downgrade()));
-        }
+        track_shared_into(self, rc, TrackedWeak::Dict);
     }
 
     pub fn track_set(&mut self, rc: &Shared<SetMap>) {
-        let addr = rc.as_ptr() as usize;
-        if self.track_addr(addr) {
-            self.weaks.push(TrackedWeak::Set(rc.downgrade()));
-        }
+        track_shared_into(self, rc, TrackedWeak::Set);
     }
 
     pub fn track_iter(&mut self, rc: &Shared<IteratorState>) {
-        let addr = rc.as_ptr() as usize;
-        if self.track_addr(addr) {
-            self.weaks.push(TrackedWeak::Iter(rc.downgrade()));
-        }
+        track_shared_into(self, rc, TrackedWeak::Iter);
     }
 
     pub fn track_cell(&mut self, rc: &Shared<Value>) {
-        let addr = rc.as_ptr() as usize;
-        if self.track_addr(addr) {
-            self.weaks.push(TrackedWeak::Cell(rc.downgrade()));
-        }
+        track_shared_into(self, rc, TrackedWeak::Cell);
     }
 
     pub fn track_struct(&mut self, rc: &Arc<StructInstance>) {
@@ -88,6 +84,35 @@ impl GcTracker {
 
     pub fn tracked_count(&self) -> usize {
         self.weaks.len()
+    }
+
+    /// 去掉已失效的 Weak 跟踪项（不打断环、不做标记）。供 M:N helper 限制表大小。
+    pub fn prune_dead(&mut self) -> usize {
+        let before = self.weaks.len();
+        self.weaks.retain(|w| match w {
+            TrackedWeak::List(weak) => weak.upgrade().is_some(),
+            TrackedWeak::Dict(weak) => weak.upgrade().is_some(),
+            TrackedWeak::Set(weak) => weak.upgrade().is_some(),
+            TrackedWeak::Iter(weak) => weak.upgrade().is_some(),
+            TrackedWeak::Cell(weak) => weak.upgrade().is_some(),
+            TrackedWeak::Struct(weak) => weak.strong_count() > 0,
+        });
+        // 按存活条目重建地址集，避免死指针占坑。
+        self.addrs.clear();
+        for w in &self.weaks {
+            let addr = match w {
+                TrackedWeak::List(weak) => weak.upgrade().map(|rc| rc.as_ptr() as usize),
+                TrackedWeak::Dict(weak) => weak.upgrade().map(|rc| rc.as_ptr() as usize),
+                TrackedWeak::Set(weak) => weak.upgrade().map(|rc| rc.as_ptr() as usize),
+                TrackedWeak::Iter(weak) => weak.upgrade().map(|rc| rc.as_ptr() as usize),
+                TrackedWeak::Cell(weak) => weak.upgrade().map(|rc| rc.as_ptr() as usize),
+                TrackedWeak::Struct(weak) => weak.upgrade().map(|rc| Arc::as_ptr(&rc) as usize),
+            };
+            if let Some(addr) = addr {
+                self.addrs.insert(addr);
+            }
+        }
+        before.saturating_sub(self.weaks.len())
     }
 
     /// 标记-清扫：从 `vm` 根可达对象做标记，再清空不可达对象内部以打断环。
@@ -280,10 +305,20 @@ pub fn mark_value(val: &Value, marked: &mut FxHashSet<usize>, worklist: &mut Vec
                 }
             }
         }
-        Value::Mutex(m) | Value::MutexGuard(m) => {
+        Value::Mutex(m) => {
             let addr = m.as_ptr() as usize;
             if marked.insert(addr) {
                 worklist.push(m.borrow().value.clone());
+            }
+        }
+        Value::MutexGuard(g) => {
+            let addr = g.as_ptr() as usize;
+            if marked.insert(addr) {
+                let m = g.borrow().mutex();
+                let maddr = m.as_ptr() as usize;
+                if marked.insert(maddr) {
+                    worklist.push(m.borrow().value.clone());
+                }
             }
         }
         Value::Sync(s) => {
@@ -380,6 +415,12 @@ fn mark_sync_children(inner: &crate::value::SyncInner, worklist: &mut Vec<Value>
         SyncInner::WaitGroup { .. }
         | SyncInner::Semaphore { .. }
         | SyncInner::Barrier { .. }
-        | SyncInner::Cond { .. } => {}
+        | SyncInner::Cond { .. }
+        | SyncInner::TimeoutCtx { .. } => {}
+        SyncInner::TaskGroup { first_error, .. } => {
+            if let Some(err) = first_error {
+                worklist.push(err.clone());
+            }
+        }
     }
 }

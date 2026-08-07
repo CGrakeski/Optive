@@ -18,7 +18,10 @@ use crate::shared::Shared;
 
 fn is_c_layout_annotation(ty: &Expr) -> bool {
     static_type_value_from_expr(ty)
-        .map(|v| type_value_display(&v) == "C.layout")
+        .map(|v| {
+            let s = type_value_display(&v);
+            s == "C.layout" || s.ends_with(".C.layout")
+        })
         .unwrap_or(false)
 }
 
@@ -307,6 +310,15 @@ impl Generator {
         self.emit_bind_name_flags(name, false);
     }
 
+    /// 外层作用域里可作为闭包捕获的词法局部（含已捕获进来的名字）。
+    /// 模块级 / 全局绑定不应进 `__make_closure__`，应在内层用 LoadGlobal 解析。
+    fn is_enclosing_local(&self, name: &str) -> bool {
+        self.local_slots
+            .as_ref()
+            .is_some_and(|m| m.contains_key(name))
+            || self.captured_names.contains(name)
+    }
+
     fn emit_bind_name_flags(&mut self, name: &str, is_const: bool) {
         if self.local_slots.is_some() {
             let slot = self.ensure_local_slot(name);
@@ -320,7 +332,9 @@ impl Generator {
                 name: name.to_string(),
                 is_const,
             });
-            self.cg.emit(Instruction::Store(name.to_string()));
+            // 须走 StoreGlobal，写入 module global 表；裸 Store 只写活动 globals，
+            // 模块 init 结束后跨模块调用会 NameError（如 `use ….{ C }`）。
+            self.emit_store_name(name);
         }
     }
 
@@ -737,6 +751,9 @@ impl Generator {
                         params.iter().map(|p| p.name.clone()).collect();
                     let free = if self.local_slots.is_some() {
                         free_vars::free_vars_in_block(body, &param_names)
+                            .into_iter()
+                            .filter(|n| self.is_enclosing_local(n))
+                            .collect()
                     } else {
                         Vec::new()
                     };
@@ -759,7 +776,7 @@ impl Generator {
                         for fname in &free {
                             self.cg
                                 .emit(Instruction::Push(Value::Text(fname.clone())));
-                            self.cg.emit(Instruction::Load(fname.clone()));
+                            self.emit_load_name(fname);
                         }
                         self.cg.emit(Instruction::DictNew(free.len()));
                         self.cg
@@ -1312,7 +1329,7 @@ impl Generator {
             .emit(Instruction::Load("__with_exit__".into()));
         self.cg.emit(Instruction::Call { argc: 2 });
         self.cg.emit(Instruction::Pop);
-        self.cg.emit(Instruction::Load(exc));
+        self.emit_load_temp(&exc);
         self.cg.emit(Instruction::Throw);
 
         self.cg.mark_label(try_end);
@@ -1372,7 +1389,8 @@ impl Generator {
             end_label: try_end,
         });
         self.handler_stack.push(OpenHandler::Try);
-        self.gen_block(body, false)?;
+        // 无 else 且作值时保留 body 结果；有 else 时成功路径走 else（与 Python 语义一致），body 不留值。
+        self.gen_block(body, as_value && else_block.is_none())?;
         self.cg.emit(Instruction::EndTry);
         // EndTry 已在运行时弹帧；catch 会在 body 前 PopTry。编译期栈在此收起。
         self.handler_stack.pop();
@@ -1517,7 +1535,7 @@ impl Generator {
                 self.cg.emit(Instruction::GotoIfNot(fail_label));
             }
             Pattern::Bind(_) => {}
-            Pattern::List(elems) => {
+            Pattern::List(elems) | Pattern::Tuple(elems) => {
                 self.emit_load_match_at(temp, path)?;
                 self.cg.emit(Instruction::IsList);
                 self.cg.emit(Instruction::GotoIfNot(fail_label));
@@ -1632,7 +1650,7 @@ impl Generator {
                 self.emit_load_match_at(temp, path)?;
                 self.emit_bind_name(name);
             }
-            Pattern::List(elems) => {
+            Pattern::List(elems) | Pattern::Tuple(elems) => {
                 for (i, elem) in elems.iter().enumerate() {
                     let mut child_path = path.to_vec();
                     child_path.push(i);
@@ -2724,7 +2742,12 @@ impl Generator {
             } => {
                 let param_names: HashSet<String> =
                     params.iter().map(|p| p.name.clone()).collect();
-                let free = free_vars::free_vars_in_block(body, &param_names);
+                let free_all = free_vars::free_vars_in_block(body, &param_names);
+                // 只捕获词法局部；模块级名字留在函数内用 LoadGlobal / module_env。
+                let free: Vec<String> = free_all
+                    .into_iter()
+                    .filter(|n| self.is_enclosing_local(n))
+                    .collect();
                 let captured: HashSet<String> = free.iter().cloned().collect();
                 let is_generator = Self::block_has_yield(body);
                 let func = self.compile_function(
@@ -2744,7 +2767,7 @@ impl Generator {
                     for name in &free {
                         self.cg
                             .emit(Instruction::Push(Value::Text(name.clone())));
-                        self.cg.emit(Instruction::Load(name.clone()));
+                        self.emit_load_name(name);
                     }
                     self.cg.emit(Instruction::DictNew(free.len()));
                     self.cg
@@ -2890,7 +2913,7 @@ impl Generator {
                 }
             }
             ExprKind::Suspend => {
-                self.cg.emit(Instruction::Suspend);
+                self.emit_suspend_expr();
             }
             ExprKind::Select { cases, else_block } => {
                 self.gen_select(cases, else_block.as_ref())?;
@@ -2975,9 +2998,7 @@ impl Generator {
 
         if let Some(else_b) = else_block {
             // 粗略：若没有任何 case 就绪，先让步再重试；多次空转后走 else。
-            // 用一次 Yield 后若仍全不就绪则 else（简化：直接检查通道全关由 SelectTryRecv 的 closed 处理）。
-            // 此处：跑一次调度，再若仍无进展则 else。
-            self.cg.emit(Instruction::Suspend);
+            self.emit_select_idle(&sleep_temps);
             // 再 poll 一轮；若仍无则 else
             let else_lbl = self.cg.fresh_label();
             for (i, case) in cases.iter().enumerate() {
@@ -3001,11 +3022,38 @@ impl Generator {
             self.gen_block(else_b, true)?;
             self.cg.emit(Instruction::Goto(end));
         } else {
-            self.cg.emit(Instruction::Suspend);
+            self.emit_select_idle(&sleep_temps);
             self.cg.emit(Instruction::Goto(start));
         }
         self.cg.mark_label(end);
         Ok(())
+    }
+
+    /// 表达式位置的 `suspend`：指令本身不压值，补 `none` 满足「expr 留 1 值」契约，
+    /// 供语句层 `Pop` / 表达式位消费。勿用于 select 空转让步。
+    fn emit_suspend_expr(&mut self) {
+        self.cg.emit(Instruction::Suspend);
+        self.cg.emit(Instruction::Push(Value::None));
+    }
+
+    /// 控制流位置的裸挂起（select idle 等）：不压值，后继不得假定栈顶有结果。
+    fn emit_suspend_idle(&mut self) {
+        self.cg.emit(Instruction::Suspend);
+    }
+
+    /// 有 sleep case 时用 SelectIdle（睡到最近截止 + 调度让出），避免 task 上 Suspend 永久挂起饿死 tick。
+    /// 无 sleep 时仍 Suspend，让通道等待能调度其它 fiber。
+    fn emit_select_idle(&mut self, sleep_temps: &[Option<String>]) {
+        let deadlines: Vec<&String> = sleep_temps.iter().filter_map(|t| t.as_ref()).collect();
+        if deadlines.is_empty() {
+            self.emit_suspend_idle();
+            return;
+        }
+        for tmp in &deadlines {
+            self.emit_load_temp(tmp);
+        }
+        self.cg
+            .emit(Instruction::SelectIdle(deadlines.len()));
     }
 
     fn gen_select_poll(&mut self, event: &Expr, sleep_tmp: Option<&str>) -> Result<()> {
@@ -3205,7 +3253,11 @@ impl Generator {
             .collect();
         let param_names: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
 
-        let elem_free = free_vars::free_vars_in_expr(elem, &param_names);
+        // 只捕获词法局部；模块级名字在内层用 LoadGlobal / module_env。
+        let elem_free: Vec<String> = free_vars::free_vars_in_expr(elem, &param_names)
+            .into_iter()
+            .filter(|n| self.is_enclosing_local(n))
+            .collect();
         let elem_body = vec![LocatedStmt { line: 0, column: 1, stmt: Stmt::Return(Some(elem.clone())),
         }];
         let elem_fn = self.compile_function(
@@ -3226,7 +3278,7 @@ impl Generator {
             for name in &elem_free {
                 self.cg
                     .emit(Instruction::Push(Value::Text(name.clone())));
-                self.cg.emit(Instruction::Load(name.clone()));
+                self.emit_load_name(name);
             }
             self.cg.emit(Instruction::DictNew(elem_free.len()));
             self.cg
@@ -3235,7 +3287,10 @@ impl Generator {
         }
 
         for guard in guards {
-            let g_free = free_vars::free_vars_in_expr(guard, &param_names);
+            let g_free: Vec<String> = free_vars::free_vars_in_expr(guard, &param_names)
+                .into_iter()
+                .filter(|n| self.is_enclosing_local(n))
+                .collect();
             let g_body = vec![LocatedStmt { line: 0, column: 1, stmt: Stmt::Return(Some(guard.clone())),
             }];
             let g_fn = self.compile_function(
@@ -3256,7 +3311,7 @@ impl Generator {
                 for name in &g_free {
                     self.cg
                         .emit(Instruction::Push(Value::Text(name.clone())));
-                    self.cg.emit(Instruction::Load(name.clone()));
+                    self.emit_load_name(name);
                 }
                 self.cg.emit(Instruction::DictNew(g_free.len()));
                 self.cg
@@ -3320,7 +3375,11 @@ impl Generator {
 
     fn gen_for_iter_bind(&mut self, items: &[ForItem]) -> Result<()> {
         if items.len() == 1 {
-            self.emit_bind_name(&items[0].name);
+            if items[0].name == "_" {
+                self.cg.emit(Instruction::Pop);
+            } else {
+                self.emit_bind_name(&items[0].name);
+            }
             return Ok(());
         }
         let tuple_name = self.cg.fresh_temp("__zip_tuple");
@@ -3330,7 +3389,11 @@ impl Generator {
             self.cg
                 .emit(Instruction::PushSmall(i as i64));
             self.cg.emit(Instruction::Index);
-            self.emit_bind_name(&item.name);
+            if item.name == "_" {
+                self.cg.emit(Instruction::Pop);
+            } else {
+                self.emit_bind_name(&item.name);
+            }
         }
         Ok(())
     }

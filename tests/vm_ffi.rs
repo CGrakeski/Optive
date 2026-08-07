@@ -105,6 +105,13 @@ fn sized_int_literal() {
 }
 
 #[test]
+fn sized_zero_int_literal() {
+    // B1：`0i32` 不得被当成非法 `0i` 数字前缀。
+    let v = value("0i32");
+    assert!(matches!(v, Value::Sized(optive::sized::SizedNum::I32(0))));
+}
+
+#[test]
 fn sized_float_literal() {
     let v = value("3.5f64");
     match v {

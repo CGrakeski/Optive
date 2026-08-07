@@ -177,6 +177,7 @@ pub fn build_std_module() -> Shared<ModuleObject> {
     std_children.insert("collections".into(), build_collections_module());
     std_children.insert("time".into(), build_time_module());
     std_children.insert("sync".into(), build_sync_module());
+    std_children.insert("async".into(), build_async_module());
     std_children.insert("text".into(), build_text_module());
     std_children.insert("path".into(), build_path_module());
     std_children.insert("fs".into(), build_fs_module());
@@ -383,29 +384,23 @@ fn math_sqrt(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     Ok(Value::Num(float_from_f64(x.sqrt())?))
 }
 
-fn math_abs(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    expect_arity("abs", args, 1)?;
-    Ok(Value::Num(expect_num_value("abs", args, 0)?.abs_num()))
+macro_rules! define_math_num_unary {
+    ($(($fn_name:ident, $api:literal, $method:ident)),+ $(,)?) => {
+        $(
+            fn $fn_name(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+                expect_arity($api, args, 1)?;
+                Ok(Value::Num(expect_num_value($api, args, 0)?.$method()))
+            }
+        )+
+    };
 }
 
-fn math_floor(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    expect_arity("floor", args, 1)?;
-    Ok(Value::Num(expect_num_value("floor", args, 0)?.floor_num()))
-}
-
-fn math_ceil(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    expect_arity("ceil", args, 1)?;
-    Ok(Value::Num(expect_num_value("ceil", args, 0)?.ceil_num()))
-}
-
-fn math_round(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    expect_arity("round", args, 1)?;
-    Ok(Value::Num(expect_num_value("round", args, 0)?.round_num()))
-}
-
-fn math_trunc(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    expect_arity("trunc", args, 1)?;
-    Ok(Value::Num(expect_num_value("trunc", args, 0)?.trunc_num()))
+define_math_num_unary! {
+    (math_abs, "abs", abs_num),
+    (math_floor, "floor", floor_num),
+    (math_ceil, "ceil", ceil_num),
+    (math_round, "round", round_num),
+    (math_trunc, "trunc", trunc_num),
 }
 
 fn math_pow(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -1246,53 +1241,25 @@ fn ast_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 }
 
 fn ast_clone_export(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("ast_clone requires 1 argument"));
-    }
-    runtime_ast::clone_ast_value(&args[0])
+    runtime_ast::with_arity1("ast_clone", args, runtime_ast::clone_ast_value)
 }
 
-fn ast_type_convert_export(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err(
-            "ast_type_convert requires 2 arguments",
-        ));
-    }
-    runtime_ast::compose_ast_type_convert(&args[0], &args[1])
+macro_rules! ast_export_natural2 {
+    ($(($name:ident, $api:literal, $compose:path)),+ $(,)?) => {
+        $(
+            fn $name(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+                runtime_ast::with_arity2($api, args, $compose)
+            }
+        )+
+    };
 }
 
-fn ast_call_export(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("ast_call requires 2 arguments"));
-    }
-    runtime_ast::compose_ast_func_call(&args[0], &args[1])
-}
-
-fn ast_macro_call_export(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err(
-            "ast_macro_call requires 2 arguments",
-        ));
-    }
-    runtime_ast::compose_ast_macro_call(&args[0], &args[1])
-}
-
-fn ast_vec_push_export(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err(
-            "ast_vec_push requires 2 arguments",
-        ));
-    }
-    runtime_ast::ast_vec_push(&args[0], &args[1])
-}
-
-fn ast_vec_extend_export(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err(
-            "ast_vec_extend requires 2 arguments",
-        ));
-    }
-    runtime_ast::ast_vec_extend(&args[0], &args[1])
+ast_export_natural2! {
+    (ast_type_convert_export, "ast_type_convert", runtime_ast::compose_ast_type_convert),
+    (ast_call_export, "ast_call", runtime_ast::compose_ast_func_call),
+    (ast_macro_call_export, "ast_macro_call", runtime_ast::compose_ast_macro_call),
+    (ast_vec_push_export, "ast_vec_push", runtime_ast::ast_vec_push),
+    (ast_vec_extend_export, "ast_vec_extend", runtime_ast::ast_vec_extend),
 }
 
 fn ast_unparse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -1445,7 +1412,7 @@ fn typing_fields_of(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
     let def = match &args[0] {
         Value::Struct(s) => Some(s.def.clone()),
-        Value::TypeRef(n) | Value::Text(n) => _vm.struct_defs.get(n).cloned(),
+        Value::TypeRef(n) | Value::Text(n) => _vm.struct_defs.get(n),
         _ => None,
     };
     let Some(def) = def else {
@@ -1474,7 +1441,7 @@ fn typing_protocol_of(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
             ));
         }
     };
-    let Some(pd) = _vm.protocols.get(&name).cloned() else {
+    let Some(pd) = _vm.protocols.get(&name) else {
         return Ok(Value::None);
     };
     let mut out = DictMap::new();
@@ -1586,6 +1553,106 @@ fn build_sync_module() -> Shared<ModuleObject> {
             ("yield", builtin(sync_yield)),
         ],
     )
+}
+
+fn build_async_module() -> Shared<ModuleObject> {
+    submodule(
+        "async",
+        &[
+            ("taskgroup", builtin(async_taskgroup)),
+            ("gather", builtin(async_gather)),
+            ("race", builtin(async_race)),
+            ("with_timeout", builtin(async_with_timeout)),
+        ],
+    )
+}
+
+fn async_taskgroup(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    crate::concurrency::construct_taskgroup(args)
+}
+
+fn async_with_timeout(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    crate::concurrency::construct_timeout_ctx(args)
+}
+
+fn async_gather(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(crate::error::RuntimeError::type_err(
+            "gather requires 1 list argument",
+        ));
+    }
+    let items = match &args[0] {
+        Value::List(list) => list.borrow().clone(),
+        Value::Tuple(t) => t.iter().cloned().collect(),
+        _ => {
+            return Err(crate::error::RuntimeError::type_err(
+                "gather expects a list of tasks",
+            ))
+        }
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let v = vm.await_value(item)?;
+        if vm.block_suspend {
+            return Ok(Value::None);
+        }
+        out.push(v);
+    }
+    Ok(Value::List(Shared::new(out)))
+}
+
+fn async_race(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(crate::error::RuntimeError::type_err(
+            "race requires 1 list argument",
+        ));
+    }
+    let items = match &args[0] {
+        Value::List(list) => list.borrow().clone(),
+        Value::Tuple(t) => t.iter().cloned().collect(),
+        _ => {
+            return Err(crate::error::RuntimeError::type_err(
+                "race expects a list of tasks",
+            ))
+        }
+    };
+    if items.is_empty() {
+        return Err(crate::error::RuntimeError::value_err(
+            "race requires a non-empty list",
+        ));
+    }
+    use crate::value::TaskState;
+    loop {
+        let mut any_open = false;
+        for item in &items {
+            match item {
+                Value::Task(task) => match task.borrow().state.clone() {
+                    TaskState::Done(v) => return Ok(v),
+                    TaskState::Failed(e) => {
+                        vm.throw_value(e)?;
+                        return Ok(Value::None);
+                    }
+                    TaskState::Pending { .. } | TaskState::Suspended => {
+                        any_open = true;
+                        vm.ensure_task_runnable(task);
+                    }
+                    TaskState::Running => {
+                        any_open = true;
+                    }
+                },
+                other => return Ok(other.clone()),
+            }
+        }
+        if !any_open {
+            return Err(crate::error::RuntimeError::msg(
+                "race: internal error, no open tasks",
+            ));
+        }
+        vm.wait_or_deadlock("race blocked")?;
+        if vm.block_suspend {
+            return Ok(Value::None);
+        }
+    }
 }
 
 /// `std.sync.yield()`：主动让出当前 fiber，给其它就绪 fiber 一个运行机会。
@@ -1747,7 +1814,13 @@ fn decos_debug(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 fn decos_retry(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let inner = expect_function("retry", args, 0)?;
     let attempts = if args.len() > 1 {
-        expect_int("retry", args, 1)? as usize
+        let n = expect_int("retry", args, 1)?;
+        if n <= 0 {
+            return Err(crate::error::RuntimeError::value_err(
+                "retry() attempts must be a positive integer",
+            ));
+        }
+        n as usize
     } else {
         3
     };
@@ -2183,24 +2256,22 @@ fn time_monotonic(_vm: &mut Vm, _args: &[Value]) -> Result<Value> {
     Ok(Value::Num(float_from_f64(secs)?))
 }
 
-fn time_sleep(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn time_sleep(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let secs = if args.is_empty() {
         0.0
     } else {
         expect_num_f64("sleep", args, 0)?
     };
-    std::thread::sleep(std::time::Duration::from_secs_f64(secs.max(0.0)));
-    Ok(Value::None)
+    vm.coop_sleep_secs(secs)
 }
 
-fn time_sleep_ms(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn time_sleep_ms(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let ms = if args.is_empty() {
         0
     } else {
         expect_int("sleep_ms", args, 0)?.max(0) as u64
     };
-    std::thread::sleep(std::time::Duration::from_millis(ms));
-    Ok(Value::None)
+    vm.coop_sleep_ms(ms)
 }
 
 fn text_upper(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -2311,16 +2382,20 @@ fn text_repeat(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     Ok(Value::Text(s.repeat(n)))
 }
 
-fn text_is_digit(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    text_char_predicate("is_digit", args, |c| c.is_ascii_digit())
+macro_rules! define_text_char_preds {
+    ($(($fn_name:ident, $api:literal, $pred:expr)),+ $(,)?) => {
+        $(
+            fn $fn_name(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+                text_char_predicate($api, args, $pred)
+            }
+        )+
+    };
 }
 
-fn text_is_alpha(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    text_char_predicate("is_alpha", args, |c| c.is_ascii_alphabetic())
-}
-
-fn text_is_space(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    text_char_predicate("is_space", args, |c| c.is_whitespace())
+define_text_char_preds! {
+    (text_is_digit, "is_digit", |c| c.is_ascii_digit()),
+    (text_is_alpha, "is_alpha", |c| c.is_ascii_alphabetic()),
+    (text_is_space, "is_space", |c| c.is_whitespace()),
 }
 
 fn text_char_predicate(
@@ -2372,8 +2447,35 @@ fn text_chr(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 }
 
 fn path_join(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    // 语言层路径统一用 `/`（跨平台可移植），不随 OS 改 separator。
     let parts: Vec<String> = args.iter().map(|v| v.print_string()).collect();
+    if parts.is_empty() {
+        return Ok(Value::Text(String::new()));
+    }
+    // Windows：首段为盘符/UNC/`\\?\` 绝对路径时用原生 PathBuf，避免与 `/` join 混斜杠
+    // （`abspath` 曾返回 `\\?\…` 时 `is_dir`/`exists` 会全假）。
+    #[cfg(windows)]
+    {
+        let first = std::path::Path::new(&parts[0]);
+        let looks_win_abs = first.is_absolute()
+            || parts[0].starts_with(r"\\?\")
+            || (parts[0].len() >= 2
+                && parts[0].as_bytes().get(1) == Some(&b':')
+                && parts[0]
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|c| c.is_ascii_alphabetic()));
+        if looks_win_abs {
+            let mut buf = std::path::PathBuf::from(&parts[0]);
+            for p in parts.iter().skip(1) {
+                if p.is_empty() {
+                    continue;
+                }
+                buf.push(p.trim_start_matches(['/', '\\']));
+            }
+            return Ok(Value::Text(buf.to_string_lossy().into_owned()));
+        }
+    }
+    // 相对路径段仍用 `/`，跨平台可移植。
     Ok(Value::Text(parts.join("/")))
 }
 
@@ -2399,8 +2501,20 @@ fn path_os_str_component(
     })
 }
 
-fn path_basename(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    path_os_str_component("basename", args, |p| p.file_name())
+macro_rules! define_path_os_components {
+    ($(($fn_name:ident, $api:literal, $pick:expr)),+ $(,)?) => {
+        $(
+            fn $fn_name(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+                path_os_str_component($api, args, $pick)
+            }
+        )+
+    };
+}
+
+define_path_os_components! {
+    (path_basename, "basename", |p: &std::path::Path| p.file_name()),
+    (path_extension, "extension", |p: &std::path::Path| p.extension()),
+    (path_stem, "stem", |p: &std::path::Path| p.file_stem()),
 }
 
 fn path_dirname(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -2410,14 +2524,6 @@ fn path_dirname(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
             .unwrap_or("")
             .to_string()
     })
-}
-
-fn path_extension(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    path_os_str_component("extension", args, |p| p.extension())
-}
-
-fn path_stem(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    path_os_str_component("stem", args, |p| p.file_stem())
 }
 
 fn path_is_absolute(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -2436,6 +2542,18 @@ fn path_bool_query(
     Ok(Value::Bool(query(std::path::Path::new(&p))))
 }
 
+/// Windows `canonicalize` 常带 `\\?\` 前缀；对外 API 剥掉以便与 `join` / 用户路径一致。
+#[cfg(windows)]
+fn strip_windows_extended_prefix(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{}", rest)
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s.to_string()
+    }
+}
+
 fn path_abspath(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let p = expect_text("abspath", args, 0)?;
     let abs = match std::fs::canonicalize(&p) {
@@ -2447,7 +2565,11 @@ fn path_abspath(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
             normalize_pathbuf(cwd.join(&p))
         }
     };
-    Ok(Value::Text(abs.to_string_lossy().to_string()))
+    #[cfg(windows)]
+    let out = strip_windows_extended_prefix(&abs.to_string_lossy());
+    #[cfg(not(windows))]
+    let out = abs.to_string_lossy().into_owned();
+    Ok(Value::Text(out))
 }
 
 fn normalize_pathbuf(path: std::path::PathBuf) -> std::path::PathBuf {
@@ -2488,16 +2610,20 @@ fn path_splitext(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     ])))
 }
 
-fn fs_exists(vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    path_bool_query(&vm.caps, "exists", args, |p| p.exists())
+macro_rules! define_fs_bool_queries {
+    ($(($fn_name:ident, $api:literal, $pred:expr)),+ $(,)?) => {
+        $(
+            fn $fn_name(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+                path_bool_query(&vm.caps, $api, args, $pred)
+            }
+        )+
+    };
 }
 
-fn fs_is_file(vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    path_bool_query(&vm.caps, "is_file", args, |p| p.is_file())
-}
-
-fn fs_is_dir(vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    path_bool_query(&vm.caps, "is_dir", args, |p| p.is_dir())
+define_fs_bool_queries! {
+    (fs_exists, "exists", |p: &std::path::Path| p.exists()),
+    (fs_is_file, "is_file", |p: &std::path::Path| p.is_file()),
+    (fs_is_dir, "is_dir", |p: &std::path::Path| p.is_dir()),
 }
 
 fn fs_list_dir(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -2518,36 +2644,26 @@ fn fs_list_dir(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     Ok(Value::List(Shared::new(names)))
 }
 
-fn fs_mkdir(vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    let p = expect_text("mkdir", args, 0)?;
-    vm.caps.check_fs("mkdir", &p)?;
-    std::fs::create_dir(&p)
-        .map_err(|e| crate::error::RuntimeError::io_err(format!("mkdir failed: {e}")))?;
-    Ok(Value::None)
+macro_rules! define_fs_path_op {
+    ($(($fn_name:ident, $api:literal, $fs_call:path)),+ $(,)?) => {
+        $(
+            fn $fn_name(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+                let p = expect_text($api, args, 0)?;
+                vm.caps.check_fs($api, &p)?;
+                $fs_call(&p).map_err(|e| {
+                    crate::error::RuntimeError::io_err(format!("{} failed: {e}", $api))
+                })?;
+                Ok(Value::None)
+            }
+        )+
+    };
 }
 
-fn fs_mkdir_all(vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    let p = expect_text("mkdir_all", args, 0)?;
-    vm.caps.check_fs("mkdir_all", &p)?;
-    std::fs::create_dir_all(&p)
-        .map_err(|e| crate::error::RuntimeError::io_err(format!("mkdir_all failed: {e}")))?;
-    Ok(Value::None)
-}
-
-fn fs_remove(vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    let p = expect_text("remove", args, 0)?;
-    vm.caps.check_fs("remove", &p)?;
-    std::fs::remove_file(&p)
-        .map_err(|e| crate::error::RuntimeError::io_err(format!("remove failed: {e}")))?;
-    Ok(Value::None)
-}
-
-fn fs_remove_dir(vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    let p = expect_text("remove_dir", args, 0)?;
-    vm.caps.check_fs("remove_dir", &p)?;
-    std::fs::remove_dir_all(&p)
-        .map_err(|e| crate::error::RuntimeError::io_err(format!("remove_dir failed: {e}")))?;
-    Ok(Value::None)
+define_fs_path_op! {
+    (fs_mkdir, "mkdir", std::fs::create_dir),
+    (fs_mkdir_all, "mkdir_all", std::fs::create_dir_all),
+    (fs_remove, "remove", std::fs::remove_file),
+    (fs_remove_dir, "remove_dir", std::fs::remove_dir_all),
 }
 
 fn fs_rename(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -2594,8 +2710,12 @@ fn os_setenv(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     Ok(Value::None)
 }
 
-fn os_args(_vm: &mut Vm, _args: &[Value]) -> Result<Value> {
-    let items: Vec<Value> = std::env::args().map(Value::Text).collect();
+fn os_args(vm: &mut Vm, _args: &[Value]) -> Result<Value> {
+    let items: Vec<Value> = if let Some(override_args) = &vm.argv_override {
+        override_args.iter().cloned().map(Value::Text).collect()
+    } else {
+        std::env::args().map(Value::Text).collect()
+    };
     Ok(Value::List(Shared::new(items)))
 }
 

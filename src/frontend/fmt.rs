@@ -794,6 +794,23 @@ impl Formatter {
                 }
                 self.buf.push(']');
             }
+            Pattern::Tuple(elems) => {
+                self.buf.push('(');
+                for (i, e) in elems.iter().enumerate() {
+                    if i > 0 {
+                        self.buf.push_str(", ");
+                    }
+                    match e {
+                        PatternElem::Bind(n) => self.buf.push_str(n),
+                        PatternElem::Nested(np) => self.emit_pattern(np, depth),
+                        PatternElem::Value(v) => self.emit_expr(v, depth),
+                    }
+                }
+                if elems.len() == 1 {
+                    self.buf.push(',');
+                }
+                self.buf.push(')');
+            }
             Pattern::Struct { type_name, fields } => {
                 self.buf.push_str(type_name);
                 self.buf.push('(');

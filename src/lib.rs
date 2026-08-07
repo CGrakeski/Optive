@@ -8,7 +8,7 @@ pub mod runtime;
 pub mod stdlib;
 
 pub use compiler::{
-    codegen, free_vars, hot_code, monomorph, opcode, protocol, specialize,
+    codegen, free_vars, hot_code, monomorph, opcode, protocol, specialize, stack_effect,
 };
 pub use frontend::{ast, diagnostics, error, fmt, lexer, parser, token};
 pub use runtime::{
