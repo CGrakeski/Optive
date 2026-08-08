@@ -92,6 +92,17 @@ impl Capabilities {
         }
     }
 
+    /// 子进程网关：`std.os.run` / `capture`。沙箱默认关闭（与 `env` 同开同关）。
+    pub fn check_process(&self, op: &str) -> Result<(), RuntimeError> {
+        if self.env {
+            Ok(())
+        } else {
+            Err(RuntimeError::io_err(format!(
+                "{op}: process spawn disabled (sandbox)"
+            )))
+        }
+    }
+
     /// 文件系统网关：所有 `std.fs` / `std.io` 文件操作调用前先过此关。
     /// `op` 为操作名（用于报错），`path` 为用户给出的路径（可相对）。
     pub fn check_fs(&self, op: &str, path: &str) -> Result<(), RuntimeError> {

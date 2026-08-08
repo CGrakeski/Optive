@@ -1530,29 +1530,46 @@ fn build_collections_module() -> Shared<ModuleObject> {
 fn build_time_module() -> Shared<ModuleObject> {
     submodule(
         "time",
-        &[("now", builtin(time_now)),
+        &[
+            ("now", builtin(time_now)),
             ("now_ms", builtin(time_now_ms)),
             ("monotonic", builtin(time_monotonic)),
             ("sleep", builtin(time_sleep)),
-            ("sleep_ms", builtin(time_sleep_ms)),],
+            ("sleep_ms", builtin(time_sleep_ms)),
+            ("format", builtin(time_format)),
+            ("parse", builtin(time_parse)),
+            ("utc_parts", builtin(time_utc_parts)),
+        ],
     )
 }
 
 fn build_sync_module() -> Shared<ModuleObject> {
-    submodule(
-        "sync",
+    let atomic = submodule(
+        "Atomic",
         &[
+            ("num", builtin(sync_atomic_num)),
+            ("bool", builtin(sync_atomic_bool)),
+        ],
+    );
+    Shared::new(ModuleObject {
+        name: "sync".into(),
+        full_name: "std.sync".into(),
+        exports: exports(&[
             ("Channel", Value::type_ref("Channel")),
             ("Mutex", Value::type_ref("Mutex")),
             ("RWMutex", Value::type_ref("RWMutex")),
+            ("RwLock", Value::type_ref("RWMutex")),
             ("WaitGroup", Value::type_ref("WaitGroup")),
             ("Semaphore", Value::type_ref("Semaphore")),
             ("Once", Value::type_ref("Once")),
             ("Barrier", Value::type_ref("Barrier")),
             ("Cond", Value::type_ref("Cond")),
+            ("Atomic", Value::Module(atomic)),
             ("yield", builtin(sync_yield)),
-        ],
-    )
+        ]),
+        children: HashMap::new(),
+        is_user: false,
+    })
 }
 
 fn build_async_module() -> Shared<ModuleObject> {
@@ -1563,6 +1580,12 @@ fn build_async_module() -> Shared<ModuleObject> {
             ("gather", builtin(async_gather)),
             ("race", builtin(async_race)),
             ("with_timeout", builtin(async_with_timeout)),
+            ("par_map", builtin(async_par_map)),
+            ("par_each", builtin(async_par_each)),
+            ("workers", builtin(async_workers)),
+            ("Stream", Value::type_ref("Stream")),
+            ("stream", builtin(async_stream_new)),
+            ("stream_of", builtin(async_stream_of)),
         ],
     )
 }
@@ -1622,13 +1645,29 @@ fn async_race(vm: &mut Vm, args: &[Value]) -> Result<Value> {
         ));
     }
     use crate::value::TaskState;
+    let cancel_losers = |vm: &mut Vm, winner: &Value| {
+        for item in &items {
+            if let Value::Task(task) = item {
+                if let Value::Task(w) = winner {
+                    if Shared::ptr_eq(task, w) {
+                        continue;
+                    }
+                }
+                vm.cancel_task(task);
+            }
+        }
+    };
     loop {
         let mut any_open = false;
         for item in &items {
             match item {
                 Value::Task(task) => match task.borrow().state.clone() {
-                    TaskState::Done(v) => return Ok(v),
+                    TaskState::Done(v) => {
+                        cancel_losers(vm, item);
+                        return Ok(v);
+                    }
                     TaskState::Failed(e) => {
+                        cancel_losers(vm, item);
                         vm.throw_value(e)?;
                         return Ok(Value::None);
                     }
@@ -1640,7 +1679,10 @@ fn async_race(vm: &mut Vm, args: &[Value]) -> Result<Value> {
                         any_open = true;
                     }
                 },
-                other => return Ok(other.clone()),
+                other => {
+                    cancel_losers(vm, item);
+                    return Ok(other.clone());
+                }
             }
         }
         if !any_open {
@@ -1653,6 +1695,82 @@ fn async_race(vm: &mut Vm, args: &[Value]) -> Result<Value> {
             return Ok(Value::None);
         }
     }
+}
+
+fn async_par_map(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(crate::error::RuntimeError::type_err(
+            "par_map requires 2 arguments (iterable, callable)",
+        ));
+    }
+    let items = materialize_iter(vm, &args[0])?;
+    let f = args[1].clone();
+    let mut tasks = Vec::with_capacity(items.len());
+    for item in items {
+        tasks.push(vm.spawn_task(f.clone(), vec![item]));
+    }
+    async_gather(vm, &[Value::List(Shared::new(tasks))])
+}
+
+fn async_par_each(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(crate::error::RuntimeError::type_err(
+            "par_each requires 2 arguments (iterable, callable)",
+        ));
+    }
+    let _ = async_par_map(vm, args)?;
+    if vm.block_suspend {
+        return Ok(Value::None);
+    }
+    Ok(Value::None)
+}
+
+fn async_workers(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if !args.is_empty() {
+        return Err(crate::error::RuntimeError::type_err(
+            "workers takes no arguments",
+        ));
+    }
+    Ok(Value::Num(Num::Small(vm.mn.worker_count() as i64)))
+}
+
+fn async_stream_new(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    // Stream() ≡ Channel()；for-in / next()/recv() 消费，send/close 生产。
+    crate::concurrency::construct_channel(args)
+}
+
+/// `stream_of(xs)`：后台任务把可迭代元素送入无界 Stream 后关闭。
+fn async_stream_of(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(crate::error::RuntimeError::type_err(
+            "stream_of requires 1 iterable argument",
+        ));
+    }
+    let items = Arc::new(materialize_iter(vm, &args[0])?);
+    let stream = crate::concurrency::construct_channel(&[])?;
+    let Value::Channel(ch) = &stream else {
+        unreachable!("construct_channel returns Channel");
+    };
+    let ch_task = ch.clone();
+    let producer = Value::Builtin(Arc::new(move |vm: &mut Vm, _args: &[Value]| {
+        for item in items.iter() {
+            // 无界 channel：send 不阻塞。
+            vm.channel_send(&ch_task, item.clone())?;
+        }
+        ch_task.borrow_mut().closed = true;
+        vm.mn.notify_all();
+        Ok(Value::None)
+    }));
+    let _ = vm.spawn_task(producer, vec![]);
+    Ok(stream)
+}
+
+fn sync_atomic_num(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    crate::concurrency::construct_atomic_num(args)
+}
+
+fn sync_atomic_bool(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    crate::concurrency::construct_atomic_bool(args)
 }
 
 /// `std.sync.yield()`：主动让出当前 fiber，给其它就绪 fiber 一个运行机会。
@@ -1727,13 +1845,17 @@ fn build_fs_module() -> Shared<ModuleObject> {
 fn build_os_module() -> Shared<ModuleObject> {
     submodule(
         "os",
-        &[("getenv", builtin(os_getenv)),
+        &[
+            ("getenv", builtin(os_getenv)),
             ("setenv", builtin(os_setenv)),
             ("args", builtin(os_args)),
             ("exit", builtin(os_exit)),
             ("cwd", builtin(os_cwd)),
             ("chdir", builtin(os_chdir)),
-            ("name", builtin(os_name)),],
+            ("name", builtin(os_name)),
+            ("run", builtin(os_run)),
+            ("capture", builtin(os_capture)),
+        ],
     )
 }
 
@@ -2274,6 +2396,174 @@ fn time_sleep_ms(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     vm.coop_sleep_ms(ms)
 }
 
+/// Unix 日序 → UTC (y, m, d)；算法见 Howard Hinnant。
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m as u32, d as u32)
+}
+
+fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    (era as i64) * 146097 + doe as i64 - 719468
+}
+
+fn utc_parts_from_secs(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
+    let day = if secs >= 0 {
+        secs / 86400
+    } else {
+        (secs - 86399) / 86400
+    };
+    let sod = (secs - day * 86400) as u32;
+    let (y, m, d) = civil_from_days(day);
+    let hour = sod / 3600;
+    let min = (sod % 3600) / 60;
+    let sec = sod % 60;
+    (y, m, d, hour, min, sec)
+}
+
+fn time_utc_parts(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    expect_arity("utc_parts", args, 1)?;
+    let secs = expect_int("utc_parts", args, 0)?;
+    let (y, m, d, hh, mm, ss) = utc_parts_from_secs(secs);
+    let mut map = DictMap::new();
+    map.insert(ValueKey::Text("year".into()), Value::Num(Num::Small(y as i64)));
+    map.insert(ValueKey::Text("month".into()), Value::Num(Num::Small(m as i64)));
+    map.insert(ValueKey::Text("day".into()), Value::Num(Num::Small(d as i64)));
+    map.insert(ValueKey::Text("hour".into()), Value::Num(Num::Small(hh as i64)));
+    map.insert(ValueKey::Text("minute".into()), Value::Num(Num::Small(mm as i64)));
+    map.insert(ValueKey::Text("second".into()), Value::Num(Num::Small(ss as i64)));
+    Ok(Value::Dict(Shared::new(map)))
+}
+
+fn time_format(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(crate::error::RuntimeError::type_err(
+            "format requires 2 arguments (secs, fmt)",
+        ));
+    }
+    let secs = expect_int("format", args, 0)?;
+    let fmt = expect_text("format", args, 1)?;
+    let (y, m, d, hh, mm, ss) = utc_parts_from_secs(secs);
+    let mut out = String::new();
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            match chars.next() {
+                Some('Y') => out.push_str(&format!("{y:04}")),
+                Some('m') => out.push_str(&format!("{m:02}")),
+                Some('d') => out.push_str(&format!("{d:02}")),
+                Some('H') => out.push_str(&format!("{hh:02}")),
+                Some('M') => out.push_str(&format!("{mm:02}")),
+                Some('S') => out.push_str(&format!("{ss:02}")),
+                Some('%') => out.push('%'),
+                Some(other) => {
+                    out.push('%');
+                    out.push(other);
+                }
+                None => out.push('%'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Ok(Value::Text(out))
+}
+
+fn time_take_digits(it: &mut std::iter::Peekable<std::str::Chars<'_>>, n: usize) -> Result<u32> {
+    let mut s = String::new();
+    for _ in 0..n {
+        match it.next() {
+            Some(c) if c.is_ascii_digit() => s.push(c),
+            _ => {
+                return Err(crate::error::RuntimeError::value_err(
+                    "time.parse: expected digits",
+                ))
+            }
+        }
+    }
+    s.parse::<u32>()
+        .map_err(|_| crate::error::RuntimeError::value_err("time.parse: invalid number"))
+}
+
+fn time_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(crate::error::RuntimeError::type_err(
+            "parse requires 2 arguments (text, fmt)",
+        ));
+    }
+    let text = expect_text("parse", args, 0)?;
+    let fmt = expect_text("parse", args, 1)?;
+    let mut yi = 1970i32;
+    let mut mo = 1u32;
+    let mut da = 1u32;
+    let mut hh = 0u32;
+    let mut mi = 0u32;
+    let mut se = 0u32;
+    let mut ti = text.chars().peekable();
+    let mut fi = fmt.chars().peekable();
+    while let Some(fc) = fi.next() {
+        if fc == '%' {
+            let spec = fi.next().ok_or_else(|| {
+                crate::error::RuntimeError::value_err("time.parse: trailing % in format")
+            })?;
+            match spec {
+                'Y' => yi = time_take_digits(&mut ti, 4)? as i32,
+                'm' => mo = time_take_digits(&mut ti, 2)?,
+                'd' => da = time_take_digits(&mut ti, 2)?,
+                'H' => hh = time_take_digits(&mut ti, 2)?,
+                'M' => mi = time_take_digits(&mut ti, 2)?,
+                'S' => se = time_take_digits(&mut ti, 2)?,
+                '%' => {
+                    if ti.next() != Some('%') {
+                        return Err(crate::error::RuntimeError::value_err(
+                            "time.parse: expected '%'",
+                        ));
+                    }
+                }
+                other => {
+                    return Err(crate::error::RuntimeError::value_err(format!(
+                        "time.parse: unsupported format %{other}"
+                    )))
+                }
+            }
+        } else {
+            let got = ti.next();
+            if got != Some(fc) {
+                return Err(crate::error::RuntimeError::value_err(format!(
+                    "time.parse: expected '{fc}', got {got:?}"
+                )));
+            }
+        }
+    }
+    if ti.next().is_some() {
+        return Err(crate::error::RuntimeError::value_err(
+            "time.parse: trailing input",
+        ));
+    }
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&da) || hh > 23 || mi > 59 || se > 59 {
+        return Err(crate::error::RuntimeError::value_err(
+            "time.parse: out-of-range date/time component",
+        ));
+    }
+    let days = days_from_civil(yi, mo, da);
+    let secs = days * 86400 + (hh * 3600 + mi * 60 + se) as i64;
+    Ok(Value::Num(Num::Small(secs)))
+}
+
 fn text_upper(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     Ok(Value::Text(expect_text("upper", args, 0)?.to_uppercase()))
 }
@@ -2740,6 +3030,110 @@ fn os_chdir(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn os_name(_vm: &mut Vm, _args: &[Value]) -> Result<Value> {
     Ok(Value::Text(std::env::consts::OS.to_string()))
+}
+
+/// 解析 `run`/`capture` 的命令：`text` 或 `[prog, arg...]`。
+fn os_parse_cmdline(args: &[Value]) -> Result<(String, Vec<String>)> {
+    if args.is_empty() {
+        return Err(crate::error::RuntimeError::type_err(
+            "run/capture requires a command (text or list)",
+        ));
+    }
+    match &args[0] {
+        Value::Text(cmd) => {
+            let extra: Vec<String> = match args.get(1) {
+                None => Vec::new(),
+                Some(Value::List(list)) => list
+                    .borrow()
+                    .iter()
+                    .map(|v| v.print_string())
+                    .collect(),
+                Some(Value::Tuple(t)) => t.iter().map(|v| v.print_string()).collect(),
+                Some(other) => {
+                    return Err(crate::error::RuntimeError::type_err(format!(
+                        "run/capture args must be a list, got {}",
+                        other.type_name()
+                    )))
+                }
+            };
+            Ok((cmd.clone(), extra))
+        }
+        Value::List(list) => {
+            let items = list.borrow();
+            if items.is_empty() {
+                return Err(crate::error::RuntimeError::value_err(
+                    "run/capture command list must be non-empty",
+                ));
+            }
+            let prog = items[0].print_string();
+            let rest = items[1..].iter().map(|v| v.print_string()).collect();
+            Ok((prog, rest))
+        }
+        other => Err(crate::error::RuntimeError::type_err(format!(
+            "run/capture expects text or list command, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+fn os_spawn_result(
+    vm: &mut Vm,
+    prog: &str,
+    args: &[String],
+    capture: bool,
+) -> Result<Value> {
+    vm.caps.check_process("os.run")?;
+    vm.request_cooperative_yield();
+    let mut cmd = std::process::Command::new(prog);
+    cmd.args(args);
+    if capture {
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+    }
+    let output = if capture {
+        cmd.output()
+    } else {
+        cmd.status().map(|status| std::process::Output {
+            status,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        })
+    }
+    .map_err(|e| crate::error::RuntimeError::io_err(format!("os.run failed: {e}")))?;
+    vm.request_cooperative_yield();
+    let code = output.status.code().unwrap_or(if output.status.success() {
+        0
+    } else {
+        1
+    });
+    let mut map = DictMap::new();
+    map.insert(
+        ValueKey::Text("ok".into()),
+        Value::Bool(output.status.success()),
+    );
+    map.insert(
+        ValueKey::Text("status".into()),
+        Value::Num(Num::Small(code as i64)),
+    );
+    map.insert(
+        ValueKey::Text("stdout".into()),
+        Value::Text(String::from_utf8_lossy(&output.stdout).into_owned()),
+    );
+    map.insert(
+        ValueKey::Text("stderr".into()),
+        Value::Text(String::from_utf8_lossy(&output.stderr).into_owned()),
+    );
+    Ok(Value::Dict(Shared::new(map)))
+}
+
+fn os_run(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    let (prog, rest) = os_parse_cmdline(args)?;
+    os_spawn_result(vm, &prog, &rest, false)
+}
+
+fn os_capture(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    let (prog, rest) = os_parse_cmdline(args)?;
+    os_spawn_result(vm, &prog, &rest, true)
 }
 
 fn json_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -4208,8 +4602,48 @@ fn csv_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
 }
 
+fn csv_stringify(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    expect_arity("stringify", args, 1)?;
+    let rows = match &args[0] {
+        Value::List(list) => list.borrow().clone(),
+        _ => {
+            return Err(crate::error::RuntimeError::type_err(
+                "csv.stringify expects a list of rows (each row a list)",
+            ))
+        }
+    };
+    let mut wtr = csv::Writer::from_writer(vec![]);
+    for row in rows {
+        let cells: Vec<String> = match row {
+            Value::List(list) => list.borrow().iter().map(|v| v.print_string()).collect(),
+            Value::Tuple(t) => t.iter().map(|v| v.print_string()).collect(),
+            other => {
+                return Err(crate::error::RuntimeError::type_err(format!(
+                    "csv.stringify row must be list/tuple, got {}",
+                    other.type_name()
+                )))
+            }
+        };
+        wtr.write_record(&cells).map_err(|e| {
+            crate::error::RuntimeError::value_err(format!("csv.stringify: {e}"))
+        })?;
+    }
+    let data = wtr.into_inner().map_err(|e| {
+        crate::error::RuntimeError::value_err(format!("csv.stringify: {e}"))
+    })?;
+    Ok(Value::Text(String::from_utf8(data).map_err(|e| {
+        crate::error::RuntimeError::value_err(format!("csv.stringify: {e}"))
+    })?))
+}
+
 fn build_csv_module() -> Shared<ModuleObject> {
-    submodule("csv", &[("parse", builtin(csv_parse))])
+    submodule(
+        "csv",
+        &[
+            ("parse", builtin(csv_parse)),
+            ("stringify", builtin(csv_stringify)),
+        ],
+    )
 }
 
 // --- std.xml ---

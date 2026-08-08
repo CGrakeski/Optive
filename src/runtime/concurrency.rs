@@ -28,9 +28,11 @@ pub fn get_channel_method(ch: &Shared<ChannelInner>, field: &str) -> Result<Valu
             vm.channel_send(&ch, args[0].clone())?;
             Ok(Value::None)
         }),
-        "recv" => method!(ch, vm, |args| {
+        "recv" | "next" => method!(ch, vm, |args| {
             if !args.is_empty() {
-                return Err(RuntimeError::type_err("Channel.recv takes no arguments"));
+                return Err(RuntimeError::type_err(
+                    "Channel.recv/next takes no arguments",
+                ));
             }
             vm.channel_recv(&ch)
         }),
@@ -115,6 +117,7 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
         SyncInner::Cond { .. } => "Cond",
         SyncInner::TaskGroup { .. } => "TaskGroup",
         SyncInner::TimeoutCtx { .. } => "TimeoutCtx",
+        SyncInner::Atomic { .. } => "Atomic",
     };
     match (kind, field) {
         // --- RWMutex ---
@@ -269,6 +272,8 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
         }),
         ("TaskGroup", "__exit__") => method!(s, vm, |args| {
             let _ = args;
+            // 正常退出 join 全部；首错会在 notify 时 cancel 兄弟任务。
+            // 主动提前取消请用 g.cancel()。
             vm.taskgroup_wait(&s)
         }),
         ("TaskGroup", "run") => method!(s, vm, |args| {
@@ -284,6 +289,15 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
                 return Err(RuntimeError::type_err("TaskGroup.wait takes no arguments"));
             }
             vm.taskgroup_wait(&s)
+        }),
+        ("TaskGroup", "cancel") => method!(s, vm, |args| {
+            if !args.is_empty() {
+                return Err(RuntimeError::type_err(
+                    "TaskGroup.cancel takes no arguments",
+                ));
+            }
+            vm.taskgroup_cancel(&s);
+            Ok(Value::None)
         }),
         // --- TimeoutCtx ---
         ("TimeoutCtx", "__enter__") => method!(s, _vm, |args| {
@@ -309,8 +323,107 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
                 _ => unreachable!(),
             }
         }),
+        ("TimeoutCtx", "check") => method!(s, vm, |args| {
+            if !args.is_empty() {
+                return Err(RuntimeError::type_err(
+                    "TimeoutCtx.check takes no arguments",
+                ));
+            }
+            let expired = match &*s.borrow() {
+                SyncInner::TimeoutCtx { deadline } => std::time::Instant::now() >= *deadline,
+                _ => unreachable!(),
+            };
+            if expired {
+                let exc = crate::exceptions::make_exception(vm, "Cancelled", "timeout")?;
+                vm.throw_value(exc)?;
+            }
+            Ok(Value::None)
+        }),
+        // --- Atomic ---
+        ("Atomic", "get") => method!(s, _vm, |args| {
+            if !args.is_empty() {
+                return Err(RuntimeError::type_err("Atomic.get takes no arguments"));
+            }
+            match &*s.borrow() {
+                SyncInner::Atomic { value } => Ok(value.clone()),
+                _ => unreachable!(),
+            }
+        }),
+        ("Atomic", "set") => method!(s, _vm, |args| {
+            if args.len() != 1 {
+                return Err(RuntimeError::type_err("Atomic.set requires 1 argument"));
+            }
+            match &mut *s.borrow_mut() {
+                SyncInner::Atomic { value } => {
+                    *value = args[0].clone();
+                    Ok(Value::None)
+                }
+                _ => unreachable!(),
+            }
+        }),
+        ("Atomic", "swap") => method!(s, _vm, |args| {
+            if args.len() != 1 {
+                return Err(RuntimeError::type_err("Atomic.swap requires 1 argument"));
+            }
+            match &mut *s.borrow_mut() {
+                SyncInner::Atomic { value } => Ok(std::mem::replace(value, args[0].clone())),
+                _ => unreachable!(),
+            }
+        }),
+        ("Atomic", "add") => method!(s, _vm, |args| {
+            if args.len() != 1 {
+                return Err(RuntimeError::type_err("Atomic.add requires 1 argument"));
+            }
+            let delta = args[0].clone();
+            let mut inner = s.borrow_mut();
+            let SyncInner::Atomic { value } = &mut *inner else {
+                unreachable!()
+            };
+            if !matches!((&*value, &delta), (Value::Num(_), Value::Num(_))) {
+                return Err(RuntimeError::type_err(
+                    "Atomic.add expects numeric Atomic and delta",
+                ));
+            }
+            let sum = value.add(&delta)?;
+            *value = sum.clone();
+            Ok(sum)
+        }),
         _ => Err(RuntimeError::attr_err(format!(
             "{kind} has no method {field}"
+        ))),
+    }
+}
+
+/// `Task.cancel` / `cancelled` / `done`。
+pub fn get_task_method(task: &Shared<crate::value::TaskInner>, field: &str) -> Result<Value> {
+    match field {
+        "cancel" => method!(task, vm, |args| {
+            if !args.is_empty() {
+                return Err(RuntimeError::type_err("Task.cancel takes no arguments"));
+            }
+            vm.cancel_task(&task);
+            Ok(Value::None)
+        }),
+        "cancelled" => method!(task, _vm, |args| {
+            if !args.is_empty() {
+                return Err(RuntimeError::type_err(
+                    "Task.cancelled takes no arguments",
+                ));
+            }
+            Ok(Value::Bool(task.borrow().is_cancelled()))
+        }),
+        "done" => method!(task, _vm, |args| {
+            if !args.is_empty() {
+                return Err(RuntimeError::type_err("Task.done takes no arguments"));
+            }
+            use crate::value::TaskState;
+            Ok(Value::Bool(matches!(
+                task.borrow().state,
+                TaskState::Done(_) | TaskState::Failed(_)
+            )))
+        }),
+        _ => Err(RuntimeError::attr_err(format!(
+            "Task has no method {field}"
         ))),
     }
 }
@@ -527,7 +640,47 @@ pub fn construct_taskgroup(args: &[Value]) -> Result<Value> {
     Ok(Value::Sync(Shared::new(SyncInner::TaskGroup {
         count: 0,
         first_error: None,
+        cancel_requested: false,
+        tasks: Vec::new(),
     })))
+}
+
+pub fn construct_atomic(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(RuntimeError::type_err(
+            "Atomic() requires 1 argument (num or bool)",
+        ));
+    }
+    match &args[0] {
+        Value::Num(_) | Value::Bool(_) => Ok(Value::Sync(Shared::new(SyncInner::Atomic {
+            value: args[0].clone(),
+        }))),
+        _ => Err(RuntimeError::type_err(
+            "Atomic() expects num or bool initial value",
+        )),
+    }
+}
+
+pub fn construct_atomic_num(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(RuntimeError::type_err("Atomic.num requires 1 num argument"));
+    }
+    match &args[0] {
+        Value::Num(_) => construct_atomic(args),
+        _ => Err(RuntimeError::type_err("Atomic.num expects a num")),
+    }
+}
+
+pub fn construct_atomic_bool(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(RuntimeError::type_err(
+            "Atomic.bool requires 1 bool argument",
+        ));
+    }
+    match &args[0] {
+        Value::Bool(_) => construct_atomic(args),
+        _ => Err(RuntimeError::type_err("Atomic.bool expects a bool")),
+    }
 }
 
 pub fn construct_timeout_ctx(args: &[Value]) -> Result<Value> {

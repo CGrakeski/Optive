@@ -36,6 +36,13 @@ fn set_empty_via_ctor() {
 }
 
 #[test]
+fn empty_set_displays_as_comma_literal() {
+    assert_eq!(value("set()").display_string(), "{,}");
+    assert_eq!(value("{,}").display_string(), "{,}");
+}
+
+
+#[test]
 fn set_add_remove() {
     assert_num(
         r#"

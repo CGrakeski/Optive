@@ -7,6 +7,7 @@ use std::process;
 
 use std::borrow::Cow;
 
+use optive::custom::{self, CliMsg, Diag, ReplMsg};
 use optive::{repl_needs_continuation, run_source_in_vm, vm::Vm};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
@@ -19,8 +20,6 @@ use optive::caps::Capabilities;
 use crate::cli::debug_cmd::inject_dep_map;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const REPL_PRIMARY: &str = ">>> ";
-const REPL_CONTINUE: &str = "... ";
 
 /// Windows 上 rustyline 按原始 prompt 算宽度且不忽略 ANSI；
 /// 颜色只能放在 Highlighter，不能塞进 `readline` 的 prompt 字符串。
@@ -43,10 +42,56 @@ impl Highlighter for ReplHelper {
     }
 }
 
+fn take_custom_arg(args: &[String]) -> (Option<String>, Vec<String>) {
+    let mut custom = None;
+    let mut out = Vec::with_capacity(args.len());
+    if let Some(first) = args.first() {
+        out.push(first.clone());
+    }
+    let mut i = 1;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if let Some(rest) = a.strip_prefix("--custom=") {
+            custom = Some(rest.to_string());
+            i += 1;
+            continue;
+        }
+        if a == "--custom" {
+            if i + 1 < args.len() {
+                custom = Some(args[i + 1].clone());
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        out.push(args[i].clone());
+        i += 1;
+    }
+    (custom, out)
+}
+
+fn init_custom(cli_override: Option<&str>) {
+    if let Err(e) = custom::init_from_env_and_cwd(cli_override) {
+        color::eprint_error(format!("Error: {e}"));
+        process::exit(2);
+    }
+}
+
+fn t_cli(msg: CliMsg) -> String {
+    custom::render(&Diag::Cli(msg))
+}
+
+fn t_repl(msg: ReplMsg) -> String {
+    custom::render(&Diag::Repl(msg))
+}
+
 fn main() {
     let raw_args: Vec<String> = env::args().collect();
     let (color_choice, args) = color::take_color_args(&raw_args);
     color::init(color_choice);
+    let (custom_override, args) = take_custom_arg(&args);
+    init_custom(custom_override.as_deref());
 
     if args.len() > 1 {
         match args[1].as_str() {
@@ -174,6 +219,13 @@ fn main() {
             }
             "debug" => {
                 if let Err(e) = cli::debug_cmd::cmd_debug(&args[2..]) {
+                    color::eprint_error(format!("Error: {e}"));
+                    process::exit(1);
+                }
+                return;
+            }
+            "custom" => {
+                if let Err(e) = cli::custom_cmd::run(&args[2..]) {
                     color::eprint_error(format!("Error: {e}"));
                     process::exit(1);
                 }
@@ -389,7 +441,7 @@ fn cmd_update(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let ensured = cli::deps::ensure_for_update(&project, only.as_deref())?;
     print_ensure_report(&ensured);
     if ensured.wrote_lock {
-        color::status_line("Wrote optive.lock");
+        color::status_line("Wrote Optive.lock");
     }
     Ok(())
 }
@@ -601,40 +653,42 @@ fn run_in_vm(
 }
 
 fn print_help() {
-    println!("Optive {VERSION}");
+    println!("{} {VERSION}", t_cli(CliMsg::HelpTitle));
     println!();
-    println!("Usage:");
-    println!("  Optive                         Start interactive REPL");
-    println!("  Optive <script.tive>           Run a script");
-    println!("  Optive -c <code>               Run code from argument (multi-line OK)");
-    println!("  Optive new <ProjectName>       Create a new project");
-    println!("  Optive run [path] [-- args…]   Ensure deps (strict lock) + run entry");
-    println!("  Optive up [path] [-- args…]    update + run");
-    println!("  Optive add <git-url> […]       Add dependency (default: pin tip commit)");
-    println!("  Optive remove <name>           Remove dependency");
-    println!("  Optive update [name] [--dry-run] [-v]");
-    println!("  Optive cache gc [--dry-run]    Remove orphan packs");
-    println!("  Optive deps [-v]               List project dependencies");
-    println!("  Optive deps doctor [-v]        Diagnose deps / lock / orphans");
-    println!("  Optive env                     Print OPTIVE_HOME and paths");
-    println!("  Optive change track_latest=…   Toggle tip-following (warns)");
-    println!("  Optive fmt <file> [-o|--out]   Format a .tive file (default: write back)");
-    println!("  Optive debug [file|path]       Debug a script or project entry");
+    println!("{}", t_cli(CliMsg::HelpUsageHeader));
+    println!("{}", t_cli(CliMsg::HelpRepl));
+    println!("{}", t_cli(CliMsg::HelpRunScript));
+    println!("{}", t_cli(CliMsg::HelpRunCode));
+    println!("{}", t_cli(CliMsg::HelpNew));
+    println!("{}", t_cli(CliMsg::HelpRun));
+    println!("{}", t_cli(CliMsg::HelpUp));
+    println!("{}", t_cli(CliMsg::HelpAdd));
+    println!("{}", t_cli(CliMsg::HelpRemove));
+    println!("{}", t_cli(CliMsg::HelpUpdate));
+    println!("{}", t_cli(CliMsg::HelpCache));
+    println!("{}", t_cli(CliMsg::HelpDeps));
+    println!("{}", t_cli(CliMsg::HelpDepsDoctor));
+    println!("{}", t_cli(CliMsg::HelpEnv));
+    println!("{}", t_cli(CliMsg::HelpChange));
+    println!("{}", t_cli(CliMsg::HelpFmt));
+    println!("{}", t_cli(CliMsg::HelpDebug));
+    println!("{}", t_cli(CliMsg::HelpCustom));
     println!();
-    println!("Runtime capability flags (apply to run / up / debug / <script> / -c):");
-    println!("  --sandbox[=DIR]          No network, no env, no FFI; fs limited to DIR (default: cwd)");
-    println!("  --no-network            Disable std.http");
-    println!("  --no-ffi                Disable C.frompath / extern");
-    println!("  --allow-ffi             Allow native FFI (overrides sandbox default)");
-    println!("  --allow-path DIR         Allow fs access under DIR (repeatable; combines with --sandbox)");
-    println!("  Optive -h, --help              Show this help");
-    println!("  Optive -V, --version           Show version");
+    println!("{}", t_cli(CliMsg::HelpCapsHeader));
+    println!("{}", t_cli(CliMsg::HelpSandbox));
+    println!("{}", t_cli(CliMsg::HelpNoNetwork));
+    println!("{}", t_cli(CliMsg::HelpNoFfi));
+    println!("{}", t_cli(CliMsg::HelpAllowFfi));
+    println!("{}", t_cli(CliMsg::HelpAllowPath));
+    println!("{}", t_cli(CliMsg::HelpH));
+    println!("{}", t_cli(CliMsg::HelpV));
     println!();
-    println!("Env:");
-    println!("  OPTIVE_HOME              Global pack/ + index.db root");
-    println!("  OPTIVE_USE_LOCAL_DEPS=1  Debug: install into project deps/");
+    println!("{}", t_cli(CliMsg::HelpEnvHeader));
+    println!("{}", t_cli(CliMsg::HelpOptiveHome));
+    println!("{}", t_cli(CliMsg::HelpLocalDeps));
+    println!("{}", t_cli(CliMsg::HelpOptiveCustomEnv));
     println!();
-    println!("Files: Optive.toml (intent), optive.lock (repro), Optive.cache (local)");
+    println!("{}", t_cli(CliMsg::HelpFiles));
 }
 
 fn history_path() -> PathBuf {
@@ -648,11 +702,11 @@ fn history_path() -> PathBuf {
 }
 
 fn print_repl_help() {
-    println!("Optive REPL");
-    println!("  :help              Show this help");
-    println!("  :quit / :exit      Exit (also quit / exit)");
-    println!("  Ctrl-C             Cancel unfinished multi-line input");
-    println!("  Ctrl-D             Exit");
+    println!("{}", t_repl(ReplMsg::HelpTitle));
+    println!("{}", t_repl(ReplMsg::HelpHelp));
+    println!("{}", t_repl(ReplMsg::HelpQuit));
+    println!("{}", t_repl(ReplMsg::HelpCtrlC));
+    println!("{}", t_repl(ReplMsg::HelpCtrlD));
 }
 
 fn repl() {
@@ -673,12 +727,15 @@ fn repl() {
 
     let mut vm = Vm::new();
     let mut accumulator = String::new();
+    let pack = custom::active_pack();
+    let primary = pack.repl_prompt().to_string();
+    let continuation = pack.repl_continuation().to_string();
 
     loop {
         let prompt = if accumulator.is_empty() {
-            REPL_PRIMARY
+            primary.as_str()
         } else {
-            REPL_CONTINUE
+            continuation.as_str()
         };
         // 宽度按纯文本 prompt 计算；着色仅通过 Highlighter 绘制。
         if let Some(h) = rl.helper_mut() {

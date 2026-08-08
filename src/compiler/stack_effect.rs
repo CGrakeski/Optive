@@ -112,6 +112,7 @@ impl Instruction {
             | Instruction::IsInstance(_)
             | Instruction::GoValue
             | Instruction::Await
+            | Instruction::Snap
             | Instruction::MakeDeadline
             | Instruction::SelectPollDeadline => Adjust {
                 pop: 1,
@@ -166,6 +167,12 @@ impl Instruction {
             | Instruction::CallSelf { argc }
             | Instruction::MacroCall { argc } => Adjust {
                 pop: (*argc as u16).saturating_add(1),
+                push: 1,
+                alt_push: None,
+            },
+            // callee 已编码在指令里，只弹参数。
+            Instruction::CallGlobal { argc, .. } => Adjust {
+                pop: *argc as u16,
                 push: 1,
                 alt_push: None,
             },

@@ -3,6 +3,7 @@
 //! 本地脚本拥有本机文件系统、进程与模块导入权限。
 
 pub mod compiler;
+pub mod custom;
 pub mod frontend;
 pub mod runtime;
 pub mod stdlib;

@@ -475,11 +475,12 @@ pub enum TaskState {
     Failed(Value),
 }
 
-#[derive(Clone)]
 pub struct TaskInner {
     pub state: TaskState,
     /// 归属的 `TaskGroup`（若有）：任务结束时自动 `done`。
     pub task_group: Option<Shared<SyncInner>>,
+    /// 协作式取消请求；在 await / sleep / 调度入口等检查点生效。
+    pub cancelled: bool,
 }
 
 impl TaskInner {
@@ -487,6 +488,7 @@ impl TaskInner {
         Self {
             state: TaskState::Pending { callable, args },
             task_group: None,
+            cancelled: false,
         }
     }
 
@@ -494,7 +496,16 @@ impl TaskInner {
         Self {
             state: TaskState::Done(value),
             task_group: None,
+            cancelled: false,
         }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
+
+    pub fn request_cancel(&mut self) {
+        self.cancelled = true;
     }
 }
 
@@ -640,14 +651,20 @@ pub enum SyncInner {
     Barrier { n: i64, waiting: usize, generation: u64 },
     /// 条件变量：`signals` 为待消费的唤醒令牌，`waiters` 为当前等待者数。
     Cond { signals: i64, waiters: i64 },
-    /// `std.async.taskgroup()`：作用域等待组；`run` 跟踪子任务，`__exit__` join。
+    /// `std.async.taskgroup()`：作用域等待组；`run` 跟踪子任务，`__exit__` cancel+join。
     TaskGroup {
         count: i64,
         first_error: Option<Value>,
+        cancel_requested: bool,
+        tasks: Vec<Shared<TaskInner>>,
     },
-    /// `std.async.with_timeout(sec)`：截止时刻；完整取消传播仍待补。
+    /// `std.async.with_timeout(sec)`：截止时刻；`check()` 超时抛 `Cancelled`。
     TimeoutCtx {
         deadline: std::time::Instant,
+    },
+    /// `std.sync.Atomic.num/bool`：互斥保护的原子槽。
+    Atomic {
+        value: Value,
     },
 }
 
@@ -674,7 +691,7 @@ pub enum Value {
     TypeRef(String),
     List(Shared<Vec<Value>>),
     Dict(Shared<DictMap>),
-    /// 可哈希值的有序集合。空集用 `set()`，不是 `{}`（空字典）。
+    /// 可哈希值的有序集合。空集展示为 `{,}`（`{}` 仍是空字典）。
     Set(Shared<SetMap>),
     /// 不可变定长序列。空元组为 `()`。
     Tuple(Arc<[Value]>),
@@ -888,6 +905,7 @@ impl Value {
                 SyncInner::Cond { .. } => "Cond",
                 SyncInner::TaskGroup { .. } => "TaskGroup",
                 SyncInner::TimeoutCtx { .. } => "TimeoutCtx",
+                SyncInner::Atomic { .. } => "Atomic",
             },
             Value::SyncGuard(g) => match &*g.borrow() {
                 SyncGuardInner::Read { .. } => "RWMutexReadGuard",
@@ -944,7 +962,7 @@ impl Value {
             Value::Set(s) => {
                 let borrowed = s.borrow();
                 if borrowed.is_empty() {
-                    "set()".to_string()
+                    "{,}".to_string()
                 } else {
                     let parts: Vec<_> = borrowed.iter().map(key_display).collect();
                     format!("{{{}}}", parts.join(", "))
@@ -1033,6 +1051,7 @@ impl Value {
                 SyncInner::Cond { .. } => "<Cond>".to_string(),
                 SyncInner::TaskGroup { .. } => "<TaskGroup>".to_string(),
                 SyncInner::TimeoutCtx { .. } => "<TimeoutCtx>".to_string(),
+                SyncInner::Atomic { .. } => "<Atomic>".to_string(),
             },
             Value::SyncGuard(g) => match &*g.borrow() {
                 SyncGuardInner::Read { .. } => "<RWMutexReadGuard>".to_string(),
@@ -1101,7 +1120,7 @@ impl Value {
             (Value::Num(a), Value::Num(b)) => {
                 let rb = b.to_rational();
                 if rb.is_zero() {
-                    return Err(RuntimeError::zero_div("division by zero"));
+                    return Err(RuntimeError::zero_div_diag());
                 }
                 let ra = a.to_rational();
                 Ok(Value::Num(Num::from_rational(ra / rb)))
@@ -1371,7 +1390,7 @@ fn rem_num(a: &Num, b: &Num) -> Result<Num> {
     let ai = a.to_bigint()?;
     let bi = b.to_bigint()?;
     if bi.is_zero() {
-        return Err(RuntimeError::zero_div("division by zero"));
+        return Err(RuntimeError::zero_div_diag());
     }
     // Python-style：余数符号跟随除数
     let mut r = &ai % &bi;

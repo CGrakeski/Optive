@@ -25,6 +25,66 @@ fn is_c_layout_annotation(ty: &Expr) -> bool {
         .unwrap_or(false)
 }
 
+fn collect_assigned_names(body: &Block, out: &mut HashSet<String>) {
+    for s in body {
+        match &s.stmt {
+            Stmt::Assign {
+                target: LValue::Name(n),
+                ..
+            } => {
+                out.insert(n.clone());
+            }
+            Stmt::VarDecl { name, is_var: true, .. } => {
+                // 块内新建 var 无妨；跨任务写的是 Assign。
+                let _ = name;
+            }
+            Stmt::If {
+                then_block,
+                elifs,
+                else_block,
+                ..
+            } => {
+                collect_assigned_names(then_block, out);
+                for (_, b) in elifs {
+                    collect_assigned_names(b, out);
+                }
+                if let Some(b) = else_block {
+                    collect_assigned_names(b, out);
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::Loop { body, .. }
+            | Stmt::For { body, .. }
+            | Stmt::With { body, .. }
+            | Stmt::Block(body) => collect_assigned_names(body, out),
+            Stmt::Try {
+                body,
+                catches,
+                else_block,
+            } => {
+                collect_assigned_names(body, out);
+                for c in catches {
+                    collect_assigned_names(&c.body, out);
+                }
+                if let Some(b) = else_block {
+                    collect_assigned_names(b, out);
+                }
+            }
+            Stmt::Match {
+                cases, else_block, ..
+            } => {
+                for c in cases {
+                    collect_assigned_names(&c.body, out);
+                }
+                if let Some(b) = else_block {
+                    collect_assigned_names(b, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 enum CompKind {
     List,
     Set,
@@ -2891,6 +2951,16 @@ impl Generator {
             ExprKind::Go { operand } => {
                 self.gen_go_operand(operand)?;
             }
+            ExprKind::ParFor { items, body } => {
+                self.gen_par_for(items, body)?;
+            }
+            ExprKind::ParBlock { exprs } => {
+                self.gen_par_block(exprs)?;
+            }
+            ExprKind::Snap { operand } => {
+                self.gen_expr(operand)?;
+                self.cg.emit(Instruction::Snap);
+            }
             ExprKind::Await { operand } => {
                 if let ExprKind::Call { callee, args } = &operand.kind {
                     let has_named = args.iter().any(|a| a.name.is_some());
@@ -2955,6 +3025,129 @@ impl Generator {
         // 非调用：求值后包装为已完成 Task。
         self.gen_expr(operand)?;
         self.cg.emit(Instruction::GoValue);
+        Ok(())
+    }
+
+    /// `par for (x in xs) { body }` → `std.async.par_map(xs, do(x) { body })`
+    fn gen_par_for(&mut self, items: &[ForItem], body: &Block) -> Result<()> {
+        if items.is_empty() {
+            return Err(RuntimeError::type_err(
+                "par for requires at least one iterator",
+            ));
+        }
+        if items.len() != 1 {
+            return Err(RuntimeError::msg(
+                "par for with multiple iterators is not yet supported; zip manually then par for",
+            ));
+        }
+        let bound: HashSet<String> = items.iter().map(|i| i.name.clone()).collect();
+        self.check_par_no_shared_assign(body, &bound)?;
+
+        let loc = items[0].iterable.loc;
+        let params = vec![FuncParam {
+            name: items[0].name.clone(),
+            is_variadic: false,
+            is_kwvariadic: false,
+            implicit: false,
+            type_expr: None,
+            type_strong: false,
+            default_expr: None,
+        }];
+        let do_fn = Expr::new(
+            loc,
+            ExprKind::DoFunc {
+                params,
+                return_type: None,
+                return_strong: false,
+                return_wrapper: None,
+                body: body.clone(),
+            },
+        );
+        let call = self.make_std_async_call(
+            loc,
+            "par_map",
+            vec![items[0].iterable.clone(), do_fn],
+        );
+        self.gen_expr(&call)
+    }
+
+    /// `par { e1; e2 }` → `std.async.gather([go e1, go e2, ...])`
+    fn gen_par_block(&mut self, exprs: &[Expr]) -> Result<()> {
+        if exprs.is_empty() {
+            return Err(RuntimeError::type_err(
+                "par block requires at least one expression",
+            ));
+        }
+        let empty = HashSet::new();
+        for e in exprs {
+            // 把单表达式包成块检查赋值（`par { x = 1 }` 非法跨任务写）
+            let stub = vec![LocatedStmt {
+                line: e.loc.line,
+                column: e.loc.column,
+                stmt: Stmt::Expr(e.clone()),
+            }];
+            self.check_par_no_shared_assign(&stub, &empty)?;
+        }
+        let loc = exprs[0].loc;
+        let go_elems: Vec<Expr> = exprs
+            .iter()
+            .map(|e| {
+                Expr::new(
+                    e.loc,
+                    ExprKind::Go {
+                        operand: Box::new(e.clone()),
+                    },
+                )
+            })
+            .collect();
+        let list = Expr::new(loc, ExprKind::List(go_elems));
+        let call = self.make_std_async_call(loc, "gather", vec![list]);
+        self.gen_expr(&call)
+    }
+
+    fn make_std_async_call(&self, loc: SourceLoc, name: &str, args: Vec<Expr>) -> Expr {
+        let std_async = Expr::new(
+            loc,
+            ExprKind::Member {
+                object: Box::new(Expr::new(
+                    loc,
+                    ExprKind::Member {
+                        object: Box::new(Expr::new(loc, ExprKind::Var("std".into()))),
+                        field: "async".into(),
+                    },
+                )),
+                field: name.into(),
+            },
+        );
+        Expr::new(
+            loc,
+            ExprKind::Call {
+                callee: Box::new(std_async),
+                args: args
+                    .into_iter()
+                    .map(|value| CallArg {
+                        name: None,
+                        is_splat: false,
+                        is_kwsplat: false,
+                        value,
+                    })
+                    .collect(),
+            },
+        )
+    }
+
+    /// 禁止 `par` 体对封闭作用域名字赋值（裸共享可变）。
+    fn check_par_no_shared_assign(&self, body: &Block, bound: &HashSet<String>) -> Result<()> {
+        let mut assigned = HashSet::new();
+        collect_assigned_names(body, &mut assigned);
+        let free: HashSet<String> = free_vars::free_vars_in_block(body, bound)
+            .into_iter()
+            .collect();
+        for name in assigned.intersection(&free) {
+            return Err(RuntimeError::msg(format!(
+                "cannot assign to '{name}' across par/go tasks; use Mutex / Channel / Atomic"
+            )));
+        }
         Ok(())
     }
 

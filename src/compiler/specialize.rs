@@ -112,6 +112,14 @@ pub(crate) fn specialize_with_entry(code: &mut [Instruction], entry_env: &[Optio
                 let _ = stack.pop(); // 被调者
                 stack.push(None);
             }
+            Instruction::CallGlobal { argc, .. } => {
+                let argc = *argc;
+                env.fill(None);
+                for _ in 0..argc {
+                    let _ = stack.pop();
+                }
+                stack.push(None);
+            }
             Instruction::CallList | Instruction::CallEx => {
                 env.fill(None);
                 stack.clear();
@@ -366,7 +374,7 @@ pub(crate) fn specialize_with_entry(code: &mut [Instruction], entry_env: &[Optio
                 let _ = stack.pop(); // callee
                 stack.push(None); // Task
             }
-            Instruction::GoValue | Instruction::Await => {
+            Instruction::GoValue | Instruction::Await | Instruction::Snap => {
                 let _ = stack.pop();
                 stack.push(None);
             }

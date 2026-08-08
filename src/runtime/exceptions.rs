@@ -111,16 +111,17 @@ pub fn exception_message(exc: &Value) -> Option<String> {
     }
 }
 
-/// 未捕获异常的展示：`TypeName: message`（与 Python 一致）。
+/// 未捕获异常的展示：`TypeName: message`（与 Python 一致；模板可定制）。
 pub fn format_uncaught(exc: &Value) -> String {
     let Value::Struct(s) = exc else {
         return exc.display_string();
     };
     let name = s.def.name.as_str();
-    match exception_message(exc) {
-        Some(msg) if !msg.is_empty() => format!("{name}: {msg}"),
-        _ => name.to_string(),
-    }
+    let msg = match exception_message(exc) {
+        Some(msg) if !msg.is_empty() => msg,
+        _ => String::new(),
+    };
+    crate::custom::active_pack().format_exception_line(name, &msg)
 }
 
 /// 供 `std.exceptions.tree` 等使用的继承表。

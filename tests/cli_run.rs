@@ -71,7 +71,7 @@ entry = "src/main.tive"
     let (code, stdout, stderr) = run_optive(&["run"], &root);
     assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
     assert!(stdout.contains("42"), "expected print 42, got: {stdout}");
-    assert!(root.join("optive.lock").is_file(), "should write lock");
+    assert!(root.join("Optive.lock").is_file(), "should write lock");
 }
 
 #[test]
@@ -119,7 +119,7 @@ helper = { git = "https://github.com/example/helper.git", rev = "bbbbbbbbbbbbbbb
     .unwrap();
     fs::write(root.join("main.tive"), "print(1)\n").unwrap();
     fs::write(
-        root.join("optive.lock"),
+        root.join("Optive.lock"),
         r#"
 version = 1
 

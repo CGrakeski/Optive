@@ -4,6 +4,7 @@ pub mod cache;
 pub mod caps;
 pub mod color;
 pub mod commands;
+pub mod custom_cmd;
 pub mod debug_cmd;
 pub mod deps;
 pub mod doctor;

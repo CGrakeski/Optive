@@ -25,6 +25,8 @@ pub enum ExceptionKind {
     RecursionError,
     /// 协作/并行调度下无可运行任务仍阻塞（channel / mutex / await 等）。
     DeadlockError,
+    /// 任务被协作式取消（`Task.cancel` / `race` 失败者 / `taskgroup` 退出）。
+    Cancelled,
 }
 
 impl ExceptionKind {
@@ -48,6 +50,7 @@ impl ExceptionKind {
         Self::NotImplemented,
         Self::RecursionError,
         Self::DeadlockError,
+        Self::Cancelled,
     ];
 
     pub const fn type_name(self) -> &'static str {
@@ -71,6 +74,7 @@ impl ExceptionKind {
             Self::NotImplemented => "NotImplementedError",
             Self::RecursionError => "RecursionError",
             Self::DeadlockError => "DeadlockError",
+            Self::Cancelled => "Cancelled",
         }
     }
 
@@ -89,7 +93,8 @@ impl ExceptionKind {
             | Self::NameError
             | Self::IOError
             | Self::AssertionError
-            | Self::NotImplemented => Some(Self::Exception),
+            | Self::NotImplemented
+            | Self::Cancelled => Some(Self::Exception),
             Self::UnsupportedOp => Some(Self::TypeError),
             Self::ZeroDivision => Some(Self::ArithmeticError),
             Self::KeyError | Self::IndexError => Some(Self::LookupError),
@@ -185,6 +190,13 @@ impl RuntimeError {
         Self::typed(ExceptionKind::ZeroDivision, message)
     }
 
+    /// 按当前定制包渲染的除零错误（人读文案；类型名仍为 ZeroDivisionError）。
+    pub fn zero_div_diag() -> Self {
+        Self::zero_div(crate::custom::render(&crate::custom::Diag::Runtime(
+            crate::custom::ErrorKindMsg::ZeroDivision,
+        )))
+    }
+
     pub fn io_err(message: impl Into<String>) -> Self {
         Self::typed(ExceptionKind::IOError, message)
     }
@@ -199,6 +211,10 @@ impl RuntimeError {
 
     pub fn deadlock(message: impl Into<String>) -> Self {
         Self::typed(ExceptionKind::DeadlockError, message)
+    }
+
+    pub fn cancelled(message: impl Into<String>) -> Self {
+        Self::typed(ExceptionKind::Cancelled, message)
     }
 
     pub fn kind(&self) -> ExceptionKind {

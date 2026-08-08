@@ -417,9 +417,17 @@ fn mark_sync_children(inner: &crate::value::SyncInner, worklist: &mut Vec<Value>
         | SyncInner::Barrier { .. }
         | SyncInner::Cond { .. }
         | SyncInner::TimeoutCtx { .. } => {}
-        SyncInner::TaskGroup { first_error, .. } => {
+        SyncInner::Atomic { value } => worklist.push(value.clone()),
+        SyncInner::TaskGroup {
+            first_error,
+            tasks,
+            ..
+        } => {
             if let Some(err) = first_error {
                 worklist.push(err.clone());
+            }
+            for t in tasks {
+                worklist.push(Value::Task(t.clone()));
             }
         }
     }

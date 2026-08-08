@@ -1,0 +1,106 @@
+// std.macros —— 实用宏库（调用形如 name{args}）
+
+macro dbg(x) {
+    return quote(v) with (x) {
+        var v = eval(x)
+        print("[dbg]", v)
+        v
+    }
+}
+
+macro assert(cond) {
+    return quote with (cond) {
+        if (!(eval(cond))) {
+            throw AssertionError("assertion failed")
+        }
+    }
+}
+
+macro assert_eq(a, b) {
+    return quote(va, vb) with (a, b) {
+        var va = eval(a)
+        var vb = eval(b)
+        if (va != vb) {
+            throw AssertionError(std.concat("assert_eq failed: ", va, " != ", vb))
+        }
+    }
+}
+
+macro assert_ne(a, b) {
+    return quote(va, vb) with (a, b) {
+        var va = eval(a)
+        var vb = eval(b)
+        if (va == vb) {
+            throw AssertionError(std.concat("assert_ne failed: both are ", va))
+        }
+    }
+}
+
+macro todo() {
+    return quote {
+        throw NotImplementedError("todo")
+    }
+}
+
+macro unimplemented() {
+    return quote {
+        throw NotImplementedError("unimplemented")
+    }
+}
+
+macro unreachable() {
+    return quote {
+        throw RuntimeError("unreachable")
+    }
+}
+
+macro or_else(x, d) {
+    return quote(v) with (x, d) {
+        var v = eval(x)
+        if (v is none) { eval(d) } else { v }
+    }
+}
+
+macro ignore(x) {
+    return quote with (x) {
+        eval(x)
+        none
+    }
+}
+
+macro time_it(x) {
+    return quote(t0, v, t1, dt) with (x) {
+        var t0 = std.time.monotonic()
+        var v = eval(x)
+        var t1 = std.time.monotonic()
+        var dt = t1 - t0
+        print("[time_it]", dt, "s")
+        v
+    }
+}
+
+macro unless(cond, body) {
+    return quote with (cond, body) {
+        if (!(eval(cond))) {
+            eval(body)
+        }
+    }
+}
+
+macro when(cond, body) {
+    return quote with (cond, body) {
+        if (eval(cond)) {
+            eval(body)
+        }
+    }
+}
+
+macro identity(x) {
+    return x
+}
+
+macro stringify(x) {
+    return quote with (x) {
+        str(eval(x))
+    }
+}

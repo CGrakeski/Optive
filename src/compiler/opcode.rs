@@ -87,6 +87,8 @@ pub enum Instruction {
     /// 计数循环：栈顶为计数器。`<= 0` 时弹出并跳到目标；否则计数器减 1。
     LoopCountdown(usize),
     Call { argc: usize },
+    /// 融合：`LoadGlobal(idx); Call { argc }` → 不经栈装载 callee。
+    CallGlobal { global_idx: usize, argc: usize },
     CallSelf { argc: usize },
     CallList,
     /// 扩展调用：栈为 `args_list, kwargs_dict, callee`。
@@ -121,6 +123,8 @@ pub enum Instruction {
     IterNext,
     IterEnd,
     Throw,
+    /// 栈顶：若为 `none` 则抛 `ValueError`，否则保留。
+    Snap,
     PushExc,
     EnterTry {
         catch_label: usize,
@@ -436,7 +440,7 @@ pub fn compact_parallel(map: &[usize], old_to_new: &[usize]) -> Vec<usize> {
 /// 供调用方同步紧化 `line_map` / `column_map`。
 pub fn peephole_fuse(code: Vec<Instruction>) -> (Vec<Instruction>, Vec<usize>) {
     let n = code.len();
-    if n < 3 {
+    if n < 2 {
         return (code, (0..=n).collect());
     }
     // 收集所有跳转目标 PC，防止融合跨越跳转入口。
@@ -465,6 +469,22 @@ pub fn peephole_fuse(code: Vec<Instruction>) -> (Vec<Instruction>, Vec<usize>) {
     let mut remap = vec![0usize; n + 1];
     let mut i = 0;
     while i < n {
+        if i + 1 < n && !jump_targets.contains(&(i + 1)) {
+            if let (Instruction::LoadGlobal(idx), Instruction::Call { argc }) =
+                (&code[i], &code[i + 1])
+            {
+                if *idx < u32::MAX as usize && *argc < u32::MAX as usize {
+                    remap[i] = new_code.len();
+                    remap[i + 1] = new_code.len();
+                    new_code.push(Instruction::CallGlobal {
+                        global_idx: *idx,
+                        argc: *argc,
+                    });
+                    i += 2;
+                    continue;
+                }
+            }
+        }
         if i + 2 < n
             && !jump_targets.contains(&(i + 1))
             && !jump_targets.contains(&(i + 2))
@@ -684,6 +704,7 @@ pub fn function_lightweight(
         !matches!(
             ins,
             Instruction::Call { .. }
+                | Instruction::CallGlobal { .. }
                 | Instruction::CallList
                 | Instruction::CallEx
                 | Instruction::EnterTry { .. }

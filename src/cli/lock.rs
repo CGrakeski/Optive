@@ -1,4 +1,4 @@
-//! `optive.lock` — 可复现依赖图。
+//! `Optive.lock` — 可复现依赖图。
 
 use std::collections::BTreeMap;
 use std::fs;

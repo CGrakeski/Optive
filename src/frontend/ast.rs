@@ -414,7 +414,7 @@ pub enum ExprKind {
         items: Vec<ForItem>,
         guards: Vec<Expr>,
     },
-    /// 集合字面量 `{a, b, c}`（无冒号）。空集用 `set()`，不是 `{}`。
+    /// 集合字面量 `{a, b, c}`（无冒号）。空集为 `{,}`，不是 `{}`。
     Set(Vec<Expr>),
     /// `{x for (x in xs) if (cond)}` 集合推导式。
     SetComp {
@@ -440,6 +440,15 @@ pub enum ExprKind {
     Handle { operand: Box<Expr> },
     /// `go expr` — 启动任务，立即返回 Task。
     Go { operand: Box<Expr> },
+    /// `par for (x in xs) { ... }` — 并行 map，脱糖为 `std.async.par_map` / `gather`。
+    ParFor {
+        items: Vec<ForItem>,
+        body: Block,
+    },
+    /// `par { e1; e2; ... }` — 并行求值表达式，返回结果元组。
+    ParBlock { exprs: Vec<Expr> },
+    /// `snap expr` — 若为 `none` 则抛异常，否则返回 `expr`。
+    Snap { operand: Box<Expr> },
     /// `await expr` — 启动并等待。
     Await { operand: Box<Expr> },
     /// `suspend` — 协作式让出 CPU（调度器预算用尽时也会隐式挂起）。
@@ -715,6 +724,25 @@ pub fn fill_placeholders(expr: &Expr, repl: &Expr) -> Expr {
         ExprKind::Go { operand } => Expr::new(
             expr.loc,
             ExprKind::Go {
+                operand: Box::new(fill_placeholders(operand, repl)),
+            },
+        ),
+        ExprKind::ParFor { items, body } => Expr::new(
+            expr.loc,
+            ExprKind::ParFor {
+                items: fill_placeholder_for_items(items, repl),
+                body: body.clone(),
+            },
+        ),
+        ExprKind::ParBlock { exprs } => Expr::new(
+            expr.loc,
+            ExprKind::ParBlock {
+                exprs: exprs.iter().map(|e| fill_placeholders(e, repl)).collect(),
+            },
+        ),
+        ExprKind::Snap { operand } => Expr::new(
+            expr.loc,
+            ExprKind::Snap {
                 operand: Box::new(fill_placeholders(operand, repl)),
             },
         ),

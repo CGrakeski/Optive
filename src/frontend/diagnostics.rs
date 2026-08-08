@@ -34,12 +34,30 @@ fn format_located_error(
     column: usize,
     message: &str,
 ) -> String {
-    format_source_error(source, file, line, column, "error", message)
+    let pack = crate::custom::active_pack();
+    format_source_error(
+        source,
+        file,
+        line,
+        column,
+        pack.parse_label_error(),
+        pack.parse_arrow(),
+        message,
+    )
 }
 
 /// 在已知行号时，带源码上下文格式化运行时错误。
 pub fn format_runtime_at_line(source: &str, file: &str, line: usize, message: &str) -> String {
-    format_source_error(source, file, line, 1, "error", message)
+    let pack = crate::custom::active_pack();
+    format_source_error(
+        source,
+        file,
+        line,
+        1,
+        pack.parse_label_error(),
+        pack.parse_arrow(),
+        message,
+    )
 }
 
 /// 带调用栈与各帧源码上下文的运行时错误。
@@ -53,16 +71,25 @@ pub fn format_runtime_with_stack(
         return format_runtime_at_line(fallback_source, fallback_file, 1, message);
     }
 
+    let pack = crate::custom::active_pack();
     let mut out = String::new();
-    out.push_str("\nTraceback (most recent call last):\n");
+    out.push('\n');
+    out.push_str(pack.traceback_header());
+    out.push('\n');
 
-    for (i, frame) in stack.iter().enumerate() {
+    let bottom_up =
+        pack.traceback_direction() == crate::custom::TraceDirection::BottomUp;
+    let iter: Box<dyn Iterator<Item = (usize, &ErrorStackFrame)>> = if bottom_up {
+        Box::new(stack.iter().enumerate().rev())
+    } else {
+        Box::new(stack.iter().enumerate())
+    };
+
+    for (i, frame) in iter {
         let is_innermost = i + 1 == stack.len();
         let line = if frame.line == 0 { 1 } else { frame.line };
-        out.push_str(&format!(
-            "  File \"{}\", line {}, in {}\n",
-            frame.file, line, frame.func
-        ));
+        out.push_str(&pack.format_traceback_frame(&frame.file, line, &frame.func));
+        out.push('\n');
         let src = frame
             .source
             .as_deref()
@@ -122,7 +149,8 @@ fn format_source_error(
     file: &str,
     line: usize,
     column: usize,
-    kind: &str,
+    label: &str,
+    arrow: &str,
     message: &str,
 ) -> String {
     let lines: Vec<&str> = source.lines().collect();
@@ -130,8 +158,11 @@ fn format_source_error(
     let col_idx = column.saturating_sub(1);
 
     let mut out = String::new();
-    out.push_str(&format!("{kind}: {message}\n"));
-    out.push_str(&format!(" --> {file}:{line}:{column}\n"));
+    out.push_str(label);
+    out.push_str(message);
+    out.push('\n');
+    out.push_str(arrow);
+    out.push_str(&format!("{file}:{line}:{column}\n"));
     // 与源码行 `{n:>3} |` 对齐，避免 `^` 相对文本左偏（看起来像指到中间）。
     out.push_str(&format!("{:>3} |\n", ""));
 

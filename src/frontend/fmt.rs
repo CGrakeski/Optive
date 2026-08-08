@@ -979,14 +979,18 @@ impl Formatter {
                 self.buf.push('}');
             }
             ExprKind::Set(elems) => {
-                self.buf.push('{');
-                for (i, e) in elems.iter().enumerate() {
-                    if i > 0 {
-                        self.buf.push_str(", ");
+                if elems.is_empty() {
+                    self.buf.push_str("{,}");
+                } else {
+                    self.buf.push('{');
+                    for (i, e) in elems.iter().enumerate() {
+                        if i > 0 {
+                            self.buf.push_str(", ");
+                        }
+                        self.emit_expr_replacing(e, depth, replace_var, with);
                     }
-                    self.emit_expr_replacing(e, depth, replace_var, with);
+                    self.buf.push('}');
                 }
-                self.buf.push('}');
             }
             ExprKind::Tuple(elems) => {
                 self.buf.push('(');
@@ -1065,6 +1069,34 @@ impl Formatter {
             }
             ExprKind::Go { operand } => {
                 self.buf.push_str("go ");
+                self.emit_expr_replacing(operand, depth, replace_var, with);
+            }
+            ExprKind::ParFor { items, body } => {
+                self.buf.push_str("par for (");
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        self.buf.push_str(", ");
+                    }
+                    self.buf.push_str(&item.name);
+                    self.buf.push_str(" in ");
+                    self.emit_expr_replacing(&item.iterable, depth, replace_var, with);
+                }
+                self.buf.push_str(") ");
+                self.emit_block(body, depth);
+            }
+            ExprKind::ParBlock { exprs } => {
+                self.buf.push_str("par {");
+                self.buf.push('\n');
+                for e in exprs {
+                    self.indent(depth + 1);
+                    self.emit_expr_replacing(e, depth + 1, replace_var, with);
+                    self.buf.push('\n');
+                }
+                self.indent(depth);
+                self.buf.push('}');
+            }
+            ExprKind::Snap { operand } => {
+                self.buf.push_str("snap ");
                 self.emit_expr_replacing(operand, depth, replace_var, with);
             }
             ExprKind::Await { operand } => {

@@ -9,6 +9,11 @@ license = "MulanPSL-2.0"
 name = "Optive"
 path = "src/main.rs"
 
+## CPU 分析负载入口（配合 samply 等外部采样器）。不引入库依赖，改动面最小。
+[[bin]]
+name = "benchmark-analysis"
+path = "src/bin/benchmark-analysis.rs"
+
 [features]
 default = ["mn"]
 ## M:N 真并行调度（work-stealing）。关闭时仍用 Arc 堆，但只跑 1 个 worker（协作语义）。
@@ -60,6 +65,13 @@ strip = true
 codegen-units = 4
 debug-assertions = false
 overflow-checks = true
+
+## 保留符号，供 samply / ETW 采样定位函数热点。
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = false
+codegen-units = 1
 
 [profile.bench]
 inherits = "release"

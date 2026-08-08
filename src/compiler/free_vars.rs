@@ -452,8 +452,23 @@ fn collect_expr(expr: &Expr, locals: &HashMap<String, ()>, free: &mut HashSet<St
             collect_expr(else_expr, locals, free);
         }
         ExprKind::Handle { operand } => collect_expr(operand, locals, free),
-        ExprKind::Go { operand } | ExprKind::Await { operand } => {
+        ExprKind::Go { operand } | ExprKind::Await { operand } | ExprKind::Snap { operand } => {
             collect_expr(operand, locals, free)
+        }
+        ExprKind::ParFor { items, body } => {
+            for item in items {
+                collect_expr(&item.iterable, locals, free);
+            }
+            let mut scoped = locals.clone();
+            for item in items {
+                scoped.insert(item.name.clone(), ());
+            }
+            collect_block(body, &mut scoped, free);
+        }
+        ExprKind::ParBlock { exprs } => {
+            for e in exprs {
+                collect_expr(e, locals, free);
+            }
         }
         ExprKind::Suspend => {}
         ExprKind::Select { cases, else_block } => {

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-const MANIFEST_NAMES: &[&str] = &["Optive.toml", "optive.toml"];
+const MANIFEST_NAMES: &[&str] = &["Optive.toml"];
 
 /// 依赖修订声明种类（决定是否可被 `update` 追 tip）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,7 +243,7 @@ impl Project {
     }
 
     pub fn lock_path(&self) -> PathBuf {
-        self.root.join("optive.lock")
+        self.root.join("Optive.lock")
     }
 
     pub fn cache_path(&self) -> PathBuf {
@@ -359,7 +359,7 @@ pub fn find_project(start: Option<&Path>) -> Result<Project, String> {
                     .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("");
-                if MANIFEST_NAMES.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+                if name == "Optive.toml" {
                     return load_project(p);
                 }
                 return Err(format!(

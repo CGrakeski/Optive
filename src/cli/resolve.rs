@@ -94,7 +94,7 @@ pub fn ensure_graph(
         if let Some(ref lock) = existing_lock {
             if !lock.matches_root_intent(&project.manifest) {
                 return Err(
-                    "optive.lock is out of date with Optive.toml; run `Optive update` or `Optive up`"
+                    "Optive.lock is out of date with Optive.toml; run `Optive update` or `Optive up`"
                         .into(),
                 );
             }
@@ -133,7 +133,7 @@ pub fn ensure_graph(
                         {
                             if !lock::dependency_matches_lock_edge(dep, edge) {
                                 return Err(format!(
-                                    "optive.lock is out of date for dependency `{name}` (intent changed); run `Optive update` without a name filter, or `Optive up`"
+                                    "Optive.lock is out of date for dependency `{name}` (intent changed); run `Optive update` without a name filter, or `Optive up`"
                                 )
                                 .into());
                             }
@@ -330,7 +330,7 @@ fn ensure_from_lock(
         let computed = store::content_id(&edge.git, &edge.rev);
         if computed != edge.id {
             return Err(format!(
-                "corrupt optive.lock: edge {} id {} != content_id({})",
+                "corrupt Optive.lock: edge {} id {} != content_id({})",
                 edge.name, edge.id, computed
             )
             .into());
@@ -424,7 +424,7 @@ fn materialize_lock_subtree(
         let computed = store::content_id(&edge.git, &edge.rev);
         if computed != edge.id {
             return Err(format!(
-                "corrupt optive.lock: edge {} id {} != content_id({})",
+                "corrupt Optive.lock: edge {} id {} != content_id({})",
                 edge.name, edge.id, computed
             )
             .into());

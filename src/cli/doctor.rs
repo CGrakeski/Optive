@@ -19,6 +19,8 @@ pub fn print_env() {
         println!("OPTIVE_HOME (env):       (unset, using default)");
     }
     println!("pack/:                   {}", home::pack_dir().display());
+    println!("custom/:                 {}", home::custom_dir().display());
+    println!("Config.toml:             {}", home::global_config_path().display());
     println!("index.db:                {}", home::index_db_path().display());
     println!(
         "OPTIVE_USE_LOCAL_DEPS:   {}",
@@ -384,7 +386,7 @@ fn resolve_dep_path(
 }
 
 fn read_pkg_version(package_root: &Path) -> Option<String> {
-    for name in ["Optive.toml", "optive.toml"] {
+    for name in ["Optive.toml"] {
         let p = package_root.join(name);
         if !p.is_file() {
             continue;

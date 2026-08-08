@@ -1417,6 +1417,33 @@ impl Parser {
         Ok(Stmt::For { items, body })
     }
 
+    /// `par { expr; expr; ... }`：块内仅允许表达式语句。
+    fn parse_par_block_exprs(&mut self) -> Result<Vec<Expr>, ParseError> {
+        self.expect(TokenKind::LBrace, "expected '{' after par")?;
+        self.brace_depth += 1;
+        let mut exprs = Vec::new();
+        self.skip_newlines();
+        while !self.check(TokenKind::RBrace) && !self.is_at_end() {
+            let located = self.parse_stmt()?;
+            match located.stmt {
+                Stmt::Expr(e) => exprs.push(e),
+                Stmt::Comment { .. } => {}
+                _ => {
+                    return Err(self.error(
+                        "par block only allows expression statements (e.g. par { f(); g() })",
+                    ))
+                }
+            }
+            self.skip_newlines();
+        }
+        self.expect(TokenKind::RBrace, "expected '}' after par block")?;
+        self.brace_depth -= 1;
+        if exprs.is_empty() {
+            return Err(self.error("par block requires at least one expression"));
+        }
+        Ok(exprs)
+    }
+
     fn parse_try(&mut self) -> Result<Stmt, ParseError> {
         let body = self.parse_block()?;
         let mut catches = Vec::new();
@@ -2067,6 +2094,7 @@ impl Parser {
                 | TokenKind::KwSelect
                 | TokenKind::KwHandle
                 | TokenKind::KwGo
+                | TokenKind::KwSnap
                 | TokenKind::KwAwait
                 | TokenKind::KwIf
                 | TokenKind::Placeholder
@@ -2382,6 +2410,27 @@ impl Parser {
             self.advance();
             let operand = self.parse_comparison_ex(allow_macro)?;
             return Ok(Expr::new(loc, ExprKind::Go { operand: Box::new(operand) }));
+        }
+        if self.check(TokenKind::KwPar) {
+            let loc = self.loc_here();
+            self.advance();
+            self.skip_newlines();
+            if self.match_kind(TokenKind::KwFor) {
+                let items = self.parse_for_items_in_parens()?;
+                let body = self.parse_block()?;
+                return Ok(Expr::new(loc, ExprKind::ParFor { items, body }));
+            }
+            if self.check(TokenKind::LBrace) {
+                let exprs = self.parse_par_block_exprs()?;
+                return Ok(Expr::new(loc, ExprKind::ParBlock { exprs }));
+            }
+            return Err(self.error("expected 'for' or '{' after 'par'"));
+        }
+        if self.check(TokenKind::KwSnap) {
+            let loc = self.loc_here();
+            self.advance();
+            let operand = self.parse_comparison_ex(allow_macro)?;
+            return Ok(Expr::new(loc, ExprKind::Snap { operand: Box::new(operand) }));
         }
         if self.check(TokenKind::KwAwait) {
             let loc = self.loc_here();
@@ -2836,8 +2885,15 @@ impl Parser {
                 if self.check(TokenKind::RBrace) {
                     self.advance();
                     self.brace_depth -= 1;
-                    // `{}` 为空字典；空集合用 `set()`。
+                    // `{}` 为空字典；空集合字面量为 `{,}`（`set()` 仍可构造空集）。
                     return Ok(Expr::new(loc, ExprKind::Dict(Vec::new())));
+                }
+                if self.check(TokenKind::Comma) {
+                    self.advance();
+                    self.skip_newlines();
+                    self.expect(TokenKind::RBrace, "expected '}' after '{,'")?;
+                    self.brace_depth -= 1;
+                    return Ok(Expr::new(loc, ExprKind::Set(Vec::new())));
                 }
                 let first = self.parse_expr()?;
                 if self.match_kind(TokenKind::Colon) {
@@ -2900,7 +2956,9 @@ impl Parser {
                     Ok(Expr::new(loc, ExprKind::Set(elems)))
                 }
             }
-            _ => Err(self.error("expected expression")),
+            _ => Err(self.error(&crate::custom::render(
+                &crate::custom::Diag::Parse(crate::custom::ParseMsg::ExpectedExpression),
+            ))),
         }
     }
 

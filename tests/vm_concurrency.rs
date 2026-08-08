@@ -439,6 +439,175 @@ ok
 }
 
 #[test]
+fn task_cancel_before_run() {
+    assert_bool(
+        r#"
+let t = go do {
+  suspend
+  return 1
+}
+t.cancel()
+t.cancelled()
+"#,
+        true,
+    );
+}
+
+#[test]
+fn await_cancelled_task_throws() {
+    run_err(
+        r#"
+let t = go do {
+  std.time.sleep(10.0)
+  return 1
+}
+t.cancel()
+await t
+"#,
+    );
+}
+
+#[test]
+fn race_cancels_losers() {
+    assert_bool(
+        r#"
+let slow = go do {
+  suspend
+  suspend
+  return 99
+}
+let fast = go do { return 7 }
+let v = std.async.race([slow, fast])
+v == 7 and slow.cancelled()
+"#,
+        true,
+    );
+}
+
+#[test]
+fn taskgroup_cancels_siblings_on_error() {
+    assert_bool(
+        r#"
+var cancelled = false
+try {
+  with (std.async.taskgroup() as g) {
+    g.run(do() {
+      std.time.sleep(10.0)
+    })
+    g.run(do() {
+      throw ValueError("boom")
+    })
+  }
+} catch (e) {
+  cancelled = true
+}
+cancelled
+"#,
+        true,
+    );
+}
+
+#[test]
+fn par_map_sums() {
+    assert_num(
+        r#"
+func double(x) { return x * 2 }
+let ys = std.async.par_map([1, 2, 3], double)
+ys[0] + ys[1] + ys[2]
+"#,
+        "12",
+    );
+}
+
+#[test]
+fn atomic_add() {
+    assert_num(
+        r#"
+let a = std.sync.Atomic.num(10)
+a.add(5)
+a.get()
+"#,
+        "15",
+    );
+}
+
+#[test]
+fn async_workers_at_least_one() {
+    // 本套件固定 workers=1；API 本身返回当前调度器 worker 数。
+    assert_num(
+        r#"
+std.async.workers()
+"#,
+        "1",
+    );
+}
+
+#[test]
+fn par_for_maps() {
+    assert_num(
+        r#"
+let ys = par for (x in [1, 2, 3]) { x * 10 }
+ys[0] + ys[1] + ys[2]
+"#,
+        "60",
+    );
+}
+
+#[test]
+fn par_block_gathers() {
+    assert_num(
+        r#"
+let r = par {
+  10 + 1
+  20 + 2
+}
+r[0] + r[1]
+"#,
+        "33",
+    );
+}
+
+#[test]
+fn par_for_rejects_shared_assign() {
+    run_err(
+        r#"
+var n = 0
+par for (x in [1, 2]) {
+  n = n + x
+}
+"#,
+    );
+}
+
+#[test]
+fn stream_of_for_in() {
+    assert_num(
+        r#"
+let s = std.async.stream_of([1, 2, 3])
+var t = 0
+for (x in s) {
+  t = t + x
+}
+t
+"#,
+        "6",
+    );
+}
+
+#[test]
+fn stream_next_alias() {
+    assert_num(
+        r#"
+let s = std.async.stream()
+s.send(7)
+s.close()
+s.next()
+"#,
+        "7",
+    );
+}
+
+#[test]
 fn channel_for_in_task_blocks_then_receives() {
     // IterNext 必须在 channel 阻塞时挂起，不能把 none 当元素。
     assert_num(

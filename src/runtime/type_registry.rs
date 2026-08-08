@@ -845,14 +845,15 @@ pub fn call_primitive_ctor(_vm: &mut Vm, type_name: &str, args: Vec<Value>) -> O
             "expects 1 argument",
             0,
         ))),
-        "Channel" | "channel" => Some(crate::concurrency::construct_channel(&args)),
+        "Channel" | "channel" | "Stream" => Some(crate::concurrency::construct_channel(&args)),
         "Mutex" | "mutex" => Some(crate::concurrency::construct_mutex(&args)),
-        "RWMutex" => Some(crate::concurrency::construct_rwmutex(&args)),
+        "RWMutex" | "RwLock" => Some(crate::concurrency::construct_rwmutex(&args)),
         "WaitGroup" => Some(crate::concurrency::construct_waitgroup(&args)),
         "Semaphore" => Some(crate::concurrency::construct_semaphore(&args)),
         "Once" => Some(crate::concurrency::construct_once(&args)),
         "Barrier" => Some(crate::concurrency::construct_barrier(&args)),
         "Cond" => Some(crate::concurrency::construct_cond(&args)),
+        "Atomic" => Some(crate::concurrency::construct_atomic(&args)),
         "type" if args.len() == 1 => Some(Ok(Value::type_ref(args[0].type_name()))),
         "type" => Some(Err(type_ctor_arity_error(
             "type",
@@ -2028,8 +2029,9 @@ fn install_primitive_type_globals(vm: &mut Vm) {
     for ty in [
         "text", "num", "bool", "list", "dict", "set", "tuple", "bytes", "iterator", "nonetype",
         "type", "AST", "Frame", "Traceback", "ptr", "i8", "u8", "i16", "u16", "i32", "u32", "i64",
-        "u64", "isize", "usize", "f32", "f64", "Channel", "Mutex",
-        "RWMutex", "WaitGroup", "Semaphore", "Once", "Barrier", "Cond",
+        "u64", "isize", "usize", "f32", "f64", "Channel", "Stream", "Mutex",
+        "RWMutex", "RwLock", "WaitGroup", "Semaphore", "Once", "Barrier", "Cond",
+        "Atomic",
         // 类型形态 / 特殊类型名：注解求值走 load_name，必须是全局类型句柄
         "Union", "Maybe", "Never", "Literal", "Callable", "Tuple",
         "Covariant", "Contravariant", "Invariant", "function",
@@ -2040,13 +2042,16 @@ fn install_primitive_type_globals(vm: &mut Vm) {
     // 优先使用元类型句柄，覆盖同名的旧式内建函数。
     vm.globals.insert("type".into(), Value::type_ref("type"));
     vm.globals.insert("Channel".into(), Value::type_ref("Channel"));
+    vm.globals.insert("Stream".into(), Value::type_ref("Stream"));
     vm.globals.insert("Mutex".into(), Value::type_ref("Mutex"));
     vm.globals.insert("RWMutex".into(), Value::type_ref("RWMutex"));
+    vm.globals.insert("RwLock".into(), Value::type_ref("RWMutex"));
     vm.globals.insert("WaitGroup".into(), Value::type_ref("WaitGroup"));
     vm.globals.insert("Semaphore".into(), Value::type_ref("Semaphore"));
     vm.globals.insert("Once".into(), Value::type_ref("Once"));
     vm.globals.insert("Barrier".into(), Value::type_ref("Barrier"));
     vm.globals.insert("Cond".into(), Value::type_ref("Cond"));
+    vm.globals.insert("Atomic".into(), Value::type_ref("Atomic"));
 }
 
 fn primitive_convert_handler(type_name: &'static str) -> BuiltinFn {

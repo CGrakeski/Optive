@@ -301,6 +301,9 @@ pub fn ast_from_expr(expr: &Expr) -> RuntimeAstNode {
         | ExprKind::IfThenElse { .. }
         | ExprKind::Handle { .. }
         | ExprKind::Go { .. }
+        | ExprKind::ParFor { .. }
+        | ExprKind::ParBlock { .. }
+        | ExprKind::Snap { .. }
         | ExprKind::Await { .. }
         | ExprKind::Suspend
         | ExprKind::Select { .. }

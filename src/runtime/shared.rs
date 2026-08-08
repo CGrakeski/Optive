@@ -175,6 +175,21 @@ impl SharedMap {
         self.inner.write().insert(key, value)
     }
 
+    /// 按已有键就地写入；若值为 `Cell` 则写单元格内容。键不存在返回 `false`（不分配）。
+    #[inline]
+    pub fn set_inplace(&self, key: &str, value: crate::value::Value) -> bool {
+        let mut g = self.inner.write();
+        let Some(slot) = g.get_mut(key) else {
+            return false;
+        };
+        if let crate::value::Value::Cell(cell) = slot {
+            *cell.borrow_mut() = value;
+        } else {
+            *slot = value;
+        }
+        true
+    }
+
     #[inline]
     pub fn contains_key(&self, key: &str) -> bool {
         self.inner.read().contains_key(key)

@@ -403,6 +403,25 @@ pub fn substitute_expr(expr: &Expr, type_names: &HashMap<String, String>) -> Exp
         ExprKind::Go { operand } => ExprKind::Go {
             operand: Box::new(substitute_expr(operand, type_names)),
         },
+        ExprKind::ParFor { items, body } => ExprKind::ParFor {
+            items: items
+                .iter()
+                .map(|i| ForItem {
+                    name: i.name.clone(),
+                    iterable: substitute_expr(&i.iterable, type_names),
+                })
+                .collect(),
+            body: substitute_block(body, type_names),
+        },
+        ExprKind::ParBlock { exprs } => ExprKind::ParBlock {
+            exprs: exprs
+                .iter()
+                .map(|e| substitute_expr(e, type_names))
+                .collect(),
+        },
+        ExprKind::Snap { operand } => ExprKind::Snap {
+            operand: Box::new(substitute_expr(operand, type_names)),
+        },
         ExprKind::Await { operand } => ExprKind::Await {
             operand: Box::new(substitute_expr(operand, type_names)),
         },

@@ -1,7 +1,7 @@
 //! 新增/扩充标准库冒烟测试：encoding / csv / toml / yaml / xml / math / typing / % 格式化。
 mod common;
 
-use common::{assert_num, assert_text, value};
+use common::{assert_num, assert_text, bool_val, value};
 use optive::value::Value;
 
 #[test]
@@ -59,6 +59,50 @@ out
         Value::Bytes(b) => assert_eq!(b.as_slice(), b"hello"),
         other => panic!("{}", other.display_string()),
     }
+}
+
+#[test]
+fn time_format_parse_roundtrip() {
+    assert_text(
+        r#"
+let s = std.time.format(0, "%Y-%m-%d %H:%M:%S")
+s
+"#,
+        "1970-01-01 00:00:00",
+    );
+    assert_num(
+        r#"
+std.time.parse("1970-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")
+"#,
+        "0",
+    );
+}
+
+#[test]
+fn os_capture_echo() {
+    // Windows: cmd /C echo；Unix: echo。
+    let src = if cfg!(windows) {
+        r#"
+let r = std.os.capture(["cmd", "/C", "echo", "hi"])
+r["ok"] and std.text.contains(r["stdout"], "hi")
+"#
+    } else {
+        r#"
+let r = std.os.capture(["echo", "hi"])
+r["ok"] and std.text.contains(r["stdout"], "hi")
+"#
+    };
+    assert!(bool_val(src), "{src}");
+}
+
+#[test]
+fn csv_stringify_rows() {
+    assert_text(
+        r#"
+std.csv.stringify([["a", "b"], ["1", "2"]])
+"#,
+        "a,b\n1,2\n",
+    );
 }
 
 #[test]
@@ -175,11 +219,13 @@ fn typing_tuple_and_callable() {
 fn sync_module_exports() {
     let _ = value("std.sync.Channel");
     let _ = value("std.sync.RWMutex");
+    let _ = value("std.sync.RwLock");
     let _ = value("std.sync.WaitGroup");
     let _ = value("std.sync.Semaphore");
     let _ = value("std.sync.Once");
     let _ = value("std.sync.Barrier");
     let _ = value("std.sync.Cond");
+    let _ = value("std.sync.Atomic.num(0)");
 }
 
 #[test]

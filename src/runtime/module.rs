@@ -67,7 +67,36 @@ fn rebind_export_value(val: &Value, env: &Arc<ModuleGlobalEnv>) -> Value {
 pub fn install_std(vm: &mut Vm) {
     let std_mod = std_modules::build_std_module();
     vm.register_builtin_module("std", std_mod.clone());
-    vm.globals.insert("std".into(), Value::Module(std_mod));
+    vm.globals.insert("std".into(), Value::Module(std_mod.clone()));
+    if let Err(e) = install_std_macros(vm, &std_mod) {
+        // 宏库加载失败不应让解释器起不来，但测试里应立刻暴露。
+        eprintln!("warning: failed to install std.macros: {}", e.message());
+    }
+}
+
+/// 编译嵌入的 `macros.tive`，挂到 `std.macros`。
+fn install_std_macros(vm: &mut Vm, std_mod: &Shared<ModuleObject>) -> Result<()> {
+    let source = include_str!("../stdlib/macros.tive");
+    let exports = run_module_source(
+        vm,
+        source,
+        "macros",
+        PathBuf::from("<std.macros>"),
+        String::new(),
+        None,
+    )?;
+    let macros_mod = Shared::new(ModuleObject {
+        name: "macros".into(),
+        full_name: "std.macros".into(),
+        exports,
+        children: HashMap::new(),
+        is_user: false,
+    });
+    std_mod
+        .borrow_mut()
+        .children
+        .insert("macros".into(), macros_mod);
+    Ok(())
 }
 
 pub fn find_module(vm: &mut Vm, module_name: &str) -> Result<Value> {
@@ -353,7 +382,7 @@ fn resolve_package_entry_file(
     package_root: &Path,
     logical_name: &str,
 ) -> Result<Option<PathBuf>> {
-    for name in ["Optive.toml", "optive.toml"] {
+    for name in ["Optive.toml"] {
         let p = package_root.join(name);
         if !p.is_file() {
             continue;

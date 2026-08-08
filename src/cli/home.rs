@@ -41,6 +41,14 @@ pub fn pack_dir() -> PathBuf {
     optive_home().join("pack")
 }
 
+pub fn custom_dir() -> PathBuf {
+    optive_home().join("custom")
+}
+
+pub fn global_config_path() -> PathBuf {
+    optive_home().join("Config.toml")
+}
+
 pub fn index_db_path() -> PathBuf {
     optive_home().join("index.db")
 }

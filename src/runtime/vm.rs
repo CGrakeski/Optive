@@ -31,6 +31,8 @@ enum StackVal {
     Empty,
     Bool(bool),
     Int(i64),
+    /// 用户函数：避免每次 Load/Call 经 `Heap(Box<Value::Function>)` 分配。
+    Func(Arc<FunctionObject>),
     Heap(Box<Value>),
 }
 
@@ -41,6 +43,8 @@ enum HotFlow {
     Cold,
     PendingRet,
     Fail,
+    /// 已切换 `hot_ops`（如轻量 `Call`），外层须 `continue 'outer` 刷新切片。
+    Switched,
 }
 
 /// `run_interpreter` 出口：正常值、任务已挂起、或调试器请求暂停。
@@ -171,6 +175,7 @@ impl StackVal {
             Value::None => StackVal::Empty,
             Value::Bool(b) => StackVal::Bool(b),
             Value::Num(Num::Small(n)) => StackVal::Int(n),
+            Value::Function(f) => StackVal::Func(f),
             other => StackVal::Heap(Box::new(other)),
         }
     }
@@ -181,6 +186,7 @@ impl StackVal {
             StackVal::Empty => Value::None,
             StackVal::Bool(b) => Value::Bool(b),
             StackVal::Int(n) => Value::Num(Num::Small(n)),
+            StackVal::Func(f) => Value::Function(f),
             StackVal::Heap(b) => *b,
         }
     }
@@ -191,17 +197,19 @@ impl StackVal {
             StackVal::Empty => Value::None,
             StackVal::Bool(b) => Value::Bool(*b),
             StackVal::Int(n) => Value::Num(Num::Small(*n)),
+            StackVal::Func(f) => Value::Function(f.clone()),
             StackVal::Heap(b) => (**b).clone(),
         }
     }
 
-    /// 复制栈槽：内联变体按位复制，堆变体对内部 Value 做 Clone。
+    /// 复制栈槽：内联变体按位复制；`Func` 只增 Arc 引用；堆变体 Clone。
     #[inline(always)]
     fn copy_imm(&self) -> Self {
         match self {
             StackVal::Empty => StackVal::Empty,
             StackVal::Bool(b) => StackVal::Bool(*b),
             StackVal::Int(n) => StackVal::Int(*n),
+            StackVal::Func(f) => StackVal::Func(f.clone()),
             StackVal::Heap(v) => StackVal::Heap(Box::new((**v).clone())),
         }
     }
@@ -212,6 +220,7 @@ impl StackVal {
             StackVal::Empty => false,
             StackVal::Bool(b) => *b,
             StackVal::Int(n) => *n != 0,
+            StackVal::Func(_) => true,
             StackVal::Heap(b) => b.is_truthy(),
         }
     }
@@ -261,8 +270,16 @@ fn validate_hot_bytecode(hot: &crate::hot_code::HotCode) -> Result<()> {
         // 槽位 / 参数计数字段不得为负（否则 as usize 会变成巨大偏移）。
         let is_slot_or_argc = matches!(
             op,
-            H_LOAD_FAST | H_STORE_FAST | H_RET_FAST | H_CALL_SELF | H_LOAD_FAST_SUB_IMM
+            H_LOAD_FAST
+                | H_STORE_FAST
+                | H_RET_FAST
+                | H_CALL_SELF
+                | H_LOAD_FAST_SUB_IMM
                 | H_LOAD_FAST_LE_IMM
+                | H_LOAD_GLOBAL
+                | H_STORE_GLOBAL
+                | H_CALL
+                | H_CALL_GLOBAL
         );
         if is_slot_or_argc && arg < 0 {
             return Err(RuntimeError::msg(format!(
@@ -546,6 +563,7 @@ enum StepAction {
     GotoIfNot(usize),
     LoopCountdown(usize),
     Call { argc: usize },
+    CallGlobal { global_idx: usize, argc: usize },
     CallSelf { argc: usize },
     CallList,
     CallEx,
@@ -576,6 +594,7 @@ enum StepAction {
     IterNext,
     IterEnd,
     Throw,
+    Snap,
     PushExc,
     EnterTry {
         catch_label: usize,
@@ -1170,11 +1189,19 @@ impl Vm {
     }
 
     pub(crate) fn snapshot_module_global_env(&self) -> ModuleGlobalEnv {
+        let mut map = self.globals.deep_clone();
+        // 顶层热路径可能只更新 script_globals；快照前合并，避免模块看到旧值。
+        for (idx, name) in self.script_global_names.iter().enumerate() {
+            if name.is_empty() {
+                continue;
+            }
+            if let Some(v) = self.script_globals.get(idx) {
+                map.insert(name.clone(), v.clone());
+            }
+        }
         ModuleGlobalEnv {
             global_names: self.script_global_names.clone(),
-            globals: crate::shared::SyncCell::new(
-                self.globals.deep_clone().into_iter().collect(),
-            ),
+            globals: crate::shared::SyncCell::new(map.into_iter().collect()),
             finalized: true,
         }
     }
@@ -1237,6 +1264,19 @@ impl Vm {
                 None => Err(RuntimeError::name_err(format!("undefined name: {name}"))),
             };
         }
+        // 顶层：直接走平行槽，避免 SharedMap 读锁 + clone。
+        if let Some(v) = self.script_globals.get(idx) {
+            let name = self.script_global_names.get(idx).map(|s| s.as_str()).unwrap_or("");
+            if name.is_empty() {
+                return Err(RuntimeError::msg(format!(
+                    "internal: LoadGlobal({idx}) resolves to empty global name"
+                )));
+            }
+            return Ok(match v {
+                Value::Cell(c) => c.borrow().clone(),
+                other => other.clone(),
+            });
+        }
         let Some(name) = self.script_global_names.get(idx) else {
             return Err(RuntimeError::msg(format!(
                 "internal: LoadGlobal({idx}) out of range for script global table (len {})",
@@ -1253,6 +1293,108 @@ impl Vm {
             Some(v) => Ok(v.clone()),
             None => Err(RuntimeError::name_err(format!("undefined name: {name}"))),
         }
+    }
+
+    /// 顶层脚本全局槽写入（无 module_env）。同步 `script_globals` 与 `globals`。
+    #[inline(always)]
+    fn store_script_global_top(&mut self, idx: usize, val: Value) -> Result<()> {
+        if idx >= self.script_global_names.len() {
+            return Err(RuntimeError::msg(format!(
+                "internal: StoreGlobal({idx}) out of range for script global table (len {})",
+                self.script_global_names.len()
+            )));
+        }
+        if self.script_global_names[idx].is_empty() {
+            return Err(RuntimeError::msg(format!(
+                "internal: StoreGlobal({idx}) resolves to empty global name"
+            )));
+        }
+        if self.has_const_names
+            && self
+                .const_names
+                .contains(self.script_global_names[idx].as_str())
+        {
+            return Err(RuntimeError::msg(format!(
+                "cannot assign to const binding: {}",
+                self.script_global_names[idx]
+            )));
+        }
+        if idx < self.script_globals.len() {
+            self.script_globals[idx] = val.clone();
+        }
+        if !self
+            .globals
+            .set_inplace(self.script_global_names[idx].as_str(), val.clone())
+        {
+            self.globals
+                .insert(self.script_global_names[idx].clone(), val);
+        }
+        let name = self.script_global_names[idx].clone();
+        self.finalize_const_init(&name);
+        Ok(())
+    }
+
+    /// `StoreGlobal` 完整语义（含 module_env）；热/冷路径共用。
+    fn exec_store_global(&mut self, idx: usize, val: Value) -> Result<()> {
+        if self.user_call_frames.is_empty() {
+            return self.store_script_global_top(idx, val);
+        }
+        // 与 LoadGlobal 一致：有活动函数时按该函数 module_env 的名字解析下标，
+        // 避免 REPL/二次 load_program 替换 script_global_names 后写错槽。
+        let name = if let Some(env) = self.active_module_global_env() {
+            env.global_names.get(idx).cloned().ok_or_else(|| {
+                RuntimeError::msg(format!(
+                    "internal: StoreGlobal({idx}) out of range for function global table (len {})",
+                    env.global_names.len()
+                ))
+            })?
+        } else {
+            self.script_global_names.get(idx).cloned().ok_or_else(|| {
+                RuntimeError::msg(format!(
+                    "internal: StoreGlobal({idx}) out of range for script global table (len {})",
+                    self.script_global_names.len()
+                ))
+            })?
+        };
+        if name.is_empty() {
+            return Err(RuntimeError::msg(format!(
+                "internal: StoreGlobal({idx}) resolves to empty global name"
+            )));
+        }
+        if self.const_names.contains(name.as_str()) {
+            return Err(RuntimeError::msg(format!(
+                "cannot assign to const binding: {name}"
+            )));
+        }
+        // 克隆 Rc，避免与 `finalize_const_init` 的 &mut self 借权冲突。
+        let module_env = self
+            .user_call_frames
+            .iter()
+            .rev()
+            .find_map(|frame| frame.func.module_env.clone());
+        if let Some(env) = module_env {
+            // 写入模块快照，使导入后模块函数的赋值留在模块内。
+            {
+                let mut g = env.globals.borrow_mut();
+                if let Some(Value::Cell(cell)) = g.get(name.as_str()) {
+                    *cell.borrow_mut() = val.clone();
+                } else {
+                    g.insert(name.clone(), val.clone());
+                }
+            }
+            // 主脚本/REPL：名字在 live globals 或 script 表里时必须同步，
+            // 否则函数内 StoreGlobal 只改快照，顶层读到旧值。
+            if self.globals.contains_key(name.as_str())
+                || self.script_global_names.iter().any(|n| n == &name)
+            {
+                self.store_global_by_name(&name, val);
+            }
+            self.finalize_const_init(&name);
+        } else {
+            self.store_global_by_name(&name, val);
+            self.finalize_const_init(&name);
+        }
+        Ok(())
     }
 
     fn load_script_global_by_name(&self, name: &str) -> Option<Value> {
@@ -1614,7 +1756,7 @@ impl Vm {
         // 只清理 Heap 槽（防止 Rc/Box 延迟释放）；Int/Bool/Empty 无析构，
         // 下次 call_self 会覆盖，跳过可省去 ~2.7M 次/帧的空写。
         for i in base..self.lw_sp {
-            if matches!(self.lw_slots[i], StackVal::Heap(_)) {
+            if matches!(self.lw_slots[i], StackVal::Heap(_) | StackVal::Func(_)) {
                 self.lw_slots[i] = StackVal::Empty;
             }
         }
@@ -1759,7 +1901,7 @@ impl Vm {
         match (a, b) {
             (StackVal::Int(x), StackVal::Int(y)) => {
                 if y == 0 {
-                    return Err(RuntimeError::zero_div("division by zero"));
+                    return Err(RuntimeError::zero_div_diag());
                 }
                 if x == i64::MIN && y == -1 {
                     // 数学上 MIN % -1 == 0；避免 Rust 溢出 panic（BigInt 路径无此问题）。
@@ -2310,7 +2452,215 @@ impl Vm {
                 }
                 HotFlow::Cont
             }
+            H_LOAD_GLOBAL => {
+                self.pc = pc + 1;
+                let idx = arg as usize;
+                // 顶层：平行槽 + Int 特化，避开 SharedMap 读锁/clone。
+                if self.user_call_frames.is_empty() && idx < self.script_globals.len() {
+                    // SAFETY: idx < script_globals.len()。
+                    let sv = match unsafe { self.script_globals.get_unchecked(idx) } {
+                        Value::Num(Num::Small(n)) => {
+                            self.op_push_int(*n);
+                            return HotFlow::Cont;
+                        }
+                        Value::None => StackVal::Empty,
+                        Value::Bool(b) => StackVal::Bool(*b),
+                        Value::Function(f) => StackVal::Func(f.clone()),
+                        Value::Cell(c) => StackVal::from_value(c.borrow().clone()),
+                        other => StackVal::from_value(other.clone()),
+                    };
+                    self.op_push(sv);
+                    return HotFlow::Cont;
+                }
+                match self.load_script_global(idx) {
+                    Ok(v) => {
+                        self.op_push(StackVal::from_value(v));
+                        HotFlow::Cont
+                    }
+                    Err(e) => {
+                        self.set_hot_error(e);
+                        HotFlow::Fail
+                    }
+                }
+            }
+            H_STORE_GLOBAL => {
+                self.pc = pc + 1;
+                let idx = arg as usize;
+                let v = self.pop_hot();
+                if self.user_call_frames.is_empty() {
+                    // 顶层快路径：平行槽 + SharedMap 同步（函数 module_env 会回退读 globals）。
+                    if !self.has_const_names
+                        && idx < self.script_globals.len()
+                        && idx < self.script_global_names.len()
+                        && !self.script_global_names[idx].is_empty()
+                    {
+                        if let StackVal::Int(n) = v {
+                            let num = Value::Num(Num::Small(n));
+                            // SAFETY: idx 已界检。
+                            unsafe {
+                                *self.script_globals.get_unchecked_mut(idx) = num.clone();
+                            }
+                            if !self.globals.set_inplace(
+                                self.script_global_names[idx].as_str(),
+                                num.clone(),
+                            ) {
+                                self.globals
+                                    .insert(self.script_global_names[idx].clone(), num);
+                            }
+                            return HotFlow::Cont;
+                        }
+                    }
+                }
+                if let Err(e) = self.exec_store_global(idx, v.into_value()) {
+                    self.set_hot_error(e);
+                    return HotFlow::Fail;
+                }
+                HotFlow::Cont
+            }
+            H_CALL => {
+                let argc = arg as usize;
+                if self.debug_active {
+                    return HotFlow::Cold;
+                }
+                // 栈顶为 callee，其下为 argc 个参数（最后一参最靠近顶）。
+                if self.stack_sp < argc + 1 {
+                    self.set_hot_error(RuntimeError::msg("stack underflow"));
+                    return HotFlow::Fail;
+                }
+                let callee_idx = self.stack_sp - 1;
+                // SAFETY: callee_idx < stack_sp <= stack.len()。
+                let is_lw = unsafe {
+                    match self.stack.get_unchecked(callee_idx) {
+                        StackVal::Func(f) => Self::func_is_hot_callable(f, argc),
+                        StackVal::Heap(v) => match v.as_ref() {
+                            Value::Function(f) => Self::func_is_hot_callable(f, argc),
+                            _ => false,
+                        },
+                        _ => false,
+                    }
+                };
+                if !is_lw {
+                    return HotFlow::Cold;
+                }
+                self.pc = pc + 1;
+                let func = match self.pop_hot() {
+                    StackVal::Func(f) => f,
+                    StackVal::Heap(b) => match *b {
+                        Value::Function(f) => f,
+                        _ => {
+                            self.set_hot_error(RuntimeError::msg(
+                                "internal: H_CALL lightweight mismatch",
+                            ));
+                            return HotFlow::Fail;
+                        }
+                    },
+                    _ => {
+                        self.set_hot_error(RuntimeError::msg(
+                            "internal: H_CALL lightweight mismatch",
+                        ));
+                        return HotFlow::Fail;
+                    }
+                };
+                if self.try_elide_ret_fast_call(&func, argc) {
+                    return HotFlow::Cont;
+                }
+                if let Err(e) = self.setup_lightweight_user_call_stack(func, argc) {
+                    self.set_hot_error(e);
+                    return HotFlow::Fail;
+                }
+                HotFlow::Switched
+            }
+            H_CALL_GLOBAL => {
+                let (global_idx, argc_i) = crate::hot_code::decode_slot_imm(arg);
+                let argc = argc_i as usize;
+                if self.debug_active {
+                    return HotFlow::Cold;
+                }
+                if self.stack_sp < argc {
+                    self.set_hot_error(RuntimeError::msg("stack underflow"));
+                    return HotFlow::Fail;
+                }
+                let func = match self.resolve_global_function_hot(global_idx) {
+                    Ok(Some(f)) if Self::func_is_hot_callable(&f, argc) => f,
+                    Ok(Some(_)) | Ok(None) => return HotFlow::Cold,
+                    Err(e) => {
+                        self.set_hot_error(e);
+                        return HotFlow::Fail;
+                    }
+                };
+                self.pc = pc + 1;
+                // `return x` / `RetFast(0)` 单指令体：就地整理参数栈，不切代码。
+                if self.try_elide_ret_fast_call(&func, argc) {
+                    return HotFlow::Cont;
+                }
+                if let Err(e) = self.setup_lightweight_user_call_stack(func, argc) {
+                    self.set_hot_error(e);
+                    return HotFlow::Fail;
+                }
+                HotFlow::Switched
+            }
             _ => HotFlow::Cold,
+        }
+    }
+
+    #[inline(always)]
+    fn func_is_hot_callable(f: &FunctionObject, argc: usize) -> bool {
+        f.lightweight
+            && !f.is_generator
+            && f.captured.is_none()
+            && f.variadic_param_index.is_none()
+            && f.kwvariadic_param_index.is_none()
+            && argc == f.params.len()
+            && f.defaults.iter().all(|d| d.is_none())
+    }
+
+    /// 体为单条 `RetFast(slot)` 时：把栈上参数收成返回值，跳过调用帧。
+    #[inline(always)]
+    fn try_elide_ret_fast_call(&mut self, func: &FunctionObject, argc: usize) -> bool {
+        use crate::hot_code::H_RET_FAST;
+        let ops = func.hot.ops.as_ref();
+        let args = func.hot.args.as_ref();
+        if ops.len() != 1 || args.len() != 1 || ops[0] != H_RET_FAST {
+            return false;
+        }
+        let slot = args[0] as usize;
+        if slot >= argc || self.stack_sp < argc {
+            return false;
+        }
+        let base = self.stack_sp - argc;
+        // SAFETY: base+slot < stack_sp <= stack.len()。
+        let result = unsafe { self.stack.get_unchecked(base + slot).copy_imm() };
+        for i in base..self.stack_sp {
+            // SAFETY: i < stack_sp <= len。
+            unsafe {
+                *self.stack.get_unchecked_mut(i) = StackVal::Empty;
+            }
+        }
+        self.stack_sp = base;
+        self.op_push(result);
+        true
+    }
+
+    /// 热路径解析全局函数：顶层走平行槽，避免 SharedMap。
+    #[inline(always)]
+    fn resolve_global_function_hot(
+        &self,
+        idx: usize,
+    ) -> Result<Option<Arc<FunctionObject>>> {
+        if self.user_call_frames.is_empty() && idx < self.script_globals.len() {
+            // SAFETY: idx 已界检。
+            return Ok(match unsafe { self.script_globals.get_unchecked(idx) } {
+                Value::Function(f) => Some(f.clone()),
+                Value::Cell(c) => match &*c.borrow() {
+                    Value::Function(f) => Some(f.clone()),
+                    _ => None,
+                },
+                _ => None,
+            });
+        }
+        match self.load_script_global(idx)? {
+            Value::Function(f) => Ok(Some(f)),
+            _ => Ok(None),
         }
     }
 
@@ -2450,6 +2800,10 @@ impl Vm {
                         }
                     }
                     HotFlow::PendingRet => {
+                        // 轻量 `Call` 入口用 lw 帧且不推 fast_ret；Ret 走 PendingRet 时需先拆 lw。
+                        if self.lw_depth > 0 && self.fast_ret_sp == 0 {
+                            self.pop_lightweight_frame();
+                        }
                         let (leave, result_sv) = self
                             .pending_ret
                             .take()
@@ -2461,6 +2815,9 @@ impl Vm {
                         if until_depth.is_some_and(|d| self.user_call_frames.len() == d) {
                             return Ok(InterpResult::Value(self.op_last_value()));
                         }
+                        continue 'outer;
+                    }
+                    HotFlow::Switched => {
                         continue 'outer;
                     }
                     HotFlow::Cold => {
@@ -2676,6 +3033,10 @@ impl Vm {
             I::GotoIfNot(target) => StepAction::GotoIfNot(*target),
             I::LoopCountdown(target) => StepAction::LoopCountdown(*target),
             I::Call { argc } => StepAction::Call { argc: *argc },
+            I::CallGlobal { global_idx, argc } => StepAction::CallGlobal {
+                global_idx: *global_idx,
+                argc: *argc,
+            },
             I::CallSelf { argc } => StepAction::CallSelf { argc: *argc },
             I::CallList => StepAction::CallList,
             I::CallEx => StepAction::CallEx,
@@ -2709,6 +3070,7 @@ impl Vm {
             I::IterNext => StepAction::IterNext,
             I::IterEnd => StepAction::IterEnd,
             I::Throw => StepAction::Throw,
+            I::Snap => StepAction::Snap,
             I::PushExc => StepAction::PushExc,
             I::EnterTry {
                 catch_label,
@@ -3089,61 +3451,7 @@ impl Vm {
             }
             StepAction::StoreGlobal(idx) => {
                 let val = self.pop()?;
-                // 与 LoadGlobal 一致：有活动函数时按该函数 module_env 的名字解析下标，
-                // 避免 REPL/二次 load_program 替换 script_global_names 后写错槽。
-                let name = if let Some(env) = self.active_module_global_env() {
-                    env.global_names.get(idx).cloned().ok_or_else(|| {
-                        RuntimeError::msg(format!(
-                            "internal: StoreGlobal({idx}) out of range for function global table (len {})",
-                            env.global_names.len()
-                        ))
-                    })?
-                } else {
-                    self.script_global_names.get(idx).cloned().ok_or_else(|| {
-                        RuntimeError::msg(format!(
-                            "internal: StoreGlobal({idx}) out of range for script global table (len {})",
-                            self.script_global_names.len()
-                        ))
-                    })?
-                };
-                if name.is_empty() {
-                    return Err(RuntimeError::msg(format!(
-                        "internal: StoreGlobal({idx}) resolves to empty global name"
-                    )));
-                }
-                if self.const_names.contains(name.as_str()) {
-                    return Err(RuntimeError::msg(format!(
-                        "cannot assign to const binding: {name}"
-                    )));
-                }
-                // 克隆 Rc，避免与 `finalize_const_init` 的 &mut self 借权冲突。
-                let module_env = self
-                    .user_call_frames
-                    .iter()
-                    .rev()
-                    .find_map(|frame| frame.func.module_env.clone());
-                if let Some(env) = module_env {
-                    // 写入模块快照，使导入后模块函数的赋值留在模块内。
-                    {
-                        let mut g = env.globals.borrow_mut();
-                        if let Some(Value::Cell(cell)) = g.get(name.as_str()) {
-                            *cell.borrow_mut() = val.clone();
-                        } else {
-                            g.insert(name.clone(), val.clone());
-                        }
-                    }
-                    // 主脚本/REPL：名字在 live globals 或 script 表里时必须同步，
-                    // 否则函数内 StoreGlobal 只改快照，顶层读到旧值。
-                    if self.globals.contains_key(name.as_str())
-                        || self.script_global_names.iter().any(|n| n == &name)
-                    {
-                        self.store_global_by_name(&name, val);
-                    }
-                    self.finalize_const_init(&name);
-                } else {
-                    self.store_global_by_name(&name, val);
-                    self.finalize_const_init(&name);
-                }
+                self.exec_store_global(idx, val)?;
             }
             StepAction::NewVar { name, is_const } => {
                 if is_const {
@@ -3303,6 +3611,27 @@ impl Vm {
                     self.push_value(result);
                 }
                 // 协作让出：返回值已入栈，随后挂起纤程。
+                if self.pending_suspend {
+                    return Ok(());
+                }
+            }
+            StepAction::CallGlobal { global_idx, argc } => {
+                let callee = self.load_script_global(global_idx)?;
+                self.call_args_buf.clear();
+                for _ in 0..argc {
+                    let arg = self.pop()?;
+                    self.call_args_buf.push(arg);
+                }
+                self.call_args_buf.reverse();
+                let args = std::mem::take(&mut self.call_args_buf);
+                let result = self.call_value(callee, args)?;
+                if self.call_retry_armed {
+                    self.call_retry_armed = false;
+                    return Ok(());
+                }
+                if !self.user_call_deferred && self.active_exception.is_none() {
+                    self.push_value(result);
+                }
                 if self.pending_suspend {
                     return Ok(());
                 }
@@ -3579,6 +3908,13 @@ impl Vm {
                 let exc = self.pop()?;
                 return self.throw_value(exc);
             }
+            StepAction::Snap => {
+                let v = self.pop()?;
+                if matches!(v, Value::None) {
+                    return Err(RuntimeError::value_err("snap of none"));
+                }
+                self.push_value(v);
+            }
             StepAction::EnterTry {
                 catch_label,
                 else_label,
@@ -3785,6 +4121,7 @@ impl Vm {
                 self.push_value(result);
             }
             StepAction::Suspend => {
+                self.fail_if_current_task_cancelled()?;
                 self.budget_left = self.suspend_budget;
                 if self.task_ctx.is_some() {
                     self.pending_suspend = true;
@@ -3923,6 +4260,15 @@ impl Vm {
         // 模块函数体内的裸 Load：优先定义模块快照（use/import 绑定落于此）。
         if let Some(env) = self.active_module_global_env() {
             if let Some(v) = env.globals.borrow().get(name) {
+                return Ok(match v {
+                    Value::Cell(c) => c.borrow().clone(),
+                    other => other.clone(),
+                });
+            }
+        }
+        // 顶层热 Store 可能只写 script_globals；按名加载时优先平行槽。
+        if let Some(idx) = self.script_global_names.iter().position(|n| n == name) {
+            if let Some(v) = self.script_globals.get(idx) {
                 return Ok(match v {
                     Value::Cell(c) => c.borrow().clone(),
                     other => other.clone(),
@@ -4225,6 +4571,20 @@ impl Vm {
                 Ok(out)
             }
             Value::Function(func) => {
+                if kwargs.is_empty()
+                    && func.lightweight
+                    && !self.debug_active
+                    && !func.is_generator
+                    && func.captured.is_none()
+                    && func.variadic_param_index.is_none()
+                    && func.kwvariadic_param_index.is_none()
+                    && args.len() == func.params.len()
+                    && func.defaults.iter().all(|d| d.is_none())
+                {
+                    self.setup_lightweight_user_call(func, args)?;
+                    self.user_call_deferred = true;
+                    return Ok(Value::None);
+                }
                 let bound = self.bind_call_arguments(&func, args, kwargs)?;
                 if func.is_generator {
                     return self.make_generator_iterator(func, bound);
@@ -5178,6 +5538,83 @@ impl Vm {
         self.active_line_map = func.line_map.clone();
         self.active_column_map = func.column_map.clone();
         self.pc = 0;
+        Ok(())
+    }
+
+    /// 轻量函数的普通 `Call`（参数已是 `Vec`）：转到栈版入口。
+    fn setup_lightweight_user_call(
+        &mut self,
+        func: Arc<FunctionObject>,
+        args: Vec<Value>,
+    ) -> Result<()> {
+        let argc = args.len();
+        for a in args {
+            self.op_push(StackVal::from_value(a));
+        }
+        self.setup_lightweight_user_call_stack(func, argc)
+    }
+
+    /// 从操作数栈弹出 `argc` 个参数（顶为最后一参）并进入轻量调用。
+    fn setup_lightweight_user_call_stack(
+        &mut self,
+        func: Arc<FunctionObject>,
+        argc: usize,
+    ) -> Result<()> {
+        if self.user_call_frames.len() >= self.cached_max_depth {
+            return Err(RuntimeError::msg(
+                "RecursionError: maximum recursion depth exceeded",
+            ));
+        }
+        if self.lw_depth >= self.cached_max_depth {
+            return Err(RuntimeError::msg(
+                "RecursionError: maximum recursion depth exceeded",
+            ));
+        }
+        if self.stack_sp < argc {
+            return Err(RuntimeError::msg("stack underflow"));
+        }
+
+        self.func_stack.push(func.clone());
+        // 与 leave_scope 配对；轻量路径不使用名字表 / 堆局部帧。
+        self.name_to_slot.push(None);
+        self.locals_stack.push(Vec::new());
+
+        self.user_call_frames.push(UserCallFrame {
+            saved_code: self.code.clone(),
+            saved_hot_ops: self.hot_ops.clone(),
+            saved_hot_args: self.hot_args.clone(),
+            saved_pc: self.pc,
+            saved_line_map: self.active_line_map.clone(),
+            saved_column_map: self.active_column_map.clone(),
+            func: func.clone(),
+            pushed_func_stack: true,
+        });
+
+        self.code = func.body.clone();
+        self.hot_ops = func.hot.ops.clone();
+        self.hot_args = func.hot.args.clone();
+        self.active_line_map = func.line_map.clone();
+        self.active_column_map = func.column_map.clone();
+
+        let nslots = func.frame_slots.max(argc);
+        let base = self.lw_sp;
+        self.push_lw_base(base);
+        self.lw_base = base;
+        self.lw_depth += 1;
+        self.lw_entry_pc = func.entry_pc;
+        self.lw_frame_slots = func.frame_slots;
+        let need = base + nslots;
+        if need > self.lw_slots.len() {
+            self.lw_slots.resize(need, StackVal::Empty);
+        }
+        for i in (0..argc).rev() {
+            self.lw_slots[base + i] = self.pop_hot();
+        }
+        for i in argc..nslots {
+            self.lw_slots[base + i] = StackVal::Empty;
+        }
+        self.lw_sp = need;
+        self.pc = func.entry_pc;
         Ok(())
     }
 
@@ -6646,6 +7083,22 @@ impl Vm {
             }
         };
 
+        // 认领后若已取消：直接 Failed(Cancelled)，不跑用户代码。
+        if task.borrow().is_cancelled() {
+            let exc = match exceptions::make_exception(self, "Cancelled", "task cancelled") {
+                Ok(v) => v,
+                Err(_) => Value::Text("task cancelled".into()),
+            };
+            // 丢弃 Pending 载荷 / Suspended fiber，避免泄漏。
+            if matches!(state, TaskState::Suspended) {
+                let _ = self.fiber_take(key);
+            }
+            task.borrow_mut().state = TaskState::Failed(exc.clone());
+            self.taskgroup_notify_finished(&task, Some(exc));
+            self.mn.notify_all();
+            return Ok(true);
+        }
+
         let saved_ctx = self.task_ctx.take();
         let saved_budget = self.budget_left;
         let saved_pending = self.pending_suspend;
@@ -6804,6 +7257,7 @@ impl Vm {
         if total.is_zero() {
             return Ok(Value::None);
         }
+        self.fail_if_current_task_cancelled()?;
         let in_task = self.task_ctx.is_some() || self.sched_depth > 0;
         if !in_task {
             std::thread::sleep(total);
@@ -6828,6 +7282,7 @@ impl Vm {
         }
         let slice = (until - now).min(COOP_SLEEP_SLICE);
         std::thread::sleep(slice);
+        self.fail_if_current_task_cancelled()?;
         if std::time::Instant::now() >= until {
             self.sync_wait_resume = None;
             return Ok(Value::None);
@@ -6842,6 +7297,14 @@ impl Vm {
             return Ok(value);
         };
         loop {
+            if task.borrow().is_cancelled()
+                && !matches!(
+                    task.borrow().state,
+                    TaskState::Done(_) | TaskState::Failed(_)
+                )
+            {
+                return self.finalize_task_cancelled(&task);
+            }
             let state = task.borrow().state.clone();
             match state {
                 TaskState::Done(v) => return Ok(v),
@@ -7082,19 +7545,49 @@ impl Vm {
         callable: Value,
     ) -> Result<Value> {
         use crate::value::{SyncInner, TaskInner};
-        {
-            let mut inner = s.borrow_mut();
-            let SyncInner::TaskGroup { count, .. } = &mut *inner else {
-                return Err(RuntimeError::type_err("expected TaskGroup"));
-            };
-            *count = count.saturating_add(1);
-        }
         // 必须在入队前挂上 task_group，避免 M:N 下竞态漏记 done。
         let mut pending = TaskInner::pending(callable, vec![]);
         pending.task_group = Some(s.clone());
         let task = Shared::new(pending);
+        {
+            let mut inner = s.borrow_mut();
+            let SyncInner::TaskGroup {
+                count,
+                cancel_requested,
+                tasks,
+                ..
+            } = &mut *inner
+            else {
+                return Err(RuntimeError::type_err("expected TaskGroup"));
+            };
+            *count = count.saturating_add(1);
+            tasks.push(task.clone());
+            if *cancel_requested {
+                task.borrow_mut().request_cancel();
+            }
+        }
         self.enqueue_task(task.clone());
         Ok(Value::Task(task))
+    }
+
+    pub(crate) fn taskgroup_cancel(&mut self, s: &Shared<crate::value::SyncInner>) {
+        use crate::value::SyncInner;
+        let tasks = {
+            let mut inner = s.borrow_mut();
+            let SyncInner::TaskGroup {
+                cancel_requested,
+                tasks,
+                ..
+            } = &mut *inner
+            else {
+                return;
+            };
+            *cancel_requested = true;
+            tasks.clone()
+        };
+        for t in tasks {
+            self.cancel_task(&t);
+        }
     }
 
     pub(crate) fn taskgroup_wait(
@@ -7105,7 +7598,7 @@ impl Vm {
         loop {
             let first_error = {
                 let mut inner = s.borrow_mut();
-                let SyncInner::TaskGroup { count, first_error } = &mut *inner else {
+                let SyncInner::TaskGroup { count, first_error, .. } = &mut *inner else {
                     return Err(RuntimeError::type_err("expected TaskGroup"));
                 };
                 if *count == 0 {
@@ -7137,23 +7630,103 @@ impl Vm {
         };
         // 只通知一次：清掉归属，避免重复 done。
         task.borrow_mut().task_group = None;
-        let hit_zero = match &mut *group.borrow_mut() {
-            SyncInner::TaskGroup { count, first_error } => {
-                if let Some(err) = failed {
-                    if first_error.is_none() {
-                        *first_error = Some(err);
+        let (hit_zero, cancel_siblings) = {
+            let mut inner = group.borrow_mut();
+            match &mut *inner {
+                SyncInner::TaskGroup {
+                    count,
+                    first_error,
+                    cancel_requested,
+                    ..
+                } => {
+                    let mut cancel_siblings = false;
+                    if let Some(err) = failed {
+                        let is_cancelled = exceptions::struct_is_a(self, &err, "Cancelled");
+                        if is_cancelled {
+                            // 组主动取消时的 Cancelled 不记为组错误。
+                            if !*cancel_requested && first_error.is_none() {
+                                *first_error = Some(err);
+                            }
+                        } else if first_error.is_none() {
+                            *first_error = Some(err);
+                            *cancel_requested = true;
+                            cancel_siblings = true;
+                        }
                     }
+                    if *count > 0 {
+                        *count -= 1;
+                    }
+                    (*count == 0, cancel_siblings)
                 }
-                if *count > 0 {
-                    *count -= 1;
-                }
-                *count == 0
+                _ => (false, false),
             }
-            _ => false,
         };
+        if cancel_siblings {
+            self.taskgroup_cancel(&group);
+        }
         if hit_zero {
             self.mn.notify_all();
         }
+    }
+
+    /// 请求协作式取消；已结束的任务不变。挂起/待运行任务会入队以便尽快以 `Cancelled` 收尾。
+    pub(crate) fn cancel_task(&mut self, task: &Shared<TaskInner>) {
+        let should_enqueue = {
+            let mut inner = task.borrow_mut();
+            if matches!(inner.state, TaskState::Done(_) | TaskState::Failed(_)) {
+                return;
+            }
+            inner.request_cancel();
+            matches!(
+                inner.state,
+                TaskState::Pending { .. } | TaskState::Suspended
+            )
+        };
+        if should_enqueue {
+            self.ensure_task_runnable(task);
+        }
+        self.mn.notify_all();
+    }
+
+    /// 若当前任务已取消，返回 `Cancelled` 宿主错误。
+    pub(crate) fn fail_if_current_task_cancelled(&self) -> Result<()> {
+        if let Some(ctx) = &self.task_ctx {
+            if ctx.task.borrow().is_cancelled() {
+                return Err(RuntimeError::cancelled("task cancelled"));
+            }
+        }
+        Ok(())
+    }
+
+    /// 将仍开放的任务以 `Cancelled` 失败收尾（用于 await 已 cancel 的任务）。
+    fn finalize_task_cancelled(&mut self, task: &Shared<TaskInner>) -> Result<Value> {
+        let already = {
+            let state = task.borrow().state.clone();
+            match state {
+                TaskState::Done(v) => Some(Ok(v)),
+                TaskState::Failed(e) => Some(Err(e)),
+                _ => None,
+            }
+        };
+        match already {
+            Some(Ok(v)) => return Ok(v),
+            Some(Err(e)) => {
+                self.throw_value(e)?;
+                return Ok(Value::None);
+            }
+            None => {}
+        }
+        let exc = exceptions::make_exception(self, "Cancelled", "task cancelled")?;
+        {
+            let mut inner = task.borrow_mut();
+            if !matches!(inner.state, TaskState::Done(_) | TaskState::Failed(_)) {
+                inner.state = TaskState::Failed(exc.clone());
+            }
+        }
+        self.taskgroup_notify_finished(task, Some(exc.clone()));
+        self.mn.notify_all();
+        self.throw_value(exc)?;
+        Ok(Value::None)
     }
 
     pub(crate) fn semaphore_acquire(
@@ -8000,6 +8573,7 @@ fn get_attr(vm: &mut Vm, obj: &Value, field: &str) -> Result<Value> {
         Value::Set(set) => type_registry::get_set_method(set, field),
         Value::Tuple(tuple) => type_registry::get_tuple_method(tuple, field),
         Value::Bytes(bytes) => type_registry::get_bytes_method(bytes, field),
+        Value::Task(t) => crate::concurrency::get_task_method(t, field),
         Value::Channel(ch) => crate::concurrency::get_channel_method(ch, field),
         Value::Mutex(m) => crate::concurrency::get_mutex_method(m, field),
         Value::MutexGuard(m) => crate::concurrency::get_mutex_guard_method(m, field),

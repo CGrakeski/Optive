@@ -186,6 +186,32 @@ fn run_parallel_primes(workers: usize) -> optive::value::Value {
     run_source_in_vm(&mut vm, PARALLEL_PRIMES_SRC, "<bench-primes>").expect("parallel primes")
 }
 
+const CHANNEL_PING_SRC: &str = r#"
+const let N = 20000
+let a = Channel(1)
+let b = Channel(1)
+go do {
+  var i = 0
+  loop (N) {
+    a.send(i)
+    let _ = b.recv()
+    i = i + 1
+  }
+}
+var i = 0
+loop (N) {
+  let x = a.recv()
+  b.send(x)
+  i = i + 1
+}
+N
+"#;
+
+fn run_channel_ping(workers: usize) -> optive::value::Value {
+    let mut vm = Vm::with_workers(workers);
+    run_source_in_vm(&mut vm, CHANNEL_PING_SRC, "<bench-ping>").expect("channel ping")
+}
+
 /// Run ignored benchmarks: `cargo test --test benchmarks -- --ignored --nocapture`
 fn run_assert_bench(name: &str, runs: usize, src: &str, expect: &str) {
     let stats = BenchStats::run(name, runs, || {
@@ -276,34 +302,39 @@ fn bench_nested_loop_1b_vm_only() {
     );
 }
 
-/// 并行筛素数：M:1（1 OS worker）vs M:N（4 OS workers），同 8 个 go 任务。
+/// 并行筛素数：同 8 个 go 任务，扫 OPTIVE_WORKERS / Vm::with_workers = 1,2,4,8。
 #[test]
 #[ignore = "slow benchmark; run with --ignored"]
 fn bench_parallel_primes() {
     const EXPECT: &str = "5133";
-    let m1 = BenchStats::run("parallel_primes workers=1 (M:1)", 3, || {
-        let v = run_parallel_primes(1);
-        assert_eq!(v.display_string(), EXPECT);
-    });
-    m1.report();
+    let mut avgs = Vec::new();
+    for w in [1usize, 2, 4, 8] {
+        let s = BenchStats::run(format!("parallel_primes workers={w}"), 3, || {
+            let v = run_parallel_primes(w);
+            assert_eq!(v.display_string(), EXPECT);
+        });
+        s.report();
+        avgs.push((w, s.avg_ms()));
+    }
+    if let Some((_, base)) = avgs.first() {
+        if *base > 0.0 {
+            for (w, avg) in &avgs {
+                println!("parallel_primes speedup vs 1 worker @ {w}: {:.2}x", base / avg);
+            }
+        }
+    }
+}
 
-    let mn = BenchStats::run("parallel_primes workers=4 (M:N)", 3, || {
-        let v = run_parallel_primes(4);
-        assert_eq!(v.display_string(), EXPECT);
-    });
-    mn.report();
-
-    let mn8 = BenchStats::run("parallel_primes workers=8 (M:N)", 3, || {
-        let v = run_parallel_primes(8);
-        assert_eq!(v.display_string(), EXPECT);
-    });
-    mn8.report();
-
-    if m1.avg_ms() > 0.0 {
-        println!(
-            "parallel_primes speedup (1/4 workers): {:.2}x\nparallel_primes speedup (1/8 workers): {:.2}x",
-            m1.avg_ms() / mn.avg_ms(),
-            m1.avg_ms() / mn8.avg_ms()
-        );
+/// Channel 乒乓：调度 + 同步开销（非 CPU 密集）；对比 1 vs 4 worker。
+#[test]
+#[ignore = "slow benchmark; run with --ignored"]
+fn bench_channel_ping() {
+    const EXPECT: &str = "20000";
+    for w in [1usize, 4] {
+        let s = BenchStats::run(format!("channel_ping×20000 workers={w}"), 5, || {
+            let v = run_channel_ping(w);
+            assert_eq!(v.display_string(), EXPECT);
+        });
+        s.report();
     }
 }

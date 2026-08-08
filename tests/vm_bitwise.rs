@@ -53,6 +53,20 @@ struct N {
 }
 
 #[test]
+fn struct_rmod_magic() {
+    assert_num(
+        r#"
+struct N {
+    var v
+    func __rmod__(self, other) { return N(other % self.v) }
+}
+(10 % N(3)).v
+"#,
+        "1",
+    );
+}
+
+#[test]
 fn struct_bitand_and_invert_magic() {
     assert_num(
         r#"

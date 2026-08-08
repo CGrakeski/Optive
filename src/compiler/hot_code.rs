@@ -32,6 +32,10 @@ pub const H_LOOP_COUNTDOWN: u8 = 23;
 pub const H_LOAD_FAST_SUB_IMM: u8 = 24;
 pub const H_LOAD_FAST_LE_IMM: u8 = 25;
 pub const H_MOD_NUM: u8 = 26;
+pub const H_LOAD_GLOBAL: u8 = 27;
+pub const H_STORE_GLOBAL: u8 = 28;
+pub const H_CALL: u8 = 29;
+pub const H_CALL_GLOBAL: u8 = 30;
 pub const H_COLD: u8 = 255;
 
 #[derive(Clone, Default)]
@@ -56,6 +60,8 @@ impl HotCode {
                 Instruction::PushSmall(n) => (H_PUSH_SMALL, *n),
                 Instruction::LoadFast(s) => (H_LOAD_FAST, *s as i64),
                 Instruction::StoreFast(s) => (H_STORE_FAST, *s as i64),
+                Instruction::LoadGlobal(s) => (H_LOAD_GLOBAL, *s as i64),
+                Instruction::StoreGlobal(s) => (H_STORE_GLOBAL, *s as i64),
                 Instruction::LoadFastSubImm { slot, imm } => {
                     (H_LOAD_FAST_SUB_IMM, encode_slot_imm(*slot, *imm))
                 }
@@ -78,6 +84,11 @@ impl HotCode {
                 Instruction::GotoIfNot(t) => (H_GOTO_IF_NOT, *t as i64),
                 Instruction::LoopCountdown(t) => (H_LOOP_COUNTDOWN, *t as i64),
                 Instruction::CallSelf { argc } => (H_CALL_SELF, *argc as i64),
+                Instruction::Call { argc } => (H_CALL, *argc as i64),
+                Instruction::CallGlobal { global_idx, argc } => (
+                    H_CALL_GLOBAL,
+                    encode_slot_imm(*global_idx, *argc as i64),
+                ),
                 Instruction::Ret => (H_RET, 0),
                 Instruction::RetLeave => (H_RET_LEAVE, 0),
                 Instruction::RetFast(s) => (H_RET_FAST, *s as i64),
