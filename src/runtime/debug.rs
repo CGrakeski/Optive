@@ -2,12 +2,12 @@
 //!
 //! 热路径仅在 `Vm.debug.is_some()` 时多一次 Option 检查；未附加调试器时与原先一致。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::error::RuntimeError;
-use crate::value::{TaskState, Value};
+use crate::value::{TaskInner, TaskState, Value};
 use crate::vm::{ErrorStackFrame, Vm};
 use crate::Result;
 
@@ -33,10 +33,16 @@ pub enum StopReason {
     Entry,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct LineBreakpoint {
+    pub condition: Option<String>,
+    pub log: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct DebugState {
-    /// `(规范化路径, 行号)`；空路径表示「任意文件」。
-    pub line_breakpoints: HashSet<(String, usize)>,
+    /// `(规范化路径, 行号)` → 可选条件 / 日志。
+    pub line_breakpoints: HashMap<(String, usize), LineBreakpoint>,
     /// 函数名断点（精确名，或 `*substr` 子串）。
     pub function_breakpoints: HashSet<String>,
     pub pending_break: bool,
@@ -57,12 +63,16 @@ pub struct DebugState {
     pub started: bool,
     /// 未捕获异常停下时暂存错误文案。
     pub last_uncaught: Option<String>,
+    /// 步进/断点焦点纤程；`None` 表示主纤程（无 task_ctx）。
+    pub focus_fiber: Option<Shared<TaskInner>>,
+    /// `fiber N` 所选列表下标（仅展示）。
+    pub focus_fiber_index: Option<usize>,
 }
 
 impl Default for DebugState {
     fn default() -> Self {
         Self {
-            line_breakpoints: HashSet::new(),
+            line_breakpoints: HashMap::new(),
             function_breakpoints: HashSet::new(),
             pending_break: false,
             stop_reason: None,
@@ -75,6 +85,8 @@ impl Default for DebugState {
             stop_on_entry: true,
             started: false,
             last_uncaught: None,
+            focus_fiber: None,
+            focus_fiber_index: None,
         }
     }
 }
@@ -86,12 +98,28 @@ impl DebugState {
     }
 
     pub fn add_line_breakpoint(&mut self, file: &str, line: usize) {
+        self.add_line_breakpoint_ex(file, line, None, None);
+    }
+
+    pub fn add_line_breakpoint_ex(
+        &mut self,
+        file: &str,
+        line: usize,
+        condition: Option<String>,
+        log: Option<String>,
+    ) {
         let key = if file.is_empty() {
             (String::new(), line)
         } else {
             (normalize_path(file), line)
         };
-        self.line_breakpoints.insert(key);
+        self.line_breakpoints.insert(
+            key,
+            LineBreakpoint {
+                condition,
+                log,
+            },
+        );
     }
 
     pub fn remove_line_breakpoint(&mut self, file: &str, line: usize) -> bool {
@@ -100,7 +128,7 @@ impl DebugState {
         } else {
             (normalize_path(file), line)
         };
-        self.line_breakpoints.remove(&key)
+        self.line_breakpoints.remove(&key).is_some()
     }
 
     pub fn clear_breakpoints(&mut self) {
@@ -154,11 +182,19 @@ fn paths_match(bp_file: &str, actual: &str) -> bool {
     a == b || a.ends_with(&b) || b.ends_with(&a)
 }
 
-fn line_bp_hit(state: &DebugState, file: &str, line: usize) -> bool {
+fn find_line_bp<'a>(
+    state: &'a DebugState,
+    file: &str,
+    line: usize,
+) -> Option<&'a LineBreakpoint> {
     if line == 0 {
-        return false;
+        return None;
     }
-    state.line_breakpoints.iter().any(|(f, l)| *l == line && paths_match(f, file))
+    state
+        .line_breakpoints
+        .iter()
+        .find(|((f, l), _)| *l == line && paths_match(f, file))
+        .map(|(_, bp)| bp)
 }
 
 fn func_bp_matches(bp: &str, name: &str) -> bool {
@@ -169,8 +205,18 @@ fn func_bp_matches(bp: &str, name: &str) -> bool {
     }
 }
 
+fn fiber_focus_allows(vm: &Vm, state: &DebugState) -> bool {
+    match &state.focus_fiber {
+        None => vm.debug_current_task().is_none(),
+        Some(focus) => vm
+            .debug_current_task()
+            .as_ref()
+            .is_some_and(|t| Shared::ptr_eq(t, focus)),
+    }
+}
+
 /// 在即将执行 `pc` 处检查是否应暂停。
-pub fn should_pause(vm: &Vm, state: &mut DebugState) -> bool {
+pub fn should_pause(vm: &mut Vm, state: &mut DebugState) -> bool {
     if state.pending_break {
         return true;
     }
@@ -181,6 +227,9 @@ pub fn should_pause(vm: &Vm, state: &mut DebugState) -> bool {
             return true;
         }
     }
+
+    // 跨纤程步进：非焦点纤程忽略行/步停（显式 breakpoint()/pending 仍停）。
+    let focus_ok = fiber_focus_allows(vm, state);
 
     let (file_raw, _) = current_location(vm);
     let file = normalize_path(&file_raw);
@@ -232,53 +281,94 @@ pub fn should_pause(vm: &Vm, state: &mut DebugState) -> bool {
         _ => false,
     };
 
-    // 1) 指令级单步：下一 PC 即停
-    if matches!(state.step, Some(StepMode::Insn)) {
-        state.stop_reason = Some(StopReason::Step);
-        state.step = None;
-        state.last_func_name = func_name.clone();
-        return true;
-    }
-
-    // 2) 行级单步
-    if let Some(mode) = state.step {
-        let hit = match mode {
-            StepMode::In => line > 0 && !same_line_as_last_stop,
-            StepMode::Over { max_depth } => {
-                line > 0 && depth <= max_depth && !same_line_as_last_stop
-            }
-            StepMode::Out { target_depth } => depth < target_depth,
-            StepMode::Insn => false,
-        };
-        if hit {
+    if focus_ok {
+        // 1) 指令级单步：下一 PC 即停
+        if matches!(state.step, Some(StepMode::Insn)) {
             state.stop_reason = Some(StopReason::Step);
             state.step = None;
             state.last_func_name = func_name.clone();
             return true;
         }
-    }
 
-    // 3) 行断点：命中且未被「刚停在该行」抑制
-    if line_bp_hit(state, &file, line) && state.bp_skip_line.is_none() {
-        state.stop_reason = Some(StopReason::Breakpoint);
-        state.bp_skip_line = Some((file.clone(), line));
-        state.last_func_name = func_name.clone();
-        return true;
-    }
-
-    // 4) 函数断点：刚进入匹配函数时停一次
-    if entered_func && state.armed_func_bp.is_none() {
-        if let Some(name) = &func_name {
-            if let Some(bp) = state
-                .function_breakpoints
-                .iter()
-                .find(|bp| func_bp_matches(bp, name))
-                .cloned()
-            {
-                state.armed_func_bp = Some(bp);
-                state.stop_reason = Some(StopReason::Breakpoint);
+        // 2) 行级单步
+        if let Some(mode) = state.step {
+            let hit = match mode {
+                StepMode::In => line > 0 && !same_line_as_last_stop,
+                StepMode::Over { max_depth } => {
+                    line > 0 && depth <= max_depth && !same_line_as_last_stop
+                }
+                StepMode::Out { target_depth } => depth < target_depth,
+                StepMode::Insn => false,
+            };
+            if hit {
+                state.stop_reason = Some(StopReason::Step);
+                state.step = None;
                 state.last_func_name = func_name.clone();
                 return true;
+            }
+        }
+
+        // 3) 行断点：条件 / 日志
+        if let Some(bp) = find_line_bp(state, &file, line) {
+            if state.bp_skip_line.is_none() {
+                let cond = bp.condition.clone();
+                let log = bp.log.clone();
+                if let Some(log_expr) = log {
+                    match eval_in_paused_vm(vm, &log_expr) {
+                        Ok(v) => println!("[blog {}:{}] {}", file, line, v.display_string()),
+                        Err(e) => println!(
+                            "[blog {}:{}] error: {}",
+                            file,
+                            line,
+                            e.message()
+                        ),
+                    }
+                    // 纯日志断点：打印后继续（若同时有条件则仍可停）
+                    if cond.is_none() {
+                        state.bp_skip_line = Some((file.clone(), line));
+                        state.last_func_name = func_name.clone();
+                        return false;
+                    }
+                }
+                let cond_ok = if let Some(c) = cond {
+                    match eval_in_paused_vm(vm, &c) {
+                        Ok(v) => v.is_truthy(),
+                        Err(e) => {
+                            println!(
+                                "[break {}:{}] condition error: {}",
+                                file,
+                                line,
+                                e.message()
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    true
+                };
+                if cond_ok {
+                    state.stop_reason = Some(StopReason::Breakpoint);
+                    state.bp_skip_line = Some((file.clone(), line));
+                    state.last_func_name = func_name.clone();
+                    return true;
+                }
+            }
+        }
+
+        // 4) 函数断点：刚进入匹配函数时停一次
+        if entered_func && state.armed_func_bp.is_none() {
+            if let Some(name) = &func_name {
+                if let Some(bp) = state
+                    .function_breakpoints
+                    .iter()
+                    .find(|bp| func_bp_matches(bp, name))
+                    .cloned()
+                {
+                    state.armed_func_bp = Some(bp);
+                    state.stop_reason = Some(StopReason::Breakpoint);
+                    state.last_func_name = func_name.clone();
+                    return true;
+                }
             }
         }
     }
@@ -316,11 +406,17 @@ pub struct FiberInfo {
     pub index: usize,
     pub state: String,
     pub detail: String,
+    pub task: Shared<TaskInner>,
 }
 
 pub fn list_fibers(vm: &Vm) -> Vec<FiberInfo> {
     let mut out = Vec::new();
-    for (i, task) in vm.ready_tasks.iter().enumerate() {
+    let mut seen: HashSet<usize> = HashSet::new();
+    let mut push_task = |task: &Shared<TaskInner>| {
+        let addr = task.as_ptr() as usize;
+        if !seen.insert(addr) {
+            return;
+        }
         let st = task.borrow().state.clone();
         let (name, detail) = match &st {
             TaskState::Pending { callable, args } => (
@@ -332,11 +428,21 @@ pub fn list_fibers(vm: &Vm) -> Vec<FiberInfo> {
             TaskState::Done(v) => ("done".into(), v.display_string()),
             TaskState::Failed(e) => ("failed".into(), e.display_string()),
         };
+        let index = out.len();
         out.push(FiberInfo {
-            index: i,
+            index,
             state: name,
             detail,
+            task: task.clone(),
         });
+    };
+    for task in vm.ready_tasks.iter() {
+        push_task(task);
+    }
+    for v in vm.mn.scheduled_task_values() {
+        if let Value::Task(task) = v {
+            push_task(&task);
+        }
     }
     out
 }
@@ -431,6 +537,51 @@ pub fn set_local_or_global(vm: &mut Vm, name: &str, value: Value) -> Result<()> 
     Ok(())
 }
 
+/// `set` 支持简单名或深路径（`a.b` / `a[i]`）：后者整句求值赋值。
+pub fn debug_set(vm: &mut Vm, lhs: &str, expr: &str) -> Result<()> {
+    let lhs = lhs.trim();
+    let expr = expr.trim();
+    if lhs.contains('.') || lhs.contains('[') {
+        let stmt = format!("{lhs} = {expr}");
+        eval_in_paused_vm(vm, &stmt)?;
+        Ok(())
+    } else {
+        let v = eval_in_paused_vm(vm, expr)?;
+        set_local_or_global(vm, lhs, v)
+    }
+}
+
 pub fn list_locals(vm: &Vm) -> Vec<(String, Value)> {
     vm.debug_list_locals()
+}
+
+/// 解析 `break` 规格：`[file:]N [if <expr>|log <expr>]`
+pub fn parse_break_spec(spec: &str) -> Option<(String, usize, Option<String>, Option<String>)> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    let (loc_part, rest) = if let Some(idx) = spec.find(" if ") {
+        (&spec[..idx], Some(("if", spec[idx + 4..].trim())))
+    } else if let Some(idx) = spec.find(" log ") {
+        (&spec[..idx], Some(("log", spec[idx + 5..].trim())))
+    } else {
+        (spec, None)
+    };
+    let loc_part = loc_part.trim();
+    let (file, line) = if let Ok(line) = loc_part.parse::<usize>() {
+        (String::new(), line)
+    } else if let Some((file_part, line_s)) = loc_part.rsplit_once(':') {
+        let line = line_s.parse::<usize>().ok()?;
+        (file_part.to_string(), line)
+    } else {
+        return None;
+    };
+    let (condition, log) = match rest {
+        Some(("if", e)) if !e.is_empty() => (Some(e.to_string()), None),
+        Some(("log", e)) if !e.is_empty() => (None, Some(e.to_string())),
+        None => (None, None),
+        _ => return None,
+    };
+    Some((file, line, condition, log))
 }

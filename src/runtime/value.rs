@@ -329,6 +329,11 @@ pub enum IteratorKind {
     Channel {
         channel: Shared<ChannelInner>,
     },
+    /// `stream_take` / 惰性 take：最多产出 `remaining` 个元素。
+    Take {
+        remaining: usize,
+        source: Shared<IteratorState>,
+    },
     /// 用户生成器：调用含 `yield` 的 func/do 得到的惰性迭代器。
     Generator {
         func: Arc<FunctionObject>,
@@ -515,6 +520,13 @@ pub struct ChannelInner {
     pub queue: VecDeque<Value>,
     pub capacity: Option<usize>,
     pub closed: bool,
+}
+
+/// Stream 体：缓冲 channel 视图，或拉取包装（map/filter/take/from_gen）。
+#[derive(Clone)]
+pub enum StreamInner {
+    Channel(Shared<ChannelInner>),
+    Iter(Shared<IteratorState>),
 }
 
 impl ChannelInner {
@@ -717,6 +729,8 @@ pub enum Value {
     Task(Shared<TaskInner>),
     /// 通道（`Channel()` / `Channel(n)`）。
     Channel(Shared<ChannelInner>),
+    /// 只拉取流（与 Channel 共用队列实现；无对外 `send`）。
+    Stream(Shared<StreamInner>),
     /// 互斥锁（`Mutex(v)`）。
     Mutex(Shared<MutexInner>),
     /// `Mutex.lock()` 得到的守卫，可用于 `with`；最后一个引用释放时自动 unlock。
@@ -894,6 +908,7 @@ impl Value {
             Value::Variant(v) => &v.inst_name,
             Value::Task(_) => "Task",
             Value::Channel(_) => "Channel",
+            Value::Stream(_) => "Stream",
             Value::Mutex(_) => "Mutex",
             Value::MutexGuard(_) => "MutexGuard",
             Value::Sync(s) => match &*s.borrow() {
@@ -1040,6 +1055,7 @@ impl Value {
             ),
             Value::Task(_) => "<Task>".to_string(),
             Value::Channel(_) => "<Channel>".to_string(),
+            Value::Stream(_) => "<Stream>".to_string(),
             Value::Mutex(_) => "<Mutex>".to_string(),
             Value::MutexGuard(_) => "<MutexGuard>".to_string(),
             Value::Sync(s) => match &*s.borrow() {
@@ -1225,6 +1241,7 @@ impl Value {
             (Value::Cell(a), Value::Cell(b)) => Ok(Shared::ptr_eq(a, b)),
             (Value::Task(a), Value::Task(b)) => Ok(Shared::ptr_eq(a, b)),
             (Value::Channel(a), Value::Channel(b)) => Ok(Shared::ptr_eq(a, b)),
+            (Value::Stream(a), Value::Stream(b)) => Ok(Shared::ptr_eq(a, b)),
             (Value::Mutex(a), Value::Mutex(b)) => Ok(Shared::ptr_eq(a, b)),
             (Value::MutexGuard(a), Value::MutexGuard(b)) => Ok(Shared::ptr_eq(a, b)),
             (Value::Sync(a), Value::Sync(b)) => Ok(Shared::ptr_eq(a, b)),
@@ -1269,6 +1286,7 @@ pub fn values_identical(a: &Value, b: &Value) -> bool {
         (Value::Cell(x), Value::Cell(y)) => Shared::ptr_eq(x, y),
         (Value::Task(x), Value::Task(y)) => Shared::ptr_eq(x, y),
         (Value::Channel(x), Value::Channel(y)) => Shared::ptr_eq(x, y),
+        (Value::Stream(x), Value::Stream(y)) => Shared::ptr_eq(x, y),
         (Value::Mutex(x), Value::Mutex(y)) => Shared::ptr_eq(x, y),
         (Value::MutexGuard(x), Value::MutexGuard(y)) => Shared::ptr_eq(x, y),
         (Value::Sync(x), Value::Sync(y)) => Shared::ptr_eq(x, y),
@@ -1624,10 +1642,40 @@ impl IteratorState {
                     Ok(Some(v))
                 }
             }
+            IteratorKind::Take { remaining, source } => {
+                if *remaining == 0 {
+                    return Ok(None);
+                }
+                let source = source.clone();
+                let next = source.borrow_mut().next_value(vm)?;
+                match next {
+                    Some(v) => {
+                        *remaining -= 1;
+                        Ok(Some(v))
+                    }
+                    None => Ok(None),
+                }
+            }
             IteratorKind::Generator { .. } => Err(RuntimeError::msg(
                 "internal: generator iteration must use Vm::advance_iterator",
             )),
         }
+    }
+}
+
+/// 与 `value_to_iterable` 类似，但 Stream 拉取体与 Iterator 共享同一状态（不克隆游标）。
+pub fn value_to_iterator_shared(v: &Value) -> crate::Result<Shared<IteratorState>> {
+    match v {
+        Value::Iterator(it) => Ok(it.clone()),
+        Value::Stream(s) => match &*s.borrow() {
+            StreamInner::Channel(ch) => Ok(Shared::new(IteratorState {
+                kind: IteratorKind::Channel {
+                    channel: ch.clone(),
+                },
+            })),
+            StreamInner::Iter(it) => Ok(it.clone()),
+        },
+        other => Ok(Shared::new(value_to_iterable(other)?)),
     }
 }
 
@@ -1683,6 +1731,14 @@ pub fn value_to_iterable(v: &Value) -> crate::Result<IteratorState> {
                 channel: ch.clone(),
             },
         }),
+        Value::Stream(s) => match &*s.borrow() {
+            StreamInner::Channel(ch) => Ok(IteratorState {
+                kind: IteratorKind::Channel {
+                    channel: ch.clone(),
+                },
+            }),
+            StreamInner::Iter(it) => Ok(it.borrow().clone()),
+        },
         Value::Dict(d) => {
             let items: Vec<Value> = d
                 .borrow()

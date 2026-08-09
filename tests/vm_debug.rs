@@ -292,3 +292,78 @@ fn debug_eval_reads_locals() {
     assert_eq!(debug::line_at_pc(&vm), 5);
 }
 
+#[test]
+fn debug_conditional_breakpoint() {
+    let mut vm = Vm::new();
+    let state = Shared::new(DebugState {
+        stop_on_entry: false,
+        ..Default::default()
+    });
+    state
+        .borrow_mut()
+        .add_line_breakpoint_ex("", 3, Some("a == 1".into()), None);
+    debug::attach(&mut vm, state.clone());
+    load(&mut vm, "a = 1\nb = 2\nc = a + b\n");
+    assert!(vm.run_until_debug_break().unwrap().is_none());
+    assert_eq!(state.borrow().stop_reason, Some(StopReason::Breakpoint));
+    assert_eq!(debug::line_at_pc(&vm), 3);
+
+    // 条件为假：不应停下
+    let mut vm2 = Vm::new();
+    let state2 = Shared::new(DebugState {
+        stop_on_entry: false,
+        ..Default::default()
+    });
+    state2
+        .borrow_mut()
+        .add_line_breakpoint_ex("", 3, Some("a == 0".into()), None);
+    debug::attach(&mut vm2, state2);
+    load(&mut vm2, "a = 1\nb = 2\nc = a + b\n");
+    let done = vm2.run_until_debug_break().expect("run");
+    assert!(done.is_some(), "false condition must not stop");
+}
+
+#[test]
+fn debug_log_breakpoint_continues() {
+    let mut vm = Vm::new();
+    let state = Shared::new(DebugState {
+        stop_on_entry: false,
+        ..Default::default()
+    });
+    state
+        .borrow_mut()
+        .add_line_breakpoint_ex("", 2, None, Some("x".into()));
+    debug::attach(&mut vm, state.clone());
+    load(&mut vm, "x = 9\ny = x + 1\n");
+    let done = vm.run_until_debug_break().expect("run");
+    assert!(done.is_some(), "log breakpoint should not stop");
+}
+
+#[test]
+fn debug_deep_set_index() {
+    let mut vm = Vm::new();
+    let state = Shared::new(DebugState {
+        stop_on_entry: false,
+        ..Default::default()
+    });
+    state.borrow_mut().add_line_breakpoint("", 2);
+    debug::attach(&mut vm, state);
+    load(&mut vm, "a = [1, 2, 3]\nb = a[0]\n");
+    assert!(vm.run_until_debug_break().unwrap().is_none());
+    debug::debug_set(&mut vm, "a[1]", "99").expect("set");
+    let v = debug::eval_in_paused_vm(&mut vm, "a[1]").expect("eval");
+    assert_eq!(v.display_string(), "99");
+}
+
+#[test]
+fn debug_parse_break_spec() {
+    let (f, l, c, g) = debug::parse_break_spec("12 if n > 0").unwrap();
+    assert!(f.is_empty());
+    assert_eq!(l, 12);
+    assert_eq!(c.as_deref(), Some("n > 0"));
+    assert!(g.is_none());
+    let (_, _, c2, g2) = debug::parse_break_spec("foo.tive:3 log x").unwrap();
+    assert_eq!(c2, None);
+    assert_eq!(g2.as_deref(), Some("x"));
+}
+

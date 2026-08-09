@@ -32,6 +32,7 @@ impl<T> Shared<T> {
 
     #[inline]
     pub fn borrow_mut(&self) -> RwLockWriteGuard<'_, T> {
+        crate::gc::write_barrier_addr(Arc::as_ptr(&self.inner) as usize);
         self.inner.write()
     }
 
@@ -42,6 +43,7 @@ impl<T> Shared<T> {
 
     #[inline]
     pub fn try_borrow_mut(&self) -> Option<RwLockWriteGuard<'_, T>> {
+        crate::gc::write_barrier_addr(Arc::as_ptr(&self.inner) as usize);
         self.inner.try_write()
     }
 
@@ -134,7 +136,15 @@ impl<T> SyncCell<T> {
 
     #[inline]
     pub fn borrow_mut(&self) -> RwLockWriteGuard<'_, T> {
+        // 脏卡：锁地址在 track_struct 时登记为 Struct 别名，terminate 可 O(1) 解析。
+        crate::gc::write_barrier_addr(self.lock_addr());
         self.inner.write()
+    }
+
+    /// `RwLock` 身份地址（Struct 槽位写屏障别名用）。
+    #[inline]
+    pub fn lock_addr(&self) -> usize {
+        &self.inner as *const RwLock<T> as usize
     }
 
     #[inline]

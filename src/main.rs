@@ -10,11 +10,12 @@ use std::borrow::Cow;
 use optive::custom::{self, CliMsg, Diag, ReplMsg};
 use optive::{repl_needs_continuation, run_source_in_vm, vm::Vm};
 use rustyline::error::ReadlineError;
-use rustyline::highlight::Highlighter;
+use rustyline::highlight::{CmdKind, Highlighter};
 use rustyline::history::DefaultHistory;
 use rustyline::{Completer, Editor, Helper, Hinter, Validator};
 
 use cli::color;
+use cli::repl_highlight::{self, LineHighlightCache};
 use cli::resolve::{EnsureResult};
 use optive::caps::Capabilities;
 use crate::cli::debug_cmd::inject_dep_map;
@@ -26,6 +27,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Helper, Completer, Hinter, Validator)]
 struct ReplHelper {
     colored_prompt: String,
+    line_cache: LineHighlightCache,
 }
 
 impl Highlighter for ReplHelper {
@@ -39,6 +41,14 @@ impl Highlighter for ReplHelper {
         } else {
             Cow::Borrowed(prompt)
         }
+    }
+
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+        self.line_cache.get_or_highlight(line)
+    }
+
+    fn highlight_char(&self, _line: &str, _pos: usize, _kind: CmdKind) -> bool {
+        repl_highlight::highlight_enabled()
     }
 }
 
@@ -714,6 +724,7 @@ fn repl() {
         Ok(mut e) => {
             e.set_helper(Some(ReplHelper {
                 colored_prompt: String::new(),
+                line_cache: LineHighlightCache::default(),
             }));
             e
         }

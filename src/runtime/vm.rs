@@ -155,6 +155,12 @@ env_usize!(suspend_budget_default, "OPTIVE_SUSPEND_BUDGET", 8_192);
 env_usize!(cached max_call_depth, "OPTIVE_MAX_CALL_DEPTH", 10_000);
 env_usize!(cached gc_auto_threshold, "OPTIVE_GC_THRESHOLD", 8_192);
 
+#[inline]
+fn clamp_suspend_budget(n: usize) -> usize {
+    // tick_budget 无检查递减；预算必须 ≥1。
+    n.max(1)
+}
+
 // 预分配容量常量 — 避免热路径扩容，控制初始内存占用。
 const STACK_INIT_CAP: usize = 256;
 const CALL_ARGS_BUF_INIT_CAP: usize = 8;
@@ -417,8 +423,10 @@ pub struct Vm {
     hot_failed: bool,
     /// 与 hot_failed 配套的详细错误；失败时由外层取出。
     hot_error: Option<RuntimeError>,
-    /// 堆对象 Weak 跟踪表；与 VM 根标记配合，在 gc_collect 时清扫环。
-    pub gc: crate::gc::GcTracker,
+    /// 跨 worker 共享的环收集器（Weak 跟踪 + 并发标记状态）。
+    pub gc: std::sync::Arc<crate::gc::SharedGc>,
+    /// 自动 GC 跟踪表阈值（每 Vm 可覆盖，避免测试改进程环境）。
+    gc_threshold: usize,
     /// `:: list[T]` 等强绑定后挂在列表对象上的元素契约（按 Rc 指针键）。
     pub(crate) list_element_contracts: FxHashMap<usize, Value>,
     pub(crate) dict_contracts: FxHashMap<usize, (Value, Value)>,
@@ -439,6 +447,9 @@ pub struct Vm {
     mn_primary: bool,
     /// M:N 死锁检测：连续「全局静默」轮次计数（仅主实例使用）。
     mn_idle_rounds: u32,
+    /// 当前 select 轮次的伪随机 case 次序（`SelectBegin` / `SelectNextIndex`）。
+    select_fair_order: Vec<usize>,
+    select_fair_pos: usize,
     /// STW 失败后的自动 GC 冷却：在此之前且 tracked_count 未超过记录值时跳过。
     gc_auto_cooldown_until: Option<std::time::Instant>,
     /// 冷却期内允许提前重试的下限：仅当 `tracked_count >` 此值时才无视时间冷却。
@@ -466,6 +477,8 @@ pub struct Vm {
     pending_suspend: bool,
     /// 主纤程预算耗尽，需跑一轮就绪队列。
     pending_main_yield: bool,
+    /// M:1 热 StoreGlobal 跳过了 SharedMap 同步；调度其它纤程前需 flush。
+    script_globals_map_dirty: bool,
     /// 正在 `advance_iterator` 恢复生成器。
     generator_resuming: bool,
     /// 当前恢复的生成器状态（供 Yield/YieldFrom 写回）。
@@ -628,6 +641,8 @@ enum StepAction {
     MakeDeadline,
     SelectPollDeadline,
     SelectIdle(usize),
+    SelectBegin(usize),
+    SelectNextIndex,
 }
 
 pub struct ModuleInitSnapshot {
@@ -651,6 +666,17 @@ impl Vm {
 
     /// 构造指定 OS worker 数的 Vm（`1` = M:1；`>1` = M:N）。测试与嵌入宿主可绕过环境变量。
     pub fn with_workers(workers: usize) -> Self {
+        Self::with_workers_gc(workers, crate::gc::GcMode::from_env())
+    }
+
+    /// 覆盖自动 GC 跟踪表阈值（测试用；不影响进程环境变量）。
+    pub fn with_gc_threshold(mut self, threshold: usize) -> Self {
+        self.gc_threshold = threshold.max(1);
+        self
+    }
+
+    /// 指定 worker 数与 GC 模式（helper 与主线程共享同一 `SharedGc`）。
+    pub fn with_workers_gc(workers: usize, gc_mode: crate::gc::GcMode) -> Self {
         let workers = workers.max(1);
         let mut vm = Self {
             code: Arc::new(Vec::new()),
@@ -711,7 +737,8 @@ impl Vm {
             pending_ret: None,
             hot_failed: false,
             hot_error: None,
-            gc: crate::gc::GcTracker::new(),
+            gc: std::sync::Arc::new(crate::gc::SharedGc::with_mode(gc_mode)),
+            gc_threshold: gc_auto_threshold(),
             list_element_contracts: FxHashMap::default(),
             dict_contracts: FxHashMap::default(),
             set_element_contracts: FxHashMap::default(),
@@ -726,6 +753,8 @@ impl Vm {
             mn_parallel: false,
             mn_primary: true,
             mn_idle_rounds: 0,
+            select_fair_order: Vec::new(),
+            select_fair_pos: 0,
             gc_auto_cooldown_until: None,
             gc_auto_cooldown_hold_count: 0,
             sched_depth: 0,
@@ -735,10 +764,11 @@ impl Vm {
             ffi_wait: None,
             sync_wait_resume: None,
             task_ctx: None,
-            suspend_budget: suspend_budget_default(),
-            budget_left: suspend_budget_default(),
+            suspend_budget: clamp_suspend_budget(suspend_budget_default()),
+            budget_left: clamp_suspend_budget(suspend_budget_default()),
             pending_suspend: false,
             pending_main_yield: false,
+            script_globals_map_dirty: false,
             generator_resuming: false,
             active_generator: None,
             pending_gen_yield: None,
@@ -770,6 +800,7 @@ impl Vm {
                 vm.mn_parallel = false;
             }
         }
+        crate::gc::install_current_gc(vm.gc.clone());
         vm
     }
 
@@ -838,12 +869,22 @@ impl Vm {
     /// 跟踪表过大时自动清扫环，避免无人调用 `gc()` 时 Weak 表无限增长。
     fn maybe_auto_gc(&mut self) {
         let count = self.gc.tracked_count();
-        if count < gc_auto_threshold() {
+        let requested = self.mn_parallel && self.mn_primary && self.mn.take_gc_request();
+        if count < self.gc_threshold && !requested {
+            return;
+        }
+        // Helper 不发起 STW：只登记请求并修剪死 Weak，避免与 primary 双端握手死锁。
+        if self.mn_parallel && !self.mn_primary {
+            self.mn.request_gc();
+            let _ = self.gc.prune_dead();
             return;
         }
         // STW 失败后冷却：避免 tracked_count 仍超阈时反复打满 begin_stw 超时。
         if let Some(until) = self.gc_auto_cooldown_until {
             if std::time::Instant::now() < until && count <= self.gc_auto_cooldown_hold_count {
+                if requested {
+                    self.mn.request_gc();
+                }
                 return;
             }
         }
@@ -851,80 +892,161 @@ impl Vm {
     }
 
     /// 标记-清扫环收集：从根出发标记可达堆对象，再清空不可达容器内部。
-    /// M:N 下先请求 stop-the-world，再在安全点清空。
+    /// - `OPTIVE_GC_MODE=stw`：完整 STW 标记+清扫
+    /// - `concurrent`：短 STW 拍根 → 并发/并行标记 → 短 STW 终止+清扫；握手失败回退 STW（不跳过）
+    /// - M:N helper 调用时转为 `request_gc` + `prune_dead`（仅 primary 做 STW）
     pub fn gc_collect(&mut self) -> usize {
+        use crate::gc::GcMode;
+        use std::sync::atomic::Ordering;
         if self.mn_parallel && !self.mn_primary {
-            // Helper 不发起 STW；仅修剪已死 Weak，避免跟踪表无限增长。
+            self.mn.request_gc();
             return self.gc.prune_dead();
         }
-        let stw = if self.mn_parallel {
+        let t0 = std::time::Instant::now();
+        let gc = self.gc.clone();
+        let Some(_collect_guard) = gc.collect_lock.try_lock() else {
+            // 已有收集在进行
+            return 0;
+        };
+        let need_stw = self.mn_parallel;
+        let stw_ok = if need_stw {
             self.mn.begin_stw()
         } else {
             true
         };
-        if self.mn_parallel && !stw {
-            // 未能在限时内停住全部 helper：跳过本轮收集，避免带活线程扫堆。
-            // 记录并周期性告警，防止高负载下 GC 永远收不到而无人察觉。
+
+        let cleared = if !stw_ok {
+            // 握手失败：冷却后重试，不永久跳过环收集。
             let n = self.mn.note_stw_failure();
+            gc.stw_fallback_count.fetch_add(1, Ordering::Relaxed);
             if n == 1 || n % 64 == 0 {
-                eprintln!("optive: GC stop-the-world 超时（累计 {n} 次），本轮收集已跳过");
+                eprintln!(
+                    "optive: GC stop-the-world 超时（累计 {n} 次），本轮回退冷却后重试"
+                );
             }
-            // 冷却：至少等一轮 STW 超时量级，且 count 未继续增长时不再重试。
+            let hold = gc.tracked_count();
+            self.gc_auto_cooldown_hold_count = hold;
+            self.gc_auto_cooldown_until =
+                Some(std::time::Instant::now() + Self::gc_stw_cooldown());
+            0
+        } else {
+            let cleared = match gc.mode() {
+                GcMode::Stw => gc.collect_stw_inner(self),
+                GcMode::Concurrent => self.gc_collect_concurrent_phased(),
+            };
+            if need_stw {
+                self.mn.end_stw();
+            }
+            self.gc_auto_cooldown_until = None;
+            self.gc_auto_cooldown_hold_count = 0;
+            cleared
+        };
+
+        let collect_ns = t0.elapsed().as_nanos() as u64;
+        let stw_ns = gc.last_stw_ns.load(Ordering::Relaxed);
+        if stw_ok {
+            gc.note_collect_stats(stw_ns, collect_ns, cleared);
+        } else {
+            gc.last_collect_ns.store(collect_ns, Ordering::Relaxed);
+        }
+        cleared
+    }
+
+    /// concurrent：Prepare(STW 中) → 放行 mutator 并并行标记 → Terminate+Sweep(再 STW)。
+    /// `last_stw_ns` 只累计真实停顿（prepare + terminate/sweep），不含并发标记段。
+    fn gc_collect_concurrent_phased(&mut self) -> usize {
+        use std::sync::atomic::Ordering;
+        let mut stw_ns = 0u64;
+
+        // Prepare（已在外层 STW 中）
+        let prep_t0 = std::time::Instant::now();
+        self.gc.concurrent_prepare_roots(self);
+        stw_ns += prep_t0.elapsed().as_nanos() as u64;
+
+        // 放行 mutator，进入并发标记（此段不算 STW）
+        if self.mn_parallel {
+            self.mn.end_stw();
+        }
+        self.gc.concurrent_mark_drain();
+        // 终止前在 mutator 仍跑时尽量排空脏卡，缩短第二段 STW。
+        for _ in 0..8 {
+            if self.gc.concurrent_flush_dirty_to_gray() == 0 {
+                break;
+            }
+            self.gc.concurrent_mark_drain();
+        }
+
+        // 终止 + 清扫：再停世界
+        let term_t0 = std::time::Instant::now();
+        let stw2 = if self.mn_parallel {
+            self.mn.begin_stw()
+        } else {
+            true
+        };
+        if !stw2 {
+            self.gc.set_marking(false);
+            let n = self.mn.note_stw_failure();
+            self.gc.stw_fallback_count.fetch_add(1, Ordering::Relaxed);
+            if n == 1 || n % 64 == 0 {
+                eprintln!(
+                    "optive: GC terminate STW 超时（累计 {n} 次），本轮回退冷却后重试"
+                );
+            }
             let hold = self.gc.tracked_count();
             self.gc_auto_cooldown_hold_count = hold;
             self.gc_auto_cooldown_until =
                 Some(std::time::Instant::now() + Self::gc_stw_cooldown());
-            return 0;
+            let stw3 = if self.mn_parallel {
+                self.mn.begin_stw()
+            } else {
+                true
+            };
+            let cleared = if stw3 {
+                self.gc.collect_stw_inner(self)
+            } else {
+                0
+            };
+            stw_ns += term_t0.elapsed().as_nanos() as u64;
+            self.gc.last_stw_ns.store(stw_ns, Ordering::Relaxed);
+            return cleared;
         }
-        // 先将 tracker 移出 self（collect 需要 &Vm），处理完再挂回。
-        let mut tracker = std::mem::take(&mut self.gc);
-        let cleared = tracker.collect(self);
-        self.gc = tracker;
-        if self.mn_parallel {
-            self.mn.end_stw();
-        }
-        self.gc_auto_cooldown_until = None;
-        self.gc_auto_cooldown_hold_count = 0;
+        let marked = self.gc.concurrent_terminate(self);
+        let cleared = self.gc.sweep_marked(&marked);
+        stw_ns += term_t0.elapsed().as_nanos() as u64;
+        self.gc.last_stw_ns.store(stw_ns, Ordering::Relaxed);
+        // 保持 STW，由外层 end_stw
         cleared
     }
 
     fn gc_stw_cooldown() -> std::time::Duration {
-        // 与 STW 超时同量级，避免失败后立即再次阻塞同等时长。
-        std::env::var("OPTIVE_STW_TIMEOUT_MS")
+        // 短冷却即可抑制风暴；勿与 STW 超时同量级（否则对照墙钟被冷却主导）。
+        std::env::var("OPTIVE_GC_COOLDOWN_MS")
             .ok()
             .and_then(|s| s.parse().ok())
             .filter(|&n: &u64| n > 0)
             .map(std::time::Duration::from_millis)
-            .unwrap_or(std::time::Duration::from_millis(2_000))
+            .unwrap_or(std::time::Duration::from_millis(50))
     }
 
-    /// 将 VM 中所有 GC 根加入工作表并标记到 marked。
-    /// 由 GcTracker::collect 调用；传入 &Vm 以便遍历各根集。
-    pub(crate) fn gc_mark_roots(&self, marked: &mut FxHashSet<usize>) {
-        let mut worklist: Vec<Value> = Vec::new();
-
-        // 操作数栈 / 快局部
+    /// 将本 Vm 局部根推入工作表（不含共享 fiber / parked / scheduled）。
+    pub(crate) fn gc_push_local_roots(&self, worklist: &mut Vec<Value>) {
         for v in self.stack.get(..self.stack_sp).unwrap_or(&[]) {
             worklist.push(v.to_value());
         }
         for v in &self.lw_slots[..self.lw_sp.min(self.lw_slots.len())] {
             worklist.push(v.to_value());
         }
-        // 局部变量帧
         for frame in &self.locals_stack {
             for v in frame {
                 worklist.push(v.clone());
             }
         }
-        // 脚本顶层全局
         for v in self.script_globals.iter() {
             worklist.push(v.clone());
         }
-        // globals 表
-        for v in self.globals.values() {  // SharedMap::values clones
+        for v in self.globals.values() {
             worklist.push(v.clone());
         }
-        // 已注册函数 / 调用栈 / 重载表：函数对象 + 闭包捕获
         let push_func = |worklist: &mut Vec<Value>, f: &Arc<FunctionObject>| {
             worklist.push(Value::Function(f.clone()));
             if let Some(cap) = &f.captured {
@@ -932,43 +1054,36 @@ impl Vm {
             }
         };
         for f in self.functions.values() {
-            push_func(&mut worklist, &f);
+            push_func(worklist, &f);
         }
         for f in &self.func_stack {
-            push_func(&mut worklist, f);
+            push_func(worklist, f);
         }
-        // 活动异常
         if let Some(exc) = &self.active_exception {
             worklist.push(exc.clone());
         }
-        // 进行中的 for 循环迭代器
         for it in &self.iterators {
             worklist.push(Value::Iterator(it.state.clone()));
         }
-        // convert 分发表
         for dt in self.convert_tables.values() {
             worklist.push(Value::Dispatch(dt.clone()));
         }
-        // 重载分发表
         for fns in self.overload_tables.values() {
             for f in fns {
-                push_func(&mut worklist, &f);
+                push_func(worklist, &f);
             }
         }
-        // 已加载模块
         for m in self.module_cache.values() {
             worklist.push(Value::Module(m.clone()));
         }
         for m in self.builtin_modules.values() {
             worklist.push(Value::Module(m.clone()));
         }
-        // 模块 init 导出表
         if let Some(e) = &self.module_init_exports {
             for v in e.borrow().values() {
                 worklist.push(v.clone());
             }
         }
-        // 宏求值快照中的 globals/locals/functions/stack 等
         for snap in &self.macro_eval_scopes {
             for v in snap.globals.values() {
                 worklist.push(v.clone());
@@ -990,17 +1105,88 @@ impl Vm {
                 }
             }
         }
-        // 用户调用帧中挂起的闭包捕获
         for fr in &self.user_call_frames {
             if let Some(cap) = &fr.func.captured {
                 worklist.extend(cap.values().cloned());
             }
         }
+        if let Some(gen) = &self.active_generator {
+            worklist.push(Value::Iterator(gen.clone()));
+        }
+        if let Some(v) = &self.pending_gen_yield {
+            worklist.push(v.clone());
+        }
+        worklist.extend(self.gc.ffi_pins_snapshot());
+    }
 
-        // 广度优先遍历并从各根标记可达堆对象
+    fn gc_push_fiber_roots(fiber: &TaskFiber, worklist: &mut Vec<Value>) {
+        for v in &fiber.stack {
+            worklist.push(v.to_value());
+        }
+        for frame in &fiber.locals_stack {
+            for v in frame {
+                worklist.push(v.clone());
+            }
+        }
+        for v in &fiber.lw_slots {
+            worklist.push(v.to_value());
+        }
+        for f in &fiber.func_stack {
+            worklist.push(Value::Function(f.clone()));
+            if let Some(cap) = &f.captured {
+                worklist.extend(cap.values().cloned());
+            }
+        }
+        for it in &fiber.iterators {
+            worklist.push(Value::Iterator(it.state.clone()));
+        }
+        for fr in &fiber.user_call_frames {
+            if let Some(cap) = &fr.func.captured {
+                worklist.extend(cap.values().cloned());
+            }
+        }
+    }
+
+    /// 完整根集：本地 + 就绪队列 + fiber 仓 + parked helper 根 + 已调度任务。
+    pub(crate) fn gc_push_all_roots(&self, worklist: &mut Vec<Value>) {
+        self.gc_push_local_roots(worklist);
+        for t in &self.ready_tasks {
+            worklist.push(Value::Task(t.clone()));
+        }
+        for fiber in self.task_fibers.values() {
+            Self::gc_push_fiber_roots(fiber, worklist);
+        }
+        {
+            let fibers = self.mn.fibers.lock();
+            for fiber in fibers.values() {
+                Self::gc_push_fiber_roots(fiber, worklist);
+            }
+        }
+        worklist.extend(self.mn.take_parked_roots());
+        worklist.extend(self.mn.scheduled_task_values());
+    }
+
+    /// 兼容旧接口：推根并标记。
+    #[allow(dead_code)]
+    pub(crate) fn gc_mark_roots(&self, marked: &mut FxHashSet<usize>) {
+        let mut worklist: Vec<Value> = Vec::new();
+        self.gc_push_all_roots(&mut worklist);
         while let Some(v) = worklist.pop() {
             crate::gc::mark_value(&v, marked, &mut worklist);
         }
+    }
+
+    /// 安全点：发布本 Vm 根快照并响应 STW。
+    pub(crate) fn poll_gc_safepoint(&mut self) {
+        if !self.mn_parallel {
+            return;
+        }
+        if !self.mn.stw_requested.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let mut roots = Vec::new();
+        self.gc_push_local_roots(&mut roots);
+        self.mn.poll_safepoint_with_roots(Some(roots));
     }
 
     pub fn register_builtin_module(&mut self, name: &str, module: Shared<ModuleObject>) {
@@ -1204,6 +1390,26 @@ impl Vm {
             globals: crate::shared::SyncCell::new(map.into_iter().collect()),
             finalized: true,
         }
+    }
+
+    /// 将平行槽刷回 SharedMap（M:1 热 StoreGlobal 可延迟同步；调度其它纤程前必须刷）。
+    #[inline]
+    fn flush_script_globals_to_map(&mut self) {
+        if self.mn_parallel || !self.script_globals_map_dirty {
+            return;
+        }
+        for (idx, name) in self.script_global_names.iter().enumerate() {
+            if name.is_empty() {
+                continue;
+            }
+            let Some(v) = self.script_globals.get(idx).cloned() else {
+                continue;
+            };
+            if !self.globals.set_inplace(name.as_str(), v.clone()) {
+                self.globals.insert(name.clone(), v);
+            }
+        }
+        self.script_globals_map_dirty = false;
     }
 
     fn init_script_globals(&mut self, names: Vec<String>) {
@@ -2488,24 +2694,31 @@ impl Vm {
                 let idx = arg as usize;
                 let v = self.pop_hot();
                 if self.user_call_frames.is_empty() {
-                    // 顶层快路径：平行槽 + SharedMap 同步（函数 module_env 会回退读 globals）。
+                    // 顶层快路径：平行槽是 LoadGlobal 的权威来源。
+                    // M:1 下跳过 SharedMap 同步（每迭代一次 write 锁会毁掉 arith/call 微基准）；
+                    // M:N 下其它 worker 只见 SharedMap，必须立即同步。
                     if !self.has_const_names
                         && idx < self.script_globals.len()
                         && idx < self.script_global_names.len()
                         && !self.script_global_names[idx].is_empty()
                     {
                         if let StackVal::Int(n) = v {
-                            let num = Value::Num(Num::Small(n));
                             // SAFETY: idx 已界检。
                             unsafe {
-                                *self.script_globals.get_unchecked_mut(idx) = num.clone();
+                                *self.script_globals.get_unchecked_mut(idx) =
+                                    Value::Num(Num::Small(n));
                             }
-                            if !self.globals.set_inplace(
-                                self.script_global_names[idx].as_str(),
-                                num.clone(),
-                            ) {
-                                self.globals
-                                    .insert(self.script_global_names[idx].clone(), num);
+                            if self.mn_parallel {
+                                let num = Value::Num(Num::Small(n));
+                                if !self.globals.set_inplace(
+                                    self.script_global_names[idx].as_str(),
+                                    num.clone(),
+                                ) {
+                                    self.globals
+                                        .insert(self.script_global_names[idx].clone(), num);
+                                }
+                            } else {
+                                self.script_globals_map_dirty = true;
                             }
                             return HotFlow::Cont;
                         }
@@ -3110,6 +3323,8 @@ impl Vm {
             I::MakeDeadline => StepAction::MakeDeadline,
             I::SelectPollDeadline => StepAction::SelectPollDeadline,
             I::SelectIdle(n) => StepAction::SelectIdle(*n),
+            I::SelectBegin(n) => StepAction::SelectBegin(*n),
+            I::SelectNextIndex => StepAction::SelectNextIndex,
         }
     }
 
@@ -3853,8 +4068,7 @@ impl Vm {
             }
             StepAction::IterNew => {
                 let obj = self.pop()?;
-                let state = crate::value::value_to_iterable(&obj)?;
-                let rc = Shared::new(state);
+                let rc = crate::value::value_to_iterator_shared(&obj)?;
                 self.gc.track_iter(&rc);
                 self.iterators.push(ActiveIter {
                     state: rc,
@@ -4211,6 +4425,36 @@ impl Vm {
                 // 先推进墙钟（最近 sleep），再让其它任务跑；任务内 sleep 已协作切片，不会长时间霸住。
                 crate::concurrency::sleep_until_nearest_deadline(&deadlines, SELECT_IDLE_CAP_MS)?;
                 self.scheduler_yield()?;
+            }
+            StepAction::SelectBegin(n) => {
+                self.select_fair_order.clear();
+                self.select_fair_order.extend(0..n);
+                // Fisher–Yates；种子混入单调时钟，避免多就绪时永远偏向书写顺序。
+                let mut seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0)
+                    ^ (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    ^ (self.pc as u64);
+                if n > 1 {
+                    for i in (1..n).rev() {
+                        seed = seed
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1);
+                        let j = (seed >> 33) as usize % (i + 1);
+                        self.select_fair_order.swap(i, j);
+                    }
+                }
+                self.select_fair_pos = 0;
+            }
+            StepAction::SelectNextIndex => {
+                if self.select_fair_pos >= self.select_fair_order.len() {
+                    self.push_value(Value::Num(Num::Small(-1)));
+                } else {
+                    let idx = self.select_fair_order[self.select_fair_pos];
+                    self.select_fair_pos += 1;
+                    self.push_value(Value::Num(Num::Small(idx as i64)));
+                }
             }
         }
         Ok(())
@@ -6050,6 +6294,9 @@ impl Vm {
             self.struct_defs.extend(program.struct_defs.clone());
             self.enum_defs.extend(program.enum_defs.clone());
             self.variant_defs.extend(program.variant_defs.clone());
+            // 顶层热 Store 可能只写 script_globals；先刷到 SharedMap，再按 snippet
+            // 的 global_names 重建槽，否则条件/日志断点求值会读到 none。
+            self.flush_script_globals_to_map();
             self.init_script_globals(program.global_names.clone());
             self.code = Arc::new(program.code);
             self.hot_ops = program.hot.ops.clone();
@@ -6102,6 +6349,11 @@ impl Vm {
         } else {
             self.pending_main_yield = true;
         }
+    }
+
+    /// 当前调度任务（主纤程为 `None`）。
+    pub fn debug_current_task(&self) -> Option<Shared<crate::value::TaskInner>> {
+        self.task_ctx.as_ref().map(|c| c.task.clone())
     }
 
     pub fn debug_build_stack_frames(&self) -> Vec<ErrorStackFrame> {
@@ -6285,6 +6537,19 @@ impl Vm {
                     }
                     return Ok(Some(v));
                 }
+                IteratorKind::Take { remaining, source } => {
+                    if *remaining == 0 {
+                        return Ok(None);
+                    }
+                    let source = source.clone();
+                    match self.advance_iterator(&source)? {
+                        Some(v) => {
+                            *remaining -= 1;
+                            return Ok(Some(v));
+                        }
+                        None => return Ok(None),
+                    }
+                }
                 IteratorKind::Generator { .. } => {
                     unreachable!("generators handled before advance_iterator loop");
                 }
@@ -6364,6 +6629,8 @@ impl Vm {
         &mut self,
         state: &Shared<IteratorState>,
     ) -> Result<Option<Value>> {
+        // 消费者取消时，生成器在下一 yield/恢复点协作退出。
+        self.fail_if_current_task_cancelled()?;
         loop {
             let (func, locals, name_map, pc, exhausted, yield_from) = {
                 let st = state.borrow();
@@ -6562,12 +6829,15 @@ impl Vm {
     }
 
     pub(crate) fn spawn_task(&mut self, callable: Value, args: Vec<Value>) -> Value {
+        // go 任务可能经 SharedMap / module_env 读顶层绑定；刷平行槽。
+        self.flush_script_globals_to_map();
         let task = Shared::new(TaskInner::pending(callable, args));
         self.enqueue_task(task.clone());
         Value::Task(task)
     }
 
     fn enqueue_task(&mut self, task: Shared<TaskInner>) {
+        self.mn.note_scheduled_task(&task);
         if self.mn_parallel {
             self.local_worker.push(task);
             self.mn.notify_one();
@@ -6668,7 +6938,8 @@ impl Vm {
             pending_ret: None,
             hot_failed: false,
             hot_error: None,
-            gc: crate::gc::GcTracker::new(),
+            gc: self.gc.clone(),
+            gc_threshold: self.gc_threshold,
             list_element_contracts: self.list_element_contracts.clone(),
             dict_contracts: self.dict_contracts.clone(),
             set_element_contracts: self.set_element_contracts.clone(),
@@ -6680,6 +6951,8 @@ impl Vm {
             mn_parallel: true,
             mn_primary: false,
             mn_idle_rounds: 0,
+            select_fair_order: Vec::new(),
+            select_fair_pos: 0,
             gc_auto_cooldown_until: None,
             gc_auto_cooldown_hold_count: 0,
             sched_depth: 0,
@@ -6689,10 +6962,11 @@ impl Vm {
             ffi_wait: None,
             sync_wait_resume: None,
             task_ctx: None,
-            suspend_budget: self.suspend_budget,
-            budget_left: self.suspend_budget,
+            suspend_budget: clamp_suspend_budget(self.suspend_budget),
+            budget_left: clamp_suspend_budget(self.suspend_budget),
             pending_suspend: false,
             pending_main_yield: false,
+            script_globals_map_dirty: false,
             generator_resuming: false,
             active_generator: None,
             pending_gen_yield: None,
@@ -6714,14 +6988,20 @@ impl Vm {
             match std::thread::Builder::new()
                 .name(format!("optive-w{i}"))
                 .spawn(move || {
+                    crate::gc::install_current_gc(worker_vm.gc.clone());
                     while !mn.is_shutdown() {
+                        worker_vm.poll_gc_safepoint();
                         match worker_vm.take_ready_task() {
                             Some(task) => {
                                 let _ = worker_vm.scheduler_run_task(task);
                             }
-                            None => mn.wait_brief(),
+                            None => {
+                                worker_vm.poll_gc_safepoint();
+                                mn.wait_brief();
+                            }
                         }
                     }
+                    crate::gc::clear_current_gc();
                 }) {
                 Ok(_) => {
                     // 在父线程登记：避免 STW 在 helper 尚未执行 mark 前按 need=0 误判成功。
@@ -6741,7 +7021,7 @@ impl Vm {
     ///   （嵌套 capture 会破坏外层栈）；改为挂起本任务，让外层调度器继续；
     /// - 否则先跑就绪队列；M:N 下再短等。
     pub(crate) fn wait_or_deadlock(&mut self, msg: &str) -> Result<()> {
-        self.mn.poll_safepoint();
+        self.poll_gc_safepoint();
         // 任务内阻塞：立即挂起并回绕 Call，由外层（主纤程/其它 worker）推进。
         if self.sched_depth > 0 && self.task_ctx.is_some() {
             self.block_suspend = true;
@@ -6762,11 +7042,17 @@ impl Vm {
                 self.mn_idle_rounds += 1;
                 if self.mn_idle_rounds >= MN_DEADLOCK_IDLE_ROUNDS {
                     self.mn_idle_rounds = 0;
-                    return Err(RuntimeError::deadlock(msg));
+                    let detail = format!(
+                        "{msg} (workers={} busy={} queues_empty=true; cannot detect CPU livelock)",
+                        self.mn.worker_count(),
+                        self.mn.busy()
+                    );
+                    return Err(RuntimeError::deadlock(detail));
                 }
             } else {
                 self.mn_idle_rounds = 0;
             }
+            self.poll_gc_safepoint();
             self.mn.wait_brief();
             return Ok(());
         }
@@ -6795,17 +7081,33 @@ impl Vm {
 
     #[inline(always)]
     fn tick_budget(&mut self) {
-        // 预算扣减总是执行；safepoint 仅在预算耗尽（suspend_budget 条/次）时检查，
-        // 避免每条指令一次 AtomicBool::load(Acquire)。
+        // 预算扣减总是执行；常态下仅在预算耗尽时查 safepoint。
+        // STW 已请求时每条指令都停，缩短握手尾延迟、降低超时。
         self.budget_left -= 1;
-        if self.budget_left == 0 {
-            self.budget_left = self.suspend_budget;
-            self.mn.poll_safepoint();
-            if self.task_ctx.is_some() {
-                self.pending_suspend = true;
-            } else {
-                self.pending_main_yield = true;
+        if self.budget_left != 0 {
+            if self.mn_parallel
+                && self
+                    .mn
+                    .stw_requested
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                self.poll_gc_safepoint();
             }
+            return;
+        }
+        self.budget_left = clamp_suspend_budget(self.suspend_budget);
+        if self.mn_parallel {
+            self.poll_gc_safepoint();
+            // 仅在 helper 请求时由 primary 拾取；阈值触发仍走 track_value→maybe_auto_gc。
+            if self.mn_primary && self.mn.gc_request_pending() {
+                self.maybe_auto_gc();
+            }
+        }
+        if self.task_ctx.is_some() {
+            self.pending_suspend = true;
+        } else if self.mn_parallel || !self.ready_tasks.is_empty() {
+            // M:1 且就绪队列空：主纤程空转 yield 无收益，跳过。
+            self.pending_main_yield = true;
         }
     }
 
@@ -7050,6 +7352,7 @@ impl Vm {
     }
 
     pub(crate) fn scheduler_run_one(&mut self) -> Result<bool> {
+        self.flush_script_globals_to_map();
         let Some(task) = self.take_ready_task() else {
             return Ok(false);
         };
@@ -7209,6 +7512,7 @@ impl Vm {
     }
 
     pub(crate) fn scheduler_yield(&mut self) -> Result<()> {
+        self.flush_script_globals_to_map();
         if self.mn_parallel {
             // 并行：与 M:1 一致，以「进入时本地队列长度」为上界跑一轮就绪任务。
             // 固定 64 次会让单个 sleep/IO 切片任务重入队后被反复抽干，
@@ -8575,6 +8879,7 @@ fn get_attr(vm: &mut Vm, obj: &Value, field: &str) -> Result<Value> {
         Value::Bytes(bytes) => type_registry::get_bytes_method(bytes, field),
         Value::Task(t) => crate::concurrency::get_task_method(t, field),
         Value::Channel(ch) => crate::concurrency::get_channel_method(ch, field),
+        Value::Stream(s) => crate::concurrency::get_stream_method(s, field),
         Value::Mutex(m) => crate::concurrency::get_mutex_method(m, field),
         Value::MutexGuard(m) => crate::concurrency::get_mutex_guard_method(m, field),
         Value::Sync(s) => crate::concurrency::get_sync_method(s, field),

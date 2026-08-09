@@ -13,7 +13,8 @@ pub fn render(diag: &Diag) -> String {
     active_pack().render_diag(diag)
 }
 pub use pack::{
-    list_installed_ids, load_pack_dir, CustomPack, Layout, MessageSpec, PackLoadError,
+    list_installed_ids, load_pack_dir, load_pack_staging, CustomPack, Layout, MessageSpec,
+    PackLoadError,
 };
 pub use paths::{custom_dir, global_config_path};
 

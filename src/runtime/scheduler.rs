@@ -12,8 +12,8 @@ use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use parking_lot::{Condvar, Mutex};
 use rustc_hash::FxHashMap;
 
-use crate::shared::Shared;
-use crate::value::TaskInner;
+use crate::shared::{Shared, WeakShared};
+use crate::value::{TaskInner, Value};
 
 /// 挂起纤程快照存于此（跨 worker 迁移）。
 pub(crate) type FiberStore = Mutex<FxHashMap<usize, crate::vm::TaskFiber>>;
@@ -33,10 +33,17 @@ pub struct MnScheduler {
     /// 已启动的辅助线程数。
     helpers_started: AtomicUsize,
     /// GC stop-the-world：请求置位后各 worker 在安全点停住。
-    stw_requested: AtomicBool,
+    pub(crate) stw_requested: AtomicBool,
     stw_parked: AtomicUsize,
     /// STW 超时次数（可观测性）。
     stw_failures: AtomicUsize,
+    /// Helper 请求 primary 做一次 GC（避免双端同时 begin_stw 死锁）。
+    gc_requested: AtomicBool,
+    /// Helper 在 STW 安全点发布的根快照（按线程 id）。
+    pub(crate) parked_roots: Mutex<FxHashMap<usize, Vec<Value>>>,
+    /// 曾入队的任务弱引用（injector 不可遍历时的根补充）。
+    /// 按任务指针去重：挂起后重入队是热路径，绝不能每次 push 一条 Weak。
+    pub(crate) scheduled_tasks: Mutex<FxHashMap<usize, WeakShared<TaskInner>>>,
 }
 
 /// `wait_brief` 单次等待时长。
@@ -57,13 +64,40 @@ impl MnScheduler {
             stw_requested: AtomicBool::new(false),
             stw_parked: AtomicUsize::new(0),
             stw_failures: AtomicUsize::new(0),
+            gc_requested: AtomicBool::new(false),
+            parked_roots: Mutex::new(FxHashMap::default()),
+            scheduled_tasks: Mutex::new(FxHashMap::default()),
         })
+    }
+
+    pub fn request_gc(&self) {
+        self.gc_requested.store(true, Ordering::Release);
+        self.notify_one();
+    }
+
+    #[inline]
+    pub fn gc_request_pending(&self) -> bool {
+        self.gc_requested.load(Ordering::Relaxed)
+    }
+
+    /// 若有挂起的 GC 请求则清除并返回 true。
+    pub fn take_gc_request(&self) -> bool {
+        self.gc_requested.swap(false, Ordering::AcqRel)
     }
 
     /// 解释循环 / 阻塞等待处调用：若 GC 请求 STW 则停在此直到结束。
     pub fn poll_safepoint(&self) {
+        self.poll_safepoint_with_roots(None);
+    }
+
+    /// 携带可选根快照进入 STW 停车（helper 应用此路径）。
+    pub fn poll_safepoint_with_roots(&self, roots: Option<Vec<Value>>) {
         if !self.stw_requested.load(Ordering::Acquire) {
             return;
+        }
+        if let Some(roots) = roots {
+            let tid = thread_id_key();
+            self.parked_roots.lock().insert(tid, roots);
         }
         self.stw_parked.fetch_add(1, Ordering::Release);
         self.notify_all();
@@ -74,6 +108,40 @@ impl MnScheduler {
             std::thread::yield_now();
         }
         self.stw_parked.fetch_sub(1, Ordering::Release);
+        let tid = thread_id_key();
+        self.parked_roots.lock().remove(&tid);
+    }
+
+    /// 取出所有已停车 worker 发布的根（STW 期间由主线程调用）。
+    pub fn take_parked_roots(&self) -> Vec<Value> {
+        let mut out = Vec::new();
+        for roots in self.parked_roots.lock().values() {
+            out.extend(roots.iter().cloned());
+        }
+        out
+    }
+
+    pub fn note_scheduled_task(&self, task: &Shared<TaskInner>) {
+        let key = task.as_ptr() as usize;
+        let mut v = self.scheduled_tasks.lock();
+        if let Some(w) = v.get(&key) {
+            if w.upgrade().is_some() {
+                return;
+            }
+        }
+        v.insert(key, task.downgrade());
+        // 偶尔修剪已结束任务的死弱引用
+        if v.len() > 4096 {
+            v.retain(|_, w| w.upgrade().is_some());
+        }
+    }
+
+    pub fn scheduled_task_values(&self) -> Vec<Value> {
+        let mut v = self.scheduled_tasks.lock();
+        v.retain(|_, w| w.upgrade().is_some());
+        v.values()
+            .filter_map(|w| w.upgrade().map(Value::Task))
+            .collect()
     }
 
     /// 主线程 GC：拦住其它 worker。成功返回 `true`；超时则取消 STW 并返回 `false`。
@@ -112,6 +180,7 @@ impl MnScheduler {
     }
 
     pub fn push_task(&self, task: Shared<TaskInner>) {
+        self.note_scheduled_task(&task);
         self.injector.push(task);
         self.notify_one();
     }
@@ -223,6 +292,14 @@ pub fn configured_workers() -> usize {
 
 pub fn new_local_worker() -> Worker<Shared<TaskInner>> {
     Worker::new_fifo()
+}
+
+fn thread_id_key() -> usize {
+    // 稳定且足够唯一：用线程 id 的哈希。
+    use std::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    std::thread::current().id().hash(&mut h);
+    h.finish() as usize
 }
 
 fn stw_timeout() -> Duration {

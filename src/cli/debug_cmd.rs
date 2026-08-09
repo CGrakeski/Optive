@@ -8,8 +8,8 @@ use std::sync::Arc;
 use optive::codegen::Generator;
 use optive::shared::Shared;
 use optive::debug::{
-    self, eval_in_paused_vm, format_location, format_source_window, list_fibers, list_locals,
-    reason_label, set_local_or_global, stack_frames, DebugState, StepMode, StopReason,
+    self, debug_set, eval_in_paused_vm, format_location, format_source_window, list_fibers,
+    list_locals, parse_break_spec, reason_label, stack_frames, DebugState, StepMode, StopReason,
 };
 use optive::diagnostics;
 use optive::opcode::Instruction;
@@ -220,11 +220,18 @@ fn run_debug_session(
                     if st.line_breakpoints.is_empty() && st.function_breakpoints.is_empty() {
                         println!("(no breakpoints)");
                     } else {
-                        for (f, l) in &st.line_breakpoints {
+                        for ((f, l), bp) in &st.line_breakpoints {
+                            let mut extra = String::new();
+                            if let Some(c) = &bp.condition {
+                                extra.push_str(&format!(" if {c}"));
+                            }
+                            if let Some(lg) = &bp.log {
+                                extra.push_str(&format!(" log {lg}"));
+                            }
                             if f.is_empty() {
-                                println!("  line {l}");
+                                println!("  line {l}{extra}");
                             } else {
-                                println!("  {f}:{l}");
+                                println!("  {f}:{l}{extra}");
                             }
                         }
                         for name in &st.function_breakpoints {
@@ -233,17 +240,22 @@ fn run_debug_session(
                     }
                 } else {
                     let spec = rest.join(" ");
-                    if let Ok(line) = spec.parse::<usize>() {
-                        state.borrow_mut().add_line_breakpoint("", line);
-                        println!("Breakpoint at line {line}");
-                    } else if let Some((file_part, line_s)) = spec.rsplit_once(':') {
-                        if let Ok(line) = line_s.parse::<usize>() {
-                            state.borrow_mut().add_line_breakpoint(file_part, line);
-                            println!("Breakpoint at {file_part}:{line}");
+                    if let Some((file, line, cond, log)) = parse_break_spec(&spec) {
+                        state
+                            .borrow_mut()
+                            .add_line_breakpoint_ex(&file, line, cond.clone(), log.clone());
+                        let mut msg = if file.is_empty() {
+                            format!("Breakpoint at line {line}")
                         } else {
-                            state.borrow_mut().function_breakpoints.insert(spec.clone());
-                            println!("Function breakpoint on {spec}");
+                            format!("Breakpoint at {file}:{line}")
+                        };
+                        if let Some(c) = cond {
+                            msg.push_str(&format!(" if {c}"));
                         }
+                        if let Some(lg) = log {
+                            msg.push_str(&format!(" log {lg}"));
+                        }
+                        println!("{msg}");
                     } else {
                         state.borrow_mut().function_breakpoints.insert(spec.clone());
                         println!("Function breakpoint on {spec}");
@@ -356,38 +368,55 @@ fn run_debug_session(
 
             "set" => {
                 let body = line.strip_prefix("set").unwrap_or("").trim();
-                if let Some((name, expr)) = body.split_once('=') {
-                    let name = name.trim();
-                    let expr = expr.trim();
-                    match eval_in_paused_vm(vm, expr) {
-                        Ok(v) => match set_local_or_global(vm, name, v) {
-                            Ok(()) => println!("ok"),
-                            Err(e) => println!("error: {}", e.message()),
-                        },
+                if let Some((lhs, expr)) = body.split_once('=') {
+                    match debug_set(vm, lhs, expr) {
+                        Ok(()) => println!("ok"),
                         Err(e) => println!("error: {}", e.message()),
                     }
                 } else {
-                    println!("usage: set name = expr");
+                    println!("usage: set name = expr   or   set a.b = expr / set a[i] = expr");
                 }
             }
 
             "fibers" => {
                 let list = list_fibers(vm);
+                let focus = state.borrow().focus_fiber_index;
                 if list.is_empty() {
-                    println!("(no ready tasks)");
+                    println!("(no tasks; focus=main)");
                 } else {
                     for f in list {
+                        let mark = if focus == Some(f.index) { "*" } else { " " };
                         if f.detail.is_empty() {
-                            println!("  #{} {}", f.index, f.state);
+                            println!("{mark}#{} {}", f.index, f.state);
                         } else {
-                            println!("  #{} {} — {}", f.index, f.state, f.detail);
+                            println!("{mark}#{} {} — {}", f.index, f.state, f.detail);
                         }
                     }
+                }
+                if state.borrow().focus_fiber.is_none() {
+                    println!("  focus: main fiber");
                 }
             }
 
             "fiber" => {
-                println!("fiber switch for stepping is deferred; use `fibers` to inspect");
+                if rest.is_empty() || rest[0] == "main" {
+                    let mut st = state.borrow_mut();
+                    st.focus_fiber = None;
+                    st.focus_fiber_index = None;
+                    println!("focus: main fiber");
+                } else if let Ok(n) = rest[0].parse::<usize>() {
+                    let list = list_fibers(vm);
+                    if let Some(f) = list.into_iter().find(|f| f.index == n) {
+                        let mut st = state.borrow_mut();
+                        st.focus_fiber = Some(f.task);
+                        st.focus_fiber_index = Some(n);
+                        println!("focus: fiber #{n}");
+                    } else {
+                        println!("fiber #{n} not found; use `fibers`");
+                    }
+                } else {
+                    println!("usage: fiber N | fiber main");
+                }
             }
 
             "l" | "list" => {
@@ -461,6 +490,8 @@ fn print_help() {
         "Commands:
   help / h              Show this help
   break / b [file:]N    Set or list line breakpoints
+  break N if <expr>     Conditional breakpoint (stop when expr truthy)
+  break N log <expr>    Log breakpoint (print expr, continue)
   break name            Function breakpoint (exact / suffix; *sub for contains)
   delete / d [file:]N   Delete line or function breakpoint (no arg: clear all)
   continue / c          Continue (after uncaught: end session)
@@ -473,9 +504,11 @@ fn print_help() {
   frame [N]             Select / show frame (display)
   p / print / eval E    Evaluate expression
   locals / globals      List variables
-  set name = expr       Set local or global
-  fibers                List ready tasks
+  set name = expr       Set local/global or deep path (a.b / a[i])
+  fibers                List tasks (* = step focus)
+  fiber N | fiber main  Focus stepping on task N or main
   list / l [N]          Show source ±N lines (default 3)
-  quit / q              Exit debugger"
+  quit / q              Exit debugger
+  (DAP adapter is a later milestone; use this CLI for now)"
     );
 }

@@ -3154,6 +3154,7 @@ impl Generator {
     fn gen_select(&mut self, cases: &[SelectCase], else_block: Option<&Block>) -> Result<()> {
         let end = self.cg.fresh_label();
         let start = self.cg.fresh_label();
+        let idx_tmp = self.cg.fresh_temp("__sel_idx");
 
         // 预处理 sleep 截止时间。
         let mut sleep_temps: Vec<Option<String>> = Vec::with_capacity(cases.len());
@@ -3169,12 +3170,70 @@ impl Generator {
             }
         }
 
+        // 每轮：打乱 case 次序再依次 poll，多就绪时不再固定偏向书写顺序。
         self.cg.mark_label(start);
+        self.cg
+            .emit(Instruction::SelectBegin(cases.len()));
+        let attempt = self.cg.fresh_label();
+        self.cg.mark_label(attempt);
+        self.cg.emit(Instruction::SelectNextIndex);
+        self.emit_store_temp(&idx_tmp);
+        self.emit_load_temp(&idx_tmp);
+        self.cg
+            .emit(Instruction::Push(Value::Num(Num::Small(-1))));
+        self.cg.emit(Instruction::Eq);
+        let have_case = self.cg.fresh_label();
+        self.cg.emit(Instruction::GotoIfNot(have_case));
+
+        // 本轮次序已耗尽且无一就绪。
+        if let Some(else_b) = else_block {
+            self.emit_select_idle(&sleep_temps);
+            // 再公平 poll 一轮；仍无则 else
+            self.cg
+                .emit(Instruction::SelectBegin(cases.len()));
+            let attempt2 = self.cg.fresh_label();
+            self.cg.mark_label(attempt2);
+            self.cg.emit(Instruction::SelectNextIndex);
+            self.emit_store_temp(&idx_tmp);
+            self.emit_load_temp(&idx_tmp);
+            self.cg
+                .emit(Instruction::Push(Value::Num(Num::Small(-1))));
+            self.cg.emit(Instruction::Eq);
+            let have_case2 = self.cg.fresh_label();
+            self.cg.emit(Instruction::GotoIfNot(have_case2));
+            self.gen_block(else_b, true)?;
+            self.cg.emit(Instruction::Goto(end));
+            self.cg.mark_label(have_case2);
+            self.gen_select_dispatch_cases(cases, &sleep_temps, &idx_tmp, attempt2, end)?;
+        } else {
+            self.emit_select_idle(&sleep_temps);
+            self.cg.emit(Instruction::Goto(start));
+        }
+
+        self.cg.mark_label(have_case);
+        self.gen_select_dispatch_cases(cases, &sleep_temps, &idx_tmp, attempt, end)?;
+        self.cg.mark_label(end);
+        Ok(())
+    }
+
+    /// 按 `idx_tmp` 中的 case 下标 poll；未就绪则跳回 `attempt`。
+    fn gen_select_dispatch_cases(
+        &mut self,
+        cases: &[SelectCase],
+        sleep_temps: &[Option<String>],
+        idx_tmp: &str,
+        attempt: usize,
+        end: usize,
+    ) -> Result<()> {
         for (i, case) in cases.iter().enumerate() {
             let next = self.cg.fresh_label();
-            self.gen_select_poll(&case.event, sleep_temps[i].as_deref())?;
+            self.emit_load_temp(idx_tmp);
+            self.cg
+                .emit(Instruction::Push(Value::Num(Num::Small(i as i64))));
+            self.cg.emit(Instruction::Eq);
             self.cg.emit(Instruction::GotoIfNot(next));
-            // ready：栈顶为事件结果值
+            self.gen_select_poll(&case.event, sleep_temps[i].as_deref())?;
+            self.cg.emit(Instruction::GotoIfNot(attempt));
             if let Some(name) = &case.bind {
                 if name != "_" {
                     self.emit_bind_name(name);
@@ -3188,37 +3247,7 @@ impl Generator {
             self.cg.emit(Instruction::Goto(end));
             self.cg.mark_label(next);
         }
-
-        if let Some(else_b) = else_block {
-            // 粗略：若没有任何 case 就绪，先让步再重试；多次空转后走 else。
-            self.emit_select_idle(&sleep_temps);
-            // 再 poll 一轮；若仍无则 else
-            let else_lbl = self.cg.fresh_label();
-            for (i, case) in cases.iter().enumerate() {
-                let next = self.cg.fresh_label();
-                self.gen_select_poll(&case.event, sleep_temps[i].as_deref())?;
-                self.cg.emit(Instruction::GotoIfNot(next));
-                if let Some(name) = &case.bind {
-                    if name != "_" {
-                        self.emit_bind_name(name);
-                    } else {
-                        self.cg.emit(Instruction::Pop);
-                    }
-                } else {
-                    self.cg.emit(Instruction::Pop);
-                }
-                self.gen_block(&case.body, true)?;
-                self.cg.emit(Instruction::Goto(end));
-                self.cg.mark_label(next);
-            }
-            self.cg.mark_label(else_lbl);
-            self.gen_block(else_b, true)?;
-            self.cg.emit(Instruction::Goto(end));
-        } else {
-            self.emit_select_idle(&sleep_temps);
-            self.cg.emit(Instruction::Goto(start));
-        }
-        self.cg.mark_label(end);
+        self.cg.emit(Instruction::Goto(attempt));
         Ok(())
     }
 

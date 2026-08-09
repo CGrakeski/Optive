@@ -9,6 +9,8 @@
 | [`bench-compare.sh`](bench-compare.sh) | 在 base 分支与当前工作树上各跑一次 criterion 基准并对比，用于检测 VM 性能回归。 |
 | [`syntax/tive.tmLanguage.json`](syntax/tive.tmLanguage.json) | `.tive` 文件的 TextMate 语法，供 VS Code / Sublime / shiki 等做语法高亮。 |
 
+> **与 REPL 的区别**：交互式 REPL 的输入着色在解释器内（`src/cli/repl_highlight.rs`，Lexer + ANSI），不读本目录 TextMate。编辑器高亮用下面步骤；关 REPL 高亮用 `OPTIVE_REPL_HIGHLIGHT=0`。
+
 ## 语法高亮怎么用
 
 ### VS Code（无需发布插件，本机即可用）

@@ -14,6 +14,14 @@ path = "src/main.rs"
 name = "benchmark-analysis"
 path = "src/bin/benchmark-analysis.rs"
 
+[[bin]]
+name = "gc-baseline"
+path = "src/bin/gc-baseline.rs"
+
+[[bin]]
+name = "gc-mode-compare"
+path = "src/bin/gc-mode-compare.rs"
+
 [features]
 default = ["mn"]
 ## M:N 真并行调度（work-stealing）。关闭时仍用 Arc 堆，但只跑 1 个 worker（协作语义）。

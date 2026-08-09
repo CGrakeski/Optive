@@ -595,12 +595,83 @@ t
 }
 
 #[test]
+fn stream_is_not_channel_type() {
+    assert_text(r#"type(std.async.stream_of([]))"#, "Stream");
+    assert_text(r#"type(Stream())"#, "Stream");
+    assert_text(r#"type(Channel())"#, "Channel");
+}
+
+#[test]
+fn stream_send_forbidden() {
+    let err = optive::run_source(
+        r#"
+let s = Stream()
+s.send(1)
+"#,
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("send") || msg.contains("Stream"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn channel_as_stream_view() {
+    assert_num(
+        r#"
+let ch = Channel()
+go do {
+  ch.send(9)
+  ch.close()
+}
+let s = ch.as_stream()
+s.next()
+"#,
+        "9",
+    );
+}
+
+#[test]
+fn stream_take_map() {
+    assert_num(
+        r#"
+func double(x) { return x * 2 }
+let s = std.async.stream_of([1, 2, 3, 4])
+let m = std.async.stream_map(s, double)
+let t = std.async.stream_take(m, 2)
+var sum = 0
+for (v in t) { sum = sum + v }
+sum
+"#,
+        "6",
+    );
+}
+
+#[test]
+fn stream_from_gen_pull() {
+    assert_num(
+        r#"
+gen count() {
+  yield 1
+  yield 2
+  yield 3
+}
+let s = std.async.stream_from_gen(count)
+var t = 0
+for (x in s) { t = t + x }
+t
+"#,
+        "6",
+    );
+}
+
+#[test]
 fn stream_next_alias() {
     assert_num(
         r#"
-let s = std.async.stream()
-s.send(7)
-s.close()
+let s = std.async.stream_of([7])
 s.next()
 "#,
         "7",
@@ -727,6 +798,50 @@ run()
 "#,
         "42",
     );
+}
+
+/// 两 channel 同时可读时，select 多轮命中应大致均匀（书写顺序不再是优先级）。
+#[test]
+fn select_multi_ready_fairness() {
+    let v = value(
+        r#"
+let a = Channel(1)
+let b = Channel(1)
+a.send(1)
+b.send(1)
+var ca = 0
+var cb = 0
+loop (200) {
+  select {
+    case a.recv() as _ {
+      ca = ca + 1
+      a.send(1)
+    }
+    case b.recv() as _ {
+      cb = cb + 1
+      b.send(1)
+    }
+  }
+}
+[ca, cb]
+"#,
+    );
+    let Value::List(list) = v else {
+        panic!("expected list");
+    };
+    let items = list.borrow();
+    assert_eq!(items.len(), 2);
+    let ca = match &items[0] {
+        Value::Num(n) => n.to_i64().unwrap(),
+        _ => panic!("ca"),
+    };
+    let cb = match &items[1] {
+        Value::Num(n) => n.to_i64().unwrap(),
+        _ => panic!("cb"),
+    };
+    assert_eq!(ca + cb, 200, "ca={ca} cb={cb}");
+    assert!(ca >= 40 && cb >= 40, "unfair ca={ca} cb={cb}");
+    assert!((ca - cb).abs() <= 120, "skew ca={ca} cb={cb}");
 }
 
 /// B12：多 sleep case 时短周期应先就绪，不被长 sleep / Suspend 饿死。

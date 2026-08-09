@@ -406,6 +406,10 @@ pub(crate) fn specialize_with_entry(code: &mut [Instruction], entry_env: &[Optio
                     let _ = stack.pop();
                 }
             }
+            Instruction::SelectBegin(_) => {}
+            Instruction::SelectNextIndex => {
+                stack.push(Some(Tag::Num));
+            }
             Instruction::DelIndex => {
                 let _ = stack.pop();
                 let _ = stack.pop();

@@ -72,6 +72,55 @@ impl Lexer {
         Ok(tokens)
     }
 
+    /// REPL / 高亮用：尽力产出 `(byte_start, byte_end, kind)`，遇错截断且不失败。
+    /// 空白不产出 span（由调用方按间隙原样拷贝）。
+    pub fn tokenize_spans(mut self) -> Vec<(usize, usize, TokenKind)> {
+        let mut spans = Vec::new();
+        self.skip_bom();
+        while !self.is_at_end() {
+            if self.skip_whitespace() {
+                continue;
+            }
+            let start_line = self.line;
+            let start_col = self.column;
+            let start = self.pos;
+            if let Some(tok) = self.lex_comment(start_line, start_col) {
+                spans.push((start, self.pos, tok.kind));
+                self.last_kind = Some(tok.kind);
+                if self.unclosed_block_comment {
+                    break;
+                }
+                continue;
+            }
+            let tok = self.next_token();
+            let end = self.pos;
+            if tok.kind == TokenKind::End {
+                break;
+            }
+            if tok.kind == TokenKind::Mismatch {
+                let kind = if tok.value.starts_with("unterminated") {
+                    // 未闭合字面量：按字面量色扫到行末，便于边敲边看。
+                    TokenKind::StringLiteral
+                } else {
+                    TokenKind::Mismatch
+                };
+                let end = if end > start {
+                    end
+                } else {
+                    self.source.len()
+                };
+                spans.push((start, end, kind));
+                if end < self.source.len() {
+                    spans.push((end, self.source.len(), TokenKind::Mismatch));
+                }
+                break;
+            }
+            spans.push((start, end, tok.kind));
+            self.last_kind = Some(tok.kind);
+        }
+        spans
+    }
+
     fn skip_bom(&mut self) {
         if self.source.starts_with('\u{feff}') {
             self.pos += '\u{feff}'.len_utf8();

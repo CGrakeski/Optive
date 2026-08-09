@@ -5,8 +5,9 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use optive::custom::{
-    self, build_active_from_ids, load_pack_dir, set_active_pack, write_global_use, write_project_use,
-    ActivePack, CliMsg, CustomPack, Diag, ErrorKindMsg, ParseMsg, PROJECT_CUSTOM_FILE,
+    self, build_active_from_ids, load_pack_dir, load_pack_staging, set_active_pack, write_global_use,
+    write_project_use, ActivePack, CliMsg, CustomPack, Diag, ErrorKindMsg, ParseMsg,
+    PROJECT_CUSTOM_FILE,
 };
 use optive::error::{ExceptionKind, RuntimeError};
 use optive::{diagnostics, run_source};
@@ -162,6 +163,18 @@ fn write_project_and_global_use() {
         assert!(g.is_file(), "expected Config.toml at {}", g.display());
         let text = fs::read_to_string(&g).unwrap();
         assert!(text.contains("catgirl"));
+    });
+}
+
+#[test]
+fn staging_load_allows_tmp_dir_name() {
+    with_temp_home(|home| {
+        let tmp = home.join("custom/.tmp-add");
+        fs::create_dir_all(&tmp).unwrap();
+        fs::copy(catgirl_src().join("Custom.toml"), tmp.join("Custom.toml")).unwrap();
+        let pack = load_pack_staging(&tmp).expect("staging should ignore dir name");
+        assert_eq!(pack.id, "catgirl");
+        assert!(load_pack_dir(&tmp).is_err(), "installed path must match id");
     });
 }
 

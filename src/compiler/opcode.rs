@@ -174,6 +174,10 @@ pub enum Instruction {
     SelectPollDeadline,
     /// 栈上 N 个截止时间：让出调度后，睡到最近截止（有上限），避免挂起饿死 sleep case。
     SelectIdle(usize),
+    /// 开始一轮 select：Fisher–Yates 打乱 `0..n` 的 case 次序（与 Go 多就绪公平对齐）。
+    SelectBegin(usize),
+    /// 弹出下一 case 下标；次序耗尽时压 `-1`。
+    SelectNextIndex,
 }
 
 /// 将跳转指令中的标签 id 就地解析为绝对 PC。

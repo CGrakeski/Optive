@@ -195,7 +195,7 @@ pub fn builtin_ptr_live(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         return Err(RuntimeError::type_err("C.ptr_live(p) requires 1 argument"));
     }
     let p = expect_ptr("C.ptr_live", &args[0])?;
-    // Owned 且未 free；外来 unsafe_ptr 为 false（见 docs/ffi-c.md）。
+    // Owned 且未 free；外来 unsafe_ptr 为 false（见 docs/ffi.md）。
     Ok(Value::Bool(ptr_registry::is_live(p)))
 }
 

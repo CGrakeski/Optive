@@ -505,6 +505,7 @@ fn bind_extern_function(
                 ret_abi,
                 use_serial,
                 vm.ffi_threads(),
+                vm.gc.clone(),
             )?;
             vm.set_ffi_wait(pending);
             vm.block_suspend = true;
@@ -568,16 +569,21 @@ pub(crate) fn invoke_native_call(
     ret_abi: AbiType,
     use_serial: bool,
 ) -> Result<RetStorage> {
-    let ffi_args: Vec<Arg> = storage.iter_mut().map(|s| s.as_arg()).collect();
-    let raw = if use_serial {
-        let _guard = FFI_CALL_LOCK.lock();
-        unsafe { call_cif(&ffi.cif, ffi.code, &ffi_args, ret_abi) }?
-    } else {
-        let _guard = ffi.lock.lock();
-        unsafe { call_cif(&ffi.cif, ffi.code, &ffi_args, ret_abi) }?
-    };
-    super::ffi_extra::sample_error_codes();
-    Ok(raw)
+    crate::gc::ffi_enter();
+    let result = (|| {
+        let ffi_args: Vec<Arg> = storage.iter_mut().map(|s| s.as_arg()).collect();
+        let raw = if use_serial {
+            let _guard = FFI_CALL_LOCK.lock();
+            unsafe { call_cif(&ffi.cif, ffi.code, &ffi_args, ret_abi) }?
+        } else {
+            let _guard = ffi.lock.lock();
+            unsafe { call_cif(&ffi.cif, ffi.code, &ffi_args, ret_abi) }?
+        };
+        super::ffi_extra::sample_error_codes();
+        Ok(raw)
+    })();
+    crate::gc::ffi_leave();
+    result
 }
 
 /// 卸荷线程用：返回 `(结果, errno)`，不依赖调用方 TLS。
@@ -587,16 +593,21 @@ pub(crate) fn invoke_native_call_sampled(
     ret_abi: AbiType,
     use_serial: bool,
 ) -> Result<(RetStorage, i32)> {
-    let ffi_args: Vec<Arg> = storage.iter_mut().map(|s| s.as_arg()).collect();
-    let raw = if use_serial {
-        let _guard = FFI_CALL_LOCK.lock();
-        unsafe { call_cif(&ffi.cif, ffi.code, &ffi_args, ret_abi) }?
-    } else {
-        let _guard = ffi.lock.lock();
-        unsafe { call_cif(&ffi.cif, ffi.code, &ffi_args, ret_abi) }?
-    };
-    let errno = super::ffi_extra::sample_error_codes_value();
-    Ok((raw, errno))
+    crate::gc::ffi_enter();
+    let result = (|| {
+        let ffi_args: Vec<Arg> = storage.iter_mut().map(|s| s.as_arg()).collect();
+        let raw = if use_serial {
+            let _guard = FFI_CALL_LOCK.lock();
+            unsafe { call_cif(&ffi.cif, ffi.code, &ffi_args, ret_abi) }?
+        } else {
+            let _guard = ffi.lock.lock();
+            unsafe { call_cif(&ffi.cif, ffi.code, &ffi_args, ret_abi) }?
+        };
+        let errno = super::ffi_extra::sample_error_codes_value();
+        Ok((raw, errno))
+    })();
+    crate::gc::ffi_leave();
+    result
 }
 
 pub(crate) enum ArgStorage {

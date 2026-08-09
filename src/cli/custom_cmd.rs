@@ -4,7 +4,8 @@ use std::path::PathBuf;
 
 use crate::cli::manifest::find_project;
 use optive::custom::{
-    self, build_active_from_ids, custom_dir, list_installed_ids, load_pack_dir, parse_use_list,
+    self, build_active_from_ids, custom_dir, list_installed_ids, load_pack_dir, load_pack_staging,
+    parse_use_list,
     read_global_use, read_project_use, set_active_pack, write_global_use, write_project_use, CliMsg,
     Diag, GLOBAL_CONFIG_FILE, PROJECT_CUSTOM_FILE,
 };
@@ -152,7 +153,8 @@ fn cmd_add(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let tmp = custom_dir().join(".tmp-add");
     let _ = std::fs::remove_dir_all(&tmp);
     crate::cli::git_ops::clone_into(url, &tmp)?;
-    let pack = load_pack_dir(&tmp).map_err(|e| format!("invalid custom pack: {e}"))?;
+    // 临时目录名是 `.tmp-add`，不能要求与 id 一致；装到 `custom/<id>/` 后再用 load_pack_dir 校验。
+    let pack = load_pack_staging(&tmp).map_err(|e| format!("invalid custom pack: {e}"))?;
     let dest = custom_dir().join(&pack.id);
     if dest.exists() {
         std::fs::remove_dir_all(&dest)?;

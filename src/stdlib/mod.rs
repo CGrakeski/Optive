@@ -1586,6 +1586,10 @@ fn build_async_module() -> Shared<ModuleObject> {
             ("Stream", Value::type_ref("Stream")),
             ("stream", builtin(async_stream_new)),
             ("stream_of", builtin(async_stream_of)),
+            ("stream_from_gen", builtin(async_stream_from_gen)),
+            ("stream_map", builtin(async_stream_map)),
+            ("stream_filter", builtin(async_stream_filter)),
+            ("stream_take", builtin(async_stream_take)),
         ],
     )
 }
@@ -1735,8 +1739,7 @@ fn async_workers(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 }
 
 fn async_stream_new(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    // Stream() ≡ Channel()；for-in / next()/recv() 消费，send/close 生产。
-    crate::concurrency::construct_channel(args)
+    crate::concurrency::construct_stream(args)
 }
 
 /// `stream_of(xs)`：后台任务把可迭代元素送入无界 Stream 后关闭。
@@ -1747,15 +1750,22 @@ fn async_stream_of(vm: &mut Vm, args: &[Value]) -> Result<Value> {
         ));
     }
     let items = Arc::new(materialize_iter(vm, &args[0])?);
-    let stream = crate::concurrency::construct_channel(&[])?;
-    let Value::Channel(ch) = &stream else {
-        unreachable!("construct_channel returns Channel");
+    let stream = crate::concurrency::construct_stream(&[])?;
+    let Value::Stream(s) = &stream else {
+        unreachable!("construct_stream returns Stream");
     };
-    let ch_task = ch.clone();
+    let ch_task = crate::concurrency::stream_channel(s).expect("buffered stream");
     let producer = Value::Builtin(Arc::new(move |vm: &mut Vm, _args: &[Value]| {
         for item in items.iter() {
-            // 无界 channel：send 不阻塞。
+            if let Err(e) = vm.fail_if_current_task_cancelled() {
+                ch_task.borrow_mut().closed = true;
+                vm.mn.notify_all();
+                return Err(e);
+            }
             vm.channel_send(&ch_task, item.clone())?;
+            if vm.block_suspend {
+                return Ok(Value::None);
+            }
         }
         ch_task.borrow_mut().closed = true;
         vm.mn.notify_all();
@@ -1763,6 +1773,82 @@ fn async_stream_of(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }));
     let _ = vm.spawn_task(producer, vec![]);
     Ok(stream)
+}
+
+/// `stream_from_gen(g)`：按需从生成器/`Iterator` 拉取（不先物化全集）。
+fn async_stream_from_gen(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(crate::error::RuntimeError::type_err(
+            "stream_from_gen requires 1 iterable/generator argument",
+        ));
+    }
+    let iter = match &args[0] {
+        Value::Iterator(it) => it.clone(),
+        Value::Function(f) if f.is_generator => {
+            match vm.call_value(args[0].clone(), vec![])? {
+                Value::Iterator(it) => it,
+                other => crate::value::value_to_iterator_shared(&other)?,
+            }
+        }
+        other => crate::value::value_to_iterator_shared(other)?,
+    };
+    Ok(crate::concurrency::stream_from_iterator(iter))
+}
+
+fn async_stream_map(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(crate::error::RuntimeError::type_err(
+            "stream_map(stream, f) requires 2 arguments",
+        ));
+    }
+    let func = expect_function("stream_map", args, 1)?;
+    let source = crate::value::value_to_iterator_shared(&args[0])?;
+    Ok(crate::concurrency::stream_from_iterator(Shared::new(
+        IteratorState {
+            kind: IteratorKind::Map { func, source },
+        },
+    )))
+}
+
+fn async_stream_filter(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(crate::error::RuntimeError::type_err(
+            "stream_filter(stream, pred) requires 2 arguments",
+        ));
+    }
+    let pred = expect_function("stream_filter", args, 1)?;
+    let source = crate::value::value_to_iterator_shared(&args[0])?;
+    Ok(crate::concurrency::stream_from_iterator(Shared::new(
+        IteratorState {
+            kind: IteratorKind::Filter {
+                func: pred,
+                source,
+            },
+        },
+    )))
+}
+
+fn async_stream_take(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(crate::error::RuntimeError::type_err(
+            "stream_take(stream, n) requires 2 arguments",
+        ));
+    }
+    let n = crate::value::expect_i64("stream_take n", &args[1])?;
+    if n < 0 {
+        return Err(crate::error::RuntimeError::type_err(
+            "stream_take n must be non-negative",
+        ));
+    }
+    let source = crate::value::value_to_iterator_shared(&args[0])?;
+    Ok(crate::concurrency::stream_from_iterator(Shared::new(
+        IteratorState {
+            kind: IteratorKind::Take {
+                remaining: n as usize,
+                source,
+            },
+        },
+    )))
 }
 
 fn sync_atomic_num(_vm: &mut Vm, args: &[Value]) -> Result<Value> {

@@ -259,6 +259,16 @@ impl Instruction {
                 push: 0,
                 alt_push: None,
             },
+            Instruction::SelectBegin(_) => Adjust {
+                pop: 0,
+                push: 0,
+                alt_push: None,
+            },
+            Instruction::SelectNextIndex => Adjust {
+                pop: 0,
+                push: 1,
+                alt_push: None,
+            },
             Instruction::IterNext => Adjust {
                 pop: 0,
                 push: 1,

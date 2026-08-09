@@ -14,6 +14,7 @@ use crate::error::RuntimeError;
 use crate::ffi::{
     invoke_native_call_sampled, ArgStorage, FfiCallable, RetStorage, AbiType,
 };
+use crate::gc::SharedGc;
 use crate::Result;
 
 pub(crate) type FfiPendingResult = std::result::Result<(RetStorage, i32), String>;
@@ -44,6 +45,8 @@ struct Job {
     ret_abi: AbiType,
     use_serial: bool,
     pending: Arc<FfiPending>,
+    /// 卸荷线程安装，使 ffi_enter/leave 落到提交方的 SharedGc。
+    gc: Arc<SharedGc>,
 }
 
 struct PoolState {
@@ -87,12 +90,14 @@ fn ensure_workers(n: usize) -> Result<()> {
                     let Ok(mut job) = job else {
                         break;
                     };
+                    crate::gc::install_current_gc(job.gc.clone());
                     let out = invoke_native_call_sampled(
                         &job.ffi,
                         &mut job.storage,
                         job.ret_abi,
                         job.use_serial,
                     );
+                    crate::gc::clear_current_gc();
                     let packed = out.map_err(|e| e.message().to_string());
                     *job.pending.result.lock() = Some(packed);
                     // 纤程已在 ready 队列自旋重试；唤醒可能在 wait_brief 的 worker。
@@ -130,6 +135,7 @@ pub(crate) fn submit_call(
     ret_abi: AbiType,
     use_serial: bool,
     threads: usize,
+    gc: Arc<SharedGc>,
 ) -> Result<Arc<FfiPending>> {
     if threads == 0 {
         return Err(RuntimeError::msg(
@@ -144,6 +150,7 @@ pub(crate) fn submit_call(
         ret_abi,
         use_serial,
         pending: pending.clone(),
+        gc,
     };
     let state = pool_state().lock();
     let tx_guard = state.tx.lock();

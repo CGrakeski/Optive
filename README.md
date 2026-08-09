@@ -14,9 +14,9 @@
 - **渐进式类型**：可写软类型注解（解释期检查）或硬类型注解（编译期单态化），也可完全不写。
 - **泛型与协议**：`protocol` 定义接口，`struct`/`enum`/`variant` 实现之；编译器按需单态化生成专用字节码。
 - **元编程**：`macro` / `quote` 宏系统，编译期展开。
-- **C 互操作**：`extern` 加载 `.dll`/`.so`/`.dylib`；护照指针、`typed struct : C.layout`、字符串编组、沙箱 FFI 门禁（见 [`docs/ffi-c.md`](docs/ffi-c.md)）。
+- **C 互操作**：`extern` 加载 `.dll`/`.so`/`.dylib`；护照指针、`typed struct : C.layout`、字符串编组、沙箱 FFI 门禁（见 [`docs/ffi.md`](docs/ffi.md)）。
 - **依赖管理**：Git URL 作为依赖源，内容寻址存储（CAS）+ SQLite 索引，`Optive.lock` 保证可复现构建。
-- **REPL**：交互式多行输入，历史记录持久化。
+- **REPL**：交互式多行输入，历史持久化；TTY 下默认 Lexer 语法高亮（`OPTIVE_REPL_HIGHLIGHT=0` 可关）。
 - **并发**：Go 风格 `go` / `await` / `Channel` / `select` / `par`（无 `async func`）；默认 M:1，设 `OPTIVE_WORKERS` 可升至 M:N；取消与 `std.async` / `std.sync` 见文档。
 
 ---
@@ -71,7 +71,7 @@ Optive up                                 # update + run（跟随 tip）
 | `Optive.cache` | **本地**：依赖 tip/id 小抄（**不是**源码/字节码缓存；改 `src/*.tive` 下次 `run` 会重新读盘编译） | ❌（加入 `.gitignore`） |
 | `Custom.toml` | **定制**：项目选用的定制包链（`use = [...]`） | 可选 |
 
-依赖本体存在全局 `pack/` 目录（内容寻址），由 `index.db`（SQLite）索引，多个项目共享。详见 [`docs/deps-strategy.md`](docs/deps-strategy.md) 与 [`docs/deps-tutorial.md`](docs/deps-tutorial.md)。
+依赖本体存在全局 `pack/` 目录（内容寻址），由 `index.db`（SQLite）索引，多个项目共享。详见 [`docs/deps.md`](docs/deps.md)。
 
 ---
 
@@ -107,8 +107,13 @@ Optive up                                 # update + run（跟随 tip）
 | `OPTIVE_HISTORY` | REPL 历史文件路径 |
 | `OPTIVE_WORKERS` | OS worker 数（默认 `1`；`0`=核数；`>1` 真并行） |
 | `OPTIVE_SUSPEND_BUDGET` | 自动协作挂起字节码预算（默认 8192） |
-| `OPTIVE_STW_TIMEOUT_MS` | STW GC 等待 helper 时限 ms（默认 2000） |
+| `OPTIVE_STW_TIMEOUT_MS` | STW 握手时限 ms（默认 2000）；超时冷却重试 |
+| `OPTIVE_GC_COOLDOWN_MS` | STW 失败后冷却 ms（默认 50） |
+| `OPTIVE_GC_MODE` | `stw`（默认）或 `concurrent`（见 [`docs/concurrency.md`](docs/concurrency.md)「环收集」） |
+| `OPTIVE_GC_MARKERS` | concurrent 并行标记线程数（默认 ≤4） |
+| `OPTIVE_GC_THRESHOLD` | 自动 GC 跟踪表阈值（默认 8192） |
 | `OPTIVE_PATH` | 模块搜索路径（`:` / `;` 分隔） |
+| `OPTIVE_REPL_HIGHLIGHT` | `0`/`off` 关闭 REPL 输入语法高亮（默认开，且仍受 `--color` / `NO_COLOR` 约束） |
 
 ---
 
@@ -130,7 +135,7 @@ src/
 │   ├── caps.rs  concurrency.rs  enum_variant.rs  runtime_ast.rs  sized.rs
 ├── stdlib/             内置标准库
 ├── custom/             定制包（文案 + 排版；内嵌 en-US）
-└── cli/                包管理 CLI（含 caps / debug / fmt / custom 等）
+└── cli/                包管理 CLI（含 caps / debug / fmt / custom / repl_highlight 等）
 ```
 
 ---
@@ -139,18 +144,15 @@ src/
 
 完整索引见 [`docs/README.md`](docs/README.md)。
 
-- [`docs/getting-started.md`](docs/getting-started.md) — 入门教程（手把手建项目、加依赖、跑）
-- [`docs/language.md`](docs/language.md) — 语言参考（含 `%` / 位运算 / `snap` / `par` / `{,}` / `gen`·`yield`；§1.1 含 CLI）
-- [`docs/stdlib.md`](docs/stdlib.md) — 标准库 API（含 `std.async` / `std.macros` / encoding 等）
-- [`docs/debug-tutorial.md`](docs/debug-tutorial.md) / [`docs/debug.md`](docs/debug.md) — 调试器上手与命令参考
-- [`docs/ffi-c.md`](docs/ffi-c.md) — C 互操作
-- [`docs/ffi-parallel.md`](docs/ffi-parallel.md) — 并行 FFI（默认异符号可重叠；可选卸荷池）
-- [`docs/custom-packs.md`](docs/custom-packs.md) — 定制包（人读文案 / 排版；第三方包不内嵌）
-- [`docs/deps-strategy.md`](docs/deps-strategy.md) — 依赖管理设计
-- [`docs/deps-tutorial.md`](docs/deps-tutorial.md) — 依赖管理实操
-- [`docs/concurrency.md`](docs/concurrency.md) — 并发文档地图与实现状态（M:1 默认 / M:N 可选）
-- [`docs/concurrency_like_go.md`](docs/concurrency_like_go.md) — 并发语言语义（`go` / `par` / channel / `select` / 取消；权威）
-- [`docs/Deprecated/`](docs/Deprecated/) — 归档（未采用方案 / 已完成计划 / 历史修复报告 / GC 提案）
+- [`docs/language.md`](docs/language.md) — 语言参考（CLI / REPL / 语法）
+- [`docs/stdlib.md`](docs/stdlib.md) — 标准库 API
+- [`docs/deps.md`](docs/deps.md) — 依赖上手、toml/lock/cache、算法
+- [`docs/concurrency.md`](docs/concurrency.md) — 并发（`go` / channel / `par`）与环收集
+- [`docs/ffi.md`](docs/ffi.md) — C 互操作（含并行 / 卸荷）
+- [`docs/debug.md`](docs/debug.md) — 调试器上手与命令
+- [`docs/custom-tutorial.md`](docs/custom-tutorial.md) — 定制包上手（含 zh-CN / catgirl 示例）
+- [`docs/custom-packs.md`](docs/custom-packs.md) — 定制包规格摘要
+- [`docs/Deprecated/`](docs/Deprecated/) — 归档
 
 > 文档与实现冲突时，以源码与测试为准。
 

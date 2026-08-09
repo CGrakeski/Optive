@@ -13,5 +13,6 @@ pub mod home;
 pub mod lock;
 pub mod manifest;
 pub mod new_project;
+pub mod repl_highlight;
 pub mod resolve;
 pub mod store;

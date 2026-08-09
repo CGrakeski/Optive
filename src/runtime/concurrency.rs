@@ -5,7 +5,7 @@
 use crate::error::RuntimeError;
 use crate::shared::Shared;
 use crate::value::{
-    expect_i64, ChannelInner, MutexInner, Num, SyncGuardInner, SyncInner, Value,
+    expect_i64, ChannelInner, MutexInner, Num, StreamInner, SyncGuardInner, SyncInner, Value,
 };
 use crate::Result;
 use std::sync::Arc;
@@ -44,8 +44,67 @@ pub fn get_channel_method(ch: &Shared<ChannelInner>, field: &str) -> Result<Valu
             vm.mn.notify_all();
             Ok(Value::None)
         }),
+        "as_stream" => {
+            let ch = ch.clone();
+            Ok(Value::Builtin(Arc::new(move |_vm, args| {
+                if !args.is_empty() {
+                    return Err(RuntimeError::type_err(
+                        "Channel.as_stream takes no arguments",
+                    ));
+                }
+                Ok(Value::Stream(Shared::new(StreamInner::Channel(ch.clone()))))
+            })))
+        }
         _ => Err(RuntimeError::attr_err(format!(
             "Channel has no method {field}"
+        ))),
+    }
+}
+
+/// Stream：只拉取（`next`/`recv`/`close`）；禁止 `send`。
+pub fn get_stream_method(stream: &Shared<StreamInner>, field: &str) -> Result<Value> {
+    match field {
+        "send" => Err(RuntimeError::attr_err(
+            "Stream has no method send (pull-only; use Channel to produce)",
+        )),
+        "recv" | "next" => method!(stream, vm, |args| {
+            if !args.is_empty() {
+                return Err(RuntimeError::type_err(
+                    "Stream.next/recv takes no arguments",
+                ));
+            }
+            match &*stream.borrow() {
+                StreamInner::Channel(ch) => vm.channel_recv(ch),
+                StreamInner::Iter(it) => {
+                    let it = it.clone();
+                    match vm.advance_iterator(&it)? {
+                        Some(v) => Ok(v),
+                        None => Ok(Value::None),
+                    }
+                }
+            }
+        }),
+        "close" => method!(stream, vm, |args| {
+            if !args.is_empty() {
+                return Err(RuntimeError::type_err("Stream.close takes no arguments"));
+            }
+            match &*stream.borrow() {
+                StreamInner::Channel(ch) => {
+                    ch.borrow_mut().closed = true;
+                    vm.mn.notify_all();
+                }
+                StreamInner::Iter(it) => {
+                    // 拉取流：耗尽 take / 关闭底层 channel（若有）。
+                    if let crate::value::IteratorKind::Channel { channel } = &it.borrow().kind {
+                        channel.borrow_mut().closed = true;
+                        vm.mn.notify_all();
+                    }
+                }
+            }
+            Ok(Value::None)
+        }),
+        _ => Err(RuntimeError::attr_err(format!(
+            "Stream has no method {field}"
         ))),
     }
 }
@@ -533,6 +592,44 @@ pub fn construct_channel(args: &[Value]) -> Result<Value> {
     Ok(Value::Channel(Shared::new(ChannelInner::new(
         capacity,
     ))))
+}
+
+pub fn construct_stream(args: &[Value]) -> Result<Value> {
+    let capacity = match args {
+        [] => None,
+        [Value::Num(n)] => {
+            let v = n.to_i64().ok_or_else(|| {
+                RuntimeError::type_err("Stream capacity must be a non-negative integer")
+            })?;
+            if v < 0 {
+                return Err(RuntimeError::type_err(
+                    "Stream capacity must be a non-negative integer",
+                ));
+            }
+            Some(v as usize)
+        }
+        _ => {
+            return Err(RuntimeError::type_err(
+                "Stream() takes 0 or 1 numeric capacity argument",
+            ))
+        }
+    };
+    Ok(Value::Stream(Shared::new(StreamInner::Channel(Shared::new(
+        ChannelInner::new(capacity),
+    )))))
+}
+
+/// 从已有迭代器状态构造拉取 Stream（map/filter/take/from_gen）。
+pub fn stream_from_iterator(iter: Shared<crate::value::IteratorState>) -> Value {
+    Value::Stream(Shared::new(StreamInner::Iter(iter)))
+}
+
+/// 缓冲型 Stream 的底层 channel（仅 `StreamInner::Channel`）。
+pub fn stream_channel(stream: &Shared<StreamInner>) -> Option<Shared<ChannelInner>> {
+    match &*stream.borrow() {
+        StreamInner::Channel(ch) => Some(ch.clone()),
+        StreamInner::Iter(_) => None,
+    }
 }
 
 pub fn construct_mutex(args: &[Value]) -> Result<Value> {

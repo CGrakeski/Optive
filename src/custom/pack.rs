@@ -309,7 +309,17 @@ impl CustomPack {
     }
 }
 
+/// 从目录加载定制包；要求目录名与包内 `id` 一致（安装位校验）。
 pub fn load_pack_dir(dir: &Path) -> Result<CustomPack, PackLoadError> {
+    load_pack_dir_inner(dir, true)
+}
+
+/// 从临时检出目录加载（如 `custom add` 的 `.tmp-add`）；不校验目录名，仍读 `Custom.toml` 的 `id`。
+pub fn load_pack_staging(dir: &Path) -> Result<CustomPack, PackLoadError> {
+    load_pack_dir_inner(dir, false)
+}
+
+fn load_pack_dir_inner(dir: &Path, require_dir_match_id: bool) -> Result<CustomPack, PackLoadError> {
     let path = dir.join(PACK_MANIFEST_FILE);
     let text = std::fs::read_to_string(&path).map_err(|e| {
         PackLoadError::Io(format!("cannot read {}: {e}", path.display()))
@@ -325,15 +335,17 @@ pub fn load_pack_dir(dir: &Path) -> Result<CustomPack, PackLoadError> {
     if file.id.is_empty() {
         return Err(PackLoadError::Invalid("id must be non-empty".into()));
     }
-    let dir_name = dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    if dir_name != file.id {
-        return Err(PackLoadError::Invalid(format!(
-            "directory name `{dir_name}` must match id `{}`",
-            file.id
-        )));
+    if require_dir_match_id {
+        let dir_name = dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        if dir_name != file.id {
+            return Err(PackLoadError::Invalid(format!(
+                "directory name `{dir_name}` must match id `{}`",
+                file.id
+            )));
+        }
     }
 
     let mut layout_set = LayoutSet::default();
