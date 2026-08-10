@@ -395,7 +395,7 @@ pub fn verify_stack_balance(code: &[Instruction]) -> Result<(), String> {
             StackEffect::Adjust {
                 pop,
                 push,
-                alt_push: None,
+                alt_push: _none,
             } => {
                 if depth < u32::from(pop) {
                     return Err(format!(

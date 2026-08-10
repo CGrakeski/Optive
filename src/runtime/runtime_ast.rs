@@ -125,7 +125,7 @@ pub struct RuntimeAstNode {
 
 impl RuntimeAstNode {
     #[must_use]
-    pub fn as_value(self) -> Value {
+    pub fn into_value(self) -> Value {
         Value::RuntimeAst(Arc::new(self))
     }
 }
@@ -813,7 +813,7 @@ pub fn quote_binding_to_value(node: &RuntimeAstNode) -> Result<Value> {
                 .collect::<Result<_>>()?;
             Ok(Value::List(Shared::new(items)))
         }
-        _ => Ok(node.clone().as_value()),
+        _ => Ok(node.clone().into_value()),
     }
 }
 
@@ -1428,7 +1428,7 @@ pub fn compose_ast_type_convert(type_ast: &Value, value_ast: &Value) -> Result<V
         ..default_node()
     };
     std::mem::swap(&mut node.slot_a, &mut node.slot_b);
-    Ok(node.as_value())
+    Ok(node.into_value())
 }
 
 pub fn compose_ast_func_call(callee: &Value, args_vec: &Value) -> Result<Value> {
@@ -1459,7 +1459,7 @@ fn compose_ast_call(
             .collect(),
         ..default_node()
     };
-    Ok(node.as_value())
+    Ok(node.into_value())
 }
 
 fn expect_ast_list(v: &Value, ctx: &str) -> Result<Vec<RuntimeAstNode>> {
@@ -1499,12 +1499,12 @@ pub fn ast_struct_value(vm: &Vm, v: &Value) -> Result<Value> {
 
 fn runtime_ast_to_struct(vm: &Vm, node: &RuntimeAstNode) -> Result<Value> {
     let ast_field = |slot: Option<&RuntimeAstNode>| -> Value {
-        slot.map_or(Value::None, |n| n.clone().as_value())
+        slot.map_or(Value::None, |n| n.clone().into_value())
     };
     let call_args_list = |args: &[AstCallArg]| -> Value {
         Value::List(Shared::new(
             args.iter()
-                .map(|a| a.value.clone().as_value())
+                .map(|a| a.value.clone().into_value())
                 .collect(),
         ))
     };
@@ -1569,7 +1569,7 @@ fn runtime_ast_to_struct(vm: &Vm, node: &RuntimeAstNode) -> Result<Value> {
             vec![Value::List(Shared::new(
                 node.children
                     .iter()
-                    .map(|c| c.clone().as_value())
+                    .map(|c| c.clone().into_value())
                     .collect(),
             ))],
         ),
@@ -1578,7 +1578,7 @@ fn runtime_ast_to_struct(vm: &Vm, node: &RuntimeAstNode) -> Result<Value> {
             vec![
                 ast_field(node.slot_a.as_deref()),
                 Value::List(Shared::new(
-                    node.bindings.iter().map(|b| b.clone().as_value()).collect(),
+                    node.bindings.iter().map(|b| b.clone().into_value()).collect(),
                 )),
             ],
         ),

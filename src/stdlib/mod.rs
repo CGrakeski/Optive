@@ -1237,7 +1237,7 @@ fn value_key_to_value(k: &ValueKey) -> Value {
 
 fn ast_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let source = expect_text("parse", args, 0)?;
-    Ok(runtime_ast::parse_to_ast(&source)?.as_value())
+    Ok(runtime_ast::parse_to_ast(&source)?.into_value())
 }
 
 fn ast_clone_export(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -1277,7 +1277,7 @@ fn ast_walk(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let node = runtime_ast::value_as_ast(&args[0])?;
     let visitor = expect_function("walk", args, 1)?;
     runtime_ast::walk_ast_nodes(&node, &mut |n| {
-        let _ = vm.call_user_function(visitor.clone(), vec![n.clone().as_value()])?;
+        let _ = vm.call_user_function(visitor.clone(), vec![n.clone().into_value()])?;
         Ok(())
     })?;
     Ok(Value::None)

@@ -169,7 +169,7 @@ fn builtin_quote(vm: &mut Vm, args: &[Value]) -> Result<Value> {
         ));
     }
 
-    Ok(runtime_ast::quote_ast(hygienic, captured, body).as_value())
+    Ok(runtime_ast::quote_ast(hygienic, captured, body).into_value())
 }
 
 fn builtin_ast_struct(vm: &mut Vm, args: &[Value]) -> Result<Value> {
