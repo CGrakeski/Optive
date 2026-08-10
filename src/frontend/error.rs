@@ -11,7 +11,7 @@ pub enum ExceptionKind {
     Runtime,
     ValueError,
     TypeError,
-    /// 二元/一元运算不支持；对外类型名为 `TypeError`，但可与其它 TypeError 区分。
+    /// 二元/一元运算不支持；对外类型名为 `TypeError`，但可与其它 `TypeError` 区分。
     UnsupportedOp,
     SyntaxError,
     AttributeError,
@@ -53,6 +53,7 @@ impl ExceptionKind {
         Self::Cancelled,
     ];
 
+    #[must_use]
     pub const fn type_name(self) -> &'static str {
         match self {
             Self::BaseException => "BaseException",
@@ -78,6 +79,7 @@ impl ExceptionKind {
         }
     }
 
+    #[must_use]
     pub const fn parent(self) -> Option<Self> {
         match self {
             Self::BaseException => None,
@@ -102,6 +104,7 @@ impl ExceptionKind {
         }
     }
 
+    #[must_use]
     pub fn from_type_name(name: &str) -> Option<Self> {
         Self::ALL
             .iter()
@@ -190,7 +193,8 @@ impl RuntimeError {
         Self::typed(ExceptionKind::ZeroDivision, message)
     }
 
-    /// 按当前定制包渲染的除零错误（人读文案；类型名仍为 ZeroDivisionError）。
+    /// 按当前定制包渲染的除零错误（人读文案；类型名仍为 `ZeroDivisionError`）。
+    #[must_use]
     pub fn zero_div_diag() -> Self {
         Self::zero_div(crate::custom::render(&crate::custom::Diag::Runtime(
             crate::custom::ErrorKindMsg::ZeroDivision,
@@ -217,18 +221,21 @@ impl RuntimeError {
         Self::typed(ExceptionKind::Cancelled, message)
     }
 
-    pub fn kind(&self) -> ExceptionKind {
+    #[must_use]
+    pub const fn kind(&self) -> ExceptionKind {
         match self {
             Self::Host { kind, .. } | Self::AtLine { kind, .. } => *kind,
         }
     }
 
-    pub fn message(&self) -> &str {
+    #[must_use]
+    pub const fn message(&self) -> &str {
         match self {
             Self::Host { message, .. } | Self::AtLine { message, .. } => message.as_str(),
         }
     }
 
+    #[must_use]
     pub fn with_line(self, line: usize) -> Self {
         Self::AtLine {
             kind: self.kind(),

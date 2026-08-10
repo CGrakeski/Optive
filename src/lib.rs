@@ -2,6 +2,15 @@
 //!
 //! 本地脚本拥有本机文件系统、进程与模块导入权限。
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
+
 pub mod compiler;
 pub mod custom;
 pub mod frontend;
@@ -102,6 +111,7 @@ fn format_runtime_error(
 }
 
 /// REPL 辅助：检查源码是否有未闭合分隔符（忽略 `//` / `#` 行注释与字符串内容）。
+#[must_use]
 pub fn repl_needs_continuation(source: &str) -> bool {
     let mut paren = 0i32;
     let mut bracket = 0i32;

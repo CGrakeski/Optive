@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod cli;
 
 use std::env;
@@ -378,9 +386,9 @@ fn cmd_up(
 
 /// 拆分 `run`/`up` 剩余参数：可选项目路径 + `--` 后的脚本参数。
 ///
-/// - `Optive run -- a b` → path=None（cwd），script_args=[a,b]
-/// - `Optive run . -- a` → path=Some(.), script_args=[a]
-/// - `Optive run .` → path=Some(.), script_args=[]
+/// - `Optive run -- a b` → `path=None（cwd），script_args`=[a,b]
+/// - `Optive run . -- a` → path=Some(.), `script_args`=[a]
+/// - `Optive run .` → path=Some(.), `script_args`=[]
 /// - `--` 前多于一个操作数 → 用法错误
 fn split_project_and_script_args(
     rest: &[String],
@@ -518,7 +526,7 @@ fn cmd_remove(name: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn cmd_cache(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    match args.first().map(|s| s.as_str()) {
+    match args.first().map(std::string::String::as_str) {
         Some("gc") => {
             let dry = args.iter().any(|a| a == "--dry-run");
             cli::doctor::cache_gc(dry)?;
@@ -529,9 +537,9 @@ fn cmd_cache(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn cmd_deps(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    match args.first().map(|s| s.as_str()) {
+    match args.first().map(std::string::String::as_str) {
         None => cli::doctor::list_deps(false),
-        Some("-v") | Some("--verbose") if args.len() == 1 => cli::doctor::list_deps(true),
+        Some("-v" | "--verbose") if args.len() == 1 => cli::doctor::list_deps(true),
         Some("list") => {
             let verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
             cli::doctor::list_deps(verbose)
@@ -617,7 +625,7 @@ fn run_script_path_with_deps(
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let file = path.to_string_lossy().to_string();
     run_in_vm(&source, &file, caps, argv_override, |vm| {
-        inject_dep_map(vm, ensured, project_root)
+        inject_dep_map(vm, ensured, project_root);
     })
 }
 

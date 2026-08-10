@@ -1,4 +1,4 @@
-//! 全局 CAS：`pack/<id>/` + SQLite `index.db`。
+//! 全局 CAS：`pack/<id>/` + `SQLite` `index.db`。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,8 +19,7 @@ pub struct PackRecord {
 fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// 规范化 git URL 后计算 content id。
@@ -63,7 +62,7 @@ impl Store {
         conn.busy_timeout(std::time::Duration::from_secs(30))?;
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")?;
         conn.execute_batch(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS packs (
               id TEXT PRIMARY KEY,
               git_url TEXT NOT NULL,
@@ -77,7 +76,7 @@ impl Store {
               pack_id TEXT NOT NULL REFERENCES packs(id) ON DELETE CASCADE,
               PRIMARY KEY (project_key, pack_id)
             );
-            "#,
+            ",
         )?;
         Ok(Self { conn, home })
     }
@@ -118,7 +117,7 @@ impl Store {
         let path_s = rel_or_abs.to_string_lossy().to_string();
         let ts = now_unix();
         self.conn.execute(
-            r#"
+            r"
             INSERT INTO packs (id, git_url, effective_rev, path, created_at, last_access)
             VALUES (?1, ?2, ?3, ?4, ?5, ?5)
             ON CONFLICT(id) DO UPDATE SET
@@ -126,7 +125,7 @@ impl Store {
               effective_rev=excluded.effective_rev,
               path=excluded.path,
               last_access=excluded.last_access
-            "#,
+            ",
             params![id, git_url, effective_rev, path_s, ts],
         )?;
         Ok(())
@@ -159,11 +158,11 @@ impl Store {
 
     pub fn list_orphans(&self) -> Result<Vec<PackRecord>, Box<dyn std::error::Error>> {
         let mut stmt = self.conn.prepare(
-            r#"
+            r"
             SELECT p.id, p.git_url, p.effective_rev, p.path
             FROM packs p
             WHERE NOT EXISTS (SELECT 1 FROM refs r WHERE r.pack_id = p.id)
-            "#,
+            ",
         )?;
         let rows = stmt.query_map([], |row| {
             let path_s: String = row.get(3)?;
@@ -224,8 +223,7 @@ pub fn ensure_pack(
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_nanos())
     ));
     if tmp.exists() {
         fs::remove_dir_all(&tmp)?;
@@ -250,7 +248,7 @@ pub fn ensure_pack(
     Ok((id, target, true))
 }
 
-/// LOCAL_DEPS：装到项目 `deps/<name>/`。
+/// `LOCAL_DEPS：装到项目` `deps/<name>/`。
 pub fn ensure_local_pack(
     project_deps: &Path,
     name: &str,
@@ -265,8 +263,7 @@ pub fn ensure_local_pack(
     if target.is_dir() {
         let ok = fs::read_to_string(&marker)
             .ok()
-            .map(|s| s.trim() == id)
-            .unwrap_or(false);
+            .is_some_and(|s| s.trim() == id);
         if ok {
             // 有匹配标记：尽量对齐 rev；无 .git 的 fixture 目录跳过 checkout。
             if target.join(".git").is_dir() {

@@ -18,8 +18,7 @@ fn optive_home() -> PathBuf {
             let candidate = dir.join("data");
             let stem_matches = exe
                 .file_stem()
-                .map(|s| s.to_string_lossy().eq_ignore_ascii_case(PKG_NAME))
-                .unwrap_or(false);
+                .is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case(PKG_NAME));
             if candidate.is_dir() || stem_matches {
                 return candidate;
             }
@@ -31,10 +30,12 @@ fn optive_home() -> PathBuf {
     std::env::temp_dir().join(".optive")
 }
 
+#[must_use]
 pub fn custom_dir() -> PathBuf {
     optive_home().join("custom")
 }
 
+#[must_use]
 pub fn global_config_path() -> PathBuf {
     optive_home().join(GLOBAL_CONFIG_FILE)
 }

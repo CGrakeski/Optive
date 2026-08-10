@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 //! STW vs concurrent：分配风暴 + 后台 spinner（独立于并行素数）。
 //!
 //! ```text
@@ -58,7 +66,7 @@ fn main() {
 
 fn storm_src(spinners: usize, allocs: usize) -> String {
     format!(
-        r#"
+        r"
 let progress = Mutex(0)
 let done = Mutex(false)
 func spinner() {{
@@ -91,7 +99,7 @@ for (t in spinners) {{
     await t
 }}
 during
-"#
+"
     )
 }
 

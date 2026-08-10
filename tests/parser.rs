@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::{parse_err, parse_ok};
@@ -223,11 +231,11 @@ fn parse_while_loop() {
 #[test]
 fn parse_match_value_case() {
     parse_ok(
-        r#"
+        r"
 match (n) {
     case (0) { 0 }
 } else { 1 }
-"#,
+",
     );
 }
 
@@ -309,12 +317,12 @@ fn parse_struct_decl() {
 #[test]
 fn parse_variant_plain_struct_cases() {
     parse_ok(
-        r#"
+        r"
 variant Expr {
     Lit = struct { let value }
     Bin = struct { let op let left let right }
 }
-"#,
+",
     );
 }
 
@@ -486,27 +494,27 @@ fn parse_in_operator() {
 #[test]
 fn parse_with_stmt_after_call_not_decorator() {
     parse_ok(
-        r#"
+        r"
 func f(stats) {
   stats.lock()
   with (stats.lock() as g) {
     g.set(1)
   }
 }
-"#,
+",
     );
 }
 
 #[test]
 fn parse_intern_func_with_mutex() {
     parse_ok(
-        r#"
+        r"
 intern func walk_into(dir, stats) {
   with (stats.lock() as g) {
     g.set(g.get() + 1)
   }
 }
-"#,
+",
     );
 }
 

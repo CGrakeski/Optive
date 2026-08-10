@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::{assert_bool, assert_num, assert_text};
@@ -5,28 +13,28 @@ use common::{assert_bool, assert_num, assert_text};
 #[test]
 fn enum_default_numbering() {
     assert_num(
-        r#"
+        r"
 enum Color {
     Red
     Green
     Blue
 }
 Color.Red.__value__
-"#,
+",
         "0",
     );
     assert_num(
-        r#"
+        r"
 enum Color { Red Green Blue }
 Color.Green.__value__
-"#,
+",
         "1",
     );
     assert_num(
-        r#"
+        r"
 enum Color { Red Green Blue }
 Color.Blue.__value__
-"#,
+",
         "2",
     );
 }
@@ -34,13 +42,13 @@ Color.Blue.__value__
 #[test]
 fn enum_explicit_value() {
     assert_num(
-        r#"
+        r"
 enum Http {
     Ok = 200
     NotFound = 404
 }
 Http.NotFound.__value__
-"#,
+",
         "404",
     );
 }
@@ -48,17 +56,17 @@ Http.NotFound.__value__
 #[test]
 fn enum_members_and_name_of() {
     assert_num(
-        r#"
+        r"
 enum Color { Red Green Blue }
 len(Color.members())
-"#,
+",
         "3",
     );
     assert_text(
-        r#"
+        r"
 enum Color { Red Green Blue }
 Color.name_of(1)
-"#,
+",
         "Green",
     );
 }
@@ -66,11 +74,11 @@ Color.name_of(1)
 #[test]
 fn enum_cross_type_eq_false() {
     assert_bool(
-        r#"
+        r"
 enum A { x }
 enum B { x }
 A.x == B.x
-"#,
+",
         false,
     );
 }
@@ -78,10 +86,10 @@ A.x == B.x
 #[test]
 fn enum_eq_num_via_value() {
     assert_bool(
-        r#"
+        r"
 enum Color { Red Green Blue }
 Color.Red.__value__ == 0
-"#,
+",
         true,
     );
 }
@@ -102,7 +110,7 @@ match (Color.Green) {
 #[test]
 fn enum_generate_custom_numbering() {
     assert_num(
-        r#"
+        r"
 enum C {
     a = 1
     b
@@ -125,7 +133,7 @@ enum C {
     }
 }
 C.d.__value__
-"#,
+",
         "4",
     );
 }

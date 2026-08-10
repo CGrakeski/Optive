@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use optive::{run_source_in_vm, vm::Vm};
@@ -10,7 +18,7 @@ fn repl_undefined_name_in_callee_should_error() {
     let err = run_source_in_vm(&mut vm, "a()", "<repl>").expect_err("should error");
     let msg = err.to_string();
     assert!(
-        msg.contains("undefined name") || msg.contains("c"),
+        msg.contains("undefined name") || msg.contains('c'),
         "unexpected error: {msg}"
     );
 }

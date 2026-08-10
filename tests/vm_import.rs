@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::{assert_num, assert_text, run_err};
@@ -5,10 +13,10 @@ use common::{assert_num, assert_text, run_err};
 #[test]
 fn import_std_math_abs() {
     assert_num(
-        r#"
+        r"
 import std.math as math
 math.abs(-5)
-"#,
+",
         "5",
     );
 }
@@ -16,12 +24,12 @@ math.abs(-5)
 #[test]
 fn use_std_math_range() {
     assert_num(
-        r#"
+        r"
 use std.math.{ range }
 let n = 0
 for (x in range(1, 4)) { n = n + x }
 n
-"#,
+",
         "6",
     );
 }
@@ -29,10 +37,10 @@ n
 #[test]
 fn use_std_math_abs_as_alias() {
     assert_num(
-        r#"
+        r"
 use std.math.{ abs as magnitude }
 magnitude(-7)
-"#,
+",
         "7",
     );
 }
@@ -117,11 +125,11 @@ helper.add(3, 4)
 #[test]
 fn module_cache_reimport() {
     assert_num(
-        r#"
+        r"
 import std.math as m1
 import std.math as m2
 m1.abs(-3) + m2.abs(-2)
-"#,
+",
         "5",
     );
 }
@@ -129,9 +137,9 @@ m1.abs(-3) + m2.abs(-2)
 #[test]
 fn missing_module_errors() {
     run_err(
-        r#"
+        r"
 import no.such.module
-"#,
+",
     );
 }
 
@@ -186,7 +194,7 @@ m.describe(t)
     );
 }
 
-/// 导入后模块内非 export 函数仍须能读本模块级 `let`（LoadGlobal 走 module_env）。
+/// 导入后模块内非 export 函数仍须能读本模块级 `let`（`LoadGlobal` 走 `module_env`）。
 #[test]
 fn imported_module_internal_func_sees_module_let() {
     assert_num(
@@ -200,7 +208,7 @@ ok + r
     );
 }
 
-/// `use` 引入的函数必须保留定义模块的 globals，不能被调用方 module_env 换绑。
+/// `use` 引入的函数必须保留定义模块的 globals，不能被调用方 `module_env` 换绑。
 #[test]
 fn use_imported_func_keeps_defining_module_globals() {
     assert_text(
@@ -219,7 +227,7 @@ cu.via_use("let")
     );
 }
 
-/// 导入后模块函数对模块全局的赋值必须留在 module_env，不能污染调用方。
+/// 导入后模块函数对模块全局的赋值必须留在 `module_env，不能污染调用方`。
 #[test]
 fn imported_module_mutates_own_global() {
     assert_num(

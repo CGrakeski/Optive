@@ -464,7 +464,7 @@ fn rewrite_cmp(ins: &mut Instruction, stack: &mut Vec<Option<Tag>>, num_op: Inst
     stack.push(Some(Tag::Bool));
 }
 
-fn specialize_add(left: Option<Tag>, right: Option<Tag>) -> Option<Instruction> {
+const fn specialize_add(left: Option<Tag>, right: Option<Tag>) -> Option<Instruction> {
     match (left, right) {
         (Some(Tag::Num), Some(Tag::Num)) => Some(Instruction::AddNumNum),
         (Some(Tag::Text), Some(Tag::Text)) => Some(Instruction::AddTextText),
@@ -473,7 +473,7 @@ fn specialize_add(left: Option<Tag>, right: Option<Tag>) -> Option<Instruction> 
     }
 }
 
-fn result_tag_bin(left: Option<Tag>, right: Option<Tag>, op: OpKind) -> Option<Tag> {
+const fn result_tag_bin(left: Option<Tag>, right: Option<Tag>, op: OpKind) -> Option<Tag> {
     match op {
         OpKind::Add => match (left, right) {
             (Some(Tag::Num), Some(Tag::Num)) => Some(Tag::Num),
@@ -505,7 +505,7 @@ fn env_set(env: &mut Vec<Option<Tag>>, slot: usize, tag: Option<Tag>) {
     env[slot] = tag;
 }
 
-fn tag_of_value(v: &Value) -> Option<Tag> {
+const fn tag_of_value(v: &Value) -> Option<Tag> {
     match v {
         Value::Num(_) => Some(Tag::Num),
         Value::Text(_) => Some(Tag::Text),

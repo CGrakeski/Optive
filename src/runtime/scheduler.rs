@@ -37,7 +37,7 @@ pub struct MnScheduler {
     stw_parked: AtomicUsize,
     /// STW 超时次数（可观测性）。
     stw_failures: AtomicUsize,
-    /// Helper 请求 primary 做一次 GC（避免双端同时 begin_stw 死锁）。
+    /// Helper 请求 primary 做一次 GC（避免双端同时 `begin_stw` 死锁）。
     gc_requested: AtomicBool,
     /// Helper 在 STW 安全点发布的根快照（按线程 id）。
     pub(crate) parked_roots: Mutex<FxHashMap<usize, Vec<Value>>>,
@@ -50,6 +50,7 @@ pub struct MnScheduler {
 const WAIT_BRIEF_MS: u64 = 2;
 
 impl MnScheduler {
+    #[must_use]
     pub fn new(worker_count: usize) -> Arc<Self> {
         Arc::new(Self {
             injector: Injector::new(),
@@ -221,7 +222,7 @@ impl MnScheduler {
             return false;
         }
         let stealers = self.stealers.lock();
-        stealers.iter().all(|s| s.is_empty())
+        stealers.iter().all(crossbeam_deque::Stealer::is_empty)
     }
 
     pub fn worker_count(&self) -> usize {
@@ -258,7 +259,7 @@ impl MnScheduler {
             }
         }
         let stealers = self.stealers.lock().clone();
-        for s in stealers.iter() {
+        for s in &stealers {
             loop {
                 match s.steal() {
                     Steal::Success(t) => return Some(t),
@@ -276,6 +277,7 @@ impl MnScheduler {
 }
 
 /// 默认 1（M:1）；`OPTIVE_WORKERS` 可覆盖。`mn` feature 下也可用 `0` 表示 `num_cpus`。
+#[must_use]
 pub fn configured_workers() -> usize {
     match std::env::var("OPTIVE_WORKERS") {
         Ok(s) => {
@@ -290,6 +292,7 @@ pub fn configured_workers() -> usize {
     }
 }
 
+#[must_use]
 pub fn new_local_worker() -> Worker<Shared<TaskInner>> {
     Worker::new_fifo()
 }

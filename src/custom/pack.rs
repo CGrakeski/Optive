@@ -120,7 +120,7 @@ pub enum PackLoadError {
 impl std::fmt::Display for PackLoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PackLoadError::Io(s) | PackLoadError::Parse(s) | PackLoadError::Invalid(s) => {
+            Self::Io(s) | Self::Parse(s) | Self::Invalid(s) => {
                 write!(f, "{s}")
             }
         }
@@ -142,7 +142,7 @@ struct PackFile {
     gloss: BTreeMap<String, String>,
 }
 
-fn default_format_version() -> u32 {
+const fn default_format_version() -> u32 {
     1
 }
 
@@ -207,6 +207,7 @@ fn validate_template(tmpl: &str, ctx: &str) -> Result<(), PackLoadError> {
 }
 
 impl CustomPack {
+    #[must_use]
     pub fn builtin_en_us() -> Self {
         let mut messages = BTreeMap::new();
         for (k, t) in [
@@ -234,51 +235,52 @@ impl CustomPack {
     }
 
     /// `overlay` 覆盖本包：messages/gloss 按键字段合并；layout 仅覆盖 overlay 显式字段。
-    pub fn merged_with(&self, overlay: &CustomPack) -> CustomPack {
+    #[must_use]
+    pub fn merged_with(&self, overlay: &Self) -> Self {
         let mut out = self.clone();
         for (k, v) in &overlay.messages {
             let entry = out.messages.entry(k.clone()).or_default();
             if v.text.is_some() {
-                entry.text = v.text.clone();
+                entry.text.clone_from(&v.text);
             }
             if v.suffix.is_some() {
-                entry.suffix = v.suffix.clone();
+                entry.suffix.clone_from(&v.suffix);
             }
             if v.style.is_some() {
-                entry.style = v.style.clone();
+                entry.style.clone_from(&v.style);
             }
         }
         let s = &overlay.layout_set;
         if s.repl_prompt {
-            out.layout.repl.prompt = overlay.layout.repl.prompt.clone();
+            out.layout.repl.prompt.clone_from(&overlay.layout.repl.prompt);
             out.layout_set.repl_prompt = true;
         }
         if s.repl_continuation {
-            out.layout.repl.continuation = overlay.layout.repl.continuation.clone();
+            out.layout.repl.continuation.clone_from(&overlay.layout.repl.continuation);
             out.layout_set.repl_continuation = true;
         }
         if s.parse_label {
-            out.layout.parse.label_error = overlay.layout.parse.label_error.clone();
+            out.layout.parse.label_error.clone_from(&overlay.layout.parse.label_error);
             out.layout_set.parse_label = true;
         }
         if s.parse_arrow {
-            out.layout.parse.arrow = overlay.layout.parse.arrow.clone();
+            out.layout.parse.arrow.clone_from(&overlay.layout.parse.arrow);
             out.layout_set.parse_arrow = true;
         }
         if s.tb_header {
-            out.layout.traceback.header = overlay.layout.traceback.header.clone();
+            out.layout.traceback.header.clone_from(&overlay.layout.traceback.header);
             out.layout_set.tb_header = true;
         }
         if s.tb_frame {
-            out.layout.traceback.frame = overlay.layout.traceback.frame.clone();
+            out.layout.traceback.frame.clone_from(&overlay.layout.traceback.frame);
             out.layout_set.tb_frame = true;
         }
         if s.tb_direction {
-            out.layout.traceback.direction = overlay.layout.traceback.direction.clone();
+            out.layout.traceback.direction.clone_from(&overlay.layout.traceback.direction);
             out.layout_set.tb_direction = true;
         }
         if s.exc_line {
-            out.layout.exception.line = overlay.layout.exception.line.clone();
+            out.layout.exception.line.clone_from(&overlay.layout.exception.line);
             out.layout_set.exc_line = true;
         }
         for (k, v) in &overlay.gloss {
@@ -287,6 +289,7 @@ impl CustomPack {
         out
     }
 
+    #[must_use]
     pub fn render_message(&self, key: &str, fallback: &str) -> String {
         if let Some(spec) = self.messages.get(key) {
             let mut s = spec.text.as_deref().unwrap_or(fallback).to_string();
@@ -392,6 +395,7 @@ fn load_pack_dir_inner(dir: &Path, require_dir_match_id: bool) -> Result<CustomP
     })
 }
 
+#[must_use]
 pub fn list_installed_ids(custom_root: &Path) -> Vec<String> {
     let mut ids = Vec::new();
     let Ok(rd) = std::fs::read_dir(custom_root) else {

@@ -13,7 +13,7 @@ use crate::runtime_ast::RuntimeAstNode;
 use crate::shared::{Shared, SyncCell};
 use crate::Result;
 
-/// `Num::{floor,ceil,trunc,round}_num`：整数原样，有理数走 BigRational 对应方法。
+/// `Num::{floor,ceil,trunc,round}_num`：整数原样，有理数走 `BigRational` 对应方法。
 macro_rules! num_rat_round {
     ($($name:ident => $rat_method:ident),+ $(,)?) => {
         $(
@@ -46,7 +46,7 @@ macro_rules! value_num_binop {
     };
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Num {
     Small(i64),
     /// 堆上整数 — 放在 `Arc` 后以保持 `Value` 紧凑。
@@ -56,28 +56,32 @@ pub enum Num {
 }
 
 impl Num {
-    pub fn small(n: i64) -> Self {
-        Num::Small(n)
+    #[must_use]
+    pub const fn small(n: i64) -> Self {
+        Self::Small(n)
     }
 
-    pub fn from_i64(n: i64) -> Self {
+    #[must_use]
+    pub const fn from_i64(n: i64) -> Self {
         Self::small(n)
     }
 
     #[inline]
+    #[must_use]
     pub fn from_bigint(n: BigInt) -> Self {
         match n.to_i64() {
-            Some(i) => Num::Small(i),
-            None => Num::Int(Arc::new(n)),
+            Some(i) => Self::Small(i),
+            None => Self::Int(Arc::new(n)),
         }
     }
 
     #[inline]
+    #[must_use]
     pub fn from_rational(r: BigRational) -> Self {
         if r.denom() == &One::one() {
             return Self::from_bigint(r.numer().clone());
         }
-        Num::Rat(Arc::new(r))
+        Self::Rat(Arc::new(r))
     }
 
     pub fn from_literal(text: &str) -> Result<Self> {
@@ -94,43 +98,46 @@ impl Num {
             if denom.is_zero() {
                 return Err(RuntimeError::value_err(format!("invalid rational literal: {text}")));
             }
-            return Ok(Num::from_rational(BigRational::new(numer, denom)));
+            return Ok(Self::from_rational(BigRational::new(numer, denom)));
         }
         if t.contains('.') || t.contains('e') || t.contains('E') || t.starts_with('.') {
             let rat = parse_decimal_literal(t)
                 .map_err(|_| RuntimeError::value_err(format!("invalid number literal: {text}")))?;
-            return Ok(Num::from_rational(rat));
+            return Ok(Self::from_rational(rat));
         }
         if let Ok(n) = t.parse::<i64>() {
-            return Ok(Num::Small(n));
+            return Ok(Self::Small(n));
         }
         let n: BigInt = t
                 .parse()
                 .map_err(|_| RuntimeError::value_err(format!("invalid integer literal: {text}")))?;
-        Ok(Num::from_bigint(n))
+        Ok(Self::from_bigint(n))
     }
 
+    #[must_use]
     pub fn is_zero(&self) -> bool {
         match self {
-            Num::Small(n) => *n == 0,
-            Num::Int(n) => n.is_zero(),
-            Num::Rat(r) => r.is_zero(),
+            Self::Small(n) => *n == 0,
+            Self::Int(n) => n.is_zero(),
+            Self::Rat(r) => r.is_zero(),
         }
     }
 
+    #[must_use]
     pub fn to_rational(&self) -> BigRational {
         match self {
-            Num::Small(n) => BigRational::from((BigInt::from(*n), One::one())),
-            Num::Int(n) => BigRational::from((n.as_ref().clone(), One::one())),
-            Num::Rat(r) => r.as_ref().clone(),
+            Self::Small(n) => BigRational::from((BigInt::from(*n), One::one())),
+            Self::Int(n) => BigRational::from((n.as_ref().clone(), One::one())),
+            Self::Rat(r) => r.as_ref().clone(),
         }
     }
 
+    #[must_use]
     pub fn to_i64(&self) -> Option<i64> {
         match self {
-            Num::Small(n) => Some(*n),
-            Num::Int(n) => n.to_i64(),
-            Num::Rat(r) if r.denom() == &One::one() => r.numer().to_i64(),
+            Self::Small(n) => Some(*n),
+            Self::Int(n) => n.to_i64(),
+            Self::Rat(r) if r.denom() == &One::one() => r.numer().to_i64(),
             _ => None,
         }
     }
@@ -138,19 +145,20 @@ impl Num {
     /// 转为整数 `BigInt`；有理数报错（按位/取模仅支持整数）。
     pub fn to_bigint(&self) -> Result<BigInt> {
         match self {
-            Num::Small(n) => Ok(BigInt::from(*n)),
-            Num::Int(n) => Ok(n.as_ref().clone()),
-            Num::Rat(_) => Err(RuntimeError::type_err(
+            Self::Small(n) => Ok(BigInt::from(*n)),
+            Self::Int(n) => Ok(n.as_ref().clone()),
+            Self::Rat(_) => Err(RuntimeError::type_err(
                 "bitwise/modulo operators require integers, got rational",
             )),
         }
     }
 
-    pub fn abs_num(&self) -> Num {
+    #[must_use]
+    pub fn abs_num(&self) -> Self {
         match self {
-            Num::Small(n) => Num::Small(n.abs()),
-            Num::Int(i) => Num::from_bigint(i.abs()),
-            Num::Rat(r) => Num::from_rational(r.abs()),
+            Self::Small(n) => Self::Small(n.abs()),
+            Self::Int(i) => Self::from_bigint(i.abs()),
+            Self::Rat(r) => Self::from_rational(r.abs()),
         }
     }
 
@@ -169,54 +177,52 @@ impl Num {
         })
     }
 
+    #[must_use]
     pub fn eq_num(&self, other: &Self) -> bool {
         match (self, other) {
-            (Num::Small(a), Num::Small(b)) => a == b,
-            (Num::Int(a), Num::Int(b)) => a.as_ref() == b.as_ref(),
-            (Num::Rat(a), Num::Rat(b)) => a.as_ref() == b.as_ref(),
-            (Num::Small(a), Num::Int(b)) => match b.to_i64() {
+            (Self::Small(a), Self::Small(b)) => a == b,
+            (Self::Int(a), Self::Int(b)) => a.as_ref() == b.as_ref(),
+            (Self::Rat(a), Self::Rat(b)) => a.as_ref() == b.as_ref(),
+            (Self::Small(a), Self::Int(b)) => match b.to_i64() {
                 Some(bi) => a == &bi,
                 None => self.to_rational() == other.to_rational(),
             },
-            (Num::Int(a), Num::Small(b)) => match a.to_i64() {
+            (Self::Int(a), Self::Small(b)) => match a.to_i64() {
                 Some(ai) => ai == *b,
                 None => self.to_rational() == other.to_rational(),
             },
-            (Num::Small(a), Num::Rat(b)) if b.denom() == &One::one() => b
+            (Self::Small(a), Self::Rat(b)) if b.denom() == &One::one() => b
                 .numer()
-                .to_i64()
-                .map(|bi| a == &bi)
-                .unwrap_or_else(|| self.to_rational() == **b),
-            (Num::Rat(a), Num::Small(b)) if a.denom() == &One::one() => a
+                .to_i64().map_or_else(|| self.to_rational() == **b, |bi| a == &bi),
+            (Self::Rat(a), Self::Small(b)) if a.denom() == &One::one() => a
                 .numer()
-                .to_i64()
-                .map(|ai| ai == *b)
-                .unwrap_or_else(|| **a == other.to_rational()),
+                .to_i64().map_or_else(|| **a == other.to_rational(), |ai| ai == *b),
             _ => self.to_rational() == other.to_rational(),
         }
     }
 
+    #[must_use]
     pub fn cmp_num(&self, other: &Self) -> std::cmp::Ordering {
         match (self, other) {
-            (Num::Small(a), Num::Small(b)) => a.cmp(b),
-            (Num::Int(a), Num::Int(b)) => a.as_ref().cmp(b.as_ref()),
-            (Num::Rat(a), Num::Rat(b)) => a.as_ref().cmp(b.as_ref()),
-            (Num::Small(a), Num::Int(b)) => match b.to_i64() {
+            (Self::Small(a), Self::Small(b)) => a.cmp(b),
+            (Self::Int(a), Self::Int(b)) => a.as_ref().cmp(b.as_ref()),
+            (Self::Rat(a), Self::Rat(b)) => a.as_ref().cmp(b.as_ref()),
+            (Self::Small(a), Self::Int(b)) => match b.to_i64() {
                 Some(bi) => a.cmp(&bi),
                 None => self.to_rational().cmp(&other.to_rational()),
             },
-            (Num::Int(a), Num::Small(b)) => match a.to_i64() {
+            (Self::Int(a), Self::Small(b)) => match a.to_i64() {
                 Some(ai) => ai.cmp(b),
                 None => self.to_rational().cmp(&other.to_rational()),
             },
-            (Num::Small(a), Num::Rat(b)) if b.denom() == &One::one() => {
+            (Self::Small(a), Self::Rat(b)) if b.denom() == &One::one() => {
                 if let Some(bi) = b.numer().to_i64() {
                     a.cmp(&bi)
                 } else {
                     self.to_rational().cmp(b.as_ref())
                 }
             }
-            (Num::Rat(a), Num::Small(b)) if a.denom() == &One::one() => {
+            (Self::Rat(a), Self::Small(b)) if a.denom() == &One::one() => {
                 if let Some(ai) = a.numer().to_i64() {
                     ai.cmp(b)
                 } else {
@@ -231,9 +237,9 @@ impl Num {
 impl fmt::Display for Num {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Num::Small(n) => write!(f, "{n}"),
-            Num::Int(n) => write!(f, "{n}"),
-            Num::Rat(r) => {
+            Self::Small(n) => write!(f, "{n}"),
+            Self::Int(n) => write!(f, "{n}"),
+            Self::Rat(r) => {
                 if r.denom() == &One::one() {
                     write!(f, "{}", r.numer())
                 } else {
@@ -251,11 +257,12 @@ pub struct ModuleObject {
     pub name: String,
     pub full_name: String,
     pub exports: HashMap<String, Value>,
-    pub children: HashMap<String, Shared<ModuleObject>>,
+    pub children: HashMap<String, Shared<Self>>,
     pub is_user: bool,
 }
 
 impl ModuleObject {
+    #[must_use]
     pub fn new_user(name: String, full_name: String) -> Self {
         Self {
             name,
@@ -266,10 +273,12 @@ impl ModuleObject {
         }
     }
 
+    #[must_use]
     pub fn get_export(&self, name: &str) -> Option<Value> {
         self.exports.get(name).cloned()
     }
 
+    #[must_use]
     pub fn get_attr(&self, name: &str) -> Option<Value> {
         if let Some(v) = self.exports.get(name) {
             return Some(v.clone());
@@ -364,6 +373,7 @@ pub struct SetMap {
 }
 
 impl SetMap {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -377,6 +387,7 @@ impl SetMap {
         }
     }
 
+    #[must_use]
     pub fn contains(&self, key: &ValueKey) -> bool {
         self.map.contains(key)
     }
@@ -390,10 +401,12 @@ impl SetMap {
         }
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.map.len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
@@ -409,6 +422,7 @@ impl SetMap {
 }
 
 impl DictMap {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -420,10 +434,12 @@ impl DictMap {
         self.map.insert(key, val);
     }
 
+    #[must_use]
     pub fn get(&self, key: &ValueKey) -> Option<&Value> {
         self.map.get(key)
     }
 
+    #[must_use]
     pub fn contains_key(&self, key: &ValueKey) -> bool {
         self.map.contains_key(key)
     }
@@ -437,10 +453,12 @@ impl DictMap {
         }
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.map.len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
@@ -491,7 +509,8 @@ pub struct TaskInner {
 }
 
 impl TaskInner {
-    pub fn pending(callable: Value, args: Vec<Value>) -> Self {
+    #[must_use]
+    pub const fn pending(callable: Value, args: Vec<Value>) -> Self {
         Self {
             state: TaskState::Pending { callable, args },
             task_group: None,
@@ -500,7 +519,8 @@ impl TaskInner {
         }
     }
 
-    pub fn done(value: Value) -> Self {
+    #[must_use]
+    pub const fn done(value: Value) -> Self {
         Self {
             state: TaskState::Done(value),
             task_group: None,
@@ -509,11 +529,12 @@ impl TaskInner {
         }
     }
 
-    pub fn is_cancelled(&self) -> bool {
+    #[must_use]
+    pub const fn is_cancelled(&self) -> bool {
         self.cancelled
     }
 
-    pub fn request_cancel(&mut self) {
+    pub const fn request_cancel(&mut self) {
         self.cancelled = true;
     }
 }
@@ -526,7 +547,7 @@ pub struct ChannelInner {
     pub closed: bool,
 }
 
-/// Stream 体：缓冲 channel 视图，或拉取包装（map/filter/take/from_gen）。
+/// Stream 体：缓冲 channel `视图，或拉取包装（map/filter/take/from_gen`）。
 #[derive(Clone)]
 pub enum StreamInner {
     Channel(Shared<ChannelInner>),
@@ -534,7 +555,8 @@ pub enum StreamInner {
 }
 
 impl ChannelInner {
-    pub fn new(capacity: Option<usize>) -> Self {
+    #[must_use]
+    pub const fn new(capacity: Option<usize>) -> Self {
         Self {
             queue: VecDeque::new(),
             capacity,
@@ -589,7 +611,8 @@ pub struct MutexInner {
 }
 
 impl MutexInner {
-    pub fn new(value: Value) -> Self {
+    #[must_use]
+    pub const fn new(value: Value) -> Self {
         Self {
             value,
             locked: false,
@@ -598,14 +621,15 @@ impl MutexInner {
 }
 
 /// `Mutex.lock()` 的守卫载荷：最后一个 `Shared` 释放时自动 `unlock`，
-/// 避免 `m.lock().get()` 在 GetAttr 丢弃临时守卫后锁泄漏。
+/// 避免 `m.lock().get()` 在 `GetAttr` 丢弃临时守卫后锁泄漏。
 pub struct MutexGuardInner {
     mutex: Shared<MutexInner>,
     released: std::sync::atomic::AtomicBool,
 }
 
 impl MutexGuardInner {
-    pub fn new(mutex: Shared<MutexInner>) -> Self {
+    #[must_use]
+    pub const fn new(mutex: Shared<MutexInner>) -> Self {
         Self {
             mutex,
             released: std::sync::atomic::AtomicBool::new(false),
@@ -648,7 +672,7 @@ pub enum OncePhase {
     Done,
 }
 
-/// 其余并发原语（RWMutex / WaitGroup / Semaphore / Once / Barrier / Cond / TaskGroup / TimeoutCtx）的统一载荷。
+/// 其余并发原语（RWMutex / `WaitGroup` / Semaphore / Once / Barrier / Cond / `TaskGroup` / TimeoutCtx）的统一载荷。
 #[derive(Clone)]
 pub enum SyncInner {
     /// 读写锁：`readers` 为当前活跃读者数，`writer` 为是否有写者持有。
@@ -684,7 +708,7 @@ pub enum SyncInner {
     },
 }
 
-/// RWMutex 的读/写守卫，支持 `with` 自动释放。
+/// `RWMutex` 的读/写守卫，支持 `with` 自动释放。
 #[derive(Clone)]
 pub enum SyncGuardInner {
     Read { mu: Shared<SyncInner> },
@@ -705,12 +729,12 @@ pub enum Value {
     Text(String),
     /// 裸类型句柄（`num`、`MyStruct` 等）— 与 `Text` 字符串值区分。
     TypeRef(String),
-    List(Shared<Vec<Value>>),
+    List(Shared<Vec<Self>>),
     Dict(Shared<DictMap>),
     /// 可哈希值的有序集合。空集展示为 `{,}`（`{}` 仍是空字典）。
     Set(Shared<SetMap>),
     /// 不可变定长序列。空元组为 `()`。
-    Tuple(Arc<[Value]>),
+    Tuple(Arc<[Self]>),
     /// 原始字节缓冲（非 Unicode 文本）。
     Bytes(Arc<Vec<u8>>),
     Iterator(Shared<IteratorState>),
@@ -722,7 +746,7 @@ pub enum Value {
     Module(Shared<ModuleObject>),
     RuntimeAst(Arc<RuntimeAstNode>),
     Dispatch(Shared<DispatchTable>),
-    Cell(Shared<Value>),
+    Cell(Shared<Self>),
     /// 泛型结构体索引得到的特化类型句柄，如用于 `Box[num](v)` 的 `Box[num]`。
     TypeSpec(Arc<TypeSpecData>),
     /// 数值枚举成员，如 `Color.Red`。
@@ -741,7 +765,7 @@ pub enum Value {
     MutexGuard(Shared<MutexGuardInner>),
     /// 其余并发原语（RWMutex/WaitGroup/Semaphore/Once/Barrier/Cond）。
     Sync(Shared<SyncInner>),
-    /// RWMutex 读/写守卫。
+    /// `RWMutex` 读/写守卫。
     SyncGuard(Shared<SyncGuardInner>),
 }
 
@@ -783,10 +807,10 @@ pub enum ValueKey {
 impl ValueKey {
     pub fn from_value(v: &Value) -> Result<Self> {
         match v {
-            Value::Bool(b) => Ok(ValueKey::Bool(*b)),
-            Value::Num(Num::Small(n)) => Ok(ValueKey::NumInt((*n).into())),
-            Value::Num(Num::Int(n)) => Ok(ValueKey::NumInt(n.as_ref().clone())),
-            Value::Text(s) => Ok(ValueKey::Text(s.clone())),
+            Value::Bool(b) => Ok(Self::Bool(*b)),
+            Value::Num(Num::Small(n)) => Ok(Self::NumInt((*n).into())),
+            Value::Num(Num::Int(n)) => Ok(Self::NumInt(n.as_ref().clone())),
+            Value::Text(s) => Ok(Self::Text(s.clone())),
             other => Err(RuntimeError::type_err(format!(
                 "unhashable type: {}",
                 other.type_name()
@@ -865,57 +889,59 @@ pub struct StructInstance {
 impl Value {
     #[inline]
     pub fn text(s: impl Into<String>) -> Self {
-        Value::Text(s.into())
+        Self::Text(s.into())
     }
 
     pub fn type_ref(name: impl Into<String>) -> Self {
-        Value::TypeRef(name.into())
+        Self::TypeRef(name.into())
     }
 
     /// 索引 / 注解用的类型名操作数（`TypeRef`，以及旧式 `Text`）。
-    pub fn as_type_name_operand(&self) -> Option<&str> {
+    #[must_use]
+    pub const fn as_type_name_operand(&self) -> Option<&str> {
         match self {
-            Value::TypeRef(n) => Some(n.as_str()),
-            Value::Text(n) => Some(n.as_str()),
+            Self::TypeRef(n) => Some(n.as_str()),
+            Self::Text(n) => Some(n.as_str()),
             _ => None,
         }
     }
 
+    #[must_use]
     pub fn type_name(&self) -> &str {
         match self {
-            Value::None => "nonetype",
-            Value::Bool(_) => "bool",
-            Value::Num(_) => "num",
-            Value::Sized(s) => s.type_name(),
-            Value::Ptr(_) => "ptr",
-            Value::DllHandle(_) => "DllHandle",
-            Value::Text(_) => "text",
+            Self::None => "nonetype",
+            Self::Bool(_) => "bool",
+            Self::Num(_) => "num",
+            Self::Sized(s) => s.type_name(),
+            Self::Ptr(_) => "ptr",
+            Self::DllHandle(_) => "DllHandle",
+            Self::Text(_) => "text",
             // 类型句柄的值属于元类型 `type`（如 `type(A)` → type，`type(A())` → A）。
-            Value::TypeRef(_) => "type",
-            Value::List(_) => "list",
-            Value::Dict(_) => "dict",
-            Value::Set(_) => "set",
-            Value::Tuple(_) => "tuple",
-            Value::Bytes(_) => "bytes",
-            Value::Iterator(_) => "iterator",
-            Value::Function(_) => "function",
-            Value::GenericFunction(_) => "generic function",
-            Value::Macro(_) => "Macro",
-            Value::Builtin(_) => "function",
-            Value::Dispatch(_) => "friend func",
-            Value::Struct(s) => &s.def.name,
-            Value::Module(_) => "module",
-            Value::RuntimeAst(_) => "AST",
-            Value::Cell(_) => "cell",
-            Value::TypeSpec(_) => "type",
-            Value::EnumMember(m) => &m.type_name,
-            Value::Variant(v) => &v.inst_name,
-            Value::Task(_) => "Task",
-            Value::Channel(_) => "Channel",
-            Value::Stream(_) => "Stream",
-            Value::Mutex(_) => "Mutex",
-            Value::MutexGuard(_) => "MutexGuard",
-            Value::Sync(s) => match &*s.borrow() {
+            Self::TypeRef(_) => "type",
+            Self::List(_) => "list",
+            Self::Dict(_) => "dict",
+            Self::Set(_) => "set",
+            Self::Tuple(_) => "tuple",
+            Self::Bytes(_) => "bytes",
+            Self::Iterator(_) => "iterator",
+            Self::Function(_) => "function",
+            Self::GenericFunction(_) => "generic function",
+            Self::Macro(_) => "Macro",
+            Self::Builtin(_) => "function",
+            Self::Dispatch(_) => "friend func",
+            Self::Struct(s) => &s.def.name,
+            Self::Module(_) => "module",
+            Self::RuntimeAst(_) => "AST",
+            Self::Cell(_) => "cell",
+            Self::TypeSpec(_) => "type",
+            Self::EnumMember(m) => &m.type_name,
+            Self::Variant(v) => &v.inst_name,
+            Self::Task(_) => "Task",
+            Self::Channel(_) => "Channel",
+            Self::Stream(_) => "Stream",
+            Self::Mutex(_) => "Mutex",
+            Self::MutexGuard(_) => "MutexGuard",
+            Self::Sync(s) => match &*s.borrow() {
                 SyncInner::RWMutex { .. } => "RWMutex",
                 SyncInner::WaitGroup { .. } => "WaitGroup",
                 SyncInner::Semaphore { .. } => "Semaphore",
@@ -926,51 +952,53 @@ impl Value {
                 SyncInner::TimeoutCtx { .. } => "TimeoutCtx",
                 SyncInner::Atomic { .. } => "Atomic",
             },
-            Value::SyncGuard(g) => match &*g.borrow() {
+            Self::SyncGuard(g) => match &*g.borrow() {
                 SyncGuardInner::Read { .. } => "RWMutexReadGuard",
                 SyncGuardInner::Write { .. } => "RWMutexWriteGuard",
             },
         }
     }
 
+    #[must_use]
     pub fn type_name_string(&self) -> String {
         self.type_name().to_string()
     }
 
+    #[must_use]
     pub fn is_truthy(&self) -> bool {
         match self {
-            Value::None => false,
-            Value::Bool(b) => *b,
-            Value::Num(n) => !n.is_zero(),
-            Value::Sized(s) => s.is_truthy(),
-            Value::Ptr(p) => *p != 0,
-            Value::DllHandle(_) => true,
-            Value::Text(s) => !s.is_empty(),
-            Value::List(v) => !v.borrow().is_empty(),
-            Value::Dict(d) => !d.borrow().is_empty(),
-            Value::Set(s) => !s.borrow().is_empty(),
-            Value::Tuple(t) => !t.is_empty(),
-            Value::Bytes(b) => !b.is_empty(),
-            Value::Cell(c) => c.borrow().is_truthy(),
+            Self::None => false,
+            Self::Bool(b) => *b,
+            Self::Num(n) => !n.is_zero(),
+            Self::Sized(s) => s.is_truthy(),
+            Self::Ptr(p) => *p != 0,
+            Self::DllHandle(_) => true,
+            Self::Text(s) => !s.is_empty(),
+            Self::List(v) => !v.borrow().is_empty(),
+            Self::Dict(d) => !d.borrow().is_empty(),
+            Self::Set(s) => !s.borrow().is_empty(),
+            Self::Tuple(t) => !t.is_empty(),
+            Self::Bytes(b) => !b.is_empty(),
+            Self::Cell(c) => c.borrow().is_truthy(),
             _ => true,
         }
     }
 
     pub fn display_string(&self) -> String {
         match self {
-            Value::None => "none".to_string(),
-            Value::Bool(b) => b.to_string(),
-            Value::Num(n) => n.to_string(),
-            Value::Sized(s) => s.display_string(),
-            Value::Ptr(p) => format!("ptr(0x{p:x})"),
-            Value::DllHandle(h) => format!("<DllHandle {}>", h.path),
-            Value::Text(s) => format!("\"{s}\""),
-            Value::TypeRef(n) => n.clone(),
-            Value::List(v) => {
-                let parts: Vec<_> = v.borrow().iter().map(|x| x.display_string()).collect();
+            Self::None => "none".to_string(),
+            Self::Bool(b) => b.to_string(),
+            Self::Num(n) => n.to_string(),
+            Self::Sized(s) => s.display_string(),
+            Self::Ptr(p) => format!("ptr(0x{p:x})"),
+            Self::DllHandle(h) => format!("<DllHandle {}>", h.path),
+            Self::Text(s) => format!("\"{s}\""),
+            Self::TypeRef(n) => n.clone(),
+            Self::List(v) => {
+                let parts: Vec<_> = v.borrow().iter().map(Self::display_string).collect();
                 format!("[{}]", parts.join(", "))
             }
-            Value::Dict(d) => {
+            Self::Dict(d) => {
                 let parts: Vec<_> = d
                     .borrow()
                     .iter()
@@ -978,7 +1006,7 @@ impl Value {
                     .collect();
                 format!("{{{}}}", parts.join(", "))
             }
-            Value::Set(s) => {
+            Self::Set(s) => {
                 let borrowed = s.borrow();
                 if borrowed.is_empty() {
                     "{,}".to_string()
@@ -987,15 +1015,15 @@ impl Value {
                     format!("{{{}}}", parts.join(", "))
                 }
             }
-            Value::Tuple(t) => {
-                let parts: Vec<_> = t.iter().map(|x| x.display_string()).collect();
+            Self::Tuple(t) => {
+                let parts: Vec<_> = t.iter().map(Self::display_string).collect();
                 if t.len() == 1 {
                     format!("({},)", parts[0])
                 } else {
                     format!("({})", parts.join(", "))
                 }
             }
-            Value::Bytes(b) => {
+            Self::Bytes(b) => {
                 let mut out = String::from("b\"");
                 for &byte in b.iter() {
                     match byte {
@@ -1011,14 +1039,14 @@ impl Value {
                 out.push('"');
                 out
             }
-            Value::Iterator(_) => "<iterator>".to_string(),
-            Value::Function(f) => format!("<function {}>", f.name),
-            Value::GenericFunction(g) => format!("<generic function {}>", g.name),
-            Value::Macro(m) => format!("<macro {}>", m.name),
-            Value::Dispatch(d) => format!("<friend func {}>", d.borrow().name),
-            Value::Builtin(_) => "<builtin function>".to_string(),
-            Value::Module(m) => format!("<module {}>", m.borrow().full_name),
-            Value::Struct(s) => {
+            Self::Iterator(_) => "<iterator>".to_string(),
+            Self::Function(f) => format!("<function {}>", f.name),
+            Self::GenericFunction(g) => format!("<generic function {}>", g.name),
+            Self::Macro(m) => format!("<macro {}>", m.name),
+            Self::Dispatch(d) => format!("<friend func {}>", d.borrow().name),
+            Self::Builtin(_) => "<builtin function>".to_string(),
+            Self::Module(m) => format!("<module {}>", m.borrow().full_name),
+            Self::Struct(s) => {
                 let parts: Vec<_> = s
                     .def
                     .fields
@@ -1034,9 +1062,9 @@ impl Value {
                     .collect();
                 format!("{}({})", s.def.name, parts.join(", "))
             }
-            Value::RuntimeAst(_) => "<AST>".to_string(),
-            Value::Cell(c) => c.borrow().display_string(),
-            Value::TypeSpec(spec) => {
+            Self::RuntimeAst(_) => "<AST>".to_string(),
+            Self::Cell(c) => c.borrow().display_string(),
+            Self::TypeSpec(spec) => {
                 if spec.args.is_empty() {
                     format!("\"{}\"", spec.name)
                 } else {
@@ -1048,21 +1076,21 @@ impl Value {
                     format!("{}[{}]", spec.name, inner.join(", "))
                 }
             }
-            Value::EnumMember(m) => format!(
+            Self::EnumMember(m) => format!(
                 "{}.{}",
                 m.def.name, m.def.members[m.member_index].name
             ),
-            Value::Variant(v) => format!(
+            Self::Variant(v) => format!(
                 "{}({})",
                 v.inst_name,
                 v.payload.display_string()
             ),
-            Value::Task(_) => "<Task>".to_string(),
-            Value::Channel(_) => "<Channel>".to_string(),
-            Value::Stream(_) => "<Stream>".to_string(),
-            Value::Mutex(_) => "<Mutex>".to_string(),
-            Value::MutexGuard(_) => "<MutexGuard>".to_string(),
-            Value::Sync(s) => match &*s.borrow() {
+            Self::Task(_) => "<Task>".to_string(),
+            Self::Channel(_) => "<Channel>".to_string(),
+            Self::Stream(_) => "<Stream>".to_string(),
+            Self::Mutex(_) => "<Mutex>".to_string(),
+            Self::MutexGuard(_) => "<MutexGuard>".to_string(),
+            Self::Sync(s) => match &*s.borrow() {
                 SyncInner::RWMutex { .. } => "<RWMutex>".to_string(),
                 SyncInner::WaitGroup { .. } => "<WaitGroup>".to_string(),
                 SyncInner::Semaphore { .. } => "<Semaphore>".to_string(),
@@ -1073,45 +1101,46 @@ impl Value {
                 SyncInner::TimeoutCtx { .. } => "<TimeoutCtx>".to_string(),
                 SyncInner::Atomic { .. } => "<Atomic>".to_string(),
             },
-            Value::SyncGuard(g) => match &*g.borrow() {
+            Self::SyncGuard(g) => match &*g.borrow() {
                 SyncGuardInner::Read { .. } => "<RWMutexReadGuard>".to_string(),
                 SyncGuardInner::Write { .. } => "<RWMutexWriteGuard>".to_string(),
             },
         }
     }
 
+    #[must_use]
     pub fn print_string(&self) -> String {
         match self {
-            Value::Text(s) => s.clone(),
+            Self::Text(s) => s.clone(),
             other => other.display_string(),
         }
     }
 
-    pub fn add(&self, other: &Value) -> Result<Value> {
+    pub fn add(&self, other: &Self) -> Result<Self> {
         match (self, other) {
-            (Value::Num(a), Value::Num(b)) => Ok(Value::Num(add_num(a, b))),
-            (Value::Text(a), Value::Text(b)) => Ok(Value::Text(format!("{a}{b}"))),
-            (Value::List(a), Value::List(b)) => {
+            (Self::Num(a), Self::Num(b)) => Ok(Self::Num(add_num(a, b))),
+            (Self::Text(a), Self::Text(b)) => Ok(Self::Text(format!("{a}{b}"))),
+            (Self::List(a), Self::List(b)) => {
                 let mut out = a.borrow().clone();
                 out.extend(b.borrow().iter().cloned());
-                Ok(Value::List(Shared::new(out)))
+                Ok(Self::List(Shared::new(out)))
             }
-            (Value::Tuple(a), Value::Tuple(b)) => {
+            (Self::Tuple(a), Self::Tuple(b)) => {
                 let mut out = a.to_vec();
                 out.extend(b.iter().cloned());
-                Ok(Value::Tuple(Arc::from(out.into_boxed_slice())))
+                Ok(Self::Tuple(Arc::from(out.into_boxed_slice())))
             }
-            (Value::Bytes(a), Value::Bytes(b)) => {
+            (Self::Bytes(a), Self::Bytes(b)) => {
                 let mut out = a.as_ref().clone();
                 out.extend_from_slice(b.as_ref());
-                Ok(Value::Bytes(Arc::new(out)))
+                Ok(Self::Bytes(Arc::new(out)))
             }
-            (Value::Set(a), Value::Set(b)) => {
+            (Self::Set(a), Self::Set(b)) => {
                 let mut out = a.borrow().clone();
                 for k in b.borrow().iter() {
                     out.insert(k.clone());
                 }
-                Ok(Value::Set(Shared::new(out)))
+                Ok(Self::Set(Shared::new(out)))
             }
             _ => Err(RuntimeError::unsupported(format!(
                 "unsupported + between {} and {}",
@@ -1121,29 +1150,29 @@ impl Value {
         }
     }
 
-    pub fn sub(&self, other: &Value) -> Result<Value> {
+    pub fn sub(&self, other: &Self) -> Result<Self> {
         match (self, other) {
-            (Value::Num(a), Value::Num(b)) => Ok(Value::Num(sub_num(a, b))),
+            (Self::Num(a), Self::Num(b)) => Ok(Self::Num(sub_num(a, b))),
             _ => Err(RuntimeError::unsupported("unsupported - operation")),
         }
     }
 
-    pub fn mul(&self, other: &Value) -> Result<Value> {
+    pub fn mul(&self, other: &Self) -> Result<Self> {
         match (self, other) {
-            (Value::Num(a), Value::Num(b)) => Ok(Value::Num(mul_num(a, b))),
+            (Self::Num(a), Self::Num(b)) => Ok(Self::Num(mul_num(a, b))),
             _ => Err(RuntimeError::unsupported("unsupported * operation")),
         }
     }
 
-    pub fn div(&self, other: &Value) -> Result<Value> {
+    pub fn div(&self, other: &Self) -> Result<Self> {
         match (self, other) {
-            (Value::Num(a), Value::Num(b)) => {
+            (Self::Num(a), Self::Num(b)) => {
                 let rb = b.to_rational();
                 if rb.is_zero() {
                     return Err(RuntimeError::zero_div_diag());
                 }
                 let ra = a.to_rational();
-                Ok(Value::Num(Num::from_rational(ra / rb)))
+                Ok(Self::Num(Num::from_rational(ra / rb)))
             }
             _ => Err(RuntimeError::unsupported("unsupported / operation")),
         }
@@ -1159,37 +1188,38 @@ impl Value {
         rshift, rshift_num, ">>",
     }
 
-    pub fn neg(&self) -> Result<Value> {
+    pub fn neg(&self) -> Result<Self> {
         match self {
-            Value::Num(n) => Ok(Value::Num(neg_num(n))),
+            Self::Num(n) => Ok(Self::Num(neg_num(n))),
             _ => Err(RuntimeError::unsupported("unsupported unary -")),
         }
     }
 
-    pub fn invert(&self) -> Result<Value> {
+    pub fn invert(&self) -> Result<Self> {
         match self {
-            Value::Num(n) => Ok(Value::Num(invert_num(n)?)),
+            Self::Num(n) => Ok(Self::Num(invert_num(n)?)),
             _ => Err(RuntimeError::unsupported("unsupported unary ~")),
         }
     }
 
     /// `is` / `is not` 的同一性比较（非 `==`）。
-    pub fn identical(&self, other: &Value) -> bool {
+    #[must_use]
+    pub fn identical(&self, other: &Self) -> bool {
         values_identical(self, other)
     }
 
-    pub fn eq(&self, other: &Value) -> Result<bool> {
+    pub fn eq(&self, other: &Self) -> Result<bool> {
         match (self, other) {
-            (Value::None, Value::None) => Ok(true),
-            (Value::None, _) | (_, Value::None) => Ok(false),
-            (Value::Bool(a), Value::Bool(b)) => Ok(a == b),
-            (Value::Num(a), Value::Num(b)) => Ok(a.eq_num(b)),
-            (Value::Sized(a), Value::Sized(b)) => Ok(a == b),
-            (Value::Ptr(a), Value::Ptr(b)) => Ok(a == b),
-            (Value::Text(a), Value::Text(b)) => Ok(a == b),
-            (Value::TypeRef(a), Value::TypeRef(b)) => Ok(a == b),
-            (Value::TypeRef(a), Value::Text(b)) | (Value::Text(b), Value::TypeRef(a)) => Ok(a == b),
-            (Value::List(a), Value::List(b)) => {
+            (Self::None, Self::None) => Ok(true),
+            (Self::None, _) | (_, Self::None) => Ok(false),
+            (Self::Bool(a), Self::Bool(b)) => Ok(a == b),
+            (Self::Num(a), Self::Num(b)) => Ok(a.eq_num(b)),
+            (Self::Sized(a), Self::Sized(b)) => Ok(a == b),
+            (Self::Ptr(a), Self::Ptr(b)) => Ok(a == b),
+            (Self::Text(a), Self::Text(b)) => Ok(a == b),
+            (Self::TypeRef(a), Self::TypeRef(b)) => Ok(a == b),
+            (Self::TypeRef(a), Self::Text(b)) | (Self::Text(b), Self::TypeRef(a)) => Ok(a == b),
+            (Self::List(a), Self::List(b)) => {
                 let aa = a.borrow();
                 let bb = b.borrow();
                 if aa.len() != bb.len() {
@@ -1202,7 +1232,7 @@ impl Value {
                 }
                 Ok(true)
             }
-            (Value::Dict(a), Value::Dict(b)) => {
+            (Self::Dict(a), Self::Dict(b)) => {
                 let aa = a.borrow();
                 let bb = b.borrow();
                 if aa.len() != bb.len() {
@@ -1216,7 +1246,7 @@ impl Value {
                 }
                 Ok(true)
             }
-            (Value::Set(a), Value::Set(b)) => {
+            (Self::Set(a), Self::Set(b)) => {
                 let aa = a.borrow();
                 let bb = b.borrow();
                 if aa.len() != bb.len() {
@@ -1225,7 +1255,7 @@ impl Value {
                 let ok = aa.iter().all(|k| bb.contains(k));
                 Ok(ok)
             }
-            (Value::Tuple(a), Value::Tuple(b)) => {
+            (Self::Tuple(a), Self::Tuple(b)) => {
                 if a.len() != b.len() {
                     return Ok(false);
                 }
@@ -1236,30 +1266,30 @@ impl Value {
                 }
                 Ok(true)
             }
-            (Value::Bytes(a), Value::Bytes(b)) => Ok(a.as_ref() == b.as_ref()),
-            (Value::Struct(a), Value::Struct(b)) => Ok(Arc::ptr_eq(a, b)),
-            (Value::Iterator(a), Value::Iterator(b)) => Ok(Shared::ptr_eq(a, b)),
-            (Value::RuntimeAst(a), Value::RuntimeAst(b)) => Ok(Arc::ptr_eq(a, b)),
-            (Value::Dispatch(a), Value::Dispatch(b)) => Ok(Shared::ptr_eq(a, b)),
-            (Value::Macro(a), Value::Macro(b)) => Ok(Arc::ptr_eq(a, b)),
-            (Value::Cell(a), Value::Cell(b)) => Ok(Shared::ptr_eq(a, b)),
-            (Value::Task(a), Value::Task(b)) => Ok(Shared::ptr_eq(a, b)),
-            (Value::Channel(a), Value::Channel(b)) => Ok(Shared::ptr_eq(a, b)),
-            (Value::Stream(a), Value::Stream(b)) => Ok(Shared::ptr_eq(a, b)),
-            (Value::Mutex(a), Value::Mutex(b)) => Ok(Shared::ptr_eq(a, b)),
-            (Value::MutexGuard(a), Value::MutexGuard(b)) => Ok(Shared::ptr_eq(a, b)),
-            (Value::Sync(a), Value::Sync(b)) => Ok(Shared::ptr_eq(a, b)),
-            (Value::SyncGuard(a), Value::SyncGuard(b)) => Ok(Shared::ptr_eq(a, b)),
-            (Value::TypeSpec(a), Value::TypeSpec(b)) => {
+            (Self::Bytes(a), Self::Bytes(b)) => Ok(a.as_ref() == b.as_ref()),
+            (Self::Struct(a), Self::Struct(b)) => Ok(Arc::ptr_eq(a, b)),
+            (Self::Iterator(a), Self::Iterator(b)) => Ok(Shared::ptr_eq(a, b)),
+            (Self::RuntimeAst(a), Self::RuntimeAst(b)) => Ok(Arc::ptr_eq(a, b)),
+            (Self::Dispatch(a), Self::Dispatch(b)) => Ok(Shared::ptr_eq(a, b)),
+            (Self::Macro(a), Self::Macro(b)) => Ok(Arc::ptr_eq(a, b)),
+            (Self::Cell(a), Self::Cell(b)) => Ok(Shared::ptr_eq(a, b)),
+            (Self::Task(a), Self::Task(b)) => Ok(Shared::ptr_eq(a, b)),
+            (Self::Channel(a), Self::Channel(b)) => Ok(Shared::ptr_eq(a, b)),
+            (Self::Stream(a), Self::Stream(b)) => Ok(Shared::ptr_eq(a, b)),
+            (Self::Mutex(a), Self::Mutex(b)) => Ok(Shared::ptr_eq(a, b)),
+            (Self::MutexGuard(a), Self::MutexGuard(b)) => Ok(Shared::ptr_eq(a, b)),
+            (Self::Sync(a), Self::Sync(b)) => Ok(Shared::ptr_eq(a, b)),
+            (Self::SyncGuard(a), Self::SyncGuard(b)) => Ok(Shared::ptr_eq(a, b)),
+            (Self::TypeSpec(a), Self::TypeSpec(b)) => {
                 Ok(a.as_ref() == b.as_ref())
             }
-            (Value::EnumMember(a), Value::EnumMember(b)) => {
+            (Self::EnumMember(a), Self::EnumMember(b)) => {
                 Ok(Arc::ptr_eq(&a.def, &b.def) && a.member_index == b.member_index)
             }
-            (Value::EnumMember(m), Value::Num(n)) | (Value::Num(n), Value::EnumMember(m)) => {
+            (Self::EnumMember(m), Self::Num(n)) | (Self::Num(n), Self::EnumMember(m)) => {
                 Ok(crate::enum_variant::enum_member_numeric_value(m).eq_num(n))
             }
-            (Value::Variant(a), Value::Variant(b)) => Ok(Arc::ptr_eq(a, b)),
+            (Self::Variant(a), Self::Variant(b)) => Ok(Arc::ptr_eq(a, b)),
             _ => Err(RuntimeError::unsupported(format!(
                 "unsupported == between {} and {}",
                 self.type_name(),
@@ -1270,6 +1300,7 @@ impl Value {
 }
 
 /// `is` / `is not` 的同一性比较。
+#[must_use]
 pub fn values_identical(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::None, Value::None) => true,
@@ -1309,9 +1340,7 @@ pub fn values_identical(a: &Value, b: &Value) -> bool {
 fn add_num(a: &Num, b: &Num) -> Num {
     match (a, b) {
         (Num::Small(x), Num::Small(y)) => x
-            .checked_add(*y)
-            .map(Num::Small)
-            .unwrap_or_else(|| Num::from_bigint(BigInt::from(*x) + BigInt::from(*y))),
+            .checked_add(*y).map_or_else(|| Num::from_bigint(BigInt::from(*x) + BigInt::from(*y)), Num::Small),
         (Num::Int(x), Num::Int(y)) => Num::from_bigint(x.as_ref() + y.as_ref()),
         (Num::Small(x), Num::Int(y)) => match y.to_i64() {
             Some(yi) => add_num(&Num::Small(*x), &Num::Small(yi)),
@@ -1331,9 +1360,7 @@ fn add_num(a: &Num, b: &Num) -> Num {
 fn sub_num(a: &Num, b: &Num) -> Num {
     match (a, b) {
         (Num::Small(x), Num::Small(y)) => x
-            .checked_sub(*y)
-            .map(Num::Small)
-            .unwrap_or_else(|| Num::from_bigint(BigInt::from(*x) - BigInt::from(*y))),
+            .checked_sub(*y).map_or_else(|| Num::from_bigint(BigInt::from(*x) - BigInt::from(*y)), Num::Small),
         (Num::Int(x), Num::Int(y)) => Num::from_bigint(x.as_ref() - y.as_ref()),
         (Num::Small(x), Num::Int(y)) => match y.to_i64() {
             Some(yi) => sub_num(&Num::Small(*x), &Num::Small(yi)),
@@ -1353,9 +1380,7 @@ fn sub_num(a: &Num, b: &Num) -> Num {
 fn mul_num(a: &Num, b: &Num) -> Num {
     match (a, b) {
         (Num::Small(x), Num::Small(y)) => x
-            .checked_mul(*y)
-            .map(Num::Small)
-            .unwrap_or_else(|| Num::from_bigint(BigInt::from(*x) * BigInt::from(*y))),
+            .checked_mul(*y).map_or_else(|| Num::from_bigint(BigInt::from(*x) * BigInt::from(*y)), Num::Small),
         (Num::Int(x), Num::Int(y)) => Num::from_bigint(x.as_ref() * y.as_ref()),
         (Num::Small(x), Num::Int(y)) => match y.to_i64() {
             Some(yi) => mul_num(&Num::Small(*x), &Num::Small(yi)),
@@ -1375,7 +1400,7 @@ fn pow_num(base: &Num, exp: &Num) -> Result<Num> {
     if exp_r.denom() == &One::one() {
         let e = exp_r.numer();
         if e.is_negative() {
-            let pos = Num::from_bigint((-e).clone());
+            let pos = Num::from_bigint(-e );
             let powered = pow_num(base, &pos)?;
             if powered.is_zero() {
                 return Err(RuntimeError::zero_div("0.0 cannot be raised to a negative power"));
@@ -1506,28 +1531,32 @@ fn parse_decimal_plain(text: &str) -> Result<BigRational> {
 }
 
 impl IteratorState {
-    pub fn from_range(start: i64, stop: i64, step: i64) -> Self {
+    #[must_use]
+    pub const fn from_range(start: i64, stop: i64, stride: i64) -> Self {
         Self {
             kind: IteratorKind::Range {
                 current: start,
                 stop,
-                step,
+                step: stride,
             },
         }
     }
 
-    pub fn from_list(items: Vec<Value>) -> Self {
+    #[must_use]
+    pub const fn from_list(items: Vec<Value>) -> Self {
         Self {
             kind: IteratorKind::List { items, index: 0 },
         }
     }
 
-    pub fn from_zip(children: Vec<Shared<IteratorState>>) -> Self {
+    #[must_use]
+    pub const fn from_zip(children: Vec<Shared<Self>>) -> Self {
         Self {
             kind: IteratorKind::Zip { children },
         }
     }
 
+    #[must_use]
     pub fn into_value(self) -> Value {
         Value::Iterator(Shared::new(self))
     }
@@ -1724,7 +1753,7 @@ pub fn value_to_iterable(v: &Value) -> crate::Result<IteratorState> {
         }
         Value::Bytes(b) => Ok(IteratorState::from_list(
             b.iter()
-                .map(|&byte| Value::Num(Num::Small(byte as i64)))
+                .map(|&byte| Value::Num(Num::Small(i64::from(byte))))
                 .collect(),
         )),
         Value::Text(s) => Ok(IteratorState::from_list(
@@ -1761,6 +1790,7 @@ pub fn value_to_iterable(v: &Value) -> crate::Result<IteratorState> {
     }
 }
 
+#[must_use]
 pub fn value_key_to_value(k: &ValueKey) -> Value {
     match k {
         ValueKey::Bool(b) => Value::Bool(*b),
@@ -1801,12 +1831,12 @@ pub fn hash_value(v: &Value) -> crate::Result<i64> {
         Value::Bytes(b) => {
             let mut h: i64 = 0;
             for &byte in b.iter() {
-                h = h.wrapping_mul(31).wrapping_add(byte as i64);
+                h = h.wrapping_mul(31).wrapping_add(i64::from(byte));
             }
             Ok(h)
         }
         Value::Tuple(t) => {
-            let mut h: i64 = 0x9e3779b9;
+            let mut h: i64 = 0x9e37_79b9;
             for elem in t.iter() {
                 h = h.wrapping_mul(31).wrapping_add(hash_value(elem)?);
             }
@@ -1844,8 +1874,9 @@ impl fmt::Display for Value {
 }
 
 /// 将值切片转为空格分隔的显示文本，供 `print`/`eprint` 等使用。
+#[must_use]
 pub fn args_join_space(args: &[Value]) -> String {
-    args.iter().map(|v| v.print_string()).collect::<Vec<_>>().join(" ")
+    args.iter().map(Value::print_string).collect::<Vec<_>>().join(" ")
 }
 
 /// 将 `Value` 解析为 `i64`（`WaitGroup.add`、`range`、`randint` 等共用）。

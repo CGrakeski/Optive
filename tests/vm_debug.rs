@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 use std::sync::Arc;
 
 use optive::shared::Shared;
@@ -28,10 +36,10 @@ fn debug_stops_on_entry() {
     debug::attach(&mut vm, state.clone());
     load(
         &mut vm,
-        r#"
+        r"
 x = 1
 x = x + 1
-"#,
+",
     );
     let done = vm.run_until_debug_break().expect("run");
     assert!(done.is_none(), "should pause at entry");
@@ -70,12 +78,12 @@ fn debug_breakpoint_builtin() {
     debug::attach(&mut vm, state.clone());
     load(
         &mut vm,
-        r#"
+        r"
 use std.debug.{ breakpoint }
 x = 10
 breakpoint()
 x = 20
-"#,
+",
     );
     let done = vm.run_until_debug_break().expect("run");
     assert!(done.is_none());
@@ -153,14 +161,14 @@ fn debug_function_breakpoint_once() {
     debug::attach(&mut vm, state.clone());
     load(
         &mut vm,
-        r#"
+        r"
 func foo(n) {
     x = n + 1
     y = x + 1
     return y
 }
 foo(1)
-"#,
+",
     );
     assert!(vm.run_until_debug_break().unwrap().is_none());
     assert_eq!(state.borrow().stop_reason, Some(StopReason::Breakpoint));
@@ -186,7 +194,7 @@ fn debug_finish_returns_from_call() {
     debug::attach(&mut vm, state.clone());
     load(
         &mut vm,
-        r#"
+        r"
 func inner() {
     return 7
 }
@@ -194,7 +202,7 @@ func outer() {
     return inner()
 }
 r = outer()
-"#,
+",
     );
     assert!(vm.run_until_debug_break().unwrap().is_none());
     assert_eq!(state.borrow().stop_reason, Some(StopReason::Breakpoint));
@@ -253,7 +261,7 @@ fn debug_line_breakpoint_refires_each_loop_iteration() {
     });
     // 在累加行下断；循环每一轮都应再次停住
     state.borrow_mut().add_line_breakpoint("", 5);
-    debug::attach(&mut vm, state.clone());
+    debug::attach(&mut vm, state);
     load(
         &mut vm,
         "total = 0\ni = 0\nloop {\n  if (i >= 3) { break }\n  total = total + i\n  i = i + 1\n}\n",
@@ -333,7 +341,7 @@ fn debug_log_breakpoint_continues() {
     state
         .borrow_mut()
         .add_line_breakpoint_ex("", 2, None, Some("x".into()));
-    debug::attach(&mut vm, state.clone());
+    debug::attach(&mut vm, state);
     load(&mut vm, "x = 9\ny = x + 1\n");
     let done = vm.run_until_debug_break().expect("run");
     assert!(done.is_some(), "log breakpoint should not stop");
@@ -383,14 +391,14 @@ fn debug_breakpoint_hits_go_task_by_default() {
     debug::attach(&mut vm, state.clone());
     load(
         &mut vm,
-        r#"
+        r"
 use std.debug.{ breakpoint }
 let t = go do {
   breakpoint()
   return 1
 }
 await t
-"#,
+",
     );
     match vm.run_until_debug_break() {
         Ok(None) => {}

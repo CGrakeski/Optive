@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 //! 验证 `file:///` 本地 Git URL 可作为依赖源（与官方 git 行为一致）。
 
 use std::fs;

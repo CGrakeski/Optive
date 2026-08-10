@@ -135,6 +135,7 @@ impl fmt::Display for TokenKind {
     }
 }
 
+#[must_use]
 pub fn keyword_or_ident(text: &str) -> TokenKind {
     match text {
         "let" => TokenKind::KwLet,

@@ -14,54 +14,54 @@ pub struct CTypeDef {
     pub type_name_alts: &'static [&'static str],
 }
 
-fn abi_void() -> AbiType {
+const fn abi_void() -> AbiType {
     AbiType::Void
 }
-fn abi_bool() -> AbiType {
+const fn abi_bool() -> AbiType {
     AbiType::Bool
 }
-fn abi_i8() -> AbiType {
+const fn abi_i8() -> AbiType {
     AbiType::I8
 }
-fn abi_u8() -> AbiType {
+const fn abi_u8() -> AbiType {
     AbiType::U8
 }
-fn abi_i16() -> AbiType {
+const fn abi_i16() -> AbiType {
     AbiType::I16
 }
-fn abi_u16() -> AbiType {
+const fn abi_u16() -> AbiType {
     AbiType::U16
 }
-fn abi_i32() -> AbiType {
+const fn abi_i32() -> AbiType {
     AbiType::I32
 }
-fn abi_u32() -> AbiType {
+const fn abi_u32() -> AbiType {
     AbiType::U32
 }
-fn abi_i64() -> AbiType {
+const fn abi_i64() -> AbiType {
     AbiType::I64
 }
-fn abi_u64() -> AbiType {
+const fn abi_u64() -> AbiType {
     AbiType::U64
 }
-fn abi_isize() -> AbiType {
+const fn abi_isize() -> AbiType {
     AbiType::Isize
 }
-fn abi_usize() -> AbiType {
+const fn abi_usize() -> AbiType {
     AbiType::Usize
 }
-fn abi_f32() -> AbiType {
+const fn abi_f32() -> AbiType {
     AbiType::F32
 }
-fn abi_f64() -> AbiType {
+const fn abi_f64() -> AbiType {
     AbiType::F64
 }
-fn abi_ptr() -> AbiType {
+const fn abi_ptr() -> AbiType {
     AbiType::Pointer
 }
 
 /// Windows LLP64：`long` / `unsigned long` 为 32 位；其余平台随指针宽。
-fn abi_host_long() -> AbiType {
+const fn abi_host_long() -> AbiType {
     if cfg!(all(windows, target_pointer_width = "64")) {
         AbiType::I32
     } else {
@@ -69,7 +69,7 @@ fn abi_host_long() -> AbiType {
     }
 }
 
-fn abi_host_ulong() -> AbiType {
+const fn abi_host_ulong() -> AbiType {
     if cfg!(all(windows, target_pointer_width = "64")) {
         AbiType::U32
     } else {
@@ -283,11 +283,11 @@ pub static C_TYPES: &[CTypeDef] = &[
     },
 ];
 
-fn abi_char_ptr() -> AbiType {
+const fn abi_char_ptr() -> AbiType {
     AbiType::CharPtr
 }
 
-fn abi_wchar_ptr() -> AbiType {
+const fn abi_wchar_ptr() -> AbiType {
     AbiType::WCharPtr
 }
 
@@ -316,12 +316,14 @@ static LANG_ABI_NAMES: &[LangAbiEntry] = &[
 ];
 
 impl CTypeDef {
+    #[must_use]
     pub fn full_name(&self) -> String {
         format!("C.types.{}", self.c_name)
     }
 }
 
 /// 按类型名解析到表项（接受 `int` / `C.types.int` / alt / export alias）。
+#[must_use]
 pub fn lookup_c_type(name: &str) -> Option<&'static CTypeDef> {
     let bare = name.strip_prefix("C.types.").unwrap_or(name);
     C_TYPES.iter().find(|e| {
@@ -339,7 +341,8 @@ pub fn abi_from_type_name(name: &str) -> Option<AbiType> {
     lookup_c_type(name).map(|e| (e.abi)())
 }
 
-/// 所有应安装 `__convert__` 的 `C.types.*` 全名（含 type_name_alts）。
+/// 所有应安装 `__convert__` 的 `C.types.*` 全名（含 `type_name_alts`）。
+#[must_use]
 pub fn all_c_type_convert_names() -> Vec<String> {
     let mut out = Vec::new();
     for e in C_TYPES {

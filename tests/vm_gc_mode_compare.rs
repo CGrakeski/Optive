@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 //! STW vs concurrent GC 对照：分配风暴 + 后台 spinner（与素数基准无关）。
 //!
 //! 正确性：`cargo test --test vm_gc_mode_compare`
@@ -16,7 +24,7 @@ use optive::vm::Vm;
 /// 返回值 = 分配风暴期间的 spinner 推进量。
 fn storm_src(spinners: usize, allocs: usize) -> String {
     format!(
-        r#"
+        r"
 let progress = Mutex(0)
 let done = Mutex(false)
 func spinner() {{
@@ -49,9 +57,7 @@ for (t in spinners) {{
     await t
 }}
 during
-"#,
-        spinners = spinners,
-        allocs = allocs,
+",
     )
 }
 

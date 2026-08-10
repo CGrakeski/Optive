@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::{assert_num, assert_text, parse_ok, run_err};
@@ -5,7 +13,7 @@ use common::{assert_num, assert_text, parse_ok, run_err};
 #[test]
 fn parse_protocol_and_generic_func() {
     parse_ok(
-        r#"
+        r"
 protocol Multiplyable {
     func __mul__(self, other) ...
 }
@@ -14,14 +22,14 @@ func a[T: Multiplyable](x: T) -> T {
     print(T.__name__)
     return x * x
 }
-"#,
+",
     );
 }
 
 #[test]
 fn generic_func_explicit_type_args() {
     assert_num(
-        r#"
+        r"
 protocol Multiplyable {
     func __mul__(self, other) { }
 }
@@ -31,7 +39,7 @@ func a[T: Multiplyable](x: T) -> T {
 }
 
 a[num](5)
-"#,
+",
         "25",
     );
 }
@@ -60,7 +68,7 @@ a[num](5)
 #[test]
 fn generic_func_inferred_type_args() {
     assert_num(
-        r#"
+        r"
 protocol Multiplyable {
     func __mul__(self, other) { }
 }
@@ -70,7 +78,7 @@ func a[T: Multiplyable](x: T) -> T {
 }
 
 a(5)
-"#,
+",
         "25",
     );
 }
@@ -92,7 +100,7 @@ if (__package__ == "__main__") {
 #[test]
 fn protocol_field_requirement() {
     assert_num(
-        r#"
+        r"
 protocol HasA {
     var a
 }
@@ -107,7 +115,7 @@ func f[T: HasA](x: T) -> num {
 }
 
 f(S(3))
-"#,
+",
         "9",
     );
 }
@@ -115,7 +123,7 @@ f(S(3))
 #[test]
 fn generic_bound_rejected_at_call_site() {
     run_err(
-        r#"
+        r"
 protocol Multiplyable {
     func __mul__(self, other) { }
 }
@@ -129,30 +137,30 @@ func a[T: Multiplyable](x: T) -> T {
 }
 
 a[Plain](Plain(1))
-"#,
+",
     );
 }
 
 #[test]
 fn parse_protocol_field_var() {
     parse_ok(
-        r#"
+        r"
 protocol A {
     var a
 }
-"#,
+",
     );
 }
 
 #[test]
 fn generic_func_return_wrapper_substitutes_type_param() {
     assert_num(
-        r#"
+        r"
 func a[T](b: T) -> T : T.(_) {
     return b
 }
 a(1)
-"#,
+",
         "1",
     );
 }
@@ -160,21 +168,21 @@ a(1)
 #[test]
 fn generic_func_return_type_param_as_value() {
     assert_text(
-        r#"
+        r"
 func a[T](b: T) {
     return T
 }
 type(a(1))
-"#,
+",
         "type",
     );
     assert_text(
-        r#"
+        r"
 func a[T](b: T) {
     return T
 }
 text(a(1))
-"#,
+",
         "num",
     );
 }

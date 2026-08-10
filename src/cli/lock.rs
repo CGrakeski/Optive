@@ -37,7 +37,7 @@ pub struct LockEdge {
 }
 
 impl LockFile {
-    pub fn new(edges: Vec<LockEdge>) -> Self {
+    pub const fn new(edges: Vec<LockEdge>) -> Self {
         Self { version: 1, edges }
     }
 
@@ -48,7 +48,7 @@ impl LockFile {
         let text = fs::read_to_string(path).map_err(|e| {
             format!("cannot read {}: {e}", path.display())
         })?;
-        let lock: LockFile = toml::from_str(&text).map_err(|e| {
+        let lock: Self = toml::from_str(&text).map_err(|e| {
             format!("invalid {}: {e}", path.display())
         })?;
         if lock.version != 1 {

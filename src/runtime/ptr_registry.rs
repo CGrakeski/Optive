@@ -52,13 +52,15 @@ pub fn lookup(addr: usize) -> Option<PtrEntry> {
     REGISTRY.lock().get(&addr).cloned()
 }
 
-/// 是否在登记表中（Owned 或 ForeignUnsafe）—— peek 门槛。
+/// 是否在登记表中（Owned 或 `ForeignUnsafe`）—— peek 门槛。
+#[must_use]
 pub fn is_registered(addr: usize) -> bool {
     lookup(addr).is_some()
 }
 
 /// Optive 分配器意义上的「活」：由 `C.alloc*` 分配且尚未 `free`。
 /// **不含** `C.unsafe_ptr` 外来指针；**不**探测 OS 堆悬垂。
+#[must_use]
 pub fn is_live(addr: usize) -> bool {
     matches!(lookup(addr), Some(e) if e.kind == PtrKind::Owned)
 }
@@ -119,6 +121,7 @@ pub fn scalar_stride(type_name: &str) -> Result<usize> {
     Ok(sz)
 }
 
+#[must_use]
 pub fn is_ptr_type_name(name: &str) -> bool {
     matches!(
         name,
@@ -127,6 +130,7 @@ pub fn is_ptr_type_name(name: &str) -> bool {
 }
 
 /// 从 TypeSpec/注解名取出 pointee（`ptr` / `C.types.ptr` + 单参）。
+#[must_use]
 pub fn pointee_from_generic(name: &str, params: &[Value]) -> Option<String> {
     if !is_ptr_type_name(name) || params.len() != 1 {
         return None;
@@ -185,6 +189,7 @@ pub fn free_owned(addr: usize) -> Result<()> {
 }
 
 /// 仅移除登记（不 `dealloc`）。外来指针测毕或误登记时用。
+#[must_use]
 pub fn unregister_only(addr: usize) -> bool {
     unregister(addr).is_some()
 }

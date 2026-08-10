@@ -8,6 +8,7 @@ use crate::vm::ErrorStackFrame;
 const CONTEXT_LINES: usize = 2;
 
 /// 格式化语法错误：源码上下文 + 插入符行。
+#[must_use]
 pub fn format_parse_error(source: &str, file: &str, err: &ParseError) -> String {
     let ParseError::Message {
         line,
@@ -18,6 +19,7 @@ pub fn format_parse_error(source: &str, file: &str, err: &ParseError) -> String 
 }
 
 /// 格式化词法错误：源码上下文 + 插入符行。
+#[must_use]
 pub fn format_lex_error(source: &str, file: &str, err: &LexError) -> String {
     let LexError::Message {
         line,
@@ -47,6 +49,7 @@ fn format_located_error(
 }
 
 /// 在已知行号时，带源码上下文格式化运行时错误。
+#[must_use]
 pub fn format_runtime_at_line(source: &str, file: &str, line: usize, message: &str) -> String {
     let pack = crate::custom::active_pack();
     format_source_error(
@@ -61,6 +64,7 @@ pub fn format_runtime_at_line(source: &str, file: &str, line: usize, message: &s
 }
 
 /// 带调用栈与各帧源码上下文的运行时错误。
+#[must_use]
 pub fn format_runtime_with_stack(
     fallback_source: &str,
     fallback_file: &str,
@@ -189,7 +193,7 @@ fn format_source_error(
     out
 }
 
-fn char_display_width(ch: char) -> usize {
+const fn char_display_width(ch: char) -> usize {
     if ch == '\t' { 4 } else { 1 }
 }
 
@@ -324,7 +328,7 @@ mod tests {
         let msg = format_parse_error(src, "<repl>", &err);
         assert!(msg.contains("error: expected ')'"));
         assert!(msg.contains("--> <repl>:2:15"));
-        assert!(msg.contains("^"));
+        assert!(msg.contains('^'));
         assert!(msg.contains("return fib(n-1)"));
     }
 

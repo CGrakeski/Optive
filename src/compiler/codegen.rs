@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 
-use crate::ast::*;
+use crate::ast::{Expr, Block, Stmt, LValue, ExprKind, FuncParam, CallArg, Program, Visibility, LocatedStmt, DelTarget, CatchClause, CatchPattern, MatchCase, Pattern, PatternElem, EnumMemberDecl, EnumMethodDecl, ModuleRef, FStringPart, VariantCaseDecl, RET_WRAPPER_VAL, MacroParam, MacroCallArg, UnaryOp, BinaryOp, ForItem, SourceLoc, SelectCase, DestructPattern, DestructElem};
 use crate::error::RuntimeError;
 use crate::free_vars;
 use crate::opcode::{Codegen, CompiledProgram, FunctionObject, GenericFunctionTemplate, Instruction, MacroObject};
@@ -18,11 +18,10 @@ use crate::shared::Shared;
 
 fn is_c_layout_annotation(ty: &Expr) -> bool {
     static_type_value_from_expr(ty)
-        .map(|v| {
+        .is_some_and(|v| {
             let s = type_value_display(&v);
             s == "C.layout" || s.ends_with(".C.layout")
         })
-        .unwrap_or(false)
 }
 
 fn collect_assigned_names(body: &Block, out: &mut HashSet<String>) {
@@ -85,6 +84,7 @@ fn collect_assigned_names(body: &Block, out: &mut HashSet<String>) {
     }
 }
 
+#[derive(Clone, Copy)]
 enum CompKind {
     List,
     Set,
@@ -123,7 +123,7 @@ pub struct Generator {
     captured_names: HashSet<String>,
     current_return_wrapper: Option<Expr>,
     /// 正在编译生成器函数体（`yield` / `return expr` 语义不同）。
-    compiling_generator: bool,
+    yielding: bool,
 }
 
 struct CompileFnExtras<'a> {
@@ -135,6 +135,7 @@ struct CompileFnExtras<'a> {
 }
 
 impl Generator {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             cg: Codegen::new(),
@@ -156,7 +157,7 @@ impl Generator {
             block_depth: 0,
             captured_names: HashSet::new(),
             current_return_wrapper: None,
-            compiling_generator: false,
+            yielding: false,
         }
     }
 
@@ -254,13 +255,12 @@ impl Generator {
         self.program
             .functions
             .get(name)
-            .map(|f| {
+            .is_some_and(|f| {
                 f.variadic_param_index.is_some()
                     || f.kwvariadic_param_index.is_some()
-                    || f.defaults.iter().any(|d| d.is_some())
+                    || f.defaults.iter().any(std::option::Option::is_some)
                     || f.params.iter().any(|p| p.default_expr.is_some())
             })
-            .unwrap_or(false)
     }
 
     fn emit_function_value_with_defaults(
@@ -318,7 +318,7 @@ impl Generator {
         Ok(())
     }
 
-    /// 生成位置参数列表与关键字参数字典（栈：args_list, kwargs_dict）。
+    /// `生成位置参数列表与关键字参数字典（栈：args_list`, `kwargs_dict`）。
     fn gen_call_args_and_kwargs(&mut self, args: &[CallArg]) -> Result<()> {
         self.cg.emit(Instruction::VecNew(0));
         self.cg.emit(Instruction::DictNew(0));
@@ -371,7 +371,7 @@ impl Generator {
     }
 
     /// 外层作用域里可作为闭包捕获的词法局部（含已捕获进来的名字）。
-    /// 模块级 / 全局绑定不应进 `__make_closure__`，应在内层用 LoadGlobal 解析。
+    /// 模块级 / 全局绑定不应进 `__make_closure__`，应在内层用 `LoadGlobal` 解析。
     fn is_enclosing_local(&self, name: &str) -> bool {
         self.local_slots
             .as_ref()
@@ -588,19 +588,22 @@ impl Generator {
                 if f.module_env.is_some() {
                     continue;
                 }
-                let replacement = if let Some(u) = functions.get(&f.name) {
-                    if u.module_env.is_some() {
-                        u.clone()
-                    } else {
-                        let mut func = (**u).clone();
+                let replacement = functions.get(&f.name).map_or_else(
+                    || {
+                        let mut func = (**f).clone();
                         func.module_env = Some(env.clone());
                         Arc::new(func)
-                    }
-                } else {
-                    let mut func = (**f).clone();
-                    func.module_env = Some(env.clone());
-                    Arc::new(func)
-                };
+                    },
+                    |u| {
+                        if u.module_env.is_some() {
+                            u.clone()
+                        } else {
+                            let mut func = (**u).clone();
+                            func.module_env = Some(env.clone());
+                            Arc::new(func)
+                        }
+                    },
+                );
                 *ins = Instruction::Push(Value::Function(replacement));
                 changed = true;
             }
@@ -677,7 +680,7 @@ impl Generator {
         Ok(())
     }
 
-    fn field_strict(typed: bool, type_strong: bool, type_expr: &Option<Expr>) -> bool {
+    const fn field_strict(typed: bool, type_strong: bool, type_expr: Option<&Expr>) -> bool {
         type_expr.is_some() && (type_strong || typed)
     }
 
@@ -950,7 +953,7 @@ impl Generator {
                 self.maybe_register_export(*visibility, name, top_level);
             }
             Stmt::Return(expr) => {
-                if self.compiling_generator {
+                if self.yielding {
                     // 8B：`return expr` ≡ 再 yield 一次后结束；裸 return 直接结束。
                     if let Some(e) = expr {
                         self.gen_expr(e)?;
@@ -963,7 +966,7 @@ impl Generator {
                 }
             }
             Stmt::Yield(expr) => {
-                if !self.compiling_generator {
+                if !self.yielding {
                     return Err(RuntimeError::msg(
                         "`yield` is only valid inside a generator function or do",
                     ));
@@ -976,7 +979,7 @@ impl Generator {
                 self.cg.emit(Instruction::Yield);
             }
             Stmt::YieldFrom(expr) => {
-                if !self.compiling_generator {
+                if !self.yielding {
                     return Err(RuntimeError::msg(
                         "`yield from` is only valid inside a generator function or do",
                     ));
@@ -998,7 +1001,7 @@ impl Generator {
                 elifs,
                 else_block,
             } => {
-                self.gen_if(cond, then_block, elifs, else_block, top_level)?;
+                self.gen_if(cond, then_block, elifs, else_block.as_ref(), top_level)?;
             }
             Stmt::While { cond, body } => {
                 let start = self.cg.fresh_label();
@@ -1121,7 +1124,7 @@ impl Generator {
                     .iter()
                     .map(|f| FieldTypeInfo {
                         type_expr: f.type_expr.clone(),
-                        strict: Self::field_strict(*typed, f.type_strong, &f.type_expr),
+                        strict: Self::field_strict(*typed, f.type_strong, f.type_expr.as_ref()),
                     })
                     .collect();
                 let c_layout = if let Some(layout_ty) = layout {
@@ -1159,7 +1162,7 @@ impl Generator {
                     type_params: type_params.clone(),
                     c_layout,
                 });
-                self.program.struct_defs.insert(name.clone(), def.clone());
+                self.program.struct_defs.insert(name.clone(), def);
                 for m in methods {
                     let full_name = if m.outside {
                         m.name.clone()
@@ -1167,7 +1170,7 @@ impl Generator {
                         format!("{name}.{}", m.name)
                     };
                     let mut params = m.params.clone();
-                    if !m.outside && !params.first().map(|p| p.name == "self").unwrap_or(false) {
+                    if !m.outside && params.first().is_none_or(|p| p.name != "self") {
                         params.insert(
                             0,
                             FuncParam {
@@ -1239,7 +1242,7 @@ impl Generator {
                 cases,
                 visibility,
             } => {
-                self.gen_variant_decl(name, type_params, cases, *visibility, top_level)?;
+                self.gen_variant_decl(name, type_params, cases, *visibility, top_level);
             }
             Stmt::Import {
                 path,
@@ -1269,7 +1272,7 @@ impl Generator {
             }
             Stmt::Use { module, items } => {
                 let temp = self.cg.fresh_temp("__use_mod");
-                self.emit_load_module_ref(module)?;
+                self.emit_load_module_ref(module);
                 self.emit_store_temp(&temp);
                 for item in items {
                     self.emit_load_temp(&temp);
@@ -1401,7 +1404,7 @@ impl Generator {
         cond: &Expr,
         then_block: &Block,
         elifs: &[(Expr, Block)],
-        else_block: &Option<Block>,
+        else_block: Option<&Block>,
         as_value: bool,
     ) -> Result<()> {
         let end = self.cg.fresh_label();
@@ -1589,17 +1592,17 @@ impl Generator {
     ) -> Result<()> {
         match pattern {
             Pattern::Value(expr) => {
-                self.emit_load_match_at(temp, path)?;
+                self.emit_load_match_at(temp, path);
                 self.gen_expr(expr)?;
                 self.cg.emit(Instruction::MatchEq);
                 self.cg.emit(Instruction::GotoIfNot(fail_label));
             }
             Pattern::Bind(_) => {}
             Pattern::List(elems) | Pattern::Tuple(elems) => {
-                self.emit_load_match_at(temp, path)?;
+                self.emit_load_match_at(temp, path);
                 self.cg.emit(Instruction::IsList);
                 self.cg.emit(Instruction::GotoIfNot(fail_label));
-                self.emit_load_match_at(temp, path)?;
+                self.emit_load_match_at(temp, path);
                 self.cg.emit(Instruction::ListLen);
                 self.cg
                     .emit(Instruction::PushSmall(elems.len() as i64));
@@ -1612,7 +1615,7 @@ impl Generator {
                 }
             }
             Pattern::Struct { type_name, .. } => {
-                self.emit_load_match_at(temp, path)?;
+                self.emit_load_match_at(temp, path);
                 self.cg.emit(Instruction::IsInstance(type_name.clone()));
                 self.cg.emit(Instruction::GotoIfNot(fail_label));
             }
@@ -1635,7 +1638,7 @@ impl Generator {
         fail_label: usize,
     ) -> Result<()> {
         if self.program.variant_defs.contains_key(type_name) {
-            self.emit_load_match_at(temp, path)?;
+            self.emit_load_match_at(temp, path);
             self.cg
                 .emit(Instruction::Push(Value::type_ref(type_name.to_string())));
             self.cg.emit(Instruction::Load("__variant_is__".into()));
@@ -1643,7 +1646,7 @@ impl Generator {
             self.cg.emit(Instruction::GotoIfNot(fail_label));
             if let Some(inner) = args.first() {
                 let payload_temp = self.cg.fresh_temp("__variant_payload");
-                self.emit_load_match_at(temp, path)?;
+                self.emit_load_match_at(temp, path);
                 self.cg.emit(Instruction::Load("__variant_payload__".into()));
                 self.cg.emit(Instruction::Call { argc: 1 });
                 self.emit_store_temp(&payload_temp);
@@ -1651,7 +1654,7 @@ impl Generator {
             }
             return Ok(());
         }
-        self.emit_load_match_at(temp, path)?;
+        self.emit_load_match_at(temp, path);
         self.cg
             .emit(Instruction::IsInstance(type_name.to_string()));
         self.cg.emit(Instruction::GotoIfNot(fail_label));
@@ -1666,7 +1669,7 @@ impl Generator {
                     other => {
                         let fname = &field_names[i];
                         let field_temp = self.cg.fresh_temp("__match_field");
-                        self.emit_load_match_at(temp, path)?;
+                        self.emit_load_match_at(temp, path);
                         self.cg.emit(Instruction::GetAttr(fname.clone()));
                         self.emit_store_temp(&field_temp);
                         self.gen_match_pattern_test(&field_temp, other, &[], fail_label)?;
@@ -1690,7 +1693,7 @@ impl Generator {
             PatternElem::Bind(_) => Ok(()),
             PatternElem::Nested(pat) => self.gen_match_pattern_test(temp, pat, path, fail_label),
             PatternElem::Value(expr) => {
-                self.emit_load_match_at(temp, path)?;
+                self.emit_load_match_at(temp, path);
                 self.gen_expr(expr)?;
                 self.cg.emit(Instruction::MatchEq);
                 self.cg.emit(Instruction::GotoIfNot(fail_label));
@@ -1707,7 +1710,7 @@ impl Generator {
     ) -> Result<()> {
         match pattern {
             Pattern::Bind(name) => {
-                self.emit_load_match_at(temp, path)?;
+                self.emit_load_match_at(temp, path);
                 self.emit_bind_name(name);
             }
             Pattern::List(elems) | Pattern::Tuple(elems) => {
@@ -1719,7 +1722,7 @@ impl Generator {
             }
             Pattern::Struct { fields, .. } => {
                 for field in fields {
-                    self.emit_load_match_at(temp, path)?;
+                    self.emit_load_match_at(temp, path);
                     self.cg.emit(Instruction::GetAttr(field.clone()));
                     self.emit_bind_name(field);
                 }
@@ -1731,7 +1734,7 @@ impl Generator {
                 if self.program.variant_defs.contains_key(type_name) {
                     if let Some(inner) = args.first() {
                         let payload_temp = self.cg.fresh_temp("__variant_payload");
-                        self.emit_load_match_at(temp, path)?;
+                        self.emit_load_match_at(temp, path);
                         self.cg.emit(Instruction::Load("__variant_payload__".into()));
                         self.cg.emit(Instruction::Call { argc: 1 });
                         self.emit_store_temp(&payload_temp);
@@ -1746,13 +1749,13 @@ impl Generator {
                         let fname = &field_names[i];
                         match arg {
                             Pattern::Bind(bind_name) => {
-                                self.emit_load_match_at(temp, path)?;
+                                self.emit_load_match_at(temp, path);
                                 self.cg.emit(Instruction::GetAttr(fname.clone()));
                                 self.emit_bind_name(bind_name);
                             }
                             other => {
                                 let field_temp = self.cg.fresh_temp("__match_field");
-                                self.emit_load_match_at(temp, path)?;
+                                self.emit_load_match_at(temp, path);
                                 self.cg.emit(Instruction::GetAttr(fname.clone()));
                                 self.emit_store_temp(&field_temp);
                                 self.gen_match_pattern_bindings(&field_temp, other, &[])?;
@@ -1853,7 +1856,7 @@ impl Generator {
         Ok(())
     }
 
-    fn emit_load_module_ref(&mut self, module: &ModuleRef) -> Result<()> {
+    fn emit_load_module_ref(&mut self, module: &ModuleRef) {
         match module {
             ModuleRef::Qualified(parts) => {
                 self.cg.emit(Instruction::FindMod(parts.join(".")));
@@ -1866,7 +1869,6 @@ impl Generator {
                 }
             }
         }
-        Ok(())
     }
 
     fn gen_fstring(&mut self, parts: &[FStringPart]) -> Result<()> {
@@ -1902,7 +1904,7 @@ impl Generator {
         cases: &[VariantCaseDecl],
         visibility: Visibility,
         top_level: bool,
-    ) -> Result<()> {
+    ) {
         let (vdef, struct_defs) =
             crate::enum_variant::build_variant_def(name, type_params.to_vec(), cases);
         self.program.variant_defs.insert(name.to_string(), vdef);
@@ -1916,7 +1918,6 @@ impl Generator {
         });
         self.emit_store_name(name);
         self.maybe_register_export(visibility, name, top_level);
-        Ok(())
     }
 
     fn gen_match_pattern_elem_bindings(
@@ -1927,7 +1928,7 @@ impl Generator {
     ) -> Result<()> {
         match elem {
             PatternElem::Bind(name) => {
-                self.emit_load_match_at(temp, path)?;
+                self.emit_load_match_at(temp, path);
                 self.emit_bind_name(name);
                 Ok(())
             }
@@ -1936,14 +1937,13 @@ impl Generator {
         }
     }
 
-    fn emit_load_match_at(&mut self, temp: &str, path: &[usize]) -> Result<()> {
+    fn emit_load_match_at(&mut self, temp: &str, path: &[usize]) {
         self.emit_load_temp(temp);
         for &idx in path {
             self.cg
                 .emit(Instruction::PushSmall(idx as i64));
             self.cg.emit(Instruction::Index);
         }
-        Ok(())
     }
 
     fn gen_block(&mut self, block: &Block, keep_last_value: bool) -> Result<()> {
@@ -1968,7 +1968,7 @@ impl Generator {
     }
 
     /// 作为「块的值」时，这些语句能把结果留在操作数栈顶。
-    fn stmt_yields_value(stmt: &Stmt) -> bool {
+    const fn stmt_yields_value(stmt: &Stmt) -> bool {
         matches!(
             stmt,
             Stmt::Expr(_)
@@ -1982,11 +1982,11 @@ impl Generator {
 
     fn fresh_subprogram(&self) -> CompiledProgram {
         let mut program = CompiledProgram::new();
-        program.struct_defs = self.program.struct_defs.clone();
-        program.enum_defs = self.program.enum_defs.clone();
-        program.variant_defs = self.program.variant_defs.clone();
-        program.protocols = self.program.protocols.clone();
-        program.generic_functions = self.program.generic_functions.clone();
+        program.struct_defs.clone_from(&self.program.struct_defs);
+        program.enum_defs.clone_from(&self.program.enum_defs);
+        program.variant_defs.clone_from(&self.program.variant_defs);
+        program.protocols.clone_from(&self.program.protocols);
+        program.generic_functions.clone_from(&self.program.generic_functions);
         program
     }
 
@@ -2013,14 +2013,14 @@ impl Generator {
             .cloned()
             .ok_or_else(|| RuntimeError::msg(format!("unknown generic function `{name}`")))?;
         let ctx = TypeCheckContext::from_program(&self.program);
-        let func = Self::specialize_generic_template(&template, type_args, &ctx, &mut self.program.functions)?;
+        let func = Self::specialize_generic_template(&template, &type_args, &ctx, &mut self.program.functions)?;
         Ok(func)
     }
 
     /// 运行时 / REPL：由模板与类型实参生成单态函数（写入 `cache`）。
     pub fn specialize_generic_template(
         template: &GenericFunctionTemplate,
-        type_args: Vec<Value>,
+        type_args: &[Value],
         ctx: &TypeCheckContext,
         cache: &mut HashMap<String, Arc<FunctionObject>>,
     ) -> Result<Arc<FunctionObject>> {
@@ -2032,7 +2032,7 @@ impl Generator {
                 type_args.len()
             )));
         }
-        let key = Self::specialization_key(&template.name, &type_args);
+        let key = Self::specialization_key(&template.name, type_args);
         if let Some(existing) = cache.get(&key) {
             return Ok(existing.clone());
         }
@@ -2041,8 +2041,8 @@ impl Generator {
                 protocol::check_type_bound_ctx(ctx, &type_args[i], b)?;
             }
         }
-        let subs = monomorph::type_substitution_map(&template.type_params, &type_args);
-        let type_names = monomorph::type_name_map(&template.type_params, &type_args);
+        let subs = monomorph::type_substitution_map(&template.type_params, type_args);
+        let type_names = monomorph::type_name_map(&template.type_params, type_args);
         let params: Vec<FuncParam> = template
             .params
             .iter()
@@ -2057,10 +2057,10 @@ impl Generator {
             .return_wrapper
             .as_ref()
             .map(|e| monomorph::substitute_expr(e, &type_names));
-        let mut gen = Generator::new();
-        gen.program.struct_defs = ctx.struct_defs.clone();
-        gen.program.protocols = ctx.protocols.clone();
-        gen.program.functions = cache.clone();
+        let mut gen = Self::new();
+        gen.program.struct_defs.clone_from(&ctx.struct_defs);
+        gen.program.protocols.clone_from(&ctx.protocols);
+        gen.program.functions.clone_from(cache);
         let func = gen.compile_function(
             &key,
             &params,
@@ -2195,7 +2195,7 @@ impl Generator {
             }
         }
         let wrapper_for_func = return_wrapper.clone();
-        let mut sub = Generator {
+        let mut sub = Self {
             cg: Codegen::new(),
             program: self.fresh_subprogram(),
             loop_break_labels: Vec::new(),
@@ -2215,7 +2215,7 @@ impl Generator {
             block_depth: 0,
             captured_names,
             current_return_wrapper: return_wrapper,
-            compiling_generator: is_generator,
+            yielding: is_generator,
         };
         for p in params {
             if let (Some(ty), true) = (&p.type_expr, p.type_strong) {
@@ -2449,7 +2449,7 @@ impl Generator {
         params: &[MacroParam],
         body: &Block,
     ) -> Result<MacroObject> {
-        let mut sub = Generator {
+        let mut sub = Self {
             cg: Codegen::new(),
             program: self.fresh_subprogram(),
             loop_break_labels: Vec::new(),
@@ -2469,7 +2469,7 @@ impl Generator {
             block_depth: 0,
             captured_names: HashSet::new(),
             current_return_wrapper: None,
-            compiling_generator: false,
+            yielding: false,
         };
         for s in body {
             sub.gen_stmt(s, false)?;
@@ -2550,11 +2550,10 @@ impl Generator {
     }
 
     /// 压入表达式的编译期冻结 AST（宏被调名、quote 体等）。
-    fn gen_frozen_ast_expr(&mut self, expr: &Expr) -> Result<()> {
+    fn gen_frozen_ast_expr(&mut self, expr: &Expr) {
         let ast = runtime_ast::ast_from_expr(expr);
         self.cg
             .emit(Instruction::Push(Value::RuntimeAst(Arc::new(ast))));
-        Ok(())
     }
 
     /// 宏体内，宏调用实参中的裸标识符在运行时指向宏参数。
@@ -2567,7 +2566,8 @@ impl Generator {
                 return Ok(());
             }
         }
-        self.gen_frozen_ast_expr(expr)
+        self.gen_frozen_ast_expr(expr);
+        Ok(())
     }
 
     fn gen_expr(&mut self, expr: &Expr) -> Result<()> {
@@ -2877,7 +2877,7 @@ impl Generator {
                         self.gen_push_macro_call_arg(arg)?;
                         self.cg.emit(Instruction::ListAppend);
                     }
-                    self.gen_frozen_ast_expr(callee)?;
+                    self.gen_frozen_ast_expr(callee);
                     self.cg
                         .emit(Instruction::Load("__ast_macro_call__".into()));
                     self.cg.emit(Instruction::Call { argc: 2 });
@@ -3041,7 +3041,7 @@ impl Generator {
             ));
         }
         let bound: HashSet<String> = items.iter().map(|i| i.name.clone()).collect();
-        self.check_par_no_shared_assign(body, &bound)?;
+        Self::check_par_no_shared_assign(body, &bound)?;
 
         let loc = items[0].iterable.loc;
         let params = vec![FuncParam {
@@ -3063,7 +3063,7 @@ impl Generator {
                 body: body.clone(),
             },
         );
-        let call = self.make_std_async_call(
+        let call = Self::make_std_async_call(
             loc,
             "par_map",
             vec![items[0].iterable.clone(), do_fn],
@@ -3086,7 +3086,7 @@ impl Generator {
                 column: e.loc.column,
                 stmt: Stmt::Expr(e.clone()),
             }];
-            self.check_par_no_shared_assign(&stub, &empty)?;
+            Self::check_par_no_shared_assign(&stub, &empty)?;
         }
         let loc = exprs[0].loc;
         let go_elems: Vec<Expr> = exprs
@@ -3101,11 +3101,11 @@ impl Generator {
             })
             .collect();
         let list = Expr::new(loc, ExprKind::List(go_elems));
-        let call = self.make_std_async_call(loc, "gather", vec![list]);
+        let call = Self::make_std_async_call(loc, "gather", vec![list]);
         self.gen_expr(&call)
     }
 
-    fn make_std_async_call(&self, loc: SourceLoc, name: &str, args: Vec<Expr>) -> Expr {
+    fn make_std_async_call(loc: SourceLoc, name: &str, args: Vec<Expr>) -> Expr {
         let std_async = Expr::new(
             loc,
             ExprKind::Member {
@@ -3137,7 +3137,7 @@ impl Generator {
     }
 
     /// 禁止 `par` 体对封闭作用域名字赋值（裸共享可变）。
-    fn check_par_no_shared_assign(&self, body: &Block, bound: &HashSet<String>) -> Result<()> {
+    fn check_par_no_shared_assign(body: &Block, bound: &HashSet<String>) -> Result<()> {
         let mut assigned = HashSet::new();
         collect_assigned_names(body, &mut assigned);
         let free: HashSet<String> = free_vars::free_vars_in_block(body, bound)
@@ -3235,10 +3235,10 @@ impl Generator {
             self.gen_select_poll(&case.event, sleep_temps[i].as_deref())?;
             self.cg.emit(Instruction::GotoIfNot(attempt));
             if let Some(name) = &case.bind {
-                if name != "_" {
-                    self.emit_bind_name(name);
-                } else {
+                if name == "_" {
                     self.cg.emit(Instruction::Pop);
+                } else {
+                    self.emit_bind_name(name);
                 }
             } else {
                 self.cg.emit(Instruction::Pop);
@@ -3393,7 +3393,7 @@ impl Generator {
         self.cg.mark_label(start);
         self.cg.emit(Instruction::IterNext);
         self.cg.emit(Instruction::GotoIfNot(end));
-        self.gen_for_iter_bind(items)?;
+        self.gen_for_iter_bind(items);
 
         for guard in guards {
             self.gen_expr(guard)?;
@@ -3559,7 +3559,7 @@ impl Generator {
         self.cg.mark_label(start);
         self.cg.emit(Instruction::IterNext);
         self.cg.emit(Instruction::GotoIfNot(end));
-        self.gen_for_iter_bind(items)?;
+        self.gen_for_iter_bind(items);
         self.loop_break_labels.push(end);
         self.loop_continue_labels.push(start);
         self.loop_handler_depths.push(self.handler_stack.len());
@@ -3595,14 +3595,14 @@ impl Generator {
         Ok(())
     }
 
-    fn gen_for_iter_bind(&mut self, items: &[ForItem]) -> Result<()> {
+    fn gen_for_iter_bind(&mut self, items: &[ForItem]) {
         if items.len() == 1 {
             if items[0].name == "_" {
                 self.cg.emit(Instruction::Pop);
             } else {
                 self.emit_bind_name(&items[0].name);
             }
-            return Ok(());
+            return;
         }
         let tuple_name = self.cg.fresh_temp("__zip_tuple");
         self.emit_store_temp(&tuple_name);
@@ -3617,7 +3617,6 @@ impl Generator {
                 self.emit_bind_name(&item.name);
             }
         }
-        Ok(())
     }
 
     fn gen_type_convert_type_expr(&mut self, expr: &Expr) -> Result<()> {

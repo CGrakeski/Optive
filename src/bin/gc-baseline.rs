@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 //! GC 基线：对比 `stw` / `concurrent` 的停顿与总收集时间。
 //!
 //! ```text
@@ -51,7 +59,7 @@ fn run_case(
     let mut vm = Vm::with_workers_gc(workers, mode);
     let src = if with_load && workers > 1 {
         format!(
-            r#"
+            r"
 let counter = Mutex(0)
 func spinner() {{
     loop {{
@@ -79,13 +87,13 @@ for (t in spinners) {{
     handle await t
 }}
 [cleared, during]
-"#,
+",
             w = workers.saturating_mul(2),
             heap = heap
         )
     } else {
         format!(
-            r#"
+            r"
 func make_cycles(n) {{
     for (i in std.math.range(n)) {{
         let a = []
@@ -96,7 +104,7 @@ func make_cycles(n) {{
 make_cycles({heap})
 let cleared = gc()
 [cleared, 0]
-"#
+"
         )
     };
 

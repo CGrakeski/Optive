@@ -104,7 +104,7 @@ impl Default for DebugState {
 }
 
 impl DebugState {
-    pub fn request_break(&mut self, reason: StopReason) {
+    pub const fn request_break(&mut self, reason: StopReason) {
         self.pending_break = true;
         self.stop_reason = Some(reason);
     }
@@ -149,11 +149,13 @@ impl DebugState {
         self.armed_func_bp = None;
     }
 
+    #[must_use]
     pub fn is_uncaught_stop(&self) -> bool {
         self.stop_reason == Some(StopReason::Uncaught) && self.last_uncaught.is_some()
     }
 }
 
+#[must_use]
 pub fn normalize_path(p: &str) -> String {
     if p.is_empty() || p == "<test>" || p == "<script>" || p == "<dbg>" || p.starts_with('<') {
         return p.replace('\\', "/");
@@ -299,7 +301,7 @@ pub fn should_pause(vm: &mut Vm, state: &mut DebugState) -> bool {
         if matches!(state.step, Some(StepMode::Insn)) {
             state.stop_reason = Some(StopReason::Step);
             state.step = None;
-            state.last_func_name = func_name.clone();
+            state.last_func_name = func_name;
             return true;
         }
 
@@ -316,7 +318,7 @@ pub fn should_pause(vm: &mut Vm, state: &mut DebugState) -> bool {
             if hit {
                 state.stop_reason = Some(StopReason::Step);
                 state.step = None;
-                state.last_func_name = func_name.clone();
+                state.last_func_name = func_name;
                 return true;
             }
         }
@@ -339,7 +341,7 @@ pub fn should_pause(vm: &mut Vm, state: &mut DebugState) -> bool {
                     // 纯日志断点：打印后继续（若同时有条件则仍可停）
                     if cond.is_none() {
                         state.bp_skip_line = Some((file.clone(), line));
-                        state.last_func_name = func_name.clone();
+                        state.last_func_name = func_name;
                         return false;
                     }
                 }
@@ -362,7 +364,7 @@ pub fn should_pause(vm: &mut Vm, state: &mut DebugState) -> bool {
                 if cond_ok {
                     state.stop_reason = Some(StopReason::Breakpoint);
                     state.bp_skip_line = Some((file.clone(), line));
-                    state.last_func_name = func_name.clone();
+                    state.last_func_name = func_name;
                     return true;
                 }
             }
@@ -379,14 +381,14 @@ pub fn should_pause(vm: &mut Vm, state: &mut DebugState) -> bool {
                 {
                     state.armed_func_bp = Some(bp);
                     state.stop_reason = Some(StopReason::Breakpoint);
-                    state.last_func_name = func_name.clone();
+                    state.last_func_name.clone_from(&func_name);
                     return true;
                 }
             }
         }
     }
 
-    state.last_func_name = func_name.clone();
+    state.last_func_name = func_name;
     false
 }
 
@@ -449,7 +451,7 @@ pub fn list_fibers(vm: &Vm) -> Vec<FiberInfo> {
             task: task.clone(),
         });
     };
-    for task in vm.ready_tasks.iter() {
+    for task in &vm.ready_tasks {
         push_task(task);
     }
     for v in vm.mn.scheduled_task_values() {
@@ -481,7 +483,7 @@ pub fn format_source_line(vm: &Vm) -> String {
         return String::new();
     }
     let (_, src) = current_location(vm);
-    let text = src.as_ref().map(|s| s.as_ref()).unwrap_or("");
+    let text = src.as_ref().map_or("", std::convert::AsRef::as_ref);
     text.lines()
         .nth(line.saturating_sub(1))
         .unwrap_or("")
@@ -495,7 +497,7 @@ pub fn format_source_window(vm: &Vm, context: usize) -> Vec<(usize, bool, String
         return Vec::new();
     }
     let (_, src) = current_location(vm);
-    let text = src.as_ref().map(|s| s.as_ref()).unwrap_or("");
+    let text = src.as_ref().map_or("", std::convert::AsRef::as_ref);
     let lines: Vec<&str> = text.lines().collect();
     if lines.is_empty() {
         return Vec::new();
@@ -510,7 +512,8 @@ pub fn format_source_window(vm: &Vm, context: usize) -> Vec<(usize, bool, String
         .collect()
 }
 
-pub fn reason_label(r: StopReason) -> &'static str {
+#[must_use]
+pub const fn reason_label(r: StopReason) -> &'static str {
     match r {
         StopReason::Breakpoint => "breakpoint",
         StopReason::Step => "step",
@@ -568,13 +571,13 @@ pub fn list_locals(vm: &Vm) -> Vec<(String, Value)> {
     vm.debug_list_locals()
 }
 
-fn break_spec_next_kw(s: &str) -> Option<usize> {
-    let i = s.find(" if ");
-    let l = s.find(" log ");
-    match (i, l) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
+fn break_spec_next_kw(spec: &str) -> Option<usize> {
+    let if_at = spec.find(" if ");
+    let log_at = spec.find(" log ");
+    match (if_at, log_at) {
+        (Some(if_pos), Some(log_pos)) => Some(if_pos.min(log_pos)),
+        (Some(if_pos), None) => Some(if_pos),
+        (None, Some(log_pos)) => Some(log_pos),
         (None, None) => None,
     }
 }
@@ -588,6 +591,7 @@ fn take_break_clause<'a>(trail: &'a str, kw: &str) -> Option<(&'a str, &'a str)>
 }
 
 /// 解析 `break` 规格：`[file:]N [if <expr>] [log <expr>]`（顺序不限，可同时出现）。
+#[must_use]
 pub fn parse_break_spec(spec: &str) -> Option<(String, usize, Option<String>, Option<String>)> {
     let spec = spec.trim();
     if spec.is_empty() {

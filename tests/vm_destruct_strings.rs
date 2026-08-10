@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::{assert_list, assert_num, assert_text, run_err};
@@ -46,10 +54,10 @@ fn raw_string_no_escape() {
 #[test]
 fn raw_triple_string() {
     assert_text(
-        r##"
+        r#"
 r"""C:\Users\test
 line2"""
-"##,
+"#,
         "C:\\Users\\test\nline2",
     );
 }
@@ -69,10 +77,10 @@ y"""
 #[test]
 fn destruct_tuple_let() {
     assert_num(
-        r#"
+        r"
 let (x, y) = (10, 20)
 x + y
-"#,
+",
         "30",
     );
 }
@@ -80,10 +88,10 @@ x + y
 #[test]
 fn destruct_list_let() {
     assert_num(
-        r#"
+        r"
 let [a, b] = [1, 2]
 a * 10 + b
-"#,
+",
         "12",
     );
 }
@@ -91,10 +99,10 @@ a * 10 + b
 #[test]
 fn destruct_nested() {
     assert_num(
-        r#"
+        r"
 let ((a, b), [c, d]) = ((1, 2), [3, 4])
 a + b + c + d
-"#,
+",
         "10",
     );
 }
@@ -102,10 +110,10 @@ a + b + c + d
 #[test]
 fn destruct_deep_list() {
     assert_num(
-        r#"
+        r"
 let [a, [b, [c, d]]] = [1, [2, [3, 4]]]
 a * 1000 + b * 100 + c * 10 + d
-"#,
+",
         "1234",
     );
 }
@@ -113,10 +121,10 @@ a * 1000 + b * 100 + c * 10 + d
 #[test]
 fn destruct_rest() {
     assert_list(
-        r#"
+        r"
 let [first, *rest] = [1, 2, 3, 4]
 rest
-"#,
+",
         "[2, 3, 4]",
     );
 }
@@ -124,10 +132,10 @@ rest
 #[test]
 fn destruct_rest_middle() {
     assert_list(
-        r#"
+        r"
 let [a, *mid, b] = [1, 2, 3, 4, 5]
 mid
-"#,
+",
         "[2, 3, 4]",
     );
 }
@@ -135,10 +143,10 @@ mid
 #[test]
 fn destruct_rest_discard() {
     assert_num(
-        r#"
+        r"
 let [a, *_, b] = [9, 0, 0, 7]
 a * 10 + b
-"#,
+",
         "97",
     );
 }
@@ -146,10 +154,10 @@ a * 10 + b
 #[test]
 fn destruct_from_tuple_with_list_pattern() {
     assert_num(
-        r#"
+        r"
 let [x, y] = (3, 4)
 x + y
-"#,
+",
         "7",
     );
 }
@@ -157,12 +165,12 @@ x + y
 #[test]
 fn destruct_assign_stmt() {
     assert_num(
-        r#"
+        r"
 x = 0
 y = 0
 (x, y) = (5, 6)
 x + y
-"#,
+",
         "11",
     );
 }
@@ -170,10 +178,10 @@ x + y
 #[test]
 fn destruct_discard() {
     assert_num(
-        r#"
+        r"
 let (a, _, c) = (1, 99, 3)
 a + c
-"#,
+",
         "4",
     );
 }
@@ -181,21 +189,21 @@ a + c
 #[test]
 fn destruct_length_mismatch() {
     run_err(
-        r#"
+        r"
 let (a, b) = [1]
 a
-"#,
+",
     );
 }
 
 #[test]
 fn walrus_in_expression() {
     assert_num(
-        r#"
+        r"
 x = 0
 if ((n := 4) > 0) { x = n }
 x
-"#,
+",
         "4",
     );
 }
@@ -203,10 +211,10 @@ x
 #[test]
 fn walrus_chained_and_paren() {
     assert_num(
-        r#"
+        r"
 (a := (b := 7))
 a + b
-"#,
+",
         "14",
     );
 }
@@ -214,10 +222,10 @@ a + b
 #[test]
 fn walrus_bare_statement() {
     assert_num(
-        r#"
+        r"
 p := 11
 p
-"#,
+",
         "11",
     );
 }
@@ -225,11 +233,11 @@ p
 #[test]
 fn walrus_still_works_in_if() {
     assert_num(
-        r#"
+        r"
 x = 0
 if (p := 3) { x = p }
 x
-"#,
+",
         "3",
     );
 }

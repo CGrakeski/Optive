@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::assert_num;
@@ -41,13 +49,13 @@ fn invert() {
 #[test]
 fn struct_mod_magic() {
     assert_num(
-        r#"
+        r"
 struct N {
     var v
     func __mod__(self, other) { return N(self.v % other.v) }
 }
 (N(10) % N(3)).v
-"#,
+",
         "1",
     );
 }
@@ -55,13 +63,13 @@ struct N {
 #[test]
 fn struct_rmod_magic() {
     assert_num(
-        r#"
+        r"
 struct N {
     var v
     func __rmod__(self, other) { return N(other % self.v) }
 }
 (10 % N(3)).v
-"#,
+",
         "1",
     );
 }
@@ -69,14 +77,14 @@ struct N {
 #[test]
 fn struct_bitand_and_invert_magic() {
     assert_num(
-        r#"
+        r"
 struct N {
     var v
     func __and__(self, other) { return N(self.v & other) }
     func __invert__(self) { return N(~self.v) }
 }
 (~(N(0) & 0)).v
-"#,
+",
         "-1",
     );
 }

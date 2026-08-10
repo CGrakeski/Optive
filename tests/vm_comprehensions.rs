@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::{assert_list, assert_num, value};
@@ -43,10 +51,10 @@ fn dict_comp_with_guard() {
 #[test]
 fn generator_exp_lazy_to_list() {
     assert_list(
-        r#"
+        r"
 use std.iter.{ to_list }
 to_list((x * x for (x in [1, 2, 3])))
-"#,
+",
         "[1, 4, 9]",
     );
 }
@@ -54,11 +62,11 @@ to_list((x * x for (x in [1, 2, 3])))
 #[test]
 fn generator_exp_with_guard() {
     assert_list(
-        r#"
+        r"
 use std.iter.{ to_list }
 use std.math.{ range }
 to_list((x for (x in range(1, 6)) if (x == 2 or x == 4)))
-"#,
+",
         "[2, 4]",
     );
 }
@@ -66,7 +74,7 @@ to_list((x for (x in range(1, 6)) if (x == 2 or x == 4)))
 #[test]
 fn generator_exp_is_lazy() {
     assert_num(
-        r#"
+        r"
 let hits = 0
 func bump(x) {
     hits = hits + 1
@@ -74,7 +82,7 @@ func bump(x) {
 }
 let g = (bump(x) for (x in [1, 2, 3]))
 hits
-"#,
+",
         "0",
     );
 }
@@ -82,10 +90,10 @@ hits
 #[test]
 fn generator_exp_zip() {
     assert_list(
-        r#"
+        r"
 use std.iter.{ to_list }
 to_list((x + y for (x in [1, 2], y in [10, 20])))
-"#,
+",
         "[11, 22]",
     );
 }
@@ -101,10 +109,10 @@ fn nested_list_comp() {
 #[test]
 fn comp_capture_outer() {
     assert_list(
-        r#"
+        r"
 let k = 10
 [x + k for (x in [1, 2])]
-"#,
+",
         "[11, 12]",
     );
 }
@@ -112,11 +120,11 @@ let k = 10
 #[test]
 fn generator_capture_outer() {
     assert_list(
-        r#"
+        r"
 use std.iter.{ to_list }
 let k = 5
 to_list((x + k for (x in [1, 2])))
-"#,
+",
         "[6, 7]",
     );
 }

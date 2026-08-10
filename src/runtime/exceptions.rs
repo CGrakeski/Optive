@@ -74,6 +74,7 @@ pub fn inheritance_chain(vm: &Vm, type_name: &str) -> Vec<String> {
     chain
 }
 
+#[must_use]
 pub fn kind_of_value(val: &Value) -> Option<ExceptionKind> {
     let Value::Struct(s) = val else {
         return None;
@@ -101,6 +102,7 @@ pub fn make_exception_kind(vm: &Vm, kind: ExceptionKind, message: impl Into<Stri
     make_exception(vm, kind.type_name(), message)
 }
 
+#[must_use]
 pub fn exception_message(exc: &Value) -> Option<String> {
     let Value::Struct(s) = exc else {
         return None;
@@ -112,6 +114,7 @@ pub fn exception_message(exc: &Value) -> Option<String> {
 }
 
 /// 未捕获异常的展示：`TypeName: message`（与 Python 一致；模板可定制）。
+#[must_use]
 pub fn format_uncaught(exc: &Value) -> String {
     let Value::Struct(s) = exc else {
         return exc.display_string();
@@ -125,6 +128,7 @@ pub fn format_uncaught(exc: &Value) -> String {
 }
 
 /// 供 `std.exceptions.tree` 等使用的继承表。
+#[must_use]
 pub fn exception_hierarchy() -> Vec<(ExceptionKind, Option<ExceptionKind>)> {
     ExceptionKind::ALL
         .iter()

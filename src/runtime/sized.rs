@@ -22,7 +22,8 @@ pub enum SizedNum {
 }
 
 impl SizedNum {
-    pub fn type_name(self) -> &'static str {
+    #[must_use]
+    pub const fn type_name(self) -> &'static str {
         match self {
             Self::I8(_) => "i8",
             Self::U8(_) => "u8",
@@ -39,6 +40,7 @@ impl SizedNum {
         }
     }
 
+    #[must_use]
     pub fn is_truthy(self) -> bool {
         match self {
             Self::I8(v) => v != 0,
@@ -56,6 +58,7 @@ impl SizedNum {
         }
     }
 
+    #[must_use]
     pub fn display_string(self) -> String {
         match self {
             Self::I8(v) => format!("{v}i8"),
@@ -73,6 +76,7 @@ impl SizedNum {
         }
     }
 
+    #[must_use]
     pub fn print_string(self) -> String {
         match self {
             Self::I8(v) => v.to_string(),
@@ -90,14 +94,15 @@ impl SizedNum {
         }
     }
 
+    #[must_use]
     pub fn to_i64(self) -> Option<i64> {
         match self {
-            Self::I8(v) => Some(v as i64),
-            Self::U8(v) => Some(v as i64),
-            Self::I16(v) => Some(v as i64),
-            Self::U16(v) => Some(v as i64),
-            Self::I32(v) => Some(v as i64),
-            Self::U32(v) => Some(v as i64),
+            Self::I8(v) => Some(i64::from(v)),
+            Self::U8(v) => Some(i64::from(v)),
+            Self::I16(v) => Some(i64::from(v)),
+            Self::U16(v) => Some(i64::from(v)),
+            Self::I32(v) => Some(i64::from(v)),
+            Self::U32(v) => Some(i64::from(v)),
             Self::I64(v) => Some(v),
             Self::U64(v) => i64::try_from(v).ok(),
             Self::Isize(v) => Some(v as i64),
@@ -106,19 +111,20 @@ impl SizedNum {
         }
     }
 
+    #[must_use]
     pub fn to_f64(self) -> f64 {
         match self {
-            Self::I8(v) => v as f64,
-            Self::U8(v) => v as f64,
-            Self::I16(v) => v as f64,
-            Self::U16(v) => v as f64,
-            Self::I32(v) => v as f64,
-            Self::U32(v) => v as f64,
+            Self::I8(v) => f64::from(v),
+            Self::U8(v) => f64::from(v),
+            Self::I16(v) => f64::from(v),
+            Self::U16(v) => f64::from(v),
+            Self::I32(v) => f64::from(v),
+            Self::U32(v) => f64::from(v),
             Self::I64(v) => v as f64,
             Self::U64(v) => v as f64,
             Self::Isize(v) => v as f64,
             Self::Usize(v) => v as f64,
-            Self::F32(v) => v as f64,
+            Self::F32(v) => f64::from(v),
             Self::F64(v) => v,
         }
     }

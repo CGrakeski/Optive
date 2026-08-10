@@ -57,27 +57,29 @@ pub enum AstNodeKind {
 }
 
 impl AstNodeKind {
-    pub fn struct_name(self) -> Option<&'static str> {
+    #[must_use]
+    pub const fn struct_name(self) -> Option<&'static str> {
         match self {
-            AstNodeKind::Number => Some("AstNumber"),
-            AstNodeKind::String => Some("AstString"),
-            AstNodeKind::Bool => Some("AstBool"),
-            AstNodeKind::VarRef => Some("AstVarRef"),
-            AstNodeKind::Unary => Some("AstUnary"),
-            AstNodeKind::Binary => Some("AstBinary"),
-            AstNodeKind::FuncCall => Some("AstFuncCall"),
-            AstNodeKind::MacroCall => Some("AstMacroCall"),
-            AstNodeKind::MemberAccess => Some("AstMemberAccess"),
-            AstNodeKind::TypeConvert => Some("AstTypeConvert"),
-            AstNodeKind::IndexAccess => Some("AstIndexAccess"),
-            AstNodeKind::Vector => Some("AstVector"),
-            AstNodeKind::QuoteExpr => Some("AstQuote"),
+            Self::Number => Some("AstNumber"),
+            Self::String => Some("AstString"),
+            Self::Bool => Some("AstBool"),
+            Self::VarRef => Some("AstVarRef"),
+            Self::Unary => Some("AstUnary"),
+            Self::Binary => Some("AstBinary"),
+            Self::FuncCall => Some("AstFuncCall"),
+            Self::MacroCall => Some("AstMacroCall"),
+            Self::MemberAccess => Some("AstMemberAccess"),
+            Self::TypeConvert => Some("AstTypeConvert"),
+            Self::IndexAccess => Some("AstIndexAccess"),
+            Self::Vector => Some("AstVector"),
+            Self::QuoteExpr => Some("AstQuote"),
             _ => None,
         }
     }
 }
 
 /// 将宏参数 `::` 注解名（如 `VarRefNode`）映射为节点种类。
+#[must_use]
 pub fn annotation_to_kind(name: &str) -> Option<AstNodeKind> {
     match name {
         "VarRefNode" | "AstVarRef" => Some(AstNodeKind::VarRef),
@@ -110,24 +112,26 @@ pub struct RuntimeAstNode {
     pub line: usize,
     pub text: String,
     pub bool_val: bool,
-    pub stmts: Vec<RuntimeAstNode>,
-    pub children: Vec<RuntimeAstNode>,
-    pub slot_a: Option<Box<RuntimeAstNode>>,
-    pub slot_b: Option<Box<RuntimeAstNode>>,
-    pub slot_c: Option<Box<RuntimeAstNode>>,
+    pub stmts: Vec<Self>,
+    pub children: Vec<Self>,
+    pub slot_a: Option<Box<Self>>,
+    pub slot_b: Option<Box<Self>>,
+    pub slot_c: Option<Box<Self>>,
     pub hygienic_names: Vec<String>,
     pub binding_names: Vec<String>,
-    pub bindings: Vec<RuntimeAstNode>,
+    pub bindings: Vec<Self>,
     pub call_args: Vec<AstCallArg>,
 }
 
 impl RuntimeAstNode {
+    #[must_use]
     pub fn as_value(self) -> Value {
         Value::RuntimeAst(Arc::new(self))
     }
 }
 
-pub fn value_is_ast(v: &Value) -> bool {
+#[must_use]
+pub const fn value_is_ast(v: &Value) -> bool {
     matches!(v, Value::RuntimeAst(_))
 }
 
@@ -333,6 +337,7 @@ fn ast_from_macro_call_arg(arg: &MacroCallArg) -> AstCallArg {
     }
 }
 
+#[must_use]
 pub fn ast_from_block(block: &Block) -> RuntimeAstNode {
     RuntimeAstNode {
         kind: AstNodeKind::BlockStmt,
@@ -345,6 +350,7 @@ pub fn ast_from_block(block: &Block) -> RuntimeAstNode {
     }
 }
 
+#[must_use]
 pub fn ast_from_stmt(stmt: &Stmt) -> RuntimeAstNode {
     match stmt {
         Stmt::VarDecl {
@@ -366,7 +372,7 @@ pub fn ast_from_stmt(stmt: &Stmt) -> RuntimeAstNode {
                 ..default_node()
             };
             if let LValue::Name(n) = target {
-                node.text = n.clone();
+                node.text.clone_from(n);
             } else {
                 node.slot_b = Some(Box::new(lvalue_to_ast(target)));
             }
@@ -630,7 +636,7 @@ fn pattern_to_ast(pat: &Pattern) -> RuntimeAstNode {
     }
 }
 
-fn default_node() -> RuntimeAstNode {
+const fn default_node() -> RuntimeAstNode {
     RuntimeAstNode {
         kind: AstNodeKind::Unknown,
         line: 0,
@@ -648,7 +654,7 @@ fn default_node() -> RuntimeAstNode {
     }
 }
 
-fn unary_op_text(op: UnaryOp) -> &'static str {
+const fn unary_op_text(op: UnaryOp) -> &'static str {
     match op {
         UnaryOp::Neg => "-",
         UnaryOp::Not => "not",
@@ -657,7 +663,7 @@ fn unary_op_text(op: UnaryOp) -> &'static str {
     }
 }
 
-fn binary_op_text(op: BinaryOp) -> &'static str {
+const fn binary_op_text(op: BinaryOp) -> &'static str {
     match op {
         BinaryOp::Add => "+",
         BinaryOp::Sub => "-",
@@ -684,6 +690,7 @@ fn binary_op_text(op: BinaryOp) -> &'static str {
     }
 }
 
+#[must_use]
 pub fn quote_ast(
     hygienic_names: Vec<String>,
     captured_bindings: Vec<(String, RuntimeAstNode)>,
@@ -996,12 +1003,12 @@ fn ast_to_stmt(node: &RuntimeAstNode) -> Result<Stmt> {
                 .transpose()?,
         }),
         AstNodeKind::Assign => {
-            let target = if !node.text.is_empty() {
-                LValue::Name(node.text.clone())
-            } else {
+            let target = if node.text.is_empty() {
                 ast_to_lvalue(node.slot_b.as_deref().ok_or_else(|| {
                     RuntimeError::value_err("invalid assign AST")
                 })?)?
+            } else {
+                LValue::Name(node.text.clone())
             };
             Ok(Stmt::Assign {
                 target,
@@ -1492,8 +1499,7 @@ pub fn ast_struct_value(vm: &Vm, v: &Value) -> Result<Value> {
 
 fn runtime_ast_to_struct(vm: &Vm, node: &RuntimeAstNode) -> Result<Value> {
     let ast_field = |slot: Option<&RuntimeAstNode>| -> Value {
-        slot.map(|n| n.clone().as_value())
-            .unwrap_or(Value::None)
+        slot.map_or(Value::None, |n| n.clone().as_value())
     };
     let call_args_list = |args: &[AstCallArg]| -> Value {
         Value::List(Shared::new(

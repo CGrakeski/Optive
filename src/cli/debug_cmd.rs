@@ -156,10 +156,10 @@ fn run_debug_session(
     loop {
         if finished {
             if let Some(v) = &last_value {
-                if !matches!(v, Value::None) {
-                    println!("[program finished] {}", v.display_string());
-                } else {
+                if matches!(v, Value::None) {
                     println!("[program finished]");
+                } else {
+                    println!("[program finished] {}", v.display_string());
                 }
             }
             break;
@@ -333,8 +333,7 @@ fn run_debug_session(
             "p" | "print" | "eval" => {
                 let expr = if cmd == "eval" || cmd == "print" || cmd == "p" {
                     line.split_once(char::is_whitespace)
-                        .map(|(_, r)| r.trim())
-                        .unwrap_or("")
+                        .map_or("", |(_, r)| r.trim())
                 } else {
                     ""
                 };
@@ -466,7 +465,7 @@ fn resume(vm: &mut Vm) -> Result<Resume, Box<dyn std::error::Error>> {
 }
 
 fn print_stop(vm: &Vm, state: &DebugState) {
-    let reason = state.stop_reason.map(reason_label).unwrap_or("paused");
+    let reason = state.stop_reason.map_or("paused", reason_label);
     println!("Stopped ({reason}) at {}", format_location(vm));
     for (n, is_cur, text) in format_source_window(vm, 1) {
         if is_cur {

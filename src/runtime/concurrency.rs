@@ -1,4 +1,4 @@
-//! Channel / Mutex / RWMutex / WaitGroup / Semaphore / Once / Barrier / Cond
+//! Channel / Mutex / `RWMutex` / `WaitGroup` / Semaphore / Once / Barrier / Cond
 //! 构造与方法绑定。
 
 
@@ -300,7 +300,7 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
             Ok(Value::None)
         }),
         // --- Once ---
-        ("Once", "run") | ("Once", "do") => method!(s, vm, |args| {
+        ("Once", "run" | "do") => method!(s, vm, |args| {
             if args.len() != 1 {
                 return Err(RuntimeError::type_err(
                     "Once.run requires 1 callable argument",
@@ -407,7 +407,7 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
             let _ = (&s, args);
             Ok(Value::None)
         }),
-        ("TimeoutCtx", "expired") | ("TimeoutCtx", "cancelled") => method!(s, _vm, |args| {
+        ("TimeoutCtx", "expired" | "cancelled") => method!(s, _vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err(
                     "TimeoutCtx.expired takes no arguments",
@@ -657,12 +657,14 @@ pub fn construct_stream(args: &[Value]) -> Result<Value> {
     )))))
 }
 
-/// 从已有迭代器状态构造拉取 Stream（map/filter/take/from_gen）。
+/// 从已有迭代器状态构造拉取 `Stream（map/filter/take/from_gen`）。
+#[must_use]
 pub fn stream_from_iterator(iter: Shared<crate::value::IteratorState>) -> Value {
     Value::Stream(Shared::new(StreamInner::Iter(iter)))
 }
 
 /// 缓冲型 Stream 的底层 channel（仅 `StreamInner::Channel`）。
+#[must_use]
 pub fn stream_channel(stream: &Shared<StreamInner>) -> Option<Shared<ChannelInner>> {
     match &*stream.borrow() {
         StreamInner::Channel(ch) => Some(ch.clone()),

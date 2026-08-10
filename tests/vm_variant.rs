@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::{assert_num, assert_text};
@@ -5,7 +13,7 @@ use common::{assert_num, assert_text};
 #[test]
 fn variant_case_and_wrap() {
     assert_num(
-        r#"
+        r"
 variant Result {
     typed Ok(value: num)
     Err = typed struct { value: text }
@@ -14,7 +22,7 @@ variant Result {
 ok = Result.Ok(7)
 wrapped = Result(ok)
 1
-"#,
+",
         "1",
     );
 }
@@ -79,7 +87,7 @@ r = half(2)
 #[test]
 fn match_nested_variant_pattern() {
     assert_num(
-        r#"
+        r"
 variant Result {
     typed Ok(value: num)
     Err = typed struct { value: text }
@@ -93,7 +101,7 @@ func run() -> num {
     }
 }
 run()
-"#,
+",
         "9",
     );
 }

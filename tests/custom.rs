@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 //! Custom Pack：合并、渲染与身份不变量。
 
 use std::fs;
@@ -19,7 +27,7 @@ fn catgirl_src() -> PathBuf {
 }
 
 fn with_temp_home<T>(f: impl FnOnce(&PathBuf) -> T) -> T {
-    let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = HOME_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile_dir();
     std::env::set_var("OPTIVE_HOME", &dir);
     std::env::remove_var("OPTIVE_CUSTOM");
@@ -37,8 +45,7 @@ fn tempfile_dir() -> PathBuf {
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_nanos())
     ));
     let _ = fs::remove_dir_all(&p);
     fs::create_dir_all(&p).unwrap();

@@ -22,9 +22,9 @@ pub enum RevSpec {
 }
 
 impl RevSpec {
-    pub fn branch_name(&self) -> Option<&str> {
+    pub const fn branch_name(&self) -> Option<&str> {
         match self {
-            RevSpec::Branch(s) => Some(s.as_str()),
+            Self::Branch(s) => Some(s.as_str()),
             _ => None,
         }
     }
@@ -100,7 +100,7 @@ impl<'de> Deserialize<'de> for Dependency {
             },
         }
         match Raw::deserialize(deserializer)? {
-            Raw::Url(git) => Ok(Dependency {
+            Raw::Url(git) => Ok(Self {
                 git,
                 rev: RevSpec::None,
             }),
@@ -137,7 +137,7 @@ impl<'de> Deserialize<'de> for Dependency {
                 } else {
                     RevSpec::None
                 };
-                Ok(Dependency { git, rev })
+                Ok(Self { git, rev })
             }
         }
     }
@@ -181,7 +181,7 @@ pub struct Project {
 }
 
 impl Project {
-    /// 解析入口 `.tive` 文件的绝对路径（相对 root join，便于显示时 strip_prefix）。
+    /// 解析入口 `.tive` 文件的绝对路径（相对 root join，便于显示时 `strip_prefix`）。
     pub fn entry_path(&self) -> Result<PathBuf, String> {
         if let Some(entry) = &self.manifest.package.entry {
             use std::path::{Component, Path};
@@ -270,7 +270,7 @@ pub fn read_deps_if_exists(
     Ok(BTreeMap::new())
 }
 
-/// 用 toml_edit 增量写入单个依赖（尽量保留其它注释/格式）。
+/// 用 `toml_edit` 增量写入单个依赖（尽量保留其它注释/格式）。
 pub fn upsert_dependency(
     manifest_path: &Path,
     name: &str,
@@ -401,9 +401,7 @@ pub fn load_project(manifest_path: &Path) -> Result<Project, String> {
         ));
     }
     let root = manifest_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
+        .parent().map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf);
     let root = root.canonicalize().unwrap_or(root);
     let root = strip_windows_verbatim(root);
     Ok(Project {

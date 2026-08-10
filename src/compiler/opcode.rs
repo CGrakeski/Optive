@@ -143,7 +143,7 @@ pub enum Instruction {
     /// 将 list/tuple 拆为 `before` + rest(list) + `after`；栈顶为最后一个 after 元素。
     UnpackRest { before: usize, after: usize },
     Rethrow,
-    /// 栈：… value, type_val → … value（硬检查；type_val 须为类型）。
+    /// 栈：… value, `type_val` → … `value（硬检查；type_val` 须为类型）。
     TypeCheck,
     /// 栈顶 `Function`：在定义处求值并绑定所有参数/返回类型注解（须为类型值）。
     ResolveFuncTypes,
@@ -235,6 +235,7 @@ pub fn resolve_labels_in_place(code: &mut [Instruction]) -> Result<(), String> {
 ///
 /// 返回紧化后的代码及 `old_pc → new_pc` 映射（长度 n+1，含哨兵），
 /// 供调用方同步紧化 `line_map` / `column_map`。
+#[must_use]
 pub fn compact_bytecode(code: Vec<Instruction>) -> (Vec<Instruction>, Vec<usize>) {
     let n = code.len();
     if n == 0 {
@@ -411,7 +412,8 @@ pub fn compact_bytecode(code: Vec<Instruction>) -> (Vec<Instruction>, Vec<usize>
     (final_result, final_map)
 }
 
-/// 用 `old_pc → new_pc` 映射紧化并行数组（line_map / column_map）。
+/// 用 `old_pc → new_pc` `映射紧化并行数组（line_map` / `column_map`）。
+#[must_use]
 pub fn compact_parallel(map: &[usize], old_to_new: &[usize]) -> Vec<usize> {
     let n = map.len();
     if n == 0 || old_to_new.len() <= n {
@@ -442,6 +444,7 @@ pub fn compact_parallel(map: &[usize], old_to_new: &[usize]) -> Vec<usize> {
 ///
 /// 返回紧化后的代码及 `old_pc → new_pc` 映射（长度 n+1，含哨兵），
 /// 供调用方同步紧化 `line_map` / `column_map`。
+#[must_use]
 pub fn peephole_fuse(code: Vec<Instruction>) -> (Vec<Instruction>, Vec<usize>) {
     let n = code.len();
     if n < 2 {
@@ -498,8 +501,7 @@ pub fn peephole_fuse(code: Vec<Instruction>) -> (Vec<Instruction>, Vec<usize>) {
                     Instruction::LoadFast(slot),
                     Instruction::PushSmall(imm),
                     Instruction::Sub | Instruction::SubNumNum,
-                ) if *imm >= i32::MIN as i64
-                    && *imm <= i32::MAX as i64
+                ) if i32::try_from(*imm).is_ok()
                     && *slot < u32::MAX as usize =>
                 {
                     remap[i] = new_code.len();
@@ -516,8 +518,7 @@ pub fn peephole_fuse(code: Vec<Instruction>) -> (Vec<Instruction>, Vec<usize>) {
                     Instruction::LoadFast(slot),
                     Instruction::PushSmall(imm),
                     Instruction::Le | Instruction::LeNumNum,
-                ) if *imm >= i32::MIN as i64
-                    && *imm <= i32::MAX as i64
+                ) if i32::try_from(*imm).is_ok()
                     && *slot < u32::MAX as usize =>
                 {
                     remap[i] = new_code.len();
@@ -540,7 +541,7 @@ pub fn peephole_fuse(code: Vec<Instruction>) -> (Vec<Instruction>, Vec<usize>) {
     remap[n] = new_code.len();
     // 用 remap 重映射跳转目标。
     let new_len = new_code.len();
-    for ins in new_code.iter_mut() {
+    for ins in &mut new_code {
         match ins {
             Instruction::Goto(t) | Instruction::GotoIf(t) | Instruction::GotoIfNot(t)
             | Instruction::LoopCountdown(t) => {
@@ -588,7 +589,7 @@ impl MacroObject {
 }
 
 /// 模块全局名表与绑定的快照；挂到该模块内编译的函数上，使导入后 `LoadGlobal`/`StoreGlobal` 仍可用。
-/// `globals` 用 `SyncCell`（parking_lot）：导入后模块函数写入模块自己的绑定，且可跨线程共享。
+/// `globals` 用 `SyncCell`（`parking_lot）：导入后模块函数写入模块自己的绑定，且可跨线程共享`。
 /// `finalized`：模块加载结束、live 快照挂上后为 true。编译期占位 env 为 false，
 /// 以便加载收尾可升级；已 finalized 的函数（含 `use` 引入的外模块函数）不得再被换绑。
 #[derive(Clone)]
@@ -695,6 +696,7 @@ impl FunctionObject {
     }
 }
 
+#[must_use]
 pub fn function_lightweight(
     body: &[Instruction],
     uses_name_map: bool,
@@ -720,6 +722,7 @@ pub fn function_lightweight(
     })
 }
 
+#[must_use]
 pub fn function_uses_name_map(body: &[Instruction]) -> bool {
     body.iter().any(|ins| {
         matches!(
@@ -734,6 +737,7 @@ pub fn function_uses_name_map(body: &[Instruction]) -> bool {
     })
 }
 
+#[must_use]
 pub fn function_uses_try(body: &[Instruction]) -> bool {
     body.iter().any(|ins| {
         matches!(
@@ -772,6 +776,7 @@ impl Default for CompiledProgram {
 }
 
 impl CompiledProgram {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             code: Vec::new(),
@@ -804,6 +809,7 @@ pub struct Codegen {
 }
 
 impl Codegen {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             code: Vec::new(),
@@ -816,15 +822,15 @@ impl Codegen {
         }
     }
 
-    pub fn set_line(&mut self, line: usize) {
+    pub const fn set_line(&mut self, line: usize) {
         self.current_line = line;
     }
 
-    pub fn set_column(&mut self, column: usize) {
+    pub const fn set_column(&mut self, column: usize) {
         self.current_column = if column == 0 { 1 } else { column };
     }
 
-    pub fn set_loc(&mut self, line: usize, column: usize) {
+    pub const fn set_loc(&mut self, line: usize, column: usize) {
         self.set_line(line);
         self.set_column(column);
     }
@@ -837,7 +843,7 @@ impl Codegen {
         std::mem::take(&mut self.column_map)
     }
 
-    pub fn fresh_label(&mut self) -> Label {
+    pub const fn fresh_label(&mut self) -> Label {
         let id = self.label_counter;
         self.label_counter += 1;
         id

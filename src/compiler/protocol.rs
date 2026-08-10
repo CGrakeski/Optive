@@ -20,6 +20,7 @@ pub struct ProtocolDef {
     pub fields: Vec<(String, bool)>,
 }
 
+#[must_use]
 pub fn protocol_from_members(name: String, members: Vec<ProtocolMember>) -> ProtocolDef {
     let mut methods = Vec::new();
     let mut fields = Vec::new();
@@ -50,6 +51,7 @@ pub struct TypeCheckContext {
 }
 
 impl TypeCheckContext {
+    #[must_use]
     pub fn from_program(program: &crate::opcode::CompiledProgram) -> Self {
         Self {
             struct_defs: program.struct_defs.clone(),
@@ -75,6 +77,7 @@ impl TypeCheckContext {
     }
 }
 
+#[must_use]
 pub fn type_satisfies_protocol_ctx(
     ctx: &TypeCheckContext,
     ty: &Value,
@@ -162,9 +165,7 @@ pub fn check_type_bound_value_ctx(
 }
 
 fn type_value_base_name(ty: &Value) -> String {
-    type_value_base(ty)
-        .map(str::to_string)
-        .unwrap_or_else(|| type_value_display(ty))
+    type_value_base(ty).map_or_else(|| type_value_display(ty), str::to_string)
 }
 
 fn type_has_method_ctx(ctx: &TypeCheckContext, type_name: &str, method: &str) -> bool {

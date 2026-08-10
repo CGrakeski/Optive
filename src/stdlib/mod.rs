@@ -356,7 +356,7 @@ fn math_const_neg_inf() -> Value {
 
 /// Optive 的 `Num` 无法表示 IEEE 754 NaN。返回 0 作为占位；
 /// 用户代码不应将 `std.math.nan` 用于 NaN 检测。
-fn math_const_nan() -> Value {
+const fn math_const_nan() -> Value {
     Value::Num(Num::Small(0))
 }
 
@@ -596,7 +596,7 @@ fn math_is_rational(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 }
 
 fn math_range(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    let (start, stop, step) = match args.len() {
+    let (start, stop, stride) = match args.len() {
         1 => {
             let stop = expect_int("range", args, 0)?;
             (0, stop, 1)
@@ -609,11 +609,11 @@ fn math_range(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         3 => {
             let start = expect_int("range", args, 0)?;
             let stop = expect_int("range", args, 1)?;
-            let step = expect_int("range", args, 2)?;
-            if step == 0 {
+            let stride = expect_int("range", args, 2)?;
+            if stride == 0 {
                 return Err(crate::error::RuntimeError::value_err("range step must not be zero"));
             }
-            (start, stop, step)
+            (start, stop, stride)
         }
         n => {
             return Err(crate::error::RuntimeError::type_err(format!(
@@ -621,7 +621,7 @@ fn math_range(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
             )))
         }
     };
-    Ok(IteratorState::from_range(start, stop, step).into_value())
+    Ok(IteratorState::from_range(start, stop, stride).into_value())
 }
 
 fn io_read_file(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -793,7 +793,7 @@ fn format_join(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
     let sep = expect_text("join", args, 0)?;
     let items = value_to_list(&args[1])?;
-    let parts: Vec<String> = items.iter().map(|v| v.print_string()).collect();
+    let parts: Vec<String> = items.iter().map(super::runtime::value::Value::print_string).collect();
     Ok(Value::Text(parts.join(&sep)))
 }
 
@@ -1993,7 +1993,7 @@ fn decos_timer(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 fn decos_debug(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let inner = expect_function("debug", args, 0)?;
     Ok(Value::Builtin(Arc::new(move |vm, call_args| {
-        let preview: Vec<String> = call_args.iter().map(|v| v.print_string()).collect();
+        let preview: Vec<String> = call_args.iter().map(super::runtime::value::Value::print_string).collect();
         eprintln!("debug: call({})", preview.join(", "));
         vm.call_user_function(inner.clone(), call_args.to_vec())
     })))
@@ -2092,7 +2092,7 @@ fn decos_deprecated(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 fn decos_trace(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let inner = expect_function("trace", args, 0)?;
     Ok(Value::Builtin(Arc::new(move |vm, call_args| {
-        let shown: Vec<String> = call_args.iter().map(|v| v.print_string()).collect();
+        let shown: Vec<String> = call_args.iter().map(super::runtime::value::Value::print_string).collect();
         eprintln!("trace: args={}", shown.join(", "));
         let result = vm.call_user_function(inner.clone(), call_args.to_vec())?;
         eprintln!("trace: => {}", result.print_string());
@@ -2155,11 +2155,11 @@ fn func_filter(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     })))
 }
 
-fn func_zip(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn func_zip(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
         return Err(crate::error::RuntimeError::type_err("zip requires at least 2 arguments"));
     }
-    vm.zip_iterables(args.to_vec())
+    crate::vm::Vm::zip_iterables(args.to_vec())
 }
 
 fn func_reduce(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -2234,7 +2234,7 @@ fn coll_sorted(vm: &mut Vm, args: &[Value]) -> Result<Value> {
         return Err(crate::error::RuntimeError::type_err("sorted requires 1 argument"));
     }
     let mut items = materialize_iter(vm, &args[0])?;
-    items.sort_by_key(|a| a.print_string());
+    items.sort_by_key(super::runtime::value::Value::print_string);
     Ok(Value::List(Shared::new(items)))
 }
 
@@ -2283,12 +2283,12 @@ fn coll_sum(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn coll_all(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let items = materialize_iter(vm, &args[0])?;
-    Ok(Value::Bool(items.iter().all(|v| v.is_truthy())))
+    Ok(Value::Bool(items.iter().all(super::runtime::value::Value::is_truthy)))
 }
 
 fn coll_any(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let items = materialize_iter(vm, &args[0])?;
-    Ok(Value::Bool(items.iter().any(|v| v.is_truthy())))
+    Ok(Value::Bool(items.iter().any(super::runtime::value::Value::is_truthy)))
 }
 
 fn coll_unique(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -2463,11 +2463,11 @@ fn time_sleep_ms(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 }
 
 /// Unix 日序 → UTC (y, m, d)；算法见 Howard Hinnant。
-fn civil_from_days(z: i64) -> (i32, u32, u32) {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+const fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
     let y = (yoe as i64) + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
@@ -2484,10 +2484,10 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
     let mp = if m > 2 { m - 3 } else { m + 9 };
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    (era as i64) * 146097 + doe as i64 - 719468
+    i64::from(era) * 146_097 + i64::from(doe) - 719_468
 }
 
-fn utc_parts_from_secs(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
+const fn utc_parts_from_secs(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
     let day = if secs >= 0 {
         secs / 86400
     } else {
@@ -2506,12 +2506,12 @@ fn time_utc_parts(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let secs = expect_int("utc_parts", args, 0)?;
     let (y, m, d, hh, mm, ss) = utc_parts_from_secs(secs);
     let mut map = DictMap::new();
-    map.insert(ValueKey::Text("year".into()), Value::Num(Num::Small(y as i64)));
-    map.insert(ValueKey::Text("month".into()), Value::Num(Num::Small(m as i64)));
-    map.insert(ValueKey::Text("day".into()), Value::Num(Num::Small(d as i64)));
-    map.insert(ValueKey::Text("hour".into()), Value::Num(Num::Small(hh as i64)));
-    map.insert(ValueKey::Text("minute".into()), Value::Num(Num::Small(mm as i64)));
-    map.insert(ValueKey::Text("second".into()), Value::Num(Num::Small(ss as i64)));
+    map.insert(ValueKey::Text("year".into()), Value::Num(Num::Small(i64::from(y))));
+    map.insert(ValueKey::Text("month".into()), Value::Num(Num::Small(i64::from(m))));
+    map.insert(ValueKey::Text("day".into()), Value::Num(Num::Small(i64::from(d))));
+    map.insert(ValueKey::Text("hour".into()), Value::Num(Num::Small(i64::from(hh))));
+    map.insert(ValueKey::Text("minute".into()), Value::Num(Num::Small(i64::from(mm))));
+    map.insert(ValueKey::Text("second".into()), Value::Num(Num::Small(i64::from(ss))));
     Ok(Value::Dict(Shared::new(map)))
 }
 
@@ -2626,7 +2626,7 @@ fn time_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         ));
     }
     let days = days_from_civil(yi, mo, da);
-    let secs = days * 86400 + (hh * 3600 + mi * 60 + se) as i64;
+    let secs = days * 86400 + i64::from(hh * 3600 + mi * 60 + se);
     Ok(Value::Num(Num::Small(secs)))
 }
 
@@ -2723,7 +2723,7 @@ fn text_join(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let parts = value_to_list(&args[1])?;
     let joined = parts
         .iter()
-        .map(|v| v.print_string())
+        .map(super::runtime::value::Value::print_string)
         .collect::<Vec<_>>()
         .join(&sep);
     Ok(Value::Text(joined))
@@ -2751,7 +2751,7 @@ macro_rules! define_text_char_preds {
 define_text_char_preds! {
     (text_is_digit, "is_digit", |c| c.is_ascii_digit()),
     (text_is_alpha, "is_alpha", |c| c.is_ascii_alphabetic()),
-    (text_is_space, "is_space", |c| c.is_whitespace()),
+    (text_is_space, "is_space", char::is_whitespace),
 }
 
 fn text_char_predicate(
@@ -2788,12 +2788,12 @@ fn text_ord(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let ch = s.chars().next().ok_or_else(|| {
         crate::error::RuntimeError::type_err("ord requires a non-empty text")
     })?;
-    Ok(Value::Num(Num::Small(ch as u32 as i64)))
+    Ok(Value::Num(Num::Small(i64::from(ch as u32))))
 }
 
 fn text_chr(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let n = expect_int("chr", args, 0)?;
-    if !(0..=0x10FFFF).contains(&n) {
+    if !(0..=0x0010_FFFF).contains(&n) {
         return Err(crate::error::RuntimeError::value_err("chr code point out of range"));
     }
     let Some(ch) = char::from_u32(n as u32) else {
@@ -2803,7 +2803,7 @@ fn text_chr(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 }
 
 fn path_join(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    let parts: Vec<String> = args.iter().map(|v| v.print_string()).collect();
+    let parts: Vec<String> = args.iter().map(super::runtime::value::Value::print_string).collect();
     if parts.is_empty() {
         return Ok(Value::Text(String::new()));
     }
@@ -2819,7 +2819,7 @@ fn path_join(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
                 && parts[0]
                     .as_bytes()
                     .first()
-                    .is_some_and(|c| c.is_ascii_alphabetic()));
+                    .is_some_and(u8::is_ascii_alphabetic));
         if looks_win_abs {
             let mut buf = std::path::PathBuf::from(&parts[0]);
             for p in parts.iter().skip(1) {
@@ -2884,7 +2884,7 @@ fn path_dirname(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn path_is_absolute(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     // 纯词法判断，不触盘，不受沙箱限制。
-    path_bool_query(&crate::caps::Capabilities::full(), "is_absolute", args, |p| p.is_absolute())
+    path_bool_query(&crate::caps::Capabilities::full(), "is_absolute", args, std::path::Path::is_absolute)
 }
 
 fn path_bool_query(
@@ -2902,7 +2902,7 @@ fn path_bool_query(
 #[cfg(windows)]
 fn strip_windows_extended_prefix(s: &str) -> String {
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{}", rest)
+        format!(r"\\{rest}")
     } else if let Some(rest) = s.strip_prefix(r"\\?\") {
         rest.to_string()
     } else {
@@ -2912,14 +2912,11 @@ fn strip_windows_extended_prefix(s: &str) -> String {
 
 fn path_abspath(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let p = expect_text("abspath", args, 0)?;
-    let abs = match std::fs::canonicalize(&p) {
-        Ok(path) => path,
-        Err(_) => {
-            let cwd = std::env::current_dir().map_err(|e| {
-                crate::error::RuntimeError::io_err(format!("abspath failed: {e}"))
-            })?;
-            normalize_pathbuf(cwd.join(&p))
-        }
+    let abs = if let Ok(path) = std::fs::canonicalize(&p) { path } else {
+        let cwd = std::env::current_dir().map_err(|e| {
+            crate::error::RuntimeError::io_err(format!("abspath failed: {e}"))
+        })?;
+        normalize_pathbuf(cwd.join(&p))
     };
     #[cfg(windows)]
     let out = strip_windows_extended_prefix(&abs.to_string_lossy());
@@ -2995,7 +2992,7 @@ fn fs_list_dir(vm: &mut Vm, args: &[Value]) -> Result<Value> {
             entry.file_name().to_string_lossy().to_string(),
         ));
     }
-    names.sort_by_key(|a| a.print_string());
+    names.sort_by_key(super::runtime::value::Value::print_string);
     vm.request_cooperative_yield();
     Ok(Value::List(Shared::new(names)))
 }
@@ -3051,8 +3048,7 @@ fn fs_copy(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 fn os_getenv(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let key = expect_text("getenv", args, 0)?;
     Ok(std::env::var(&key)
-        .map(Value::Text)
-        .unwrap_or(Value::None))
+        .map_or(Value::None, Value::Text))
 }
 
 fn os_setenv(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -3112,9 +3108,9 @@ fn os_parse_cmdline(args: &[Value]) -> Result<(String, Vec<String>)> {
                 Some(Value::List(list)) => list
                     .borrow()
                     .iter()
-                    .map(|v| v.print_string())
+                    .map(super::runtime::value::Value::print_string)
                     .collect(),
-                Some(Value::Tuple(t)) => t.iter().map(|v| v.print_string()).collect(),
+                Some(Value::Tuple(t)) => t.iter().map(super::runtime::value::Value::print_string).collect(),
                 Some(other) => {
                     return Err(crate::error::RuntimeError::type_err(format!(
                         "run/capture args must be a list, got {}",
@@ -3132,7 +3128,7 @@ fn os_parse_cmdline(args: &[Value]) -> Result<(String, Vec<String>)> {
                 ));
             }
             let prog = items[0].print_string();
-            let rest = items[1..].iter().map(|v| v.print_string()).collect();
+            let rest = items[1..].iter().map(super::runtime::value::Value::print_string).collect();
             Ok((prog, rest))
         }
         other => Err(crate::error::RuntimeError::type_err(format!(
@@ -3167,11 +3163,7 @@ fn os_spawn_result(
     }
     .map_err(|e| crate::error::RuntimeError::io_err(format!("os.run failed: {e}")))?;
     vm.request_cooperative_yield();
-    let code = output.status.code().unwrap_or(if output.status.success() {
-        0
-    } else {
-        1
-    });
+    let code = output.status.code().unwrap_or(i32::from(!output.status.success()));
     let mut map = DictMap::new();
     map.insert(
         ValueKey::Text("ok".into()),
@@ -3179,7 +3171,7 @@ fn os_spawn_result(
     );
     map.insert(
         ValueKey::Text("status".into()),
-        Value::Num(Num::Small(code as i64)),
+        Value::Num(Num::Small(i64::from(code))),
     );
     map.insert(
         ValueKey::Text("stdout".into()),
@@ -3291,7 +3283,7 @@ impl JsonParser {
             Some('"') => Ok(Value::Text(self.parse_string()?)),
             Some('[') => self.parse_array(),
             Some('{') => self.parse_object(),
-            Some('-') | Some('0'..='9') => self.parse_number(),
+            Some('-' | '0'..='9') => self.parse_number(),
             Some(c) => Err(crate::error::RuntimeError::msg(format!(
                 "json parse: unexpected '{c}'"
             ))),
@@ -3636,7 +3628,7 @@ fn debug_format_exception(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
             .slots
             .borrow()
             .first()
-            .map(|v| v.print_string())
+            .map(super::runtime::value::Value::print_string)
             .unwrap_or_default(),
         other => other.print_string(),
     };
@@ -3671,8 +3663,7 @@ fn rng_next() -> u64 {
         if x == 0 {
             x = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0x9E3779B97F4A7C15)
+                .map_or(0x9E37_79B9_7F4A_7C15, |d| d.as_nanos() as u64)
                 | 1;
         }
         // xorshift64*
@@ -3837,7 +3828,7 @@ fn re_compile(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let re_m = re.clone();
     let re_f = re.clone();
     let re_s = re.clone();
-    let re_p = re.clone();
+    let re_p = re;
     Ok(Value::Module(Shared::new(ModuleObject {
         name: "Pattern".into(),
         full_name: format!("re.Pattern({pat})"),
@@ -4042,8 +4033,7 @@ fn exc_tree(_vm: &mut Vm, _args: &[Value]) -> Result<Value> {
     for (kind, base) in crate::exceptions::exception_hierarchy() {
         out.insert(
             ValueKey::Text(kind.type_name().to_string()),
-            base.map(|b| Value::Text(b.type_name().to_string()))
-                .unwrap_or(Value::None),
+            base.map_or(Value::None, |b| Value::Text(b.type_name().to_string())),
         );
     }
     Ok(Value::Dict(Shared::new(out)))
@@ -4137,7 +4127,7 @@ fn response_to_dict(resp: reqwest::blocking::Response) -> Result<Value> {
     let status = resp.status().as_u16();
     let url = resp.url().to_string();
     let mut header_map = DictMap::new();
-    for (k, v) in resp.headers().iter() {
+    for (k, v) in resp.headers() {
         let val = v.to_str().unwrap_or("");
         header_map.insert(
             ValueKey::Text(k.as_str().to_string()),
@@ -4148,7 +4138,7 @@ fn response_to_dict(resp: reqwest::blocking::Response) -> Result<Value> {
         .text()
         .map_err(|e| crate::error::RuntimeError::io_err(format!("http: failed to read body: {e}")))?;
     let mut out = DictMap::new();
-    out.insert(ValueKey::Text("status".into()), Value::Num(Num::Small(status as i64)));
+    out.insert(ValueKey::Text("status".into()), Value::Num(Num::Small(i64::from(status))));
     out.insert(ValueKey::Text("body".into()), Value::Text(body));
     out.insert(ValueKey::Text("headers".into()), Value::Dict(Shared::new(header_map)));
     out.insert(
@@ -4560,7 +4550,7 @@ fn serde_json_to_optive(v: &serde_json::Value) -> Result<Value> {
         }
         J::Object(o) => {
             let mut d = DictMap::new();
-            for (k, val) in o.iter() {
+            for (k, val) in o {
                 d.insert(ValueKey::Text(k.clone()), serde_json_to_optive(val)?);
             }
             Value::Dict(Shared::new(d))
@@ -4631,7 +4621,7 @@ fn csv_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         })
         .collect::<Result<Vec<_>>>()?
         .into_iter()
-        .map(|r| r.iter().map(|s| s.to_string()).collect())
+        .map(|r| r.iter().map(std::string::ToString::to_string).collect())
         .collect();
 
     if header {
@@ -4639,14 +4629,14 @@ fn csv_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
             .headers()
             .map_err(|e| crate::error::RuntimeError::value_err(format!("csv headers: {e}")))?
             .iter()
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
             .collect::<Vec<_>>();
         let out: Vec<Value> = rows
             .iter()
             .map(|row| {
                 let mut d = DictMap::new();
                 for (i, h) in headers.iter().enumerate() {
-                    let v = row.get(i).map(|s| s.as_str()).unwrap_or("");
+                    let v = row.get(i).map_or("", std::string::String::as_str);
                     d.insert(ValueKey::Text(h.clone()), Value::Text(v.to_string()));
                 }
                 Value::Dict(Shared::new(d))
@@ -4681,8 +4671,8 @@ fn csv_stringify(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let mut wtr = csv::Writer::from_writer(vec![]);
     for row in rows {
         let cells: Vec<String> = match row {
-            Value::List(list) => list.borrow().iter().map(|v| v.print_string()).collect(),
-            Value::Tuple(t) => t.iter().map(|v| v.print_string()).collect(),
+            Value::List(list) => list.borrow().iter().map(super::runtime::value::Value::print_string).collect(),
+            Value::Tuple(t) => t.iter().map(super::runtime::value::Value::print_string).collect(),
             other => {
                 return Err(crate::error::RuntimeError::type_err(format!(
                     "csv.stringify row must be list/tuple, got {}",

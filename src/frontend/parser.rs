@@ -1,4 +1,4 @@
-use crate::ast::*;
+use crate::ast::{Program, Expr, SourceLoc, LocatedStmt, Stmt, DelTarget, ExprKind, Visibility, DestructPattern, DestructElem, CallArg, ProtocolMember, Block, MacroParam, RET_WRAPPER_VAL, fill_placeholders, FuncParam, ForItem, CatchPattern, CatchClause, MatchCase, Pattern, PatternElem, EnumMethodDecl, EnumMemberDecl, VariantCaseDecl, StructField, StructMethod, ModuleRef, UseItem, FStringPart, BinaryOp, UnaryOp, MacroCallArg, SelectCase, LValue};
 use crate::error::ParseError;
 use crate::lexer::Lexer;
 use crate::runtime_ast;
@@ -307,7 +307,7 @@ impl Parser {
                 let loc = self.loc_here();
                 self.advance();
                 let do_expr = self.parse_do_func_expr(loc)?;
-                return Ok(Stmt::Expr(self.apply_decorators_to_expr(decorators, do_expr)?));
+                return Ok(Stmt::Expr(Self::apply_decorators_to_expr(decorators, do_expr)));
             }
             return Err(self.error("expected 'func', 'gen', or 'do' after with make"));
         }
@@ -339,7 +339,7 @@ impl Parser {
                 let loc = self.loc_here();
                 self.advance();
                 let do_expr = self.parse_do_func_expr(loc)?;
-                return Ok(Stmt::Expr(self.apply_decorators_to_expr(decorators, do_expr)?));
+                return Ok(Stmt::Expr(Self::apply_decorators_to_expr(decorators, do_expr)));
             }
             return Err(self.error("decorators must precede func or do"));
         }
@@ -869,11 +869,7 @@ impl Parser {
         self.is_stmt_keyword_token_at(self.pos)
     }
 
-    fn apply_decorators_to_expr(
-        &self,
-        decorators: Vec<Expr>,
-        inner: Expr,
-    ) -> Result<Expr, ParseError> {
+    fn apply_decorators_to_expr(decorators: Vec<Expr>, inner: Expr) -> Expr {
         let mut expr = inner;
         for deco in decorators.into_iter().rev() {
             { let __loc = expr.loc; expr = Expr::new(__loc, ExprKind::Call {
@@ -886,7 +882,7 @@ impl Parser {
                 }],
             }); }
         }
-        Ok(expr)
+        expr
     }
 
     fn parse_do_func_expr(&mut self, loc: SourceLoc) -> Result<Expr, ParseError> {
@@ -1328,9 +1324,8 @@ impl Parser {
         if (*self).check(TokenKind::Ellipsis) {
             self.pos += 1;
             return Ok(Block::new());
-        } else {
-            self.pos = bf_pos;
         }
+        self.pos = bf_pos;
         self.parse_block_inner()
     }
 
@@ -2013,7 +2008,7 @@ impl Parser {
         Ok(UseItem { name, alias })
     }
 
-    fn parse_fstring(&self, loc: SourceLoc, raw: &str) -> Result<Expr, ParseError> {
+    fn parse_fstring(loc: SourceLoc, raw: &str) -> Result<Expr, ParseError> {
         let mut parts: Vec<FStringPart> = Vec::new();
         let mut lit = String::new();
         let chars: Vec<char> = raw.chars().collect();
@@ -2156,7 +2151,7 @@ impl Parser {
             let loc = self.loc_here();
             self.advance();
             let inner = self.parse_do_func_expr(loc)?;
-            return self.apply_decorators_to_expr(decos, inner);
+            return Ok(Self::apply_decorators_to_expr(decos, inner));
         }
         if !decos.is_empty() {
             self.pos = pos;
@@ -2753,7 +2748,7 @@ impl Parser {
             TokenKind::FStringLiteral => {
                 let loc = self.loc_here();
                 let v = self.advance().value;
-                self.parse_fstring(loc, &v)
+                Self::parse_fstring(loc, &v)
             }
             TokenKind::BytesLiteral => {
                 let loc = self.loc_here();

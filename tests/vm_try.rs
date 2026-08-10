@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::{assert_num, assert_text, run_err};
@@ -38,7 +46,7 @@ try {
 #[test]
 fn try_else_on_success() {
     assert_num(
-        r#"
+        r"
 try {
     42
 } catch (e: Exception) {
@@ -46,7 +54,7 @@ try {
 } else {
     1
 }
-"#,
+",
         "1",
     );
 }
@@ -96,13 +104,13 @@ try {
 #[test]
 fn host_undefined_name_is_name_error() {
     assert_text(
-        r#"
+        r"
 try {
     no_such_var
 } catch (e: NameError) {
     e.message
 }
-"#,
+",
         "undefined name: no_such_var",
     );
 }
@@ -110,13 +118,13 @@ try {
 #[test]
 fn host_index_error_catchable() {
     assert_text(
-        r#"
+        r"
 try {
     [1][99]
 } catch (e: IndexError) {
     e.message
 }
-"#,
+",
         "index out of range",
     );
 }
@@ -138,13 +146,13 @@ try {
 #[test]
 fn host_type_error_from_bang() {
     assert_text(
-        r#"
+        r"
 try {
     !1
 } catch (e: TypeError) {
     e.message
 }
-"#,
+",
         "! requires bool",
     );
 }
@@ -152,13 +160,13 @@ try {
 #[test]
 fn host_type_error_not_callable() {
     assert_num(
-        r#"
+        r"
 try {
     1(2)
 } catch (e: TypeError) {
     1
 }
-"#,
+",
         "1",
     );
 }
@@ -175,7 +183,7 @@ fn handle_host_errors() {
 #[test]
 fn handle_break_clears_try_frame() {
     assert_num(
-        r#"
+        r"
 let n = 0
 loop {
     let _ = handle (1 / 0)
@@ -187,16 +195,16 @@ try {
 } catch (e: ZeroDivisionError) {
     n + 10
 }
-"#,
+",
         "11",
     );
 }
 
-/// break 从 handle 操作数内的 match 块跳出时也要 PopTry。
+/// break 从 handle 操作数内的 match 块跳出时也要 `PopTry`。
 #[test]
 fn handle_break_inside_match_operand() {
     assert_num(
-        r#"
+        r"
 let n = 0
 loop {
     n = n + 1
@@ -206,7 +214,7 @@ loop {
     n = n + 100
 }
 n
-"#,
+",
         "1",
     );
 }
@@ -214,13 +222,13 @@ n
 #[test]
 fn catch_lookup_error_base_for_index() {
     assert_num(
-        r#"
+        r"
 try {
     [0][1]
 } catch (e: LookupError) {
     3
 }
-"#,
+",
         "3",
     );
 }
@@ -228,13 +236,13 @@ try {
 #[test]
 fn throw_non_exception_is_type_error() {
     assert_text(
-        r#"
+        r"
 try {
     throw 1
 } catch (e: TypeError) {
     e.message
 }
-"#,
+",
         "can only throw exception",
     );
 }

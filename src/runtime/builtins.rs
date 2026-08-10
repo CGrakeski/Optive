@@ -216,8 +216,7 @@ fn builtin_register_dispatch_handler(vm: &mut Vm, args: &[Value]) -> Result<Valu
         .handlers
         .borrow_mut()
         .push(Value::Function(func.clone()));
-    vm.globals
-        .insert(name.clone(), Value::Dispatch(table));
+    vm.store_global_by_name(name, Value::Dispatch(table));
     Ok(Value::None)
 }
 
@@ -456,7 +455,7 @@ fn builtin_id(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         Value::Struct(r) => Arc::as_ptr(r) as usize,
         Value::Iterator(r) => r.as_ptr() as usize,
         Value::Text(s) => s.as_ptr() as usize,
-        other => other as *const Value as usize,
+        other => std::ptr::from_ref::<Value>(other) as usize,
     };
     Ok(Value::Num(Num::from_bigint((ptr as u64).into())))
 }
@@ -479,13 +478,10 @@ fn builtin_next(vm: &mut Vm, args: &[Value]) -> Result<Value> {
         Value::Iterator(it) => it.clone(),
         other => Shared::new(crate::value::value_to_iterable(other)?),
     };
-    match vm.advance_iterator(&state)? {
-        Some(v) => Ok(v),
-        None => {
-            let exc = crate::exceptions::make_exception(vm, "StopIteration", "iterator exhausted")?;
-            vm.throw_value(exc)?;
-            Ok(Value::None)
-        }
+    if let Some(v) = vm.advance_iterator(&state)? { Ok(v) } else {
+        let exc = crate::exceptions::make_exception(vm, "StopIteration", "iterator exhausted")?;
+        vm.throw_value(exc)?;
+        Ok(Value::None)
     }
 }
 
@@ -538,7 +534,7 @@ fn builtin_int(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
                 .map_err(|_| crate::error::RuntimeError::value_err("int: invalid text"))?;
             Ok(Value::Num(Num::from_bigint(n)))
         }
-        Value::Bool(b) => Ok(Value::Num(Num::Small(if *b { 1 } else { 0 }))),
+        Value::Bool(b) => Ok(Value::Num(Num::Small(i64::from(*b)))),
         other => Err(crate::error::RuntimeError::type_err(format!(
             "int not supported for {}",
             other.type_name()
@@ -674,13 +670,13 @@ fn builtin_repr(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     Ok(Value::Text(args[0].display_string()))
 }
 
-fn builtin_zip_iter(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn builtin_zip_iter(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.is_empty() {
         return Err(crate::error::RuntimeError::type_err(
             "__zip_iter__ requires at least 1 argument",
         ));
     }
-    vm.zip_iterables(args.to_vec())
+    crate::vm::Vm::zip_iterables(args.to_vec())
 }
 
 fn builtin_make_genexpr(_vm: &mut Vm, args: &[Value]) -> Result<Value> {

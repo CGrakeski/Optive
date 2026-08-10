@@ -26,7 +26,7 @@ pub struct ResolvedEdge {
     pub id: String,
     /// toml 意图：branch 名（可追 tip）
     pub branch: Option<String>,
-    /// toml 意图：tag 名（effective_rev 为剥皮 SHA）
+    /// toml 意图：tag `名（effective_rev` 为剥皮 SHA）
     pub tag: Option<String>,
     /// toml 意图：`rev =` commit pin
     pub pinned: bool,
@@ -565,15 +565,15 @@ pub fn dry_run_summary(
         if e.parent != ROOT_PARENT && !verbose {
             continue;
         }
-        let prev = old_root.get(&e.name).map(|s| s.as_str()).unwrap_or("(none)");
+        let prev = old_root.get(&e.name).map_or("(none)", std::string::String::as_str);
         if e.parent == ROOT_PARENT {
-            if prev != e.effective_rev.as_str() {
+            if prev == e.effective_rev.as_str() {
+                lines.push(format!("{}: {} (unchanged)", e.name, e.effective_rev));
+            } else {
                 lines.push(format!(
                     "{}: {prev} -> {}",
                     e.name, e.effective_rev
                 ));
-            } else {
-                lines.push(format!("{}: {} (unchanged)", e.name, e.effective_rev));
             }
         } else if verbose {
             lines.push(format!(

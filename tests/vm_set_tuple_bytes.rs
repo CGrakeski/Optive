@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::{assert_bool, assert_num, assert_text, value};
@@ -45,12 +53,12 @@ fn empty_set_displays_as_comma_literal() {
 #[test]
 fn set_add_remove() {
     assert_num(
-        r#"
+        r"
 let s = {1, 2}
 s.add(3)
 s.remove(1)
 s.len()
-"#,
+",
         "2",
     );
 }
@@ -98,7 +106,7 @@ fn bytes_decode() {
 #[test]
 fn bytes_ctor_from_list() {
     assert_num("bytes([65, 66]).len()", "2");
-    assert_text(r#"bytes([65, 66]).decode()"#, "AB");
+    assert_text(r"bytes([65, 66]).decode()", "AB");
 }
 
 #[test]
@@ -110,7 +118,7 @@ fn list_set_tuple_roundtrip_convert() {
 #[test]
 fn gc_breaks_list_cycle() {
     let cleared = run_source(
-        r#"
+        r"
 func make_cycle() {
     let a = []
     a.append(a)
@@ -118,7 +126,7 @@ func make_cycle() {
 }
 make_cycle()
 gc()
-"#,
+",
     )
     .expect("gc");
     match cleared {

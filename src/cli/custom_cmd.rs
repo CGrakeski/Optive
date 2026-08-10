@@ -57,9 +57,7 @@ fn cmd_show() {
         println!("Custom.toml: (not in a project)");
     }
     let g = custom_dir()
-        .parent()
-        .map(|p| p.join(GLOBAL_CONFIG_FILE))
-        .unwrap_or_else(|| PathBuf::from(GLOBAL_CONFIG_FILE));
+        .parent().map_or_else(|| PathBuf::from(GLOBAL_CONFIG_FILE), |p| p.join(GLOBAL_CONFIG_FILE));
     println!("Global: {}", g.display());
     if let Ok(ids) = read_global_use() {
         if !ids.is_empty() {

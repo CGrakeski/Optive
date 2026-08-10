@@ -30,8 +30,8 @@ enum Style {
     Op,
 }
 
-fn style_for(kind: TokenKind) -> Style {
-    use TokenKind::*;
+const fn style_for(kind: TokenKind) -> Style {
+    use TokenKind::{KwLet, KwVar, KwConst, KwFunc, KwGen, KwFriend, KwDo, KwReturn, KwIf, KwElif, KwElse, KwAnd, KwOr, KwNot, KwLoop, KwWhile, KwBreak, KwContinue, KwImport, KwUse, KwAs, KwIntern, KwExport, KwWith, KwMake, KwFor, KwIn, KwIs, KwThen, KwHandle, KwGo, KwPar, KwSnap, KwAwait, KwSelect, KwYield, KwSuspend, KwMatch, KwCase, KwTry, KwCatch, KwThrow, KwDel, KwOutside, KwOverload, KwMacro, KwQuote, KwTyped, KwVariant, KwEnum, KwStruct, KwProtocol, ColonColon, NumLiteral, StringLiteral, FStringLiteral, BytesLiteral, LineComment, BlockComment, Plus, Minus, Star, StarStar, Slash, Percent, Ampersand, Caret, Tilde, Bang, EqEq, Ne, Lt, Gt, Le, Ge, LtLt, GtGt, Assign, Colon, ColonEq, Arrow, FatArrow, Pipe, Bar, Dot, Comma, Ellipsis, Placeholder};
     match kind {
         KwLet | KwVar | KwConst | KwFunc | KwGen | KwFriend | KwDo | KwReturn | KwIf | KwElif
         | KwElse | KwAnd | KwOr | KwNot | KwLoop | KwWhile | KwBreak | KwContinue | KwImport
@@ -54,7 +54,7 @@ fn style_for(kind: TokenKind) -> Style {
     }
 }
 
-fn ansi_prefix(style: Style) -> &'static str {
+const fn ansi_prefix(style: Style) -> &'static str {
     match style {
         Style::None => "",
         Style::Kw => KW,
@@ -96,13 +96,10 @@ pub fn highlight_tive_line(line: &str) -> String {
         }
         let style = style_for(kind);
         let slice = &line[start..end];
-        match style {
-            Style::None => out.push_str(slice),
-            _ => {
-                out.push_str(ansi_prefix(style));
-                out.push_str(slice);
-                out.push_str(RESET);
-            }
+        if matches!(style, Style::None) { out.push_str(slice) } else {
+            out.push_str(ansi_prefix(style));
+            out.push_str(slice);
+            out.push_str(RESET);
         }
         cursor = end;
     }

@@ -209,8 +209,7 @@ pub fn list_deps(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     let lock = LockFile::load(&project.lock_path())?;
     let lock_ok = lock
         .as_ref()
-        .map(|l| l.matches_root_intent(&project.manifest))
-        .unwrap_or(false);
+        .is_some_and(|l| l.matches_root_intent(&project.manifest));
 
     let n = project.manifest.dependencies.len();
     let title = format!(
@@ -226,7 +225,7 @@ pub fn list_deps(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
         (Some(_), true) => color::dim("lock: ok"),
         (Some(_), false) => color::red("lock: stale — run Optive update"),
     };
-    println!("  {}", lock_note);
+    println!("  {lock_note}");
     println!();
 
     if n == 0 {
@@ -259,9 +258,7 @@ pub fn list_deps(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
         } else {
             "—".into()
         };
-        let effective = edge
-            .map(|e| short_rev(&e.rev))
-            .unwrap_or_else(|| "—".into());
+        let effective = edge.map_or_else(|| "—".into(), |e| short_rev(&e.rev));
         let mode = rev_mode_label(&dep.rev);
         let path_disp = match (&path, present) {
             (Some(p), true) => display_path(p),
@@ -397,7 +394,7 @@ fn read_pkg_version(package_root: &Path) -> Option<String> {
             .get("package")?
             .get("version")?
             .as_str()
-            .map(|s| s.to_string());
+            .map(std::string::ToString::to_string);
     }
     None
 }

@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::{assert_bool, assert_num, assert_text, run_err};
@@ -5,7 +13,7 @@ use common::{assert_bool, assert_num, assert_text, run_err};
 #[test]
 fn struct_add_magic() {
     assert_num(
-        r#"
+        r"
 struct Pair {
     let a
     let b
@@ -14,7 +22,7 @@ struct Pair {
     }
 }
 Pair(1, 2) + Pair(3, 4)
-"#,
+",
         "10",
     );
 }
@@ -22,7 +30,7 @@ Pair(1, 2) + Pair(3, 4)
 #[test]
 fn struct_radd_magic() {
     assert_num(
-        r#"
+        r"
 struct Wrap {
     var v
     func __radd__(self, other) {
@@ -30,7 +38,7 @@ struct Wrap {
     }
 }
 (3 + Wrap(2)).v
-"#,
+",
         "5",
     );
 }
@@ -38,7 +46,7 @@ struct Wrap {
 #[test]
 fn struct_sub_mul_div_magic() {
     assert_num(
-        r#"
+        r"
 struct N {
     var v
     func __sub__(self, other) { return N(self.v - other.v) }
@@ -48,7 +56,7 @@ struct N {
 let a = N(10)
 let b = N(2)
 (a - b).v * (a / b).v
-"#,
+",
         "40",
     );
 }
@@ -56,13 +64,13 @@ let b = N(2)
 #[test]
 fn struct_pow_magic() {
     assert_num(
-        r#"
+        r"
 struct N {
     var v
     func __pow__(self, other) { return N(self.v ** other.v) }
 }
 (N(2) ** N(10)).v
-"#,
+",
         "1024",
     );
 }
@@ -70,13 +78,13 @@ struct N {
 #[test]
 fn struct_rpow_magic() {
     assert_num(
-        r#"
+        r"
 struct N {
     var v
     func __rpow__(self, other) { return N(other ** self.v) }
 }
 (2 ** N(8)).v
-"#,
+",
         "256",
     );
 }
@@ -95,13 +103,13 @@ fn num_pow_operator() {
 #[test]
 fn struct_neg_magic() {
     assert_num(
-        r#"
+        r"
 struct N {
     var v
     func __neg__(self) { return N(-self.v) }
 }
 (-N(7)).v
-"#,
+",
         "-7",
     );
 }
@@ -109,13 +117,13 @@ struct N {
 #[test]
 fn struct_eq_magic() {
     assert_bool(
-        r#"
+        r"
 struct N {
     var v
     func __eq__(self, other) { return self.v == other.v }
 }
 N(3) == N(3)
-"#,
+",
         true,
     );
 }
@@ -123,13 +131,13 @@ N(3) == N(3)
 #[test]
 fn struct_ne_magic() {
     assert_bool(
-        r#"
+        r"
 struct N {
     var v
     func __ne__(self, other) { return self.v != other.v }
 }
 N(1) != N(2)
-"#,
+",
         true,
     );
 }
@@ -137,13 +145,13 @@ N(1) != N(2)
 #[test]
 fn struct_ne_fallback_via_eq() {
     assert_bool(
-        r#"
+        r"
 struct N {
     var v
     func __eq__(self, other) { return self.v == other.v }
 }
 N(1) != N(2)
-"#,
+",
         true,
     );
 }
@@ -151,13 +159,13 @@ N(1) != N(2)
 #[test]
 fn struct_lt_magic() {
     assert_bool(
-        r#"
+        r"
 struct N {
     var v
     func __lt__(self, other) { return self.v < other.v }
 }
 N(1) < N(2)
-"#,
+",
         true,
     );
 }
@@ -165,13 +173,13 @@ N(1) < N(2)
 #[test]
 fn struct_call_magic() {
     assert_num(
-        r#"
+        r"
 struct Adder {
     var base
     func __call__(self, x) { return self.base + x }
 }
 Adder(10)(5)
-"#,
+",
         "15",
     );
 }
@@ -208,13 +216,13 @@ str(N(1))
 #[test]
 fn struct_len_magic() {
     assert_num(
-        r#"
+        r"
 struct Box {
     var data
     func __len__(self) { return len(self.data) }
 }
 len(Box([1, 2, 3]))
-"#,
+",
         "3",
     );
 }
@@ -222,13 +230,13 @@ len(Box([1, 2, 3]))
 #[test]
 fn struct_init_magic() {
     assert_num(
-        r#"
+        r"
 struct Counter {
     var n
     func __init__(self, start) { self.n = start + 1 }
 }
 Counter(4).n
-"#,
+",
         "5",
     );
 }
@@ -241,10 +249,10 @@ fn builtin_arith_fallback_without_magic() {
 #[test]
 fn unsupported_struct_add_errors() {
     run_err(
-        r#"
+        r"
 struct A { let x }
 struct B { let y }
 A(1) + B(2)
-"#,
+",
     );
 }

@@ -31,7 +31,7 @@ pub enum StackEffect {
         else_label: usize,
         end_label: usize,
     },
-    /// `EndTry`：成功离开 try，跳到 else（非 0）或 end；同时弹出路径上的 EnterTry。
+    /// `EndTry`：成功离开 try，跳到 else（非 0）或 end；同时弹出路径上的 `EnterTry`。
     EndTry,
     /// `PopTry`：关闭路径上最近的 EnterTry（Handle / catch 清理），不改栈深。
     PopTry,
@@ -42,259 +42,260 @@ impl Instruction {
     ///
     /// 不分配、可内联；仅供静态分析，不影响执行。
     #[inline]
-    pub fn stack_effect(&self) -> StackEffect {
-        use StackEffect::*;
+    #[must_use]
+    pub const fn stack_effect(&self) -> StackEffect {
+        use StackEffect::{Adjust, PopTry, Exit, Jump, CondJump, LoopCountdown, EnterTry, EndTry};
         match self {
-            Instruction::Push(_) | Instruction::PushSmall(_) => Adjust {
+            Self::Push(_) | Self::PushSmall(_) => Adjust {
                 pop: 0,
                 push: 1,
                 alt_push: None,
             },
-            Instruction::Pop => Adjust {
+            Self::Pop => Adjust {
                 pop: 1,
                 push: 0,
                 alt_push: None,
             },
-            Instruction::Add
-            | Instruction::AddNumNum
-            | Instruction::AddTextText
-            | Instruction::AddListList
-            | Instruction::Sub
-            | Instruction::SubNumNum
-            | Instruction::Mul
-            | Instruction::MulNumNum
-            | Instruction::Div
-            | Instruction::DivNumNum
-            | Instruction::Mod
-            | Instruction::ModNumNum
-            | Instruction::Pow
-            | Instruction::PowNumNum
-            | Instruction::BitAnd
-            | Instruction::BitOr
-            | Instruction::BitXor
-            | Instruction::LShift
-            | Instruction::RShift
-            | Instruction::And
-            | Instruction::Or
-            | Instruction::Eq
-            | Instruction::EqNumNum
-            | Instruction::Ne
-            | Instruction::NeNumNum
-            | Instruction::Lt
-            | Instruction::LtNumNum
-            | Instruction::Le
-            | Instruction::LeNumNum
-            | Instruction::Gt
-            | Instruction::GtNumNum
-            | Instruction::Ge
-            | Instruction::GeNumNum
-            | Instruction::In
-            | Instruction::Is
-            | Instruction::IsNot
-            | Instruction::MatchEq
-            | Instruction::Index => Adjust {
+            Self::Add
+            | Self::AddNumNum
+            | Self::AddTextText
+            | Self::AddListList
+            | Self::Sub
+            | Self::SubNumNum
+            | Self::Mul
+            | Self::MulNumNum
+            | Self::Div
+            | Self::DivNumNum
+            | Self::Mod
+            | Self::ModNumNum
+            | Self::Pow
+            | Self::PowNumNum
+            | Self::BitAnd
+            | Self::BitOr
+            | Self::BitXor
+            | Self::LShift
+            | Self::RShift
+            | Self::And
+            | Self::Or
+            | Self::Eq
+            | Self::EqNumNum
+            | Self::Ne
+            | Self::NeNumNum
+            | Self::Lt
+            | Self::LtNumNum
+            | Self::Le
+            | Self::LeNumNum
+            | Self::Gt
+            | Self::GtNumNum
+            | Self::Ge
+            | Self::GeNumNum
+            | Self::In
+            | Self::Is
+            | Self::IsNot
+            | Self::MatchEq
+            | Self::Index => Adjust {
                 pop: 2,
                 push: 1,
                 alt_push: None,
             },
-            Instruction::SelectTrySend => Adjust {
+            Self::SelectTrySend => Adjust {
                 pop: 2,
                 push: 1,
                 alt_push: None,
             },
-            Instruction::Neg
-            | Instruction::Invert
-            | Instruction::Not
-            | Instruction::TruthyNot
-            | Instruction::GetAttr(_)
-            | Instruction::IsList
-            | Instruction::ListLen
-            | Instruction::IsInstance(_)
-            | Instruction::GoValue
-            | Instruction::Await
-            | Instruction::Snap
-            | Instruction::MakeDeadline
-            | Instruction::SelectPollDeadline => Adjust {
+            Self::Neg
+            | Self::Invert
+            | Self::Not
+            | Self::TruthyNot
+            | Self::GetAttr(_)
+            | Self::IsList
+            | Self::ListLen
+            | Self::IsInstance(_)
+            | Self::GoValue
+            | Self::Await
+            | Self::Snap
+            | Self::MakeDeadline
+            | Self::SelectPollDeadline => Adjust {
                 pop: 1,
                 push: 1,
                 alt_push: None,
             },
-            Instruction::Load(_)
-            | Instruction::LoadGlobal(_)
-            | Instruction::LoadMacro(_)
-            | Instruction::NewVarOrLoad(_)
-            | Instruction::LoadFast(_)
-            | Instruction::LoadFastSubImm { .. }
-            | Instruction::LoadFastLeImm { .. }
-            | Instruction::FindMod(_)
-            | Instruction::PushExc
-            | Instruction::ExcMatch(_) => Adjust {
+            Self::Load(_)
+            | Self::LoadGlobal(_)
+            | Self::LoadMacro(_)
+            | Self::NewVarOrLoad(_)
+            | Self::LoadFast(_)
+            | Self::LoadFastSubImm { .. }
+            | Self::LoadFastLeImm { .. }
+            | Self::FindMod(_)
+            | Self::PushExc
+            | Self::ExcMatch(_) => Adjust {
                 pop: 0,
                 push: 1,
                 alt_push: None,
             },
-            Instruction::Store(_)
-            | Instruction::StoreGlobal(_)
-            | Instruction::StoreFast(_)
-            | Instruction::BindFast { .. }
-            | Instruction::DelName(_)
-            | Instruction::DelAttr(_)
-            | Instruction::Yield
-            | Instruction::YieldFrom => Adjust {
+            Self::Store(_)
+            | Self::StoreGlobal(_)
+            | Self::StoreFast(_)
+            | Self::BindFast { .. }
+            | Self::DelName(_)
+            | Self::DelAttr(_)
+            | Self::Yield
+            | Self::YieldFrom => Adjust {
                 pop: 1,
                 push: 0,
                 alt_push: None,
             },
-            Instruction::EnterScope
-            | Instruction::LeaveScope
-            | Instruction::Label(_)
-            | Instruction::TypeCheck
-            | Instruction::ResolveFuncTypes
-            | Instruction::RegisterExport(_)
-            | Instruction::Suspend
-            | Instruction::IterEnd => Adjust {
+            Self::EnterScope
+            | Self::LeaveScope
+            | Self::Label(_)
+            | Self::TypeCheck
+            | Self::ResolveFuncTypes
+            | Self::RegisterExport(_)
+            | Self::Suspend
+            | Self::IterEnd => Adjust {
                 pop: 0,
                 push: 0,
                 alt_push: None,
             },
-            Instruction::NewVar { .. } => Adjust {
+            Self::NewVar { .. } => Adjust {
                 pop: 0,
                 push: 0,
                 alt_push: None,
             },
-            Instruction::PopTry => PopTry,
-            Instruction::Call { argc }
-            | Instruction::CallSelf { argc }
-            | Instruction::MacroCall { argc } => Adjust {
+            Self::PopTry => PopTry,
+            Self::Call { argc }
+            | Self::CallSelf { argc }
+            | Self::MacroCall { argc } => Adjust {
                 pop: (*argc as u16).saturating_add(1),
                 push: 1,
                 alt_push: None,
             },
             // callee 已编码在指令里，只弹参数。
-            Instruction::CallGlobal { argc, .. } => Adjust {
+            Self::CallGlobal { argc, .. } => Adjust {
                 pop: *argc as u16,
                 push: 1,
                 alt_push: None,
             },
-            Instruction::CallList => Adjust {
+            Self::CallList => Adjust {
                 pop: 2,
                 push: 1,
                 alt_push: None,
             },
-            Instruction::CallEx => Adjust {
+            Self::CallEx => Adjust {
                 pop: 3,
                 push: 1,
                 alt_push: None,
             },
-            Instruction::GoCall(argc) => Adjust {
+            Self::GoCall(argc) => Adjust {
                 pop: (*argc as u16).saturating_add(1),
                 push: 1,
                 alt_push: None,
             },
-            Instruction::ListAppend | Instruction::ListExtend | Instruction::SetAdd => Adjust {
+            Self::ListAppend | Self::ListExtend | Self::SetAdd => Adjust {
                 pop: 2,
                 push: 1,
                 alt_push: None,
             },
-            Instruction::DictSet => Adjust {
+            Self::DictSet => Adjust {
                 pop: 3,
                 push: 1,
                 alt_push: None,
             },
             // Ret 族不弹栈：栈顶即返回值（空栈时 VM 补 none）。
-            Instruction::Ret | Instruction::RetLeave | Instruction::RetFast(_) => Exit { pop: 0 },
-            Instruction::VecNew(n) | Instruction::SetNew(n) | Instruction::TupleNew(n) => Adjust {
+            Self::Ret | Self::RetLeave | Self::RetFast(_) => Exit { pop: 0 },
+            Self::VecNew(n) | Self::SetNew(n) | Self::TupleNew(n) => Adjust {
                 pop: *n as u16,
                 push: 1,
                 alt_push: None,
             },
-            Instruction::DictNew(n) => Adjust {
+            Self::DictNew(n) => Adjust {
                 pop: (*n as u16).saturating_mul(2),
                 push: 1,
                 alt_push: None,
             },
-            Instruction::IndexSet => Adjust {
+            Self::IndexSet => Adjust {
                 pop: 3,
                 push: 0,
                 alt_push: None,
             },
-            Instruction::SliceGet => Adjust {
+            Self::SliceGet => Adjust {
                 pop: 4,
                 push: 1,
                 alt_push: None,
             },
-            Instruction::SliceSet => Adjust {
+            Self::SliceSet => Adjust {
                 pop: 5,
                 push: 0,
                 alt_push: None,
             },
-            Instruction::DelIndex => Adjust {
+            Self::DelIndex => Adjust {
                 pop: 2,
                 push: 0,
                 alt_push: None,
             },
-            Instruction::StructNew { argc, .. } => Adjust {
+            Self::StructNew { argc, .. } => Adjust {
                 pop: *argc as u16,
                 push: 1,
                 alt_push: None,
             },
-            Instruction::VariantNew { .. } | Instruction::IterNew => Adjust {
+            Self::VariantNew { .. } | Self::IterNew => Adjust {
                 pop: 1,
                 push: 1,
                 alt_push: None,
             },
-            Instruction::SetField(_) => Adjust {
+            Self::SetField(_) => Adjust {
                 pop: 2,
                 push: 0,
                 alt_push: None,
             },
             // ready: value+bool；not ready: 仅 bool
-            Instruction::SelectTryRecv | Instruction::SelectPollTask => Adjust {
+            Self::SelectTryRecv | Self::SelectPollTask => Adjust {
                 pop: 1,
                 push: 1,
                 alt_push: Some(2),
             },
-            Instruction::SelectIdle(n) => Adjust {
+            Self::SelectIdle(n) => Adjust {
                 pop: *n as u16,
                 push: 0,
                 alt_push: None,
             },
-            Instruction::SelectBegin(_) => Adjust {
+            Self::SelectBegin(_) => Adjust {
                 pop: 0,
                 push: 0,
                 alt_push: None,
             },
-            Instruction::SelectNextIndex => Adjust {
+            Self::SelectNextIndex => Adjust {
                 pop: 0,
                 push: 1,
                 alt_push: None,
             },
-            Instruction::IterNext => Adjust {
+            Self::IterNext => Adjust {
                 pop: 0,
                 push: 1,
                 alt_push: Some(2),
             },
-            Instruction::UnpackExact(n) => Adjust {
+            Self::UnpackExact(n) => Adjust {
                 pop: 1,
                 push: *n as u16,
                 alt_push: None,
             },
-            Instruction::UnpackRest { before, after } => Adjust {
+            Self::UnpackRest { before, after } => Adjust {
                 pop: 1,
                 push: (*before as u16)
                     .saturating_add(1)
                     .saturating_add(*after as u16),
                 alt_push: None,
             },
-            Instruction::Throw => Exit { pop: 1 },
-            Instruction::Rethrow => Exit { pop: 0 },
-            Instruction::Goto(t) => Jump { target: *t },
-            Instruction::GotoIf(t) | Instruction::GotoIfNot(t) => CondJump {
+            Self::Throw => Exit { pop: 1 },
+            Self::Rethrow => Exit { pop: 0 },
+            Self::Goto(t) => Jump { target: *t },
+            Self::GotoIf(t) | Self::GotoIfNot(t) => CondJump {
                 pop: 1,
                 target: *t,
             },
-            Instruction::LoopCountdown(t) => LoopCountdown { target: *t },
-            Instruction::EnterTry {
+            Self::LoopCountdown(t) => LoopCountdown { target: *t },
+            Self::EnterTry {
                 catch_label,
                 else_label,
                 end_label,
@@ -303,7 +304,7 @@ impl Instruction {
                 else_label: *else_label,
                 end_label: *end_label,
             },
-            Instruction::EndTry => EndTry,
+            Self::EndTry => EndTry,
         }
     }
 }
@@ -351,15 +352,15 @@ pub fn verify_stack_balance(code: &[Instruction]) -> Result<(), String> {
                 push,
                 alt_push: Some(alt),
             } => {
-                if depth < pop as u32 {
+                if depth < u32::from(pop) {
                     return Err(format!(
                         "stack underflow at pc={pc}: depth={depth} pop={pop} (ins={:?})",
                         code[pc]
                     ));
                 }
-                let base = depth - pop as u32;
-                let d_lo = base + push as u32;
-                let d_hi = base + alt as u32;
+                let base = depth - u32::from(pop);
+                let d_lo = base + u32::from(push);
+                let d_hi = base + u32::from(alt);
                 let Some(next_ins) = code.get(pc + 1) else {
                     return Err(format!(
                         "variable-effect op at pc={pc} needs a following CondJump"
@@ -386,8 +387,7 @@ pub fn verify_stack_balance(code: &[Instruction]) -> Result<(), String> {
                     }
                     _ => {
                         return Err(format!(
-                            "variable-effect op at pc={pc} must be followed by GotoIf/GotoIfNot, got {:?}",
-                            next_ins
+                            "variable-effect op at pc={pc} must be followed by GotoIf/GotoIfNot, got {next_ins:?}"
                         ));
                     }
                 }
@@ -397,7 +397,7 @@ pub fn verify_stack_balance(code: &[Instruction]) -> Result<(), String> {
                 push,
                 alt_push: None,
             } => {
-                if depth < pop as u32 {
+                if depth < u32::from(pop) {
                     return Err(format!(
                         "stack underflow at pc={pc}: depth={depth} pop={pop} (ins={:?})",
                         code[pc]
@@ -405,7 +405,7 @@ pub fn verify_stack_balance(code: &[Instruction]) -> Result<(), String> {
                 }
                 work.push((
                     pc + 1,
-                    depth - pop as u32 + push as u32,
+                    depth - u32::from(pop) + u32::from(push),
                     try_stack,
                 ));
             }
@@ -413,13 +413,13 @@ pub fn verify_stack_balance(code: &[Instruction]) -> Result<(), String> {
                 work.push((target, depth, try_stack));
             }
             StackEffect::CondJump { pop, target } => {
-                if depth < pop as u32 {
+                if depth < u32::from(pop) {
                     return Err(format!(
                         "stack underflow at pc={pc}: depth={depth} pop={pop} (ins={:?})",
                         code[pc]
                     ));
                 }
-                let d = depth - pop as u32;
+                let d = depth - u32::from(pop);
                 work.push((pc + 1, d, try_stack.clone()));
                 work.push((target, d, try_stack));
             }
@@ -433,7 +433,7 @@ pub fn verify_stack_balance(code: &[Instruction]) -> Result<(), String> {
                 work.push((target, depth - 1, try_stack));
             }
             StackEffect::Exit { pop } => {
-                if depth < pop as u32 {
+                if depth < u32::from(pop) {
                     return Err(format!(
                         "stack underflow at pc={pc}: depth={depth} pop={pop} (ins={:?})",
                         code[pc]

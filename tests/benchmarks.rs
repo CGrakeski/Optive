@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 //! Performance benchmarks with statistical reporting.
 //! Run with: cargo test --test benchmarks -- --ignored --nocapture
 
@@ -31,6 +39,7 @@ impl BenchStats {
         }
     }
 
+    #[must_use]
     pub fn avg_ms(&self) -> f64 {
         self.samples_ms.iter().sum::<f64>() / self.runs as f64
     }
@@ -43,6 +52,7 @@ impl BenchStats {
         self.samples_ms.iter().copied().fold(f64::NEG_INFINITY, f64::max)
     }
 
+    #[must_use]
     pub fn variance_ms(&self) -> f64 {
         let avg = self.avg_ms();
         self.samples_ms
@@ -55,6 +65,7 @@ impl BenchStats {
             / self.runs as f64
     }
 
+    #[must_use]
     pub fn stddev_ms(&self) -> f64 {
         self.variance_ms().sqrt()
     }
@@ -73,37 +84,37 @@ impl BenchStats {
     }
 }
 
-const FIB_SRC: &str = r#"
+const FIB_SRC: &str = r"
 func fib(n) {
     if (n <= 1) { return n }
     return fib(n - 1) + fib(n - 2)
 }
 fib(30)
-"#;
+";
 
-const EMPTY_LOOP_SRC: &str = r#"
+const EMPTY_LOOP_SRC: &str = r"
 loop (1000000) { }
 42
-"#;
+";
 
-const ARITH_LOOP_SRC: &str = r#"
+const ARITH_LOOP_SRC: &str = r"
 let sum = 0
 loop (100000) {
     sum = sum + 1
 }
 sum
-"#;
+";
 
-const CALL_LOOP_SRC: &str = r#"
+const CALL_LOOP_SRC: &str = r"
 func id(x) { return x }
 let n = 0
 loop (50000) {
     n = id(n + 1)
 }
 n
-"#;
+";
 
-const NESTED_LOOP_1B_SRC: &str = r#"
+const NESTED_LOOP_1B_SRC: &str = r"
 loop (1000) {
     {
         loop (1000) {
@@ -115,10 +126,10 @@ loop (1000) {
     }
 }
 42
-"#;
+";
 
 /// 与 `examples/parallel_primes.tive` 同算法；无 print，返回素数个数。
-const PARALLEL_PRIMES_SRC: &str = r#"
+const PARALLEL_PRIMES_SRC: &str = r"
 const let FROM = 2
 const let TO = 50001
 const let WORKERS = 8
@@ -179,14 +190,14 @@ loop {
   i = i + 1
 }
 total
-"#;
+";
 
 fn run_parallel_primes(workers: usize) -> optive::value::Value {
     let mut vm = Vm::with_workers(workers);
     run_source_in_vm(&mut vm, PARALLEL_PRIMES_SRC, "<bench-primes>").expect("parallel primes")
 }
 
-const CHANNEL_PING_SRC: &str = r#"
+const CHANNEL_PING_SRC: &str = r"
 const let N = 20000
 let a = Channel(1)
 let b = Channel(1)
@@ -205,7 +216,7 @@ loop (N) {
   i = i + 1
 }
 N
-"#;
+";
 
 fn run_channel_ping(workers: usize) -> optive::value::Value {
     let mut vm = Vm::with_workers(workers);
@@ -302,7 +313,7 @@ fn bench_nested_loop_1b_vm_only() {
     );
 }
 
-/// 并行筛素数：同 8 个 go 任务，扫 OPTIVE_WORKERS / Vm::with_workers = 1,2,4,8。
+/// 并行筛素数：同 8 个 go 任务，扫 `OPTIVE_WORKERS` / `Vm::with_workers` = 1,2,4,8。
 #[test]
 #[ignore = "slow benchmark; run with --ignored"]
 fn bench_parallel_primes() {

@@ -7,6 +7,7 @@ use crate::ast::{
     PatternElem, Stmt,
 };
 
+#[must_use]
 pub fn free_vars_in_block(body: &Block, params: &HashSet<String>) -> Vec<String> {
     let mut locals = params.clone();
     let mut free = HashSet::new();
@@ -18,6 +19,7 @@ pub fn free_vars_in_block(body: &Block, params: &HashSet<String>) -> Vec<String>
     names
 }
 
+#[must_use]
 pub fn free_vars_in_expr(expr: &Expr, params: &HashSet<String>) -> Vec<String> {
     let locals: HashMap<String, ()> = params.iter().map(|n| (n.clone(), ())).collect();
     let mut free = HashSet::new();
@@ -453,7 +455,7 @@ fn collect_expr(expr: &Expr, locals: &HashMap<String, ()>, free: &mut HashSet<St
         }
         ExprKind::Handle { operand } => collect_expr(operand, locals, free),
         ExprKind::Go { operand } | ExprKind::Await { operand } | ExprKind::Snap { operand } => {
-            collect_expr(operand, locals, free)
+            collect_expr(operand, locals, free);
         }
         ExprKind::ParFor { items, body } => {
             for item in items {

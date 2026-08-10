@@ -37,27 +37,32 @@ impl<T> Shared<T> {
     }
 
     #[inline]
+    #[must_use]
     pub fn try_borrow(&self) -> Option<RwLockReadGuard<'_, T>> {
         self.inner.try_read()
     }
 
     #[inline]
+    #[must_use]
     pub fn try_borrow_mut(&self) -> Option<RwLockWriteGuard<'_, T>> {
         crate::gc::write_barrier_addr(Arc::as_ptr(&self.inner) as usize);
         self.inner.try_write()
     }
 
     #[inline]
+    #[must_use]
     pub fn as_ptr(&self) -> *const RwLock<T> {
         Arc::as_ptr(&self.inner)
     }
 
     #[inline]
+    #[must_use]
     pub fn ptr_eq(a: &Self, b: &Self) -> bool {
         Arc::ptr_eq(&a.inner, &b.inner)
     }
 
     #[inline]
+    #[must_use]
     pub fn downgrade(&self) -> WeakShared<T> {
         WeakShared {
             inner: Arc::downgrade(&self.inner),
@@ -65,6 +70,7 @@ impl<T> Shared<T> {
     }
 
     #[inline]
+    #[must_use]
     pub fn strong_count(&self) -> usize {
         Arc::strong_count(&self.inner)
     }
@@ -110,6 +116,7 @@ impl<T: ?Sized> Clone for WeakShared<T> {
 
 impl<T> WeakShared<T> {
     #[inline]
+    #[must_use]
     pub fn upgrade(&self) -> Option<Shared<T>> {
         self.inner.upgrade().map(|inner| Shared { inner })
     }
@@ -123,7 +130,7 @@ pub struct SyncCell<T> {
 
 impl<T> SyncCell<T> {
     #[inline]
-    pub fn new(value: T) -> Self {
+    pub const fn new(value: T) -> Self {
         Self {
             inner: RwLock::new(value),
         }
@@ -144,7 +151,7 @@ impl<T> SyncCell<T> {
     /// `RwLock` 身份地址（Struct 槽位写屏障别名用）。
     #[inline]
     pub fn lock_addr(&self) -> usize {
-        &self.inner as *const RwLock<T> as usize
+        &raw const self.inner as usize
     }
 
     #[inline]
@@ -167,11 +174,13 @@ pub struct SharedMap {
 
 impl SharedMap {
     #[inline]
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     #[inline]
+    #[must_use]
     pub fn get(&self, key: &str) -> Option<crate::value::Value> {
         self.inner.read().get(key).cloned()
     }
@@ -187,6 +196,7 @@ impl SharedMap {
 
     /// 按已有键就地写入；若值为 `Cell` 则写单元格内容。键不存在返回 `false`（不分配）。
     #[inline]
+    #[must_use]
     pub fn set_inplace(&self, key: &str, value: crate::value::Value) -> bool {
         let mut g = self.inner.write();
         let Some(slot) = g.get_mut(key) else {
@@ -201,11 +211,13 @@ impl SharedMap {
     }
 
     #[inline]
+    #[must_use]
     pub fn contains_key(&self, key: &str) -> bool {
         self.inner.read().contains_key(key)
     }
 
     #[inline]
+    #[must_use]
     pub fn remove(&self, key: &str) -> Option<crate::value::Value> {
         self.inner.write().remove(key)
     }
@@ -225,27 +237,32 @@ impl SharedMap {
     }
 
     #[inline]
+    #[must_use]
     pub fn values(&self) -> Vec<crate::value::Value> {
         self.inner.read().values().cloned().collect()
     }
 
     #[inline]
+    #[must_use]
     pub fn keys(&self) -> Vec<String> {
         self.inner.read().keys().cloned().collect()
     }
 
     #[inline]
+    #[must_use]
     pub fn len(&self) -> usize {
         self.inner.read().len()
     }
 
     #[inline]
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.inner.read().is_empty()
     }
 
     /// 深拷贝内部表（模块快照等需要隔离内容时用）。
     #[inline]
+    #[must_use]
     pub fn deep_clone(&self) -> FxHashMap<String, crate::value::Value> {
         self.inner.read().clone()
     }
@@ -264,6 +281,7 @@ impl SharedMap {
     }
 
     #[inline]
+    #[must_use]
     pub fn ptr_eq(a: &Self, b: &Self) -> bool {
         Arc::ptr_eq(&a.inner, &b.inner)
     }
@@ -285,26 +303,31 @@ impl<T> Default for SharedTable<T> {
 
 impl<T> SharedTable<T> {
     #[inline]
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     #[inline]
+    #[must_use]
     pub fn contains_key(&self, key: &str) -> bool {
         self.inner.read().contains_key(key)
     }
 
     #[inline]
+    #[must_use]
     pub fn len(&self) -> usize {
         self.inner.read().len()
     }
 
     #[inline]
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.inner.read().is_empty()
     }
 
     #[inline]
+    #[must_use]
     pub fn remove(&self, key: &str) -> Option<T> {
         self.inner.write().remove(key)
     }
@@ -330,6 +353,7 @@ impl<T> SharedTable<T> {
     }
 
     #[inline]
+    #[must_use]
     pub fn keys(&self) -> Vec<String> {
         self.inner.read().keys().cloned().collect()
     }
@@ -337,6 +361,7 @@ impl<T> SharedTable<T> {
 
 impl<T: Clone> SharedTable<T> {
     #[inline]
+    #[must_use]
     pub fn get(&self, key: &str) -> Option<T> {
         self.inner.read().get(key).cloned()
     }
@@ -353,11 +378,13 @@ impl<T: Clone> SharedTable<T> {
 
     /// 深拷贝内容（模块 init 快照 / diff 基线）。
     #[inline]
+    #[must_use]
     pub fn snapshot_map(&self) -> FxHashMap<String, T> {
         self.inner.read().clone()
     }
 
     #[inline]
+    #[must_use]
     pub fn values(&self) -> Vec<T> {
         self.inner.read().values().cloned().collect()
     }
@@ -382,6 +409,7 @@ impl<T> Clone for SharedTable<T> {
 
 impl<T> SharedTable<T> {
     #[inline]
+    #[must_use]
     pub fn ptr_eq(a: &Self, b: &Self) -> bool {
         Arc::ptr_eq(&a.inner, &b.inner)
     }
@@ -395,6 +423,7 @@ pub struct SharedVec<T> {
 
 impl<T> SharedVec<T> {
     #[inline]
+    #[must_use]
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(Vec::new())),
@@ -402,6 +431,7 @@ impl<T> SharedVec<T> {
     }
 
     #[inline]
+    #[must_use]
     pub fn from_vec(v: Vec<T>) -> Self {
         Self {
             inner: Arc::new(RwLock::new(v)),
@@ -409,11 +439,13 @@ impl<T> SharedVec<T> {
     }
 
     #[inline]
+    #[must_use]
     pub fn len(&self) -> usize {
         self.inner.read().len()
     }
 
     #[inline]
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.inner.read().is_empty()
     }
@@ -436,6 +468,7 @@ impl<T> SharedVec<T> {
 
 impl<T: Clone> SharedVec<T> {
     #[inline]
+    #[must_use]
     pub fn get(&self, idx: usize) -> Option<T> {
         self.inner.read().get(idx).cloned()
     }
@@ -448,6 +481,7 @@ impl<T: Clone> SharedVec<T> {
     }
 
     #[inline]
+    #[must_use]
     pub fn clone_vec(&self) -> Vec<T> {
         self.inner.read().clone()
     }

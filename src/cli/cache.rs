@@ -96,9 +96,9 @@ impl ProjectCache {
             k,
             CacheEntry {
                 git: norm,
-                branch: branch.map(|s| s.to_string()),
+                branch: branch.map(std::string::ToString::to_string),
                 commit: commit.to_string(),
-                id: id.map(|s| s.to_string()),
+                id: id.map(std::string::ToString::to_string),
             },
         );
     }

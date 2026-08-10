@@ -81,7 +81,7 @@ pub fn assert_num(source: &str, expected: &str) {
 }
 
 /// 固定 workers=1（M:1）的数值断言：协作顺序/挂起让出类断言专用，
-/// 不受 OPTIVE_WORKERS 环境影响（M:N 真并行下此类顺序保证不成立）。
+/// 不受 `OPTIVE_WORKERS` 环境影响（M:N 真并行下此类顺序保证不成立）。
 pub fn assert_num_w1(source: &str, expected: &str) {
     let mut vm = optive::vm::Vm::with_workers(1);
     let v = optive::run_source_in_vm(&mut vm, source, "<test>").expect("run");

@@ -56,10 +56,12 @@ pub fn eval_const_num(expr: &Expr) -> Result<Num> {
     }
 }
 
+#[must_use]
 pub fn build_enum_def(name: &str, members: Vec<EnumMemberInfo>) -> Arc<EnumDef> {
     Arc::new(EnumDef { name: name.to_string(), members })
 }
 
+#[must_use]
 pub fn enum_member_value(def: &Arc<EnumDef>, index: usize) -> Value {
     let type_name = enum_member_type_name(def, &def.members[index].name);
     Value::EnumMember(Arc::new(EnumMemberData {
@@ -69,22 +71,27 @@ pub fn enum_member_value(def: &Arc<EnumDef>, index: usize) -> Value {
     }))
 }
 
+#[must_use]
 pub fn enum_member_type_name(def: &EnumDef, member_name: &str) -> String {
     format!("{}.{}", def.name, member_name)
 }
 
+#[must_use]
 pub fn enum_member_numeric_value(member: &EnumMemberData) -> Num {
     member.def.members[member.member_index].value.clone()
 }
 
+#[must_use]
 pub fn case_struct_name(variant_name: &str, case_name: &str) -> String {
     format!("{variant_name}.{case_name}")
 }
 
+#[must_use]
 pub fn variant_case_fields(case: &VariantCaseDecl) -> Vec<StructField> {
     case.fields.clone()
 }
 
+#[must_use]
 pub fn build_variant_def(
     name: &str,
     type_params: Vec<(String, Option<Expr>)>,
@@ -132,6 +139,7 @@ pub fn build_variant_def(
     )
 }
 
+#[must_use]
 pub fn wrap_variant(
     inst_name: &str,
     def: &Arc<VariantDef>,
@@ -160,7 +168,7 @@ pub fn enum_name_of(vm: &mut crate::vm::Vm, enum_name: &str, args: &[Value]) -> 
         .enum_defs
         .get(enum_name)
         .ok_or_else(|| RuntimeError::msg(format!("unknown enum: {enum_name}")))?;
-    for m in def.members.iter() {
+    for m in &def.members {
         if Value::Num(m.value.clone()).eq(n)? {
             return Ok(Value::Text(m.name.clone()));
         }
@@ -168,6 +176,7 @@ pub fn enum_name_of(vm: &mut crate::vm::Vm, enum_name: &str, args: &[Value]) -> 
     Ok(Value::None)
 }
 
+#[must_use]
 pub fn builtin_enum_method_entries(
     enum_name: &str,
     def: &Arc<EnumDef>,

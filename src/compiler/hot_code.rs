@@ -45,6 +45,7 @@ pub struct HotCode {
 }
 
 impl HotCode {
+    #[must_use]
     pub fn empty() -> Self {
         Self {
             ops: Arc::from([]),
@@ -52,6 +53,7 @@ impl HotCode {
         }
     }
 
+    #[must_use]
     pub fn encode(code: &[Instruction]) -> Self {
         let mut ops = Vec::with_capacity(code.len());
         let mut args = Vec::with_capacity(code.len());
@@ -112,14 +114,16 @@ impl HotCode {
 /// 将 `(slot, imm)` 打包为单个 `i64` 热操作数。slot 占低 32 位，imm 占高 32 位。
 /// 调用方需保证 `slot < 2^32` 且 `imm` 落在 `i32` 范围内。
 #[inline(always)]
+#[must_use]
 pub fn encode_slot_imm(slot: usize, imm: i64) -> i64 {
-    (slot as u32 as i64) | ((imm as i32 as i64) << 32)
+    i64::from(slot as u32) | (i64::from(imm as i32) << 32)
 }
 
 /// 解包 `encode_slot_imm` 的结果。
 #[inline(always)]
+#[must_use]
 pub fn decode_slot_imm(arg: i64) -> (usize, i64) {
     let slot = (arg & 0xFFFF_FFFF) as u32 as usize;
-    let imm = (arg >> 32) as i32 as i64;
+    let imm = i64::from((arg >> 32) as i32);
     (slot, imm)
 }

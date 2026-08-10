@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::{assert_bool, assert_num, assert_text};
@@ -36,26 +44,26 @@ f"{1 + 2}-{true}"
 #[test]
 fn is_object_identity() {
     assert_bool(
-        r#"
+        r"
 a = [1, 2]
 b = a
 c = [1, 2]
 a is b
-"#,
+",
         true,
     );
     assert_bool(
-        r#"
+        r"
 a = [1, 2]
 c = [1, 2]
 a is c
-"#,
+",
         false,
     );
     assert_bool(
-        r#"
+        r"
 none is none
-"#,
+",
         true,
     );
 }

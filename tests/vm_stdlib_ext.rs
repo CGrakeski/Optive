@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 //! 新增/扩充标准库冒烟测试：encoding / csv / toml / yaml / xml / math / typing / % 格式化。
 mod common;
 
@@ -121,7 +129,7 @@ std.csv.parse("a,b\n1,2\n3,4")
                     assert_eq!(
                         d.borrow()
                             .get(&optive::value::ValueKey::Text("a".into()))
-                            .map(|x| x.print_string()),
+                            .map(optive::value::Value::print_string),
                         Some("1".into())
                     );
                 }

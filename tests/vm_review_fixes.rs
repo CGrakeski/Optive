@@ -1,4 +1,12 @@
-//! Regression tests for review fixes: Once race, Barrier/Cond suspend, generic TypeSpec, struct seal.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
+//! Regression tests for review fixes: Once race, Barrier/Cond suspend, generic `TypeSpec`, struct seal.
 
 mod common;
 
@@ -9,7 +17,7 @@ use optive::vm::Vm;
 #[test]
 fn once_run_caches_under_parallel_go() {
     // Many concurrent Once.run should all see the same value; bump runs once.
-    let src = r#"
+    let src = r"
 let o = Once()
 let counter = Mutex(0)
 func bump() {
@@ -34,7 +42,7 @@ let g = counter.lock()
 let n = g.get()
 g.unlock()
 a + n
-"#;
+";
     let mut vm = Vm::with_workers(4);
     let v = run_source_in_vm(&mut vm, src, "<once-par>").expect("run");
     // bump once → 101; counter == 1 → total 102
@@ -44,7 +52,7 @@ a + n
 #[test]
 fn barrier_with_suspend_does_not_release_early() {
     // 3 parties; one fiber suspends while waiting. Must not fire until all 3 wait.
-    let src = r#"
+    let src = r"
 let b = Barrier(3)
 let box = Mutex(0)
 let wg = WaitGroup(2)
@@ -70,7 +78,7 @@ g.set(g.get() + 10)
 let n = g.get()
 g.unlock()
 n
-"#;
+";
     assert_eq!(value(src).display_string(), "12");
 }
 
@@ -100,7 +108,7 @@ h.xs.append("bad")
 #[test]
 fn once_sequential_still_works() {
     assert_num(
-        r#"
+        r"
 let o = Once()
 let counter = Mutex(0)
 func bump() {
@@ -116,7 +124,7 @@ let g = counter.lock()
 let n = g.get()
 g.unlock()
 a + b + n
-"#,
+",
         "3",
     );
 }

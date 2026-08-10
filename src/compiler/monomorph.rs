@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::ast::*;
+use crate::ast::{Expr, ExprKind, CallArg, FuncParam, Block, LocatedStmt, Stmt, ForItem, CatchClause, MatchCase, LValue, FStringPart, SelectCase, Pattern, PatternElem, DelTarget};
 use crate::types::{static_type_value_from_expr, type_value_display};
 use crate::value::Value;
 
@@ -42,6 +42,7 @@ pub fn infer_type_args_from_call_args(
     Ok(vec![inferred])
 }
 
+#[must_use]
 pub fn infer_type_from_expr(expr: &Expr, param_name: &str) -> Option<Value> {
     match &expr.kind {
         ExprKind::Number(_) => Some(Value::type_ref("num")),
@@ -58,6 +59,7 @@ pub fn infer_type_from_expr(expr: &Expr, param_name: &str) -> Option<Value> {
 pub use crate::types::substitute_type_annotation as substitute_type_expr;
 pub use crate::types::substitute_type_value;
 
+#[must_use]
 pub fn substitute_func_param(
     param: &FuncParam,
     subs: &HashMap<String, Value>,
@@ -80,6 +82,7 @@ pub fn substitute_func_param(
     }
 }
 
+#[must_use]
 pub fn substitute_block(block: &Block, type_names: &HashMap<String, String>) -> Block {
     block
         .iter()
@@ -244,6 +247,7 @@ fn substitute_lvalue(lv: &LValue, type_names: &HashMap<String, String>) -> LValu
     }
 }
 
+#[must_use]
 pub fn substitute_expr(expr: &Expr, type_names: &HashMap<String, String>) -> Expr {
     let kind = match &expr.kind {
         ExprKind::Member { object, field } if field == "__name__" => match &object.kind {
@@ -592,6 +596,7 @@ fn substitute_guards(guards: &[Expr], type_names: &HashMap<String, String>) -> V
         .collect()
 }
 
+#[must_use]
 pub fn type_name_map(
     type_params: &[(String, Option<Expr>)],
     type_args: &[Value],
@@ -603,6 +608,7 @@ pub fn type_name_map(
         .collect()
 }
 
+#[must_use]
 pub fn type_substitution_map(
     type_params: &[(String, Option<Expr>)],
     type_args: &[Value],

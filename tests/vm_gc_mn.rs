@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 //! M:N / concurrent GC 环收集回归。
 
 use optive::run_source;
@@ -16,7 +24,7 @@ fn assert_cleared_at_least(src: &str, workers: usize, min: i64) {
     }
 }
 
-const CYCLE_SRC: &str = r#"
+const CYCLE_SRC: &str = r"
 func make_cycle() {
     let a = []
     a.append(a)
@@ -24,7 +32,7 @@ func make_cycle() {
 }
 make_cycle()
 gc()
-"#;
+";
 
 #[test]
 fn gc_breaks_list_cycle_m1() {
@@ -55,7 +63,7 @@ fn gc_concurrent_mode_breaks_cycle() {
 fn gc_suspended_fiber_cycle_survives_until_join() {
     // Suspended fiber holds a cycle on its stack; GC must not clear it.
     // 返回 (await 结果, gc 清扫数)：纤程根丢失时 len 会变成 0 或 await 失败。
-    let src = r#"
+    let src = r"
 func hold() {
     let a = []
     a.append(a)
@@ -66,7 +74,7 @@ let t = go hold()
 let cleared = gc()
 let n = await t
 [n, cleared]
-"#;
+";
     let mut vm = Vm::with_workers(2);
     let v = optive::run_source_in_vm(&mut vm, src, "<gc-fiber>").expect("run");
     let Value::List(items) = v else {
@@ -95,7 +103,7 @@ let n = await t
 
 #[test]
 fn gc_many_cycles_under_workers() {
-    let src = r#"
+    let src = r"
 func make_n(n) {
     for (i in std.math.range(n)) {
         let a = []
@@ -105,7 +113,7 @@ func make_n(n) {
 }
 make_n(64)
 gc()
-"#;
+";
     assert_cleared_at_least(src, 4, 1);
 }
 

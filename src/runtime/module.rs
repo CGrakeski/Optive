@@ -33,7 +33,7 @@ fn function_with_module_env(
     f.module_env = Some(env.clone());
     let mut body = (*f.body).clone();
     let mut changed = false;
-    for ins in body.iter_mut() {
+    for ins in &mut body {
         if let Instruction::Push(Value::Function(inner)) = ins {
             *ins = Instruction::Push(Value::Function(function_with_module_env(inner, env)));
             changed = true;
@@ -205,7 +205,7 @@ fn run_module_source(
     }
 
     let mut export_map = exports.borrow().clone();
-    for (name, val) in export_map.iter_mut() {
+    for (name, val) in &mut export_map {
         if matches!(val, Value::None) {
             if let Some(f) = new_functions.get(name.as_str()) {
                 *val = Value::Function(f.clone());
@@ -279,9 +279,7 @@ fn load_user_module(vm: &mut Vm, module_name: &str) -> Result<Value> {
     if vm.current_package_id == "__root__" {
         if let Ok(file_path) = locate_module_file(&path_components) {
             let import_base = file_path
-                .parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| vm.import_base.clone());
+                .parent().map_or_else(|| vm.import_base.clone(), std::path::Path::to_path_buf);
             return load_file_as_module(
                 vm,
                 module_name,
@@ -356,9 +354,7 @@ fn load_file_as_module(
     vm.module_cache
         .insert(module_name.to_string(), placeholder.clone());
     let import_base = file_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| vm.import_base.clone());
+        .parent().map_or_else(|| vm.import_base.clone(), std::path::Path::to_path_buf);
     match run_module_source(
         vm,
         &source,
@@ -573,9 +569,7 @@ fn load_string_module(vm: &mut Vm, path: &str) -> Result<Value> {
         .unwrap_or("module")
         .to_string();
     let import_base = file_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| vm.import_base.clone());
+        .parent().map_or_else(|| vm.import_base.clone(), std::path::Path::to_path_buf);
     let exports = run_module_source(
         vm,
         &source,
@@ -586,7 +580,7 @@ fn load_string_module(vm: &mut Vm, path: &str) -> Result<Value> {
     )?;
     let module = Shared::new(ModuleObject {
         name: alias.clone(),
-        full_name: canonical.clone(),
+        full_name: canonical,
         exports,
         children: HashMap::new(),
         is_user: true,

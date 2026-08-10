@@ -35,7 +35,8 @@ pub mod names {
 }
 
 /// 运行时值标签 → 原始类型名（供方法 / magic 查找）。
-pub fn value_primitive_type(val: &Value) -> Option<&'static str> {
+#[must_use]
+pub const fn value_primitive_type(val: &Value) -> Option<&'static str> {
     match val {
         Value::None => Some(names::NONE),
         Value::Bool(_) => Some(names::BOOL),
@@ -66,10 +67,12 @@ pub fn value_primitive_type(val: &Value) -> Option<&'static str> {
     }
 }
 
+#[must_use]
 pub fn is_registered_primitive(name: &str) -> bool {
     names::ALL_PRIMITIVES.contains(&name)
 }
 
+#[must_use]
 pub fn is_builtin_base(name: &str) -> bool {
     is_registered_primitive(name)
 }
@@ -110,8 +113,8 @@ pub fn check_primitive_instance(vm: &Vm, val: &Value, type_name: &str) -> Option
     })
 }
 
-fn value_matches_abi(val: &Value, abi: crate::ffi::AbiType) -> bool {
-    use crate::ffi::AbiType::*;
+const fn value_matches_abi(val: &Value, abi: crate::ffi::AbiType) -> bool {
+    use crate::ffi::AbiType::{Void, Bool, I8, U8, I16, U16, I32, U32, I64, U64, Isize, Usize, F32, F64, Pointer, CharPtr, WCharPtr};
     match abi {
         Void => matches!(val, Value::None),
         Bool => matches!(val, Value::Bool(_)),
@@ -174,6 +177,7 @@ pub fn struct_name_distance(vm: &Vm, actual: &str, expected: &str) -> Option<usi
     }
 }
 
+#[must_use]
 pub fn protocol_has_method(type_name: &str, method: &str) -> bool {
     PROTOCOL_METHODS
         .iter()
@@ -210,6 +214,7 @@ const PROTOCOL_METHODS: &[(&str, &str)] = &[
     ("text", "__rmul__"),
 ];
 
+#[must_use]
 pub fn sample_value_for_type_name(name: &str) -> Value {
     match name {
         "num" => Value::Num(Num::Small(0)),
@@ -248,6 +253,7 @@ pub fn value_to_type_value(_vm: &Vm, val: &Value) -> Value {
 }
 
 /// 将运行时类型操作数转为 类型值（供 `std.typing` 构造）。
+#[must_use]
 pub fn value_to_type_value_operand(val: &Value) -> Value {
     match val {
         Value::TypeRef(s) | Value::Text(s) => Value::TypeRef(s.clone()),
@@ -262,7 +268,7 @@ pub fn literal_operand_to_type_value(val: &Value) -> crate::Result<Value> {
     match val {
         Value::Text(s) => Ok(Value::TypeRef(format!("__lit_text:{s}"))),
         Value::Bool(b) => Ok(Value::TypeRef(format!("__lit_bool:{b}"))),
-        Value::Num(n) => Ok(Value::TypeRef(format!("__lit_num:{}", n))),
+        Value::Num(n) => Ok(Value::TypeRef(format!("__lit_num:{n}"))),
         Value::None => Ok(Value::TypeRef("__lit_none".to_string())),
         other => Err(RuntimeError::msg(format!(
             "Literal does not support {}",
@@ -362,6 +368,7 @@ fn set_match_distance(vm: &Vm, val: &Value, params: &[Value]) -> Option<usize> {
     Some(score)
 }
 
+#[must_use]
 pub fn primitive_value_to_type_value(val: &Value) -> Option<Value> {
     match val {
         Value::None => Some(Value::TypeRef("nonetype".to_string())),
@@ -531,11 +538,11 @@ fn callable_match_distance(_vm: &Vm, val: &Value, _params: &[Value]) -> Option<u
     is_callable_value(val).then_some(0)
 }
 
-fn callable_accepts(_vm: &Vm, val: &Value, _params: &[Value]) -> bool {
+const fn callable_accepts(_vm: &Vm, val: &Value, _params: &[Value]) -> bool {
     is_callable_value(val)
 }
 
-fn is_callable_value(val: &Value) -> bool {
+const fn is_callable_value(val: &Value) -> bool {
     matches!(
         val,
         Value::Function(_) | Value::GenericFunction(_) | Value::Builtin(_)
@@ -566,7 +573,7 @@ fn variance_implies(
     }
 }
 
-fn ptr_form_match_distance(_vm: &Vm, val: &Value, params: &[Value]) -> Option<usize> {
+const fn ptr_form_match_distance(_vm: &Vm, val: &Value, params: &[Value]) -> Option<usize> {
     if params.len() != 1 {
         return None;
     }
@@ -576,7 +583,7 @@ fn ptr_form_match_distance(_vm: &Vm, val: &Value, params: &[Value]) -> Option<us
     }
 }
 
-fn ptr_form_accepts(_vm: &Vm, val: &Value, params: &[Value]) -> bool {
+const fn ptr_form_accepts(_vm: &Vm, val: &Value, params: &[Value]) -> bool {
     if params.len() != 1 {
         return false;
     }
@@ -734,6 +741,7 @@ fn lookup_type_form(name: &str) -> Option<&'static TypeFormEntry> {
     FORMS.iter().find(|(n, _)| *n == name).map(|(_, e)| e)
 }
 
+#[must_use]
 pub fn is_type_form(name: &str) -> bool {
     lookup_type_form(name).is_some()
 }
@@ -749,8 +757,7 @@ pub fn type_form_match_distance(
 
 pub fn type_form_accepts(vm: &Vm, val: &Value, name: &str, params: &[Value]) -> bool {
     lookup_type_form(name)
-        .map(|f| (f.accepts)(vm, val, params))
-        .unwrap_or(false)
+        .is_some_and(|f| (f.accepts)(vm, val, params))
 }
 
 pub fn type_form_infer(
@@ -796,6 +803,7 @@ pub fn type_form_implies(vm: &Vm, actual: &Value, bound: &Value) -> Option<bool>
     form.implies.map(|f| f(vm, actual, bound))
 }
 
+#[must_use]
 pub fn type_ctor_error(type_name: &str, src: &Value) -> RuntimeError {
     RuntimeError::type_err(format!(
         "TypeError: cannot construct {type_name} from {}",
@@ -803,6 +811,7 @@ pub fn type_ctor_error(type_name: &str, src: &Value) -> RuntimeError {
     ))
 }
 
+#[must_use]
 pub fn type_convert_error(type_name: &str, src: &Value) -> RuntimeError {
     RuntimeError::type_err(format!(
         "TypeError: cannot convert {} to {type_name}",
@@ -810,6 +819,7 @@ pub fn type_convert_error(type_name: &str, src: &Value) -> RuntimeError {
     ))
 }
 
+#[must_use]
 pub fn type_ctor_arity_error(type_name: &str, expected: &str, got: usize) -> RuntimeError {
     RuntimeError::type_err(format!(
         "TypeError: {type_name}() {expected}, got {got}"
@@ -912,11 +922,7 @@ fn convert_to_sized(type_name: &str, value: &Value) -> Result<Value> {
                 .to_i64()
                 .ok_or_else(|| type_convert_error(type_name, value))?,
             Value::Bool(b) => {
-                if *b {
-                    1
-                } else {
-                    0
-                }
+                i64::from(*b)
             }
             Value::Ptr(p) => *p as i64,
             other => return Err(type_convert_error(type_name, other)),
@@ -924,9 +930,9 @@ fn convert_to_sized(type_name: &str, value: &Value) -> Result<Value> {
         // 禁止静默截断（implicit / Type.(v) 窄化须落在目标范围）。
         if signed {
             let (min, max) = match bits {
-                8 => (i8::MIN as i64, i8::MAX as i64),
-                16 => (i16::MIN as i64, i16::MAX as i64),
-                32 => (i32::MIN as i64, i32::MAX as i64),
+                8 => (i64::from(i8::MIN), i64::from(i8::MAX)),
+                16 => (i64::from(i16::MIN), i64::from(i16::MAX)),
+                32 => (i64::from(i32::MIN), i64::from(i32::MAX)),
                 64 => (i64::MIN, i64::MAX),
                 _ => return Err(type_convert_error(type_name, value)),
             };
@@ -942,9 +948,9 @@ fn convert_to_sized(type_name: &str, value: &Value) -> Result<Value> {
                 )));
             }
             let max = match bits {
-                8 => u8::MAX as i64,
-                16 => u16::MAX as i64,
-                32 => u32::MAX as i64,
+                8 => i64::from(u8::MAX),
+                16 => i64::from(u16::MAX),
+                32 => i64::from(u32::MAX),
                 64 => i64::MAX, // 更大的无符号整数需走 BigInt 路径；此处 to_i64 已受限
                 _ => return Err(type_convert_error(type_name, value)),
             };
@@ -1236,7 +1242,7 @@ fn coerce_to_num(
                 )))
             }
         }
-        Value::Bool(b) => Ok(Value::Num(Num::Small(if *b { 1 } else { 0 }))),
+        Value::Bool(b) => Ok(Value::Num(Num::Small(i64::from(*b)))),
         other => Err(on_mismatch("num", other)),
     }
 }
@@ -1500,7 +1506,7 @@ fn format_int_radix(
 ) -> Result<String> {
     let n = match v {
         Value::Num(n) => n,
-        Value::Bool(b) => return Ok((if *b { 1 } else { 0 }).to_string()),
+        Value::Bool(b) => return Ok(i32::from(*b).to_string()),
         _ => return Err(RuntimeError::value_err("not an integer for integer format")),
     };
     let prefix = if alt {
@@ -1515,12 +1521,12 @@ fn format_int_radix(
     };
     let s = match n {
         Num::Small(i) => {
-            let mag = (*i).unsigned_abs() as u128;
+            let mag = u128::from((*i).unsigned_abs());
             let body = match radix {
                 10 => mag.to_string(),
-                16 => format!("{:x}", mag),
-                8 => format!("{:o}", mag),
-                2 => format!("{:b}", mag),
+                16 => format!("{mag:x}"),
+                8 => format!("{mag:o}"),
+                2 => format!("{mag:b}"),
                 _ => return Err(RuntimeError::value_err("unsupported radix")),
             };
             let body = if upper && radix == 16 { body.to_uppercase() } else { body };
@@ -1769,27 +1775,27 @@ pub fn get_text_method(text: &str, field: &str) -> Result<Value> {
 pub fn get_list_method(list: &Shared<Vec<Value>>, field: &str) -> Result<Value> {
     match field {
         "len" => {
-            let lst = list.clone();
+            let owned = list.clone();
             Ok(Value::Builtin(Arc::new(move |_vm, args| {
                 if !args.is_empty() {
                     return Err(RuntimeError::type_err("len takes no arguments"));
                 }
-                Ok(Value::Num(Num::Small(lst.borrow().len() as i64)))
+                Ok(Value::Num(Num::Small(owned.borrow().len() as i64)))
             })))
         }
         "append" => {
-            let lst = list.clone();
+            let owned = list.clone();
             Ok(Value::Builtin(Arc::new(move |vm, args| {
                 if args.len() != 1 {
                     return Err(RuntimeError::type_err("append requires 1 argument"));
                 }
-                vm.check_list_element_write(&lst, &args[0])?;
-                lst.borrow_mut().push(args[0].clone());
+                vm.check_list_element_write(&owned, &args[0])?;
+                owned.borrow_mut().push(args[0].clone());
                 Ok(Value::None)
             })))
         }
         "extend" => {
-            let lst = list.clone();
+            let owned = list.clone();
             Ok(Value::Builtin(Arc::new(move |vm, args| {
                 if args.len() != 1 {
                     return Err(RuntimeError::type_err("extend requires 1 argument"));
@@ -1798,17 +1804,17 @@ pub fn get_list_method(list: &Shared<Vec<Value>>, field: &str) -> Result<Value> 
                 let state_rc = Shared::new(state);
                 let mut pending = Vec::new();
                 while let Some(v) = vm.advance_iterator(&state_rc)? {
-                    vm.check_list_element_write(&lst, &v)?;
+                    vm.check_list_element_write(&owned, &v)?;
                     pending.push(v);
                 }
-                lst.borrow_mut().extend(pending);
+                owned.borrow_mut().extend(pending);
                 Ok(Value::None)
             })))
         }
         "pop" => {
-            let lst = list.clone();
+            let owned = list.clone();
             Ok(Value::Builtin(Arc::new(move |_vm, args| {
-                let mut items = lst.borrow_mut();
+                let mut items = owned.borrow_mut();
                 if items.is_empty() {
                     return Err(RuntimeError::index_err("pop from empty list"));
                 }

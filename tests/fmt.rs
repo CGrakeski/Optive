@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::{assert_num, kinds, parse_ok, value};
@@ -36,12 +44,12 @@ fn kinds_still_skips_comments() {
 #[test]
 fn comment_in_ast_does_not_affect_runtime() {
     assert_num(
-        r#"
+        r"
 // leading
 let x = 1
 /* mid */
 x + 2
-"#,
+",
         "3",
     );
 }
@@ -148,7 +156,7 @@ intern let x = 2
 
 #[test]
 fn fmt_roundtrip_still_runs() {
-    let src = r#"
+    let src = r"
 func fib(n) {
     if (n <= 1) {
         return n
@@ -156,7 +164,7 @@ func fib(n) {
     return fib(n - 1) + fib(n - 2)
 }
 fib(5)
-"#;
+";
     let formatted = format_source(src).expect("fmt");
     parse_ok(&formatted);
     assert_eq!(value(&formatted).display_string(), "5");

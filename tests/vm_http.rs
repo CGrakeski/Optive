@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::{assert_num, run_err, value};
@@ -7,14 +15,14 @@ use optive::value::Value;
 #[test]
 fn import_std_http_module() {
     let v = value(
-        r#"
+        r"
 import std.http as http
 http
-"#,
+",
     );
     match v {
         Value::Module(m) => assert_eq!(m.borrow().name, "http"),
-        other => panic!("expected module, got {:?}", other),
+        other => panic!("expected module, got {other:?}"),
     }
 }
 
@@ -23,10 +31,10 @@ http
 fn http_exports_are_builtins() {
     for name in ["get", "post", "put", "delete", "patch", "head", "request"] {
         let src = format!(
-            r#"
+            r"
 import std.http as http
 http.{name}
-"#
+"
         );
         match value(&src) {
             Value::Builtin(_) => {}
@@ -50,10 +58,10 @@ http.get("ht!tp://%%%invalid-url")
 #[test]
 fn http_get_non_text_url_errors() {
     run_err(
-        r#"
+        r"
 import std.http as http
 http.get(42)
-"#,
+",
     );
 }
 
@@ -69,7 +77,7 @@ http.request("FROBNICATE", "https://example.com")
 }
 
 /// 真实网络请求：对 example.com 做 GET，断言 200 与 body 含 HTML。
-/// 默认忽略以保持 CI 离线稳定；手动运行：cargo test -- --ignored http_real
+/// 默认忽略以保持 CI 离线稳定；手动运行：cargo test -- --ignored `http_real`
 #[test]
 #[ignore]
 fn http_real_get_example_com() {

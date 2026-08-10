@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 //! 编译期栈平衡：表达式契约与 Suspend 配对（零运行时开销的 verifier）。
 
 mod common;
@@ -19,12 +27,12 @@ fn func_body(source: &str, name: &str) -> Vec<Instruction> {
 #[test]
 fn suspend_stmt_emits_push_none_before_pop() {
     let body = func_body(
-        r#"
+        r"
 func f() {
   suspend
   return 1
 }
-"#,
+",
         "f",
     );
     let mut saw = false;
@@ -47,7 +55,7 @@ func f() {
 #[test]
 fn select_idle_uses_bare_suspend_without_push() {
     let body = func_body(
-        r#"
+        r"
 func f(ch) {
   select {
     case ch.recv() as x {
@@ -55,7 +63,7 @@ func f(ch) {
     }
   }
 }
-"#,
+",
         "f",
     );
     // idle 路径：裸 Suspend 后应是 Goto，不得夹 Push(None)
@@ -76,7 +84,7 @@ func f(ch) {
 #[test]
 fn try_as_value_keeps_body_on_success() {
     common::assert_num(
-        r#"
+        r"
 func f() {
   try {
     42
@@ -85,7 +93,7 @@ func f() {
   }
 }
 f()
-"#,
+",
         "42",
     );
 }
@@ -93,7 +101,7 @@ f()
 #[test]
 fn try_as_value_else_still_wins_on_success() {
     common::assert_num(
-        r#"
+        r"
 func f() {
   try {
     42
@@ -104,7 +112,7 @@ func f() {
   }
 }
 f()
-"#,
+",
         "7",
     );
 }
@@ -112,11 +120,11 @@ f()
 #[test]
 fn module_top_level_passes_stack_verify() {
     let prog = compile(
-        r#"
+        r"
 let x = 1
 suspend
 x + 1
-"#,
+",
     )
     .expect("compile");
     verify_stack_balance(&prog.code).expect("module code stack-balanced");

@@ -1,29 +1,37 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use optive::run_source;
 use optive::run_source_in_vm;
 use optive::vm::Vm;
 
-const FIB: &str = r#"
+const FIB: &str = r"
 func fib(n) {
     if (n <= 1) { return n }
     return fib(n - 1) + fib(n - 2)
 }
 fib(30)
-"#;
+";
 
-const EMPTY_LOOP: &str = r#"
+const EMPTY_LOOP: &str = r"
 loop (1000000) { }
 42
-"#;
+";
 
-const ARITH_LOOP: &str = r#"
+const ARITH_LOOP: &str = r"
 let sum = 0
 loop (100000) { sum = sum + 1 }
 sum
-"#;
+";
 
 /// 较小区间，避免 criterion 采样过久；完整版见 `tests/benchmarks.rs`。
-const PARALLEL_PRIMES: &str = r#"
+const PARALLEL_PRIMES: &str = r"
 const let FROM = 2
 const let TO = 10001
 const let WORKERS = 8
@@ -84,7 +92,7 @@ loop {
   i = i + 1
 }
 total
-"#;
+";
 
 fn run_primes(workers: usize) {
     let mut vm = Vm::with_workers(workers);

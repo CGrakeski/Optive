@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::assert_num;
@@ -31,7 +39,7 @@ fn nested_if() {
 #[test]
 fn while_sum() {
     assert_num(
-        r#"
+        r"
 let sum = 0
 let i = 0
 while (i < 5) {
@@ -39,7 +47,7 @@ while (i < 5) {
     i = i + 1
 }
 sum
-"#,
+",
         "10",
     );
 }
@@ -47,11 +55,11 @@ sum
 #[test]
 fn while_zero_iterations() {
     assert_num(
-        r#"
+        r"
 let x = 42
 while (false) { x = 0 }
 x
-"#,
+",
         "42",
     );
 }
@@ -59,11 +67,11 @@ x
 #[test]
 fn loop_counted() {
     assert_num(
-        r#"
+        r"
 let n = 0
 loop (5) { n = n + 1 }
 n
-"#,
+",
         "5",
     );
 }
@@ -71,11 +79,11 @@ n
 #[test]
 fn loop_zero() {
     assert_num(
-        r#"
+        r"
 let n = 0
 loop (0) { n = n + 1 }
 n
-"#,
+",
         "0",
     );
 }
@@ -83,14 +91,14 @@ n
 #[test]
 fn loop_break() {
     assert_num(
-        r#"
+        r"
 let n = 0
 loop {
     n = n + 1
     if (n == 3) { break }
 }
 n
-"#,
+",
         "3",
     );
 }
@@ -98,14 +106,14 @@ n
 #[test]
 fn loop_counted_break() {
     assert_num(
-        r#"
+        r"
 let n = 0
 loop (10) {
     n = n + 1
     if (n == 3) { break }
 }
 n
-"#,
+",
         "3",
     );
 }
@@ -113,7 +121,7 @@ n
 #[test]
 fn loop_continue() {
     assert_num(
-        r#"
+        r"
 let sum = 0
 let i = 0
 loop (5) {
@@ -122,7 +130,7 @@ loop (5) {
     sum = sum + i
 }
 sum
-"#,
+",
         "12",
     );
 }
@@ -130,7 +138,7 @@ sum
 #[test]
 fn loop_return_inside_counted() {
     assert_num(
-        r#"
+        r"
 func f() {
     loop (10) {
         return 7
@@ -138,7 +146,7 @@ func f() {
     return 0
 }
 f()
-"#,
+",
         "7",
     );
 }
@@ -146,7 +154,7 @@ f()
 #[test]
 fn nested_counted_loops() {
     assert_num(
-        r#"
+        r"
 let n = 0
 loop (3) {
     loop (4) {
@@ -154,7 +162,7 @@ loop (3) {
     }
 }
 n
-"#,
+",
         "12",
     );
 }
@@ -162,11 +170,11 @@ n
 #[test]
 fn for_in_list() {
     assert_num(
-        r#"
+        r"
 let sum = 0
 for (x in [1, 2, 3, 4]) { sum = sum + x }
 sum
-"#,
+",
         "10",
     );
 }
@@ -186,11 +194,11 @@ n
 #[test]
 fn for_in_empty_list() {
     assert_num(
-        r#"
+        r"
 let n = 99
 for (x in []) { n = 0 }
 n
-"#,
+",
         "99",
     );
 }
@@ -198,13 +206,13 @@ n
 #[test]
 fn block_scope() {
     assert_num(
-        r#"
+        r"
 let x = 1
 {
     let x = 2
 }
 x
-"#,
+",
         "1",
     );
 }

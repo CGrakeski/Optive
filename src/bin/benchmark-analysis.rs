@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 //! Optive CPU 分析负载入口（供 samply / 外部采样器挂载）。
 //!
 //! ```text
@@ -17,37 +25,37 @@ use optive::run_source;
 use optive::run_source_in_vm;
 use optive::vm::Vm;
 
-const FIB_SRC: &str = r#"
+const FIB_SRC: &str = r"
 func fib(n) {
     if (n <= 1) { return n }
     return fib(n - 1) + fib(n - 2)
 }
 fib(30)
-"#;
+";
 
-const EMPTY_LOOP_SRC: &str = r#"
+const EMPTY_LOOP_SRC: &str = r"
 loop (1000000) { }
 42
-"#;
+";
 
-const ARITH_LOOP_SRC: &str = r#"
+const ARITH_LOOP_SRC: &str = r"
 let sum = 0
 loop (100000) {
     sum = sum + 1
 }
 sum
-"#;
+";
 
-const CALL_LOOP_SRC: &str = r#"
+const CALL_LOOP_SRC: &str = r"
 func id(x) { return x }
 let n = 0
 loop (50000) {
     n = id(n + 1)
 }
 n
-"#;
+";
 
-const NESTED_LOOP_1B_SRC: &str = r#"
+const NESTED_LOOP_1B_SRC: &str = r"
 loop (1000) {
     {
         loop (1000) {
@@ -59,9 +67,9 @@ loop (1000) {
     }
 }
 42
-"#;
+";
 
-const PRIMES_SEQ_SRC: &str = r#"
+const PRIMES_SEQ_SRC: &str = r"
 func is_prime(n) {
   if (n < 2) { return false }
   if (n == 2) { return true }
@@ -87,9 +95,9 @@ func count_primes() {
 }
 
 count_primes()
-"#;
+";
 
-const PARALLEL_PRIMES_SRC: &str = r#"
+const PARALLEL_PRIMES_SRC: &str = r"
 const let FROM = 2
 const let TO = 50001
 const let WORKERS = 8
@@ -150,9 +158,9 @@ loop {
   i = i + 1
 }
 total
-"#;
+";
 
-const CHANNEL_PING_SRC: &str = r#"
+const CHANNEL_PING_SRC: &str = r"
 const let N = 20000
 let a = Channel(1)
 let b = Channel(1)
@@ -171,7 +179,7 @@ loop (N) {
   i = i + 1
 }
 N
-"#;
+";
 
 #[derive(Clone, Copy)]
 struct Bench {
@@ -306,12 +314,9 @@ fn parse_args() -> (Vec<&'static Bench>, usize, usize, Option<usize>) {
     } else {
         let mut out = Vec::new();
         for n in &names {
-            match BENCHES.iter().find(|b| b.name == n) {
-                Some(b) => out.push(b),
-                None => {
-                    eprintln!("unknown bench: {n}");
-                    usage();
-                }
+            if let Some(b) = BENCHES.iter().find(|b| b.name == n) { out.push(b) } else {
+                eprintln!("unknown bench: {n}");
+                usage();
             }
         }
         out

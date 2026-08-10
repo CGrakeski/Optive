@@ -84,6 +84,7 @@ pub struct FfiRuntimeConfig {
 }
 
 impl FfiRuntimeConfig {
+    #[must_use]
     pub fn from_env() -> Arc<Self> {
         Arc::new(Self {
             serial: AtomicBool::new(configured_ffi_serial()),
@@ -235,7 +236,8 @@ impl AbiType {
 }
 
 /// `(size, align)` in bytes for layout / `C.sizeof`.
-pub fn abi_size_align(abi: AbiType) -> (usize, usize) {
+#[must_use]
+pub const fn abi_size_align(abi: AbiType) -> (usize, usize) {
     match abi {
         AbiType::Void => (0, 1),
         AbiType::Bool | AbiType::I8 | AbiType::U8 => (1, 1),
@@ -571,7 +573,7 @@ pub(crate) fn invoke_native_call(
 ) -> Result<RetStorage> {
     crate::gc::ffi_enter();
     let result = (|| {
-        let ffi_args: Vec<Arg> = storage.iter_mut().map(|s| s.as_arg()).collect();
+        let ffi_args: Vec<Arg> = storage.iter_mut().map(ArgStorage::as_arg).collect();
         let raw = if use_serial {
             let _guard = FFI_CALL_LOCK.lock();
             unsafe { call_cif(&ffi.cif, ffi.code, &ffi_args, ret_abi) }?
@@ -595,7 +597,7 @@ pub(crate) fn invoke_native_call_sampled(
 ) -> Result<(RetStorage, i32)> {
     crate::gc::ffi_enter();
     let result = (|| {
-        let ffi_args: Vec<Arg> = storage.iter_mut().map(|s| s.as_arg()).collect();
+        let ffi_args: Vec<Arg> = storage.iter_mut().map(ArgStorage::as_arg).collect();
         let raw = if use_serial {
             let _guard = FFI_CALL_LOCK.lock();
             unsafe { call_cif(&ffi.cif, ffi.code, &ffi_args, ret_abi) }?
@@ -656,23 +658,23 @@ impl ArgStorage {
 fn value_to_storage(v: &Value, abi: AbiType) -> Result<ArgStorage> {
     match abi {
         AbiType::Void => Err(RuntimeError::type_err("void cannot be a parameter")),
-        AbiType::Bool => Ok(ArgStorage::I8(if v.is_truthy() { 1 } else { 0 })),
-        AbiType::I8 => Ok(ArgStorage::I8(narrow_i64(v, i8::MIN as i64, i8::MAX as i64, "i8")? as i8)),
-        AbiType::U8 => Ok(ArgStorage::U8(narrow_i64(v, 0, u8::MAX as i64, "u8")? as u8)),
+        AbiType::Bool => Ok(ArgStorage::I8(i8::from(v.is_truthy()))),
+        AbiType::I8 => Ok(ArgStorage::I8(narrow_i64(v, i64::from(i8::MIN), i64::from(i8::MAX), "i8")? as i8)),
+        AbiType::U8 => Ok(ArgStorage::U8(narrow_i64(v, 0, i64::from(u8::MAX), "u8")? as u8)),
         AbiType::I16 => {
-            Ok(ArgStorage::I16(narrow_i64(v, i16::MIN as i64, i16::MAX as i64, "i16")? as i16))
+            Ok(ArgStorage::I16(narrow_i64(v, i64::from(i16::MIN), i64::from(i16::MAX), "i16")? as i16))
         }
-        AbiType::U16 => Ok(ArgStorage::U16(narrow_i64(v, 0, u16::MAX as i64, "u16")? as u16)),
+        AbiType::U16 => Ok(ArgStorage::U16(narrow_i64(v, 0, i64::from(u16::MAX), "u16")? as u16)),
         AbiType::I32 => {
-            Ok(ArgStorage::I32(narrow_i64(v, i32::MIN as i64, i32::MAX as i64, "i32")? as i32))
+            Ok(ArgStorage::I32(narrow_i64(v, i64::from(i32::MIN), i64::from(i32::MAX), "i32")? as i32))
         }
-        AbiType::U32 => Ok(ArgStorage::U32(narrow_i64(v, 0, u32::MAX as i64, "u32")? as u32)),
+        AbiType::U32 => Ok(ArgStorage::U32(narrow_i64(v, 0, i64::from(u32::MAX), "u32")? as u32)),
         AbiType::I64 => Ok(ArgStorage::I64(as_i64(v)?)),
         AbiType::U64 => Ok(ArgStorage::U64(as_u64(v)?)),
         AbiType::Isize => {
             if cfg!(target_pointer_width = "32") {
                 Ok(ArgStorage::I32(
-                    narrow_i64(v, i32::MIN as i64, i32::MAX as i64, "isize")? as i32,
+                    narrow_i64(v, i64::from(i32::MIN), i64::from(i32::MAX), "isize")? as i32,
                 ))
             } else {
                 Ok(ArgStorage::I64(as_i64(v)?))
@@ -756,7 +758,7 @@ unsafe fn call_cif(
         AbiType::I64 => RetStorage::I64(cif.call::<i64>(code, args)),
         AbiType::Isize => {
             if cfg!(target_pointer_width = "32") {
-                RetStorage::I64(cif.call::<i32>(code, args) as i64)
+                RetStorage::I64(i64::from(cif.call::<i32>(code, args)))
             } else {
                 RetStorage::I64(cif.call::<i64>(code, args))
             }
@@ -764,7 +766,7 @@ unsafe fn call_cif(
         AbiType::U64 => RetStorage::U64(cif.call::<u64>(code, args)),
         AbiType::Usize | AbiType::Pointer | AbiType::CharPtr | AbiType::WCharPtr => {
             if cfg!(target_pointer_width = "32") {
-                RetStorage::U64(cif.call::<u32>(code, args) as u64)
+                RetStorage::U64(u64::from(cif.call::<u32>(code, args)))
             } else {
                 RetStorage::U64(cif.call::<u64>(code, args))
             }
@@ -774,7 +776,7 @@ unsafe fn call_cif(
     })
 }
 
-fn abi_to_value(ret: RetStorage, abi: AbiType) -> Result<Value> {
+const fn abi_to_value(ret: RetStorage, abi: AbiType) -> Result<Value> {
     Ok(match (ret, abi) {
         (RetStorage::Void, _) => Value::None,
         (RetStorage::I8(v), AbiType::Bool) => Value::Bool(v != 0),
@@ -805,7 +807,7 @@ fn as_i64(v: &Value) -> Result<i64> {
         Value::Num(n) => n
             .to_i64()
             .ok_or_else(|| RuntimeError::type_err("cannot pass non-integer num as integer ABI value")),
-        Value::Bool(b) => Ok(if *b { 1 } else { 0 }),
+        Value::Bool(b) => Ok(i64::from(*b)),
         Value::Ptr(p) => Ok(*p as i64),
         other => Err(RuntimeError::type_err(format!(
             "cannot convert {} to integer ABI value",
@@ -861,7 +863,7 @@ fn eval_wrapper_expr(vm: &mut Vm, expr: &crate::ast::Expr, raw: Value) -> Result
             vm.call_value(c, call_args)
         }
         ExprKind::Member { object, field } => {
-            let base = eval_wrapper_expr(vm, object, raw.clone())?;
+            let base = eval_wrapper_expr(vm, object, raw)?;
             match base {
                 Value::Module(m) => m
                     .borrow()
@@ -988,6 +990,7 @@ fn build_c_types_module() -> Shared<ModuleObject> {
     })
 }
 
+#[must_use]
 pub fn build_language_module() -> Shared<ModuleObject> {
     let c = build_c_language_module();
     let mut children = HashMap::new();

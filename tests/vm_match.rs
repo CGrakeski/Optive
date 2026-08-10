@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::{assert_num, assert_text};
@@ -29,11 +37,11 @@ match (2) {
 #[test]
 fn match_list_destructure() {
     assert_num(
-        r#"
+        r"
 match ([10, 20]) {
     case [a, b] { a + b }
 } else { 0 }
-"#,
+",
         "30",
     );
 }
@@ -41,12 +49,12 @@ match ([10, 20]) {
 #[test]
 fn match_struct_destructure() {
     assert_num(
-        r#"
+        r"
 struct Point { let x let y }
 match (Point(3, 4)) {
     case Point { x, y } { x + y }
 } else { 0 }
-"#,
+",
         "7",
     );
 }
@@ -54,12 +62,12 @@ match (Point(3, 4)) {
 #[test]
 fn match_struct_call_pattern_binds_fields() {
     assert_num(
-        r#"
+        r"
 struct Point { let x let y }
 match (Point(3, 4)) {
     case Point(a, b) { a + b }
 } else { 0 }
-"#,
+",
         "7",
     );
 }

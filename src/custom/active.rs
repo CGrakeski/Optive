@@ -22,6 +22,7 @@ pub struct ActivePack {
 }
 
 impl ActivePack {
+    #[must_use]
     pub fn render_diag(&self, diag: &Diag) -> String {
         let key = diag.key();
         let fallback = diag.default_en();
@@ -31,26 +32,32 @@ impl ActivePack {
         self.pack.render_message(key, fallback.as_ref())
     }
 
+    #[must_use]
     pub fn repl_prompt(&self) -> &str {
         &self.pack.layout.repl.prompt
     }
 
+    #[must_use]
     pub fn repl_continuation(&self) -> &str {
         &self.pack.layout.repl.continuation
     }
 
+    #[must_use]
     pub fn parse_label_error(&self) -> &str {
         &self.pack.layout.parse.label_error
     }
 
+    #[must_use]
     pub fn parse_arrow(&self) -> &str {
         &self.pack.layout.parse.arrow
     }
 
+    #[must_use]
     pub fn traceback_header(&self) -> &str {
         &self.pack.layout.traceback.header
     }
 
+    #[must_use]
     pub fn traceback_direction(&self) -> TraceDirection {
         if self.pack.layout.traceback.direction == "bottom_up" {
             TraceDirection::BottomUp
@@ -59,6 +66,7 @@ impl ActivePack {
         }
     }
 
+    #[must_use]
     pub fn format_traceback_frame(&self, file: &str, line: usize, func: &str) -> String {
         self.pack
             .layout
@@ -69,6 +77,7 @@ impl ActivePack {
             .replace("{func}", func)
     }
 
+    #[must_use]
     pub fn format_exception_line(&self, name: &str, msg: &str) -> String {
         let gloss = self.pack.gloss.get(name).cloned().unwrap_or_default();
         if msg.is_empty()
@@ -86,6 +95,7 @@ impl ActivePack {
             .replace("{msg}", msg)
     }
 
+    #[must_use]
     pub fn chain_display(&self) -> String {
         self.chain.join(" → ")
     }

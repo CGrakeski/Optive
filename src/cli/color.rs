@@ -169,7 +169,7 @@ fn enable_windows_vt() {
                 continue;
             }
             let mut mode = 0u32;
-            if GetConsoleMode(h, &mut mode) != 0 {
+            if GetConsoleMode(h, &raw mut mode) != 0 {
                 let _ = SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
             }
         }

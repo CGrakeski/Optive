@@ -37,7 +37,7 @@ pub(crate) enum TrackedWeak {
 #[derive(Default)]
 struct TrackerData {
     weaks: Vec<TrackedWeak>,
-    /// 主地址 / 别名（如 Struct 的 SyncCell 锁）→ `weaks` 下标；sweep/prune 后重建。
+    /// 主地址 / 别名（如 Struct 的 `SyncCell` 锁）→ `weaks` 下标；sweep/prune 后重建。
     by_addr: FxHashMap<usize, usize>,
 }
 
@@ -49,6 +49,7 @@ pub enum GcMode {
 }
 
 impl GcMode {
+    #[must_use]
     pub fn from_env() -> Self {
         match std::env::var("OPTIVE_GC_MODE")
             .unwrap_or_default()
@@ -101,10 +102,12 @@ impl Default for SharedGc {
 }
 
 impl SharedGc {
+    #[must_use]
     pub fn new() -> Self {
         Self::with_mode(GcMode::from_env())
     }
 
+    #[must_use]
     pub fn with_mode(mode: GcMode) -> Self {
         let markers = std::env::var("OPTIVE_GC_MARKERS")
             .ok()
@@ -132,7 +135,7 @@ impl SharedGc {
         }
     }
 
-    /// 一次成功收集结束后记账（由 Vm::gc_collect 调用）。
+    /// 一次成功收集结束后记账（由 `Vm::gc_collect` 调用）。
     pub fn note_collect_stats(&self, stw_ns: u64, collect_ns: u64, cleared: usize) {
         self.last_stw_ns.store(stw_ns, Ordering::Relaxed);
         self.last_collect_ns.store(collect_ns, Ordering::Relaxed);
@@ -143,7 +146,7 @@ impl SharedGc {
         self.total_cleared.fetch_add(cleared, Ordering::Relaxed);
     }
 
-    pub fn mode(&self) -> GcMode {
+    pub const fn mode(&self) -> GcMode {
         self.mode
     }
 
@@ -767,7 +770,7 @@ pub fn mark_value(val: &Value, marked: &mut FxHashSet<usize>, worklist: &mut Vec
         Value::Channel(c) => {
             let addr = c.as_ptr() as usize;
             if marked.insert(addr) {
-                for v in c.borrow().queue.iter() {
+                for v in &c.borrow().queue {
                     worklist.push(v.clone());
                 }
             }
@@ -825,23 +828,12 @@ pub fn mark_value(val: &Value, marked: &mut FxHashSet<usize>, worklist: &mut Vec
                 }
             }
         }
-        Value::Num(crate::value::Num::Int(_))
-        | Value::Num(crate::value::Num::Rat(_))
-        | Value::Num(crate::value::Num::Small(_))
-        | Value::None
-        | Value::Bool(_)
-        | Value::Sized(_)
-        | Value::Ptr(_)
-        | Value::DllHandle(_)
-        | Value::Text(_)
-        | Value::TypeRef(_)
-        | Value::Bytes(_)
-        | Value::GenericFunction(_)
-        | Value::Macro(_)
-        | Value::Builtin(_)
-        | Value::RuntimeAst(_)
-        | Value::TypeSpec(_)
-        | Value::EnumMember(_) => {}
+        Value::Num(crate::value::Num::Int(_) | crate::value::Num::Rat(_) |
+crate::value::Num::Small(_)) | Value::None | Value::Bool(_) | Value::Sized(_)
+| Value::Ptr(_) | Value::DllHandle(_) | Value::Text(_) | Value::TypeRef(_) |
+Value::Bytes(_) | Value::GenericFunction(_) | Value::Macro(_) |
+Value::Builtin(_) | Value::RuntimeAst(_) | Value::TypeSpec(_) |
+Value::EnumMember(_) => {}
     }
 }
 

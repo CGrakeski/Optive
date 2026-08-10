@@ -45,7 +45,7 @@ struct Job {
     ret_abi: AbiType,
     use_serial: bool,
     pending: Arc<FfiPending>,
-    /// 卸荷线程安装，使 ffi_enter/leave 落到提交方的 SharedGc。
+    /// 卸荷线程安装，使 `ffi_enter/leave` 落到提交方的 `SharedGc`。
     gc: Arc<SharedGc>,
 }
 

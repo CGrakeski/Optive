@@ -8,7 +8,7 @@
 //! - 顶层声明之间固定 1 空行；块内不加空行
 //! - 注释以 `Stmt::Comment` 保留
 
-use crate::ast::*;
+use crate::ast::{Program, LocatedStmt, Stmt, ProtocolMember, CatchPattern, DelTarget, Visibility, Expr, FuncParam, RET_WRAPPER_VAL, ModuleRef, DestructPattern, DestructElem, LValue, Pattern, PatternElem, ExprKind, FStringPart, ForItem, CallArg, UnaryOp, BinaryOp};
 use crate::error::ParseError;
 use crate::parser::Parser;
 use crate::runtime_ast;
@@ -21,6 +21,7 @@ pub fn format_source(source: &str) -> Result<String, ParseError> {
     Ok(format_program(&program))
 }
 
+#[must_use]
 pub fn format_program(program: &Program) -> String {
     let mut out = Formatter::new();
     out.emit_block_stmts(&program.stmts, 0, true);
@@ -36,7 +37,7 @@ struct Formatter {
 }
 
 impl Formatter {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self { buf: String::new() }
     }
 
@@ -1265,7 +1266,7 @@ impl Formatter {
                 emit_one(self, a, depth);
             }
             // 超行宽则改为竖排
-            let line_start = self.buf[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let line_start = self.buf[..start].rfind('\n').map_or(0, |i| i + 1);
             let width = self.buf.len() - line_start + 1; // + ')'
             if width > MAX_WIDTH {
                 self.buf.truncate(start);
@@ -1325,7 +1326,7 @@ impl Formatter {
     }
 }
 
-fn unary_op_str(op: UnaryOp) -> &'static str {
+const fn unary_op_str(op: UnaryOp) -> &'static str {
     match op {
         UnaryOp::Neg => "-",
         UnaryOp::Not | UnaryOp::TruthyNot => "not ",
@@ -1333,7 +1334,7 @@ fn unary_op_str(op: UnaryOp) -> &'static str {
     }
 }
 
-fn binary_op_str(op: BinaryOp) -> &'static str {
+const fn binary_op_str(op: BinaryOp) -> &'static str {
     match op {
         BinaryOp::Add => "+",
         BinaryOp::Sub => "-",

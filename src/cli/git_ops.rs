@@ -213,9 +213,9 @@ fn spawn_syncer(bar: &ProgressBar, step: &StepShared, alive: &Arc<AtomicBool>) {
 
 /// 从 Git URL 中提取仓库名（支持 HTTPS 和 SSH 格式）。
 /// 示例：
-/// - "https://github.com/user/repo.git" -> "repo"
+/// - "<https://github.com/user/repo.git>" -> "repo"
 /// - "git@github.com:user/repo.git"   -> "repo"
-/// - "https://gitlab.com/group/sub/repo" -> "repo"
+/// - "<https://gitlab.com/group/sub/repo>" -> "repo"
 ///
 /// 仅允许单段安全目录名（字母数字、`.`、`_`、`-`），拒绝路径穿越。
 fn extract_repo_name(url: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -393,7 +393,7 @@ pub fn clone_into(url: &str, target_dir: &std::path::Path) -> Result<(), Box<dyn
             expected_name: target_dir
                 .file_name()
                 .and_then(|s| s.to_str())
-                .map(|s| s.to_string()),
+                .map(std::string::ToString::to_string),
         },
     )?;
     Ok(())
@@ -410,8 +410,7 @@ pub fn resolve_remote_tip(
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_nanos())
     ));
     let _ = fs::remove_dir_all(&tmp_root);
     // clone_into 要求目标路径尚不存在；只确保父目录在即可。
@@ -442,8 +441,7 @@ pub fn resolve_tag_commit(
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_nanos())
     ));
     let _ = fs::remove_dir_all(&tmp_root);
     if let Some(parent) = tmp_root.parent() {
@@ -505,16 +503,15 @@ fn clone_git_repo(
         }
         if opts.interactive_overwrite {
             println!(
-                "The target directory already exists: {:?}\nOverwrite it? [y/N]",
-                target_dir
+                "The target directory already exists: {target_dir:?}\nOverwrite it? [y/N]"
             );
             let mut input = String::new();
             io::stdin().read_line(&mut input)?;
             let input = input.trim().to_ascii_lowercase();
             if input == "y" || input == "yes" {
-                println!("Removing existing directory: {:?}", target_dir);
+                println!("Removing existing directory: {target_dir:?}");
                 fs::remove_dir_all(target_dir)?;
-                println!("Removed existing directory: {:?}", target_dir);
+                println!("Removed existing directory: {target_dir:?}");
             } else {
                 println!("Clone cancelled.");
                 return Err("clone cancelled: target directory already exists".into());

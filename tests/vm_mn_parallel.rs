@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 //! M:N 真并行压力测试（`Vm::with_workers(n)`，n>1）。
 //! 默认单测仍走 M:1；本文件显式构造多 worker。
 
@@ -23,10 +31,10 @@ fn assert_num_workers(workers: usize, source: &str, expected: &str) {
 fn mn_go_await_basic() {
     assert_num_workers(
         4,
-        r#"
+        r"
 let t = go do { return 40 + 2 }
 await t
-"#,
+",
         "42",
     );
 }
@@ -35,7 +43,7 @@ await t
 fn mn_mutex_counter_many_tasks() {
     assert_num_workers(
         4,
-        r#"
+        r"
 let m = Mutex(0)
 let wg = WaitGroup(50)
 loop (50) {
@@ -51,7 +59,7 @@ let g = m.lock()
 let n = g.get()
 g.unlock()
 n
-"#,
+",
         "50",
     );
 }
@@ -60,7 +68,7 @@ n
 fn mn_channel_pipeline() {
     assert_num_workers(
         4,
-        r#"
+        r"
 let ch = Channel()
 go do {
   loop (20) {
@@ -77,7 +85,7 @@ loop {
   sum = sum + v
 }
 sum
-"#,
+",
         "20",
     );
 }
@@ -87,7 +95,7 @@ fn mn_bounded_channel_nested_ok() {
     // 有界 channel：recv 侧调度 send 任务填满后再继续 — 挂起重试，不得自死锁。
     assert_num_workers(
         1,
-        r#"
+        r"
 let ch = Channel(2)
 go do {
   loop (10) {
@@ -104,7 +112,7 @@ loop {
   sum = sum + v
 }
 sum
-"#,
+",
         "10",
     );
 }
@@ -113,7 +121,7 @@ sum
 fn mn_bounded_channel_parallel_ok() {
     assert_num_workers(
         4,
-        r#"
+        r"
 let ch = Channel(3)
 go do {
   loop (15) {
@@ -130,7 +138,7 @@ loop {
   sum = sum + v
 }
 sum
-"#,
+",
         "15",
     );
 }
@@ -139,7 +147,7 @@ sum
 fn mn_waitgroup_fanout() {
     assert_num_workers(
         4,
-        r#"
+        r"
 let wg = WaitGroup(32)
 let m = Mutex(0)
 loop (32) {
@@ -155,7 +163,7 @@ let g = m.lock()
 let n = g.get()
 g.unlock()
 n
-"#,
+",
         "96",
     );
 }
@@ -165,10 +173,10 @@ fn mn_deadlock_is_typed_kind() {
     let mut vm = Vm::with_workers(1);
     let err = optive::run_source_in_vm(
         &mut vm,
-        r#"
+        r"
 let ch = Channel()
 ch.recv()
-"#,
+",
         "<deadlock>",
     )
     .expect_err("expected deadlock");
@@ -187,10 +195,10 @@ fn mn_deadlock_detected_with_parallel_workers() {
     let mut vm = Vm::with_workers(4);
     let err = optive::run_source_in_vm(
         &mut vm,
-        r#"
+        r"
 let ch = Channel()
 ch.recv()
-"#,
+",
         "<mn-deadlock>",
     )
     .expect_err("expected deadlock under M:N");
@@ -207,13 +215,13 @@ fn mn_no_false_deadlock_while_helper_works() {
     // helper 仍在跑任务时不得误判死锁。
     assert_num_workers(
         4,
-        r#"
+        r"
 let t = go do {
   std.time.sleep(0.2)
   return 7
 }
 await t
-"#,
+",
         "7",
     );
 }
@@ -225,7 +233,7 @@ fn mn_workers_1_still_matches_coop() {
     // OPTIVE_WORKERS，为避免环境影响，此处固定 workers=1。
     assert_num_workers(
         1,
-        r#"
+        r"
 var n = 0
 go do {
   n = 1
@@ -235,7 +243,7 @@ go do {
 suspend
 suspend
 n
-"#,
+",
         "2",
     );
 }
@@ -244,7 +252,7 @@ n
 fn mn_parallel_sum_via_channels() {
     assert_num_workers(
         4,
-        r#"
+        r"
 let out = Channel()
 let wg = WaitGroup(4)
 go do {
@@ -276,7 +284,7 @@ loop {
   sum = sum + v
 }
 sum
-"#,
+",
         "100",
     );
 }
@@ -288,7 +296,7 @@ fn mn_migrated_fiber_preserves_main_code() {
     for _ in 0..20 {
         assert_num_workers(
             8,
-            r#"
+            r"
 let wg = WaitGroup(8)
 loop (8) {
   go do {
@@ -302,7 +310,7 @@ loop (8) {
 }
 wg.wait()
 99
-"#,
+",
             "99",
         );
     }

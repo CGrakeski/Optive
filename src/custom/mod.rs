@@ -9,6 +9,7 @@ pub use active::{active_pack, init_from_env_and_cwd, set_active_pack, ActivePack
 pub use keys::{CliMsg, Diag, ErrorKindMsg, ParseMsg, ReplMsg};
 
 /// 按当前激活包渲染人读消息。
+#[must_use]
 pub fn render(diag: &Diag) -> String {
     active_pack().render_diag(diag)
 }
@@ -28,11 +29,12 @@ pub fn parse_use_list(s: &str) -> Vec<String> {
     s.split(',')
         .map(str::trim)
         .filter(|p| !p.is_empty())
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect()
 }
 
-/// 1. cli_override  2. OPTIVE_CUSTOM  3. 项目 Custom.toml  4. 全局 Config.toml
+/// 1. `cli_override`  2. `OPTIVE_CUSTOM`  3. 项目 Custom.toml  4. 全局 Config.toml
+#[must_use]
 pub fn resolve_use_chain(cli_override: Option<&str>) -> Vec<String> {
     if let Some(s) = cli_override {
         return parse_use_list(s);
@@ -145,6 +147,7 @@ pub fn build_active_from_ids(ids: &[String]) -> Result<ActivePack, String> {
     Ok(ActivePack { pack, chain })
 }
 
+#[must_use]
 pub fn project_custom_path() -> Option<PathBuf> {
     find_project_root().map(|r| r.join(PROJECT_CUSTOM_FILE))
 }

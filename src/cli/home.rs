@@ -23,8 +23,7 @@ fn default_home() -> PathBuf {
             let candidate = dir.join("data");
             let stem_matches = exe
                 .file_stem()
-                .map(|s| s.to_string_lossy().eq_ignore_ascii_case(PKG_NAME))
-                .unwrap_or(false);
+                .is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case(PKG_NAME));
             if candidate.is_dir() || stem_matches {
                 return candidate;
             }
@@ -56,7 +55,7 @@ pub fn index_db_path() -> PathBuf {
 pub fn use_local_deps() -> bool {
     matches!(
         env::var("OPTIVE_USE_LOCAL_DEPS").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+        Ok("1" | "true" | "TRUE" | "yes" | "YES")
     )
 }
 

@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::{assert_num, assert_text, num, text};
@@ -44,7 +52,7 @@ fn string_len_unicode() {
 
 #[test]
 fn dict_literal_get() {
-    assert_num(r#"{1: 10, 2: 20}[1]"#, "10");
+    assert_num(r"{1: 10, 2: 20}[1]", "10");
 }
 
 #[test]
@@ -69,7 +77,7 @@ fn text_in_list() {
 
 #[test]
 fn num_in_dict() {
-    assert_eq!(num(r#"{0: 99}[0]"#), "99");
+    assert_eq!(num(r"{0: 99}[0]"), "99");
 }
 
 #[test]

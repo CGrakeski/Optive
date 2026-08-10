@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::{assert_bool, assert_num, assert_text, run_err};
@@ -5,7 +13,7 @@ use common::{assert_bool, assert_num, assert_text, run_err};
 #[test]
 fn macro_sq_expands_at_call_site() {
     assert_num(
-        r#"
+        r"
 macro sq(x) {
     return quote(ex) with (x) {
         var ex = eval(x)
@@ -14,7 +22,7 @@ macro sq(x) {
 }
 n = 6
 sq{n}
-"#,
+",
         "36",
     );
 }
@@ -22,12 +30,12 @@ sq{n}
 #[test]
 fn macro_identity_returns_ast_param() {
     assert_num(
-        r#"
+        r"
 macro identity(x) {
     return x
 }
 identity{6}
-"#,
+",
         "6",
     );
 }
@@ -35,9 +43,9 @@ identity{6}
 #[test]
 fn quote_literal_eval() {
     assert_num(
-        r#"
+        r"
 eval(quote { 42 })
-"#,
+",
         "42",
     );
 }
@@ -45,7 +53,7 @@ eval(quote { 42 })
 #[test]
 fn quote_with_binding() {
     assert_num(
-        r#"
+        r"
 x = 5
 macro inc(v) {
     return quote with (v) {
@@ -53,7 +61,7 @@ macro inc(v) {
     }
 }
 inc{x}
-"#,
+",
         "6",
     );
 }
@@ -61,7 +69,7 @@ inc{x}
 #[test]
 fn quote_hygienic_name() {
     assert_num(
-        r#"
+        r"
 macro double_it(x) {
     return quote(a) with (x) {
         var a = eval(x)
@@ -69,7 +77,7 @@ macro double_it(x) {
     }
 }
 double_it{5}
-"#,
+",
         "10",
     );
 }
@@ -77,14 +85,14 @@ double_it{5}
 #[test]
 fn macro_forty_two_quote_block() {
     assert_num(
-        r#"
+        r"
 macro forty_two() {
     return quote {
         42
     }
 }
 forty_two{}
-"#,
+",
         "42",
     );
 }
@@ -92,7 +100,7 @@ forty_two{}
 #[test]
 fn macro_nested_call() {
     assert_num(
-        r#"
+        r"
 macro sq(x) {
     return quote(ex) with (x) {
         var ex = eval(x)
@@ -100,7 +108,7 @@ macro sq(x) {
     }
 }
 sq{sq{2}}
-"#,
+",
         "16",
     );
 }
@@ -108,10 +116,10 @@ sq{sq{2}}
 #[test]
 fn eval_ast_var_ref() {
     assert_num(
-        r#"
+        r"
 a = 7
 eval(quote { a })
-"#,
+",
         "7",
     );
 }
@@ -155,9 +163,9 @@ inspect{42}
 #[test]
 fn type_of_ast_value() {
     assert_bool(
-        r#"
+        r"
 type(quote { 1 }) == AST
-"#,
+",
         true,
     );
 }

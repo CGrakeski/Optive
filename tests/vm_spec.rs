@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::{assert_bool, assert_num, assert_text, run_err};
@@ -5,20 +13,20 @@ use common::{assert_bool, assert_num, assert_text, run_err};
 #[test]
 fn macro_must_return_ast() {
     run_err(
-        r#"
+        r"
 macro bad() { return 42 }
 bad{}
-"#,
+",
     );
 }
 
 #[test]
 fn macro_type_is_macro() {
     assert_text(
-        r#"
+        r"
 macro m(x) { return x }
 type(m)
-"#,
+",
         "Macro",
     );
 }
@@ -26,7 +34,7 @@ type(m)
 #[test]
 fn macro_pow4_returns_nested_macro_call() {
     assert_num(
-        r#"
+        r"
 macro sq(x) {
     return quote(ex) with (x) {
         var ex = eval(x)
@@ -37,7 +45,7 @@ macro pow4(x) {
     return sq{sq{x}}
 }
 pow4{2}
-"#,
+",
         "16",
     );
 }
@@ -45,14 +53,14 @@ pow4{2}
 #[test]
 fn macro_variadic_log() {
     assert_num(
-        r#"
+        r"
 macro COUNT(*msg) {
     return quote with (msg) {
         len(msg)
     }
 }
 COUNT{1, 2, 3}
-"#,
+",
         "3",
     );
 }
@@ -84,9 +92,9 @@ add("hi")
 #[test]
 fn builtin_text_constructor() {
     assert_text(
-        r#"
+        r"
 text(42)
-"#,
+",
         "42",
     );
 }
@@ -94,9 +102,9 @@ text(42)
 #[test]
 fn in_operator_list() {
     assert_bool(
-        r#"
+        r"
 3 in [1, 2, 3]
-"#,
+",
         true,
     );
 }
@@ -114,11 +122,11 @@ fn in_operator_text_substring() {
 #[test]
 fn splat_call_expansion() {
     assert_num(
-        r#"
+        r"
 func sum3(a, b, c) { return a + b + c }
 xs = [1, 2, 3]
 sum3(*xs)
-"#,
+",
         "6",
     );
 }
@@ -142,7 +150,7 @@ eval(quote {
 #[test]
 fn struct_contains_magic() {
     assert_bool(
-        r#"
+        r"
 struct Bag {
     var items: list
     func __init__(self, xs) { self.items = xs }
@@ -155,7 +163,7 @@ struct Bag {
 }
 b = Bag([1, 2])
 2 in b
-"#,
+",
         true,
     );
 }

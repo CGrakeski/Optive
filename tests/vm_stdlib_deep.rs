@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::{assert_bool, assert_num, assert_text};
@@ -5,31 +13,31 @@ use common::{assert_bool, assert_num, assert_text};
 #[test]
 fn std_math_extra() {
     assert_num(
-        r#"
+        r"
 use std.math.{ floor, ceil, clamp, pow }
 floor(3.7)
-"#,
+",
         "3",
     );
     assert_num(
-        r#"
+        r"
 use std.math.{ ceil }
 ceil(1.2)
-"#,
+",
         "2",
     );
     assert_num(
-        r#"
+        r"
 use std.math.{ clamp }
 clamp(5, 0, 3)
-"#,
+",
         "3",
     );
     assert_num(
-        r#"
+        r"
 use std.math.{ pow }
 pow(2, 3)
-"#,
+",
         "8",
     );
 }
@@ -60,10 +68,10 @@ d["a"] + d["b"][0]
 #[test]
 fn std_iter_take_skip() {
     assert_text(
-        r#"
+        r"
 use std.iter.{ take, skip, to_list }
 str(take([1, 2, 3, 4, 5], 2)) + str(skip([1, 2, 3, 4], 2))
-"#,
+",
         "[1, 2][3, 4]",
     );
 }
@@ -71,10 +79,10 @@ str(take([1, 2, 3, 4, 5], 2)) + str(skip([1, 2, 3, 4], 2))
 #[test]
 fn std_collections_flatten_chunk() {
     assert_text(
-        r#"
+        r"
 use std.collections.{ flatten, chunk }
 str(flatten([[1, 2], [3]])) + str(chunk([1, 2, 3, 4, 5], 2))
-"#,
+",
         "[1, 2, 3][[1, 2], [3, 4], [5]]",
     );
 }
@@ -109,10 +117,10 @@ is_absolute(r) and is_dir(full) and exists(full) and not startswith(r, "\\\\?\\"
 #[test]
 fn std_os_name() {
     assert_bool(
-        r#"
+        r"
 use std.os.{ name }
 len(name()) > 0
-"#,
+",
         true,
     );
 }
@@ -147,10 +155,10 @@ get(from_items([["a", 1], ["b", 2]]), "b")
 #[test]
 fn std_time_now_ms() {
     assert_bool(
-        r#"
+        r"
 use std.time.{ now_ms }
 now_ms() > 0
-"#,
+",
         true,
     );
 }
@@ -158,10 +166,10 @@ now_ms() > 0
 #[test]
 fn std_math_gcd_mod_sign() {
     assert_num(
-        r#"
+        r"
 use std.math.{ gcd, lcm, mod, sign }
 gcd(12, 18) + lcm(4, 6) + mod(10, 3) + sign(-5)
-"#,
+",
         "18",
     );
 }
@@ -199,14 +207,14 @@ get(from_list([["k", 7]]), "k")
 #[test]
 fn std_random_seed_repro() {
     assert_bool(
-        r#"
+        r"
 use std.random.{ seed, randint }
 seed(42)
 let a = randint(1, 1000)
 seed(42)
 let b = randint(1, 1000)
 a == b
-"#,
+",
         true,
     );
 }
@@ -241,14 +249,14 @@ d["n"]
 #[test]
 fn builtin_copy_id_deepcopy() {
     assert_bool(
-        r#"
+        r"
 let a = [1, [2]]
 let b = copy(a)
 let c = deepcopy(a)
 b[1][0] = 9
 c[1][0] = 8
 (a[1][0] == 9) and (c[1][0] == 8) and (id(a) != id(b))
-"#,
+",
         true,
     );
 }

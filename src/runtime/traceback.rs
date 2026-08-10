@@ -75,6 +75,7 @@ pub fn make_frame(
     }))
 }
 
+#[must_use]
 pub fn make_traceback(frames: Vec<Value>) -> Value {
     let def = traceback_def();
     Value::Struct(Arc::new(StructInstance {
@@ -93,9 +94,7 @@ pub fn capture_traceback(vm: &Vm) -> Value {
             frame.line as i64,
             &frame.name,
             vm.globals
-                .get("__package__")
-                .map(|v| v.print_string())
-                .unwrap_or_else(|| "<main>".into()),
+                .get("__package__").map_or_else(|| "<main>".into(), |v| v.print_string()),
         ));
     }
 
@@ -104,18 +103,18 @@ pub fn capture_traceback(vm: &Vm) -> Value {
         let line = vm.current_line() as i64;
         let module = vm
             .globals
-            .get("__package__")
-            .map(|v| v.print_string())
-            .unwrap_or_else(|| "<main>".into());
+            .get("__package__").map_or_else(|| "<main>".into(), |v| v.print_string());
         frames.push(make_frame(&file, line, "<module>", &module));
     }
     make_traceback(frames)
 }
 
+#[must_use]
 pub fn is_traceback(val: &Value) -> bool {
     matches!(val, Value::Struct(s) if s.def.name == TRACEBACK_TYPE)
 }
 
+#[must_use]
 pub fn set_exception_traceback(exc: &Value, tb: Value) -> Value {
     let Value::Struct(s) = exc else {
         return exc.clone();
@@ -133,6 +132,7 @@ pub fn set_exception_traceback(exc: &Value, tb: Value) -> Value {
     }))
 }
 
+#[must_use]
 pub fn get_exception_traceback(exc: &Value) -> Option<Value> {
     let Value::Struct(s) = exc else {
         return None;

@@ -50,7 +50,7 @@ impl Lexer {
                     || tok.value.starts_with("non-ASCII")
                     || tok.value.contains(' ')
                 {
-                    tok.value.clone()
+                    tok.value
                 } else if tok.value.is_empty() {
                     format!("unexpected character {:?}", self.peek_char())
                 } else {
@@ -74,6 +74,7 @@ impl Lexer {
 
     /// REPL / 高亮用：尽力产出 `(byte_start, byte_end, kind)`，遇错截断且不失败。
     /// 空白不产出 span（由调用方按间隙原样拷贝）。
+    #[must_use]
     pub fn tokenize_spans(mut self) -> Vec<(usize, usize, TokenKind)> {
         let mut spans = Vec::new();
         self.skip_bom();
@@ -127,7 +128,7 @@ impl Lexer {
         }
     }
 
-    fn is_at_end(&self) -> bool {
+    const fn is_at_end(&self) -> bool {
         self.pos >= self.source.len()
     }
 
@@ -333,11 +334,11 @@ impl Lexer {
 
     fn peek_next_is_digit(&self) -> bool {
         let rest = self.source[self.pos + '.'.len_utf8()..].chars().next();
-        rest.map(|c| c.is_ascii_digit()).unwrap_or(false)
+        rest.is_some_and(|c| c.is_ascii_digit())
     }
 
     /// 在已完成的主表达式/后缀后，`-` 开启二元减法，而非负数字面量。
-    fn minus_follows_complete_expr(&self) -> bool {
+    const fn minus_follows_complete_expr(&self) -> bool {
         matches!(
             self.last_kind,
             Some(
@@ -358,7 +359,7 @@ impl Lexer {
         let mut iter = self.source[self.pos + '-'.len_utf8()..].chars();
         match iter.next() {
             Some(c) if c.is_ascii_digit() => true,
-            Some('.') => iter.next().map(|c| c.is_ascii_digit()).unwrap_or(false),
+            Some('.') => iter.next().is_some_and(|c| c.is_ascii_digit()),
             _ => false,
         }
     }
@@ -475,7 +476,7 @@ impl Lexer {
                 let encoded: String = bytes
                     .iter()
                     .map(|&b| {
-                        char::from_u32(b as u32)
+                        char::from_u32(u32::from(b))
                             .expect("byte value 0-255 is always a valid char (theoretically unreachable)")
                     })
                     .collect();
@@ -610,7 +611,7 @@ impl Lexer {
         if self.peek_char() == Some('0') {
             let next = self.source[self.pos + 1..].chars().next();
             match next {
-                Some('x') | Some('X') => {
+                Some('x' | 'X') => {
                     self.consume_char();
                     self.consume_char();
                     let hex_start = self.pos;
@@ -653,7 +654,7 @@ impl Lexer {
                         ),
                     };
                 }
-                Some('b') | Some('B') => {
+                Some('b' | 'B') => {
                     self.consume_char();
                     self.consume_char();
                     let bin_start = self.pos;
@@ -786,14 +787,12 @@ impl Lexer {
         self.source[idx..]
             .chars()
             .next()
-            .map(is_ident_continue)
-            .unwrap_or(false)
+            .is_some_and(is_ident_continue)
     }
 
     fn identifier_continues_here(&self) -> bool {
         self.peek_char()
-            .map(is_ident_continue)
-            .unwrap_or(false)
+            .is_some_and(is_ident_continue)
     }
 }
 

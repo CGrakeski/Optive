@@ -57,8 +57,8 @@ pub enum Pattern {
     /// `(a, b)` / `("done", x)` 元组模式（匹配 tuple 或 list）。
     Tuple(Vec<PatternElem>),
     Struct { type_name: String, fields: Vec<String> },
-    Or(Vec<Pattern>),
-    Call { type_name: String, args: Vec<Pattern> },
+    Or(Vec<Self>),
+    Call { type_name: String, args: Vec<Self> },
 }
 
 #[derive(Debug, Clone)]
@@ -353,7 +353,8 @@ pub struct SourceLoc {
 }
 
 impl SourceLoc {
-    pub fn new(line: usize, column: usize) -> Self {
+    #[must_use]
+    pub const fn new(line: usize, column: usize) -> Self {
         Self { line, column }
     }
 }
@@ -366,11 +367,13 @@ pub struct Expr {
 }
 
 impl Expr {
-    pub fn new(loc: SourceLoc, kind: ExprKind) -> Self {
+    #[must_use]
+    pub const fn new(loc: SourceLoc, kind: ExprKind) -> Self {
         Self { loc, kind }
     }
 
-    pub fn at(line: usize, column: usize, kind: ExprKind) -> Self {
+    #[must_use]
+    pub const fn at(line: usize, column: usize, kind: ExprKind) -> Self {
         Self::new(SourceLoc::new(line, column), kind)
     }
 }
@@ -542,6 +545,7 @@ pub const RET_WRAPPER_VAL: &str = "__ret_wrapper_val";
 
 /// 将表达式中的 `Placeholder` 替换为 `repl`。
 /// 不进入 `DoFunc` / `Quote` 体与宏实参（那些作用域各自处理）。
+#[must_use]
 pub fn fill_placeholders(expr: &Expr, repl: &Expr) -> Expr {
     match &expr.kind {
         ExprKind::Placeholder => repl.clone(),

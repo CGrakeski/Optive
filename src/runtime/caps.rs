@@ -40,8 +40,9 @@ impl Default for Capabilities {
 
 impl Capabilities {
     /// 全开（向后兼容：直接 `Optive xxx.tive` 的默认行为）。
-    pub fn full() -> Self {
-        Capabilities {
+    #[must_use]
+    pub const fn full() -> Self {
+        Self {
             network: true,
             fs: FsPolicy::Unrestricted,
             env: true,
@@ -50,8 +51,9 @@ impl Capabilities {
     }
 
     /// 沙箱：禁网、禁改环境、禁 FFI、文件系统限制在 `roots` 之下。
-    pub fn sandbox(roots: Vec<PathBuf>) -> Self {
-        Capabilities {
+    #[must_use]
+    pub const fn sandbox(roots: Vec<PathBuf>) -> Self {
+        Self {
             network: false,
             fs: FsPolicy::Allow(roots),
             env: false,

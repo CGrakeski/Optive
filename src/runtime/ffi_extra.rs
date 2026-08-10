@@ -1,4 +1,4 @@
-//! FFI 扩展：内存读写、CString、结构体布局、errno/last_error、同步回调。
+//! FFI `扩展：内存读写、CString、结构体布局、errno/last_error、同步回调`。
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -33,9 +33,10 @@ pub fn sample_error_codes() {
 }
 
 /// 采样并返回 errno（卸荷线程把值带回调用方）。
+#[must_use]
 pub fn sample_error_codes_value() -> i32 {
     sample_error_codes();
-    LAST_ERRNO.with(|c| c.get())
+    LAST_ERRNO.with(std::cell::Cell::get)
 }
 
 pub fn set_last_errno(code: i32) {
@@ -43,7 +44,7 @@ pub fn set_last_errno(code: i32) {
 }
 
 pub fn with_active_vm<R>(vm: &mut Vm, f: impl FnOnce() -> R) -> R {
-    let ptr = vm as *mut Vm;
+    let ptr = std::ptr::from_mut::<Vm>(vm);
     let prev = FFI_ACTIVE_VM.with(|c| c.replace(ptr));
     let out = f();
     FFI_ACTIVE_VM.with(|c| c.set(prev));
@@ -51,7 +52,7 @@ pub fn with_active_vm<R>(vm: &mut Vm, f: impl FnOnce() -> R) -> R {
 }
 
 fn active_vm<'a>() -> Result<&'a mut Vm> {
-    let ptr = FFI_ACTIVE_VM.with(|c| c.get());
+    let ptr = FFI_ACTIVE_VM.with(std::cell::Cell::get);
     if ptr.is_null() {
         return Err(RuntimeError::msg(
             "C callback invoked outside an active FFI call (sync callbacks only)",
@@ -64,7 +65,7 @@ pub fn builtin_errno(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if !args.is_empty() {
         return Err(RuntimeError::type_err("C.errno takes no arguments"));
     }
-    Ok(Value::Num(Num::from_i64(LAST_ERRNO.with(|c| c.get()) as i64)))
+    Ok(Value::Num(Num::from_i64(i64::from(LAST_ERRNO.with(std::cell::Cell::get)))))
 }
 
 pub fn builtin_last_error(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -329,7 +330,7 @@ pub fn builtin_read_bytes(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
     Ok(Value::List(Shared::new(
         buf.into_iter()
-            .map(|b| Value::Num(Num::from_i64(b as i64)))
+            .map(|b| Value::Num(Num::from_i64(i64::from(b))))
             .collect(),
     )))
 }
@@ -678,12 +679,14 @@ pub struct CStructLayout {
 type FieldLayout = CFieldLayout;
 type StructLayout = CStructLayout;
 
+#[must_use]
 pub fn align_up(off: usize, align: usize) -> usize {
     let a = align.max(1);
     (off + a - 1) & !(a - 1)
 }
 
 /// 由字段 ABI 列表计算 C 布局（与 `C.Struct` / `typed struct : C.layout` 共用）。
+#[must_use]
 pub fn layout_from_abi_fields(fields_in: &[(String, AbiType)]) -> CStructLayout {
     let mut fields = Vec::new();
     let mut offset = 0usize;
@@ -918,7 +921,7 @@ pub fn builtin_store(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     Ok(Value::None)
 }
 
-fn read_field(base: usize, f: &FieldLayout) -> Result<Value> {
+const fn read_field(base: usize, f: &FieldLayout) -> Result<Value> {
     let addr = base + f.offset;
     Ok(match f.abi {
         AbiType::I32 => Value::Sized(SizedNum::I32(unsafe {
@@ -1099,7 +1102,7 @@ pub fn builtin_callback(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         let mut call_args = Vec::with_capacity(userdata.arg_abis.len());
         for (i, abi) in userdata.arg_abis.iter().enumerate() {
             let p = unsafe { *args.add(i) };
-            call_args.push(unsafe { decode_cb_arg(p as *mut c_void, *abi) });
+            call_args.push(unsafe { decode_cb_arg(p.cast_mut(), *abi) });
         }
         let result = vm.call_value(userdata.callable.clone(), call_args);
         let val = match result {
@@ -1168,7 +1171,7 @@ unsafe fn decode_cb_arg(p: *mut c_void, abi: AbiType) -> Value {
         AbiType::I64 => Value::Num(Num::from_i64(unsafe { *(p as *const i64) })),
         AbiType::U64 => {
             let n = unsafe { *(p as *const u64) };
-            if n <= i64::MAX as u64 {
+            if i64::try_from(n).is_ok() {
                 Value::Num(Num::from_i64(n as i64))
             } else {
                 Value::Sized(SizedNum::U64(n))
@@ -1202,11 +1205,7 @@ fn encode_cb_ret_u64(v: &Value, abi: AbiType) -> u64 {
     match abi {
         AbiType::Void => 0,
         AbiType::Bool | AbiType::I8 | AbiType::U8 => {
-            if v.is_truthy() {
-                1
-            } else {
-                0
-            }
+            u64::from(v.is_truthy())
         }
         AbiType::I16 | AbiType::U16 | AbiType::I32 | AbiType::U32 | AbiType::I64 | AbiType::Isize => {
             expect_i64("cb", v).unwrap_or(0) as u64
@@ -1226,7 +1225,7 @@ fn encode_cb_ret_u64(v: &Value, abi: AbiType) -> u64 {
                 Value::Num(n) => n.to_f64_checked().unwrap_or(0.0) as f32,
                 _ => 0.0,
             };
-            f.to_bits() as u64
+            u64::from(f.to_bits())
         }
         AbiType::F64 => {
             let f = match v {
@@ -1268,7 +1267,7 @@ fn expect_i64(ctx: &str, v: &Value) -> Result<i64> {
         Value::Num(n) => n
             .to_i64()
             .ok_or_else(|| RuntimeError::type_err(format!("{ctx}: expected integer"))),
-        Value::Bool(b) => Ok(if *b { 1 } else { 0 }),
+        Value::Bool(b) => Ok(i64::from(*b)),
         Value::Ptr(p) => Ok(*p as i64),
         _ => Err(RuntimeError::type_err(format!(
             "{ctx}: expected integer, got {}",

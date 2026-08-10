@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::{assert_bool, assert_num, assert_text};
@@ -20,10 +28,10 @@ fn ternary_in_let() {
 #[test]
 fn ternary_in_call_arg() {
     assert_num(
-        r#"
+        r"
 func id(x) { return x }
 id(if true then 7 else 8)
-"#,
+",
         "7",
     );
 }
@@ -62,13 +70,13 @@ fn handle_catches_zero_division() {
 #[test]
 fn try_catch_zero_division() {
     assert_text(
-        r#"
+        r"
 try {
     1/0
 } catch (e: ZeroDivisionError) {
     e.message
 }
-"#,
+",
         "division by zero",
     );
 }
@@ -76,13 +84,13 @@ try {
 #[test]
 fn try_catch_arithmetic_error_base() {
     assert_text(
-        r#"
+        r"
 try {
     1/0
 } catch (e: ArithmeticError) {
     e.message
 }
-"#,
+",
         "division by zero",
     );
 }
@@ -90,11 +98,11 @@ try {
 #[test]
 fn walrus_named_assign() {
     assert_num(
-        r#"
+        r"
 x = 0
 if (p := 3) { x = p }
 x
-"#,
+",
         "3",
     );
 }
@@ -102,10 +110,10 @@ x
 #[test]
 fn placeholder_in_pipeline() {
     assert_num(
-        r#"
+        r"
 func double(x) { return x * 2 }
 5 |> double(_)
-"#,
+",
         "10",
     );
 }

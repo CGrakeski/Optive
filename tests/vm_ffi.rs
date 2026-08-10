@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 //! C FFI / sized types / extern / implicit.
 
 mod common;
@@ -134,10 +142,10 @@ fn convert_num_to_i32() {
 #[test]
 fn convert_i32_to_c_types_int() {
     let v = value(
-        r#"
+        r"
 use std.language.{ C }
 C.types.int.(1i32)
-"#,
+",
     );
     assert!(matches!(v, Value::Sized(optive::sized::SizedNum::I32(1))));
 }
@@ -145,10 +153,10 @@ C.types.int.(1i32)
 #[test]
 fn c_types_getattr_chain() {
     let v = value(
-        r#"
+        r"
 use std.language.{ C }
 C.types.int
-"#,
+",
     );
     match v {
         Value::TypeRef(n) => assert_eq!(n, "C.types.int"),
@@ -206,7 +214,7 @@ extern(h, "no_such_symbol") func missing(a: C.types.int) -> C.types.int ...
 fn extern_add_happy_path() {
     let path = dll_path_literal();
     let src = format!(
-        r#"
+        r"
 use std.language.{{ C }}
 let h = C.frompath({path})
 extern(h) func add(
@@ -214,7 +222,7 @@ extern(h) func add(
     implicit b: C.types.int
 ) -> C.types.int : num.(i32.(_)) ...
 add(1i32, 2i32)
-"#
+"
     );
     assert_num(&src, "3");
 }
@@ -223,7 +231,7 @@ add(1i32, 2i32)
 fn extern_add_implicit_from_num() {
     let path = dll_path_literal();
     let src = format!(
-        r#"
+        r"
 use std.language.{{ C }}
 let h = C.frompath({path})
 extern(h) func add(
@@ -231,7 +239,7 @@ extern(h) func add(
     implicit b: C.types.int
 ) -> C.types.int : num.(i32.(_)) ...
 add(10, 20)
-"#
+"
     );
     assert_num(&src, "30");
 }
@@ -240,7 +248,7 @@ add(10, 20)
 fn extern_without_implicit_rejects_num() {
     let path = dll_path_literal();
     let src = format!(
-        r#"
+        r"
 use std.language.{{ C }}
 let h = C.frompath({path})
 extern(h) func add(
@@ -253,7 +261,7 @@ try {{
 }} catch (e: TypeError) {{
     1
 }}
-"#
+"
     );
     assert_num(&src, "1");
 }
@@ -284,7 +292,7 @@ try {{
 fn extern_survives_handle_drop() {
     let path = dll_path_literal();
     let src = format!(
-        r#"
+        r"
 use std.language.{{ C }}
 let h = C.frompath({path})
 extern(h) func add(
@@ -293,7 +301,7 @@ extern(h) func add(
 ) -> C.types.int : num.(i32.(_)) ...
 h = none
 add(3i32, 4i32)
-"#
+"
     );
     assert_num(&src, "7");
 }
@@ -302,11 +310,11 @@ add(3i32, 4i32)
 fn extern_unsupported_abi_type_errors() {
     let path = dll_path_literal();
     let src = format!(
-        r#"
+        r"
 use std.language.{{ C }}
 let h = C.frompath({path})
 extern(h) func add(a: list) -> C.types.int ...
-"#
+"
     );
     let err = run_source(&src).unwrap_err().to_string();
     assert!(
@@ -318,10 +326,10 @@ extern(h) func add(a: list) -> C.types.int ...
 #[test]
 fn void_ptr_alias_resolves() {
     let v = value(
-        r#"
+        r"
 use std.language.{ C }
 C.types.void_ptr
-"#,
+",
     );
     match v {
         Value::TypeRef(n) => assert_eq!(n, "C.types.void*"),
@@ -332,14 +340,14 @@ C.types.void_ptr
 #[test]
 fn c_alloc_write_read_free() {
     assert_num(
-        r#"
+        r"
 use std.language.{ C }
 let p = C.alloc(16)
 C.write_i32(p, 0, 42i32)
 let v = C.read_i32(p, 0)
 C.free(p, 16)
 num.(v)
-"#,
+",
         "42",
     );
 }
@@ -492,7 +500,7 @@ r
 fn mul_f64_via_extern() {
     let path = dll_path_literal();
     let src = format!(
-        r#"
+        r"
 use std.language.{{ C }}
 let h = C.frompath({path})
 extern(h) func mul_f64(
@@ -500,7 +508,7 @@ extern(h) func mul_f64(
     implicit b: C.types.double
 ) -> C.types.double : num.(f64.(_)) ...
 mul_f64(2.5, 4.0)
-"#
+"
     );
     let v = value(&src);
     match v {
@@ -516,7 +524,7 @@ mul_f64(2.5, 4.0)
 fn c_errno_is_number_after_call() {
     let path = dll_path_literal();
     let src = format!(
-        r#"
+        r"
 use std.language.{{ C }}
 let h = C.frompath({path})
 extern(h) func add(
@@ -525,7 +533,7 @@ extern(h) func add(
 ) -> C.types.int : num.(i32.(_)) ...
 add(1, 2)
 C.errno()
-"#
+"
     );
     let v = value(&src);
     assert!(
@@ -537,10 +545,10 @@ C.errno()
 #[test]
 fn c_types_uchar_resolves() {
     let v = value(
-        r#"
+        r"
 use std.language.{ C }
 C.types.uchar
-"#,
+",
     );
     match v {
         Value::TypeRef(n) => assert!(n.contains("uchar") || n.contains("unsigned"), "got {n}"),
@@ -553,7 +561,7 @@ fn mn_ffi_parallel_add_stress() {
     use optive::vm::Vm;
     let path = dll_path_literal();
     let src = format!(
-        r#"
+        r"
 use std.language.{{ C }}
 let h = C.frompath({path})
 extern(h) func add(
@@ -576,7 +584,7 @@ let g = m.lock()
 let total = g.get()
 g.unlock()
 total
-"#
+"
     );
     let mut vm = Vm::with_workers(4);
     let v = optive::run_source_in_vm(&mut vm, &src, "<ffi-mn>").expect("run");
@@ -589,7 +597,7 @@ total
 #[test]
 fn alloc_array_index_roundtrip() {
     assert_num(
-        r#"
+        r"
 use std.language.{ C }
 let p = C.alloc_array(i32, 4)
 p[0] = 10i32
@@ -598,7 +606,7 @@ p[2] = 30i32
 let s = num.(p[0]) + num.(p[1]) + num.(p[2])
 C.free(p)
 s
-"#,
+",
         "60",
     );
 }
@@ -606,13 +614,13 @@ s
 #[test]
 fn ptr_live_false_after_free() {
     assert_bool(
-        r#"
+        r"
 use std.language.{ C }
 let p = C.alloc(8)
 C.write_i32(p, 0, 1i32)
 C.free(p)
 C.ptr_live(p)
-"#,
+",
         false,
     );
 }
@@ -638,12 +646,12 @@ fn ptr_live_false_for_unsafe_foreign() {
 #[test]
 fn use_after_free_index_errors() {
     common::run_err(
-        r#"
+        r"
 use std.language.{ C }
 let p = C.alloc_array(i32, 2)
 C.free(p)
 p[0] = 1i32
-"#,
+",
     );
 }
 
@@ -651,7 +659,7 @@ p[0] = 1i32
 fn implicit_narrowing_out_of_range_errors() {
     let path = dll_path_literal();
     let src = format!(
-        r#"
+        r"
 use std.language.{{ C }}
 let h = C.frompath({path})
 extern(h) func add(
@@ -659,7 +667,7 @@ extern(h) func add(
     implicit b: C.types.int
 ) -> C.types.int : num.(i32.(_)) ...
 add(3000000000, 1)
-"#
+"
     );
     common::run_err(&src);
 }
@@ -702,13 +710,13 @@ point_sum
 fn unregistered_peek_fails_unless_unsafe() {
     // 使用不太可能被其它用例登记的地址；切勿用小整数假地址做成功路径 peek。
     common::run_err(
-        r#"
+        r"
 use std.language.{ C }
 C.read_i32(987654321, 0)
-"#,
+",
     );
     assert_num(
-        r#"
+        r"
 use std.language.{ C }
 let p = C.alloc(8)
 C.write_i32(p, 0, 7i32)
@@ -716,7 +724,7 @@ let q = C.unsafe_ptr(p)
 let v = C.read_i32(q, 0)
 C.free(p)
 num.(v)
-"#,
+",
         "7",
     );
 }
@@ -749,10 +757,10 @@ s + num.(back.x) + num.(back.y)
 #[test]
 fn ptr_type_form_resolves() {
     let v = value(
-        r#"
+        r"
 use std.language.{ C }
 C.types.ptr[i32]
-"#,
+",
     );
     match v {
         Value::TypeSpec(spec) => {

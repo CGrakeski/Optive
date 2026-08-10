@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::kinds;
@@ -191,7 +199,7 @@ fn lex_string_hex_escape_invalid() {
 
 #[test]
 fn lex_string_concat_ops() {
-    assert_kinds!(r###""hi" + "!""###, StringLiteral, Plus, StringLiteral);
+    assert_kinds!(r#""hi" + "!""#, StringLiteral, Plus, StringLiteral);
 }
 
 #[test]

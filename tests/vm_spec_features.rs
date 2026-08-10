@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::{assert_bool, assert_list, assert_num, assert_text};
@@ -19,7 +27,7 @@ fn list_comp_with_guard() {
 #[test]
 fn std_decos_log_decorator() {
     assert_num(
-        r#"
+        r"
 use std.decos.{ log }
 let calls = 0
 log func f(x) {
@@ -28,7 +36,7 @@ log func f(x) {
 }
 f(3)
 calls
-"#,
+",
         "1",
     );
 }
@@ -36,7 +44,7 @@ calls
 #[test]
 fn std_decos_memoize_caches_calls() {
     assert_num(
-        r#"
+        r"
 use std.decos.{ memoize }
 let calls = 0
 memoize func f(x) {
@@ -46,7 +54,7 @@ memoize func f(x) {
 f(3)
 f(3)
 calls
-"#,
+",
         "1",
     );
 }
@@ -54,7 +62,7 @@ calls
 #[test]
 fn std_decos_once_runs_once() {
     assert_num(
-        r#"
+        r"
 use std.decos.{ once }
 let calls = 0
 once func f() {
@@ -64,7 +72,7 @@ once func f() {
 f()
 f()
 calls
-"#,
+",
         "1",
     );
 }
@@ -72,10 +80,10 @@ calls
 #[test]
 fn type_convert_text_handler() {
     assert_text(
-        r#"
+        r"
 text.__convert__.__dispatch__.append(do(t, v) { return text(v + 1) })
 text.(41)
-"#,
+",
         "42",
     );
 }
@@ -83,9 +91,9 @@ text.(41)
 #[test]
 fn type_convert_bool_default_handler() {
     assert_bool(
-        r#"
+        r"
 bool.(1)
-"#,
+",
         true,
     );
 }
@@ -93,11 +101,11 @@ bool.(1)
 #[test]
 fn type_convert_struct_handler() {
     assert_num(
-        r#"
+        r"
 struct A { let n }
 A.__convert__.__dispatch__.append(do(t, v) { return A(v) })
 A.(7).n
-"#,
+",
         "7",
     );
 }
@@ -105,18 +113,18 @@ A.(7).n
 #[test]
 fn type_convert_list_iterator_roundtrip() {
     assert_list(
-        r#"
+        r"
 use std.math.{ range }
 let it = iterator(range(3))
 list.(it)
-"#,
+",
         "[0, 1, 2]",
     );
     assert_text(
-        r#"
+        r"
 let xs = [10, 20]
 type(iterator.(xs))
-"#,
+",
         "iterator",
     );
 }

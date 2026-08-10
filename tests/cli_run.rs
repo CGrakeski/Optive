@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use std::fs;
@@ -359,7 +367,7 @@ fn run_inline_code_multiline() {
     let src = "let x = 1\nprint(x + 1)\n";
     let (code, stdout, stderr) = run_optive(&["-c", src], &root);
     assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
-    assert!(stdout.contains("2"), "expected 2, got: {stdout}");
+    assert!(stdout.contains('2'), "expected 2, got: {stdout}");
 }
 
 #[test]
@@ -394,11 +402,11 @@ entry = "src/main.tive"
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(
         root.join("src/main.tive"),
-        r#"
+        r"
 let a = std.os.args()
 print(a[len(a) - 2])
 print(a[len(a) - 1])
-"#,
+",
     )
     .unwrap();
 
@@ -432,7 +440,7 @@ entry = "src/main.tive"
 
     // 在独立 cwd 下用绝对项目路径调用，避免依赖隐式 cwd 发现。
     let cwd = tempfile_project("run_path_dash_cwd");
-    let root_abs = fs::canonicalize(&root).unwrap_or(root.clone());
+    let root_abs = fs::canonicalize(&root).unwrap_or(root);
     let (code, stdout, stderr) = run_optive(
         &[
             "run",

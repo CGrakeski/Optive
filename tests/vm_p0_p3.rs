@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::{assert_bool, assert_list, assert_num, assert_text, run_err, value};
@@ -26,11 +34,11 @@ fn p0_range_returns_iterator() {
 #[test]
 fn p0_for_in_iterator() {
     assert_num(
-        r#"
+        r"
 let total = 0
 for (x in std.math.range(3)) { total = total + x }
 total
-"#,
+",
         "3",
     );
 }
@@ -38,10 +46,10 @@ total
 #[test]
 fn p0_global_iter_next() {
     assert_num(
-        r#"
+        r"
 let it = std.math.range(2)
 next(it) + next(it)
-"#,
+",
         "1",
     );
 }
@@ -86,11 +94,11 @@ type(tb)
 #[test]
 fn p1_parallel_for() {
     assert_num(
-        r#"
+        r"
 let total = 0
 for (x in [1, 2], y in [10, 20]) { total = total + x + y }
 total
-"#,
+",
         "33",
     );
 }
@@ -111,12 +119,12 @@ fn p1_struct_generics_parse() {
 #[test]
 fn p1_outside_method() {
     assert_num(
-        r#"
+        r"
 struct S { let n
     func bump(self) outside { return self.n + 1 }
 }
 S(4).bump()
-"#,
+",
         "5",
     );
 }
@@ -124,10 +132,10 @@ S(4).bump()
 #[test]
 fn p2_std_typing_union() {
     assert_text(
-        r#"
+        r"
 use std.typing.{ Union }
 Union(num, text)
-"#,
+",
         "Union[num, text]",
     );
 }
@@ -135,11 +143,11 @@ Union(num, text)
 #[test]
 fn p2_std_functional_map() {
     assert_list(
-        r#"
+        r"
 use std.functional.{ map }
 use std.iter.{ to_list }
 to_list(map(do(x) { return x * 2 }, std.math.range(3)))
-"#,
+",
         "[0, 2, 4]",
     );
 }
@@ -147,10 +155,10 @@ to_list(map(do(x) { return x * 2 }, std.math.range(3)))
 #[test]
 fn p2_std_collections_sum() {
     assert_num(
-        r#"
+        r"
 use std.collections.{ sum }
 sum([1, 2, 3])
-"#,
+",
         "6",
     );
 }
@@ -158,11 +166,11 @@ sum([1, 2, 3])
 #[test]
 fn p2_list_append_method() {
     assert_list(
-        r#"
+        r"
 let xs = [1]
 xs.append(2)
 xs
-"#,
+",
         "[1, 2]",
     );
 }
@@ -186,10 +194,10 @@ fn p2_text_upper_method() {
 #[test]
 fn p2_decos_timer_exists() {
     value(
-        r#"
+        r"
 use std.decos.{ timer }
 timer func f() { return 1 }
-"#,
+",
     );
 }
 
@@ -218,20 +226,20 @@ join("a", "b")
 #[test]
 fn p3_std_test_assert_eq() {
     value(
-        r#"
+        r"
 use std.test.{ assert_eq }
 assert_eq(1, 1)
-"#,
+",
     );
 }
 
 #[test]
 fn p3_std_debug_traceback() {
     let v = value(
-        r#"
+        r"
 use std.debug.{ traceback }
 type(traceback())
-"#,
+",
     );
     assert_eq!(v.display_string(), "Traceback");
 }
@@ -243,7 +251,7 @@ fn p3_exception_assertion_error() {
 
 #[test]
 fn p3_global_repr() {
-    assert_text(r#"repr(42)"#, "42");
+    assert_text(r"repr(42)", "42");
 }
 
 #[test]
@@ -270,11 +278,11 @@ fn complete_dict_alternating_kv() {
 #[test]
 fn complete_lazy_map_does_not_precompute() {
     assert_num(
-        r#"
+        r"
 use std.functional.{ map }
 let it = map(do(x) { return x * 10 }, std.math.range(1000000))
 next(it)
-"#,
+",
         "0",
     );
 }
@@ -292,10 +300,10 @@ assert_raises(do() { throw ValueError("bad") }, ValueError)
 #[test]
 fn complete_assert_raises_fails_without_exception() {
     run_err(
-        r#"
+        r"
 use std.test.{ assert_raises }
 assert_raises(do() { return 1 }, ValueError)
-"#,
+",
     );
 }
 
@@ -318,11 +326,11 @@ tb.frames[0].line
 #[test]
 fn complete_generic_struct_inference() {
     assert_num(
-        r#"
+        r"
 struct Box[T: num] { var value: T }
 let b = Box(42)
 b.value
-"#,
+",
         "42",
     );
 }
@@ -330,11 +338,11 @@ b.value
 #[test]
 fn complete_generic_struct_explicit_type_args() {
     assert_num(
-        r#"
+        r"
 struct Box[T: num] { var value: T }
 let b = Box[num](99)
 b.value
-"#,
+",
         "99",
     );
 }

@@ -12,7 +12,8 @@ use crate::value::{TypeSpecData, Value};
 use crate::vm::Vm;
 
 /// 值是否为元类型 `type` 的实例（类型句柄 / 类型形态）。
-pub fn value_is_type(t: &Value) -> bool {
+#[must_use]
+pub const fn value_is_type(t: &Value) -> bool {
     matches!(t, Value::TypeRef(_) | Value::TypeSpec(_))
 }
 
@@ -136,7 +137,7 @@ pub fn bind_function_annotations(vm: &mut Vm, func: &mut FunctionObject) -> crat
         return Ok(());
     }
     let prev = vm.annotation_bind_env.take();
-    vm.annotation_bind_env = func.module_env.clone();
+    vm.annotation_bind_env.clone_from(&func.module_env);
     let result = (|| {
         let mut param_types = Vec::with_capacity(func.params.len());
         for param in &func.params {
@@ -334,6 +335,7 @@ pub fn value_to_type_value(vm: &Vm, val: &Value) -> Value {
     type_registry::value_to_type_value(vm, val)
 }
 
+#[must_use]
 pub fn substitute_type_value(ty: &Value, subs: &HashMap<String, Value>) -> Value {
     match ty {
         Value::TypeRef(n) | Value::Text(n) => subs
@@ -368,6 +370,7 @@ fn generic_args_match(actual: &[Value], expected: &[Value]) -> bool {
             .all(|(a, e)| type_values_equal(a, e))
 }
 
+#[must_use]
 pub fn type_values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::TypeRef(x), Value::TypeRef(y)) | (Value::Text(x), Value::Text(y)) => x == y,
@@ -384,6 +387,7 @@ pub fn type_values_equal(a: &Value, b: &Value) -> bool {
     }
 }
 
+#[must_use]
 pub fn type_value_base(ty: &Value) -> Option<&str> {
     match ty {
         Value::TypeRef(n) | Value::Text(n) => Some(n.as_str()),
@@ -433,6 +437,7 @@ pub fn infer_generic_args(
 }
 
 /// 将静态类型字面 Expr 折成类型值（`num`、`list[num]`、`C.types.int` 路径名）。
+#[must_use]
 pub fn static_type_value_from_expr(expr: &Expr) -> Option<Value> {
     match &expr.kind {
         ExprKind::Var(name) => Some(Value::type_ref(name.clone())),
@@ -547,6 +552,7 @@ fn protocol_ctx_from_vm(vm: &Vm) -> protocol::TypeCheckContext {
 }
 
 /// 兼容旧名：显示类型值。
+#[must_use]
 pub fn type_expr_display(ty: &Value) -> String {
     type_value_display(ty)
 }
@@ -615,6 +621,7 @@ fn type_value_to_expr(loc: crate::ast::SourceLoc, ty: &Value) -> Expr {
 }
 
 /// 在类型注解 `Expr` 树中替换泛型形参（单态化 AST 用）。
+#[must_use]
 pub fn substitute_type_annotation(expr: &Expr, subs: &HashMap<String, Value>) -> Expr {
     match &expr.kind {
         ExprKind::Var(name) if subs.contains_key(name) => {
@@ -648,6 +655,7 @@ pub fn substitute_type_annotation(expr: &Expr, subs: &HashMap<String, Value>) ->
 }
 
 /// 替换泛型形参并得到类型值（运行时字段检查用）。
+#[must_use]
 pub fn substitute_type_expr(expr: &Expr, subs: &HashMap<String, Value>) -> Value {
     let subbed = substitute_type_annotation(expr, subs);
     static_type_value_from_expr(&subbed).unwrap_or_else(|| {

@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 //! 并行 FFI：per-callable 锁重叠 + 可选卸荷池。
 
 mod common;
@@ -169,7 +177,7 @@ n
 #[test]
 fn ptr_registry_concurrent_alloc_free() {
     // 压力：多 fiber 并发 alloc/free；不在 free 后再查 ptr_live（地址可能被其它 fiber 立刻复用）。
-    let src = r#"
+    let src = r"
 use std.language.{ C }
 var n = 0
 let tasks = []
@@ -187,7 +195,7 @@ for (t in tasks) {
     n = n + (await t)
 }
 n
-"#;
+";
     let mut vm = Vm::with_workers(4);
     let v = run_source_in_vm(&mut vm, src, "<ptr_stress>").expect("run");
     match v {

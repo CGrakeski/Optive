@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::{parse_err, run_err};
@@ -55,44 +63,44 @@ fn runtime_dict_missing_key() {
 #[test]
 fn runtime_struct_wrong_arity() {
     run_err(
-        r#"
+        r"
 struct P { let x let y }
 P(1)
-"#,
+",
     );
 }
 
 #[test]
 fn runtime_immutable_struct_field() {
     run_err(
-        r#"
+        r"
 struct P { let x }
 let p = P(1)
 p.x = 2
-"#,
+",
     );
 }
 
 #[test]
 fn const_reassign_rejected() {
     run_err(
-        r#"
+        r"
 const let x = 1
 x = 2
-"#,
+",
     );
 }
 
 #[test]
 fn const_reassign_in_func_rejected() {
     run_err(
-        r#"
+        r"
 func f() {
     const let x = 1
     x = 2
     return x
 }
 f()
-"#,
+",
     );
 }

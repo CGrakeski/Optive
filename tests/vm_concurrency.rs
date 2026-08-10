@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 // 本套件验证协作调度语义（顺序敏感断言在 M:N 真并行下不成立），
@@ -16,10 +24,10 @@ fn do_block_iife_sugar() {
 #[test]
 fn go_await_do_block() {
     assert_num(
-        r#"
+        r"
 let t = go do { return 41 + 1 }
 await t
-"#,
+",
         "42",
     );
 }
@@ -27,9 +35,9 @@ await t
 #[test]
 fn await_start_and_wait() {
     assert_num(
-        r#"
+        r"
 await do { return 7 }
-"#,
+",
         "7",
     );
 }
@@ -39,7 +47,7 @@ fn suspend_runs_ready_task() {
     // 真正挂起：第一次 suspend 跑到任务内 suspend；第二次再跑完。
     // 顺序保证仅 M:1 成立，固定 workers=1 避免 OPTIVE_WORKERS 影响。
     assert_num(
-        r#"
+        r"
 var n = 0
 go do {
   n = 1
@@ -49,7 +57,7 @@ go do {
 suspend
 suspend
 n
-"#,
+",
         "2",
     );
 }
@@ -57,7 +65,7 @@ n
 #[test]
 fn suspend_then_await_completes() {
     assert_num(
-        r#"
+        r"
 var n = 0
 let t = go do {
   n = 1
@@ -67,7 +75,7 @@ let t = go do {
 }
 await t
 n
-"#,
+",
         "2",
     );
 }
@@ -80,7 +88,7 @@ fn await_yield_removed() {
 #[test]
 fn await_join_task_result() {
     assert_num(
-        r#"
+        r"
 var n = 0
 let t = go do {
   n = 1
@@ -89,7 +97,7 @@ let t = go do {
 }
 await t
 n + 0
-"#,
+",
         "2",
     );
 }
@@ -97,14 +105,14 @@ n + 0
 #[test]
 fn channel_send_recv() {
     assert_num(
-        r#"
+        r"
 let ch = Channel()
 go do {
   ch.send(42)
   ch.close()
 }
 ch.recv()
-"#,
+",
         "42",
     );
 }
@@ -112,11 +120,11 @@ ch.recv()
 #[test]
 fn channel_recv_closed_is_none() {
     let v = value(
-        r#"
+        r"
 let ch = Channel()
 ch.close()
 ch.recv()
-"#,
+",
     );
     assert!(matches!(v, Value::None), "expected none, got {v:?}");
 }
@@ -124,7 +132,7 @@ ch.recv()
 #[test]
 fn select_recv_ready() {
     assert_num(
-        r#"
+        r"
 let ch = Channel()
 ch.send(7)
 select {
@@ -132,7 +140,7 @@ select {
     return x
   }
 }
-"#,
+",
         "7",
     );
 }
@@ -140,14 +148,14 @@ select {
 #[test]
 fn select_await_task() {
     assert_num(
-        r#"
+        r"
 let t = go do { return 3 }
 select {
   case await t as x {
     return x
   }
 }
-"#,
+",
         "3",
     );
 }
@@ -156,12 +164,12 @@ select {
 fn mutex_lock_get_temp_does_not_leak() {
     // `m.lock().get()` 不得永久占锁，否则后续 lock 会 Deadlock。
     assert_num(
-        r#"
+        r"
 let m = Mutex(7)
 let a = m.lock().get()
 let b = m.lock().get()
 a + b
-"#,
+",
         "14",
     );
 }
@@ -169,7 +177,7 @@ a + b
 #[test]
 fn mutex_lock_unlock() {
     assert_num(
-        r#"
+        r"
 let m = Mutex(0)
 with (m.lock() as g) {
   g.set(g.get() + 5)
@@ -177,7 +185,7 @@ with (m.lock() as g) {
 with (m.lock() as g) {
   return g.get()
 }
-"#,
+",
         "5",
     );
 }
@@ -186,7 +194,7 @@ with (m.lock() as g) {
 fn sync_yield_runs_ready_task() {
     // 「yield 两次后任务必跑完」仅 M:1 协作语义保证；固定 workers=1。
     assert_num(
-        r#"
+        r"
 var n = 0
 go do {
   n = 1
@@ -196,7 +204,7 @@ go do {
 std.sync.yield()
 std.sync.yield()
 n
-"#,
+",
         "2",
     );
 }
@@ -204,7 +212,7 @@ n
 #[test]
 fn waitgroup_add_done_wait() {
     assert_num(
-        r#"
+        r"
 let wg = WaitGroup(1)
 var n = 0
 go do {
@@ -213,7 +221,7 @@ go do {
 }
 wg.wait()
 n
-"#,
+",
         "10",
     );
 }
@@ -221,7 +229,7 @@ n
 #[test]
 fn semaphore_acquire_release() {
     assert_num(
-        r#"
+        r"
 let sem = Semaphore(0)
 var n = 0
 go do {
@@ -230,7 +238,7 @@ go do {
 }
 sem.acquire()
 n
-"#,
+",
         "1",
     );
 }
@@ -238,7 +246,7 @@ n
 #[test]
 fn once_do_runs_once() {
     assert_num(
-        r#"
+        r"
 let o = Once()
 let counter = Mutex(0)
 func bump() {
@@ -254,7 +262,7 @@ let g = counter.lock()
 let n = g.get()
 g.unlock()
 a + b + n
-"#,
+",
         "3",
     );
 }
@@ -262,7 +270,7 @@ a + b + n
 #[test]
 fn barrier_two_parties() {
     assert_num(
-        r#"
+        r"
 let b = Barrier(2)
 var n = 0
 go do {
@@ -272,7 +280,7 @@ go do {
 b.wait()
 n = n + 10
 n
-"#,
+",
         "11",
     );
 }
@@ -280,7 +288,7 @@ n
 #[test]
 fn rwmutex_read_write() {
     assert_num(
-        r#"
+        r"
 let m = RWMutex(0)
 with (m.write() as g) {
   g.set(7)
@@ -288,7 +296,7 @@ with (m.write() as g) {
 with (m.read() as g) {
   return g.get()
 }
-"#,
+",
         "7",
     );
 }
@@ -296,7 +304,7 @@ with (m.read() as g) {
 #[test]
 fn cond_wait_signal() {
     assert_num(
-        r#"
+        r"
 let m = Mutex(0)
 let cv = Cond()
 var n = 0
@@ -315,7 +323,7 @@ loop {
 }
 g.unlock()
 n
-"#,
+",
         "42",
     );
 }
@@ -325,7 +333,7 @@ fn budget_interleaves_cpu_task() {
     // 强制小预算：无显式 suspend 时，长循环任务仍应能被 await 跑完。
     std::env::set_var("OPTIVE_SUSPEND_BUDGET", "64");
     let v = value(
-        r#"
+        r"
 var n = 0
 let t = go do {
   loop (300) {
@@ -334,7 +342,7 @@ let t = go do {
   return n
 }
 await t
-"#,
+",
     );
     std::env::remove_var("OPTIVE_SUSPEND_BUDGET");
     match v {
@@ -346,7 +354,7 @@ await t
 #[test]
 fn select_as_placeholder_discards_bind() {
     assert_num(
-        r#"
+        r"
 let ch = Channel()
 ch.send(1)
 select {
@@ -354,7 +362,7 @@ select {
     return 42
   }
 }
-"#,
+",
         "42",
     );
 }
@@ -363,13 +371,13 @@ select {
 fn select_sleep_as_placeholder() {
     // sleep case 绑定值为 none；`as _` 应可解析并丢弃。
     assert_num(
-        r#"
+        r"
 select {
   case std.time.sleep(0) as _ {
     return 7
   }
 }
-"#,
+",
         "7",
     );
 }
@@ -379,7 +387,7 @@ fn async_taskgroup_joins_on_exit() {
     // 断言 join 后两个任务的累积效果；共享捕获变量的非原子自增在 M:N 真并行下
     // 存在丢失更新（用户级数据竞争），故固定 workers=1 验证 join 语义本身。
     assert_num(
-        r#"
+        r"
 var n = 0
 with (std.async.taskgroup() as g) {
   g.run(do() {
@@ -390,7 +398,7 @@ with (std.async.taskgroup() as g) {
   })
 }
 n
-"#,
+",
         "42",
     );
 }
@@ -398,11 +406,11 @@ n
 #[test]
 fn async_gather_joins_tasks() {
     assert_num(
-        r#"
+        r"
 let tasks = [go do { return 1 }, go do { return 2 }, go do { return 3 }]
 let xs = std.async.gather(tasks)
 xs[0] + xs[1] + xs[2]
-"#,
+",
         "6",
     );
 }
@@ -410,14 +418,14 @@ xs[0] + xs[1] + xs[2]
 #[test]
 fn async_race_returns_first() {
     assert_num(
-        r#"
+        r"
 let a = go do { return 11 }
 let b = go do {
   suspend
   return 99
 }
 std.async.race([a, b])
-"#,
+",
         "11",
     );
 }
@@ -425,7 +433,7 @@ std.async.race([a, b])
 #[test]
 fn async_with_timeout_enter_exit() {
     assert_num(
-        r#"
+        r"
 var ok = 0
 with (std.async.with_timeout(1.0) as ctx) {
   if (!ctx.expired()) {
@@ -433,7 +441,7 @@ with (std.async.with_timeout(1.0) as ctx) {
   }
 }
 ok
-"#,
+",
         "1",
     );
 }
@@ -441,14 +449,14 @@ ok
 #[test]
 fn task_cancel_before_run() {
     assert_bool(
-        r#"
+        r"
 let t = go do {
   suspend
   return 1
 }
 t.cancel()
 t.cancelled()
-"#,
+",
         true,
     );
 }
@@ -456,21 +464,21 @@ t.cancelled()
 #[test]
 fn await_cancelled_task_throws() {
     run_err(
-        r#"
+        r"
 let t = go do {
   std.time.sleep(10.0)
   return 1
 }
 t.cancel()
 await t
-"#,
+",
     );
 }
 
 #[test]
 fn race_cancels_losers() {
     assert_bool(
-        r#"
+        r"
 let slow = go do {
   suspend
   suspend
@@ -479,7 +487,7 @@ let slow = go do {
 let fast = go do { return 7 }
 let v = std.async.race([slow, fast])
 v == 7 and slow.cancelled()
-"#,
+",
         true,
     );
 }
@@ -510,11 +518,11 @@ cancelled
 #[test]
 fn par_map_sums() {
     assert_num(
-        r#"
+        r"
 func double(x) { return x * 2 }
 let ys = std.async.par_map([1, 2, 3], double)
 ys[0] + ys[1] + ys[2]
-"#,
+",
         "12",
     );
 }
@@ -522,11 +530,11 @@ ys[0] + ys[1] + ys[2]
 #[test]
 fn atomic_add() {
     assert_num(
-        r#"
+        r"
 let a = std.sync.Atomic.num(10)
 a.add(5)
 a.get()
-"#,
+",
         "15",
     );
 }
@@ -535,9 +543,9 @@ a.get()
 fn async_workers_at_least_one() {
     // 本套件固定 workers=1；API 本身返回当前调度器 worker 数。
     assert_num(
-        r#"
+        r"
 std.async.workers()
-"#,
+",
         "1",
     );
 }
@@ -545,10 +553,10 @@ std.async.workers()
 #[test]
 fn par_for_maps() {
     assert_num(
-        r#"
+        r"
 let ys = par for (x in [1, 2, 3]) { x * 10 }
 ys[0] + ys[1] + ys[2]
-"#,
+",
         "60",
     );
 }
@@ -556,13 +564,13 @@ ys[0] + ys[1] + ys[2]
 #[test]
 fn par_block_gathers() {
     assert_num(
-        r#"
+        r"
 let r = par {
   10 + 1
   20 + 2
 }
 r[0] + r[1]
-"#,
+",
         "33",
     );
 }
@@ -570,44 +578,44 @@ r[0] + r[1]
 #[test]
 fn par_for_rejects_shared_assign() {
     run_err(
-        r#"
+        r"
 var n = 0
 par for (x in [1, 2]) {
   n = n + x
 }
-"#,
+",
     );
 }
 
 #[test]
 fn stream_of_for_in() {
     assert_num(
-        r#"
+        r"
 let s = std.async.stream_of([1, 2, 3])
 var t = 0
 for (x in s) {
   t = t + x
 }
 t
-"#,
+",
         "6",
     );
 }
 
 #[test]
 fn stream_is_not_channel_type() {
-    assert_text(r#"type(std.async.stream_of([]))"#, "Stream");
-    assert_text(r#"type(Stream())"#, "Stream");
-    assert_text(r#"type(Channel())"#, "Channel");
+    assert_text(r"type(std.async.stream_of([]))", "Stream");
+    assert_text(r"type(Stream())", "Stream");
+    assert_text(r"type(Channel())", "Channel");
 }
 
 #[test]
 fn stream_send_forbidden() {
     let err = optive::run_source(
-        r#"
+        r"
 let s = Stream()
 s.send(1)
-"#,
+",
     )
     .unwrap_err();
     let msg = err.to_string();
@@ -620,7 +628,7 @@ s.send(1)
 #[test]
 fn channel_as_stream_view() {
     assert_num(
-        r#"
+        r"
 let ch = Channel()
 go do {
   ch.send(9)
@@ -628,7 +636,7 @@ go do {
 }
 let s = ch.as_stream()
 s.next()
-"#,
+",
         "9",
     );
 }
@@ -636,7 +644,7 @@ s.next()
 #[test]
 fn stream_take_map() {
     assert_num(
-        r#"
+        r"
 func double(x) { return x * 2 }
 let s = std.async.stream_of([1, 2, 3, 4])
 let m = std.async.stream_map(s, double)
@@ -644,7 +652,7 @@ let t = std.async.stream_take(m, 2)
 var sum = 0
 for (v in t) { sum = sum + v }
 sum
-"#,
+",
         "6",
     );
 }
@@ -652,7 +660,7 @@ sum
 #[test]
 fn stream_from_gen_pull() {
     assert_num(
-        r#"
+        r"
 gen count() {
   yield 1
   yield 2
@@ -662,7 +670,7 @@ let s = std.async.stream_from_gen(count)
 var t = 0
 for (x in s) { t = t + x }
 t
-"#,
+",
         "6",
     );
 }
@@ -670,10 +678,10 @@ t
 #[test]
 fn stream_next_alias() {
     assert_num(
-        r#"
+        r"
 let s = std.async.stream_of([7])
 s.next()
-"#,
+",
         "7",
     );
 }
@@ -682,7 +690,7 @@ s.next()
 fn channel_for_in_task_blocks_then_receives() {
     // IterNext 必须在 channel 阻塞时挂起，不能把 none 当元素。
     assert_num(
-        r#"
+        r"
 let ch = Channel()
 let t = go do {
   for (x in ch) {
@@ -692,7 +700,7 @@ let t = go do {
 }
 go do { ch.send(42) }
 await t
-"#,
+",
         "42",
     );
 }
@@ -768,14 +776,14 @@ n
 #[test]
 fn for_placeholder_discards_bind() {
     assert_num(
-        r#"
+        r"
 var n = 0
 for (_ in [1, 2, 3]) {
   n = n + 1
 }
 let xs = [0 for (_ in std.math.range(0, 4))]
 n + len(xs)
-"#,
+",
         "7",
     );
 }
@@ -784,7 +792,7 @@ n + len(xs)
 #[test]
 fn go_do_calls_sibling_module_func() {
     assert_num(
-        r#"
+        r"
 func sibling(n) {
   return n + 1
 }
@@ -795,7 +803,7 @@ func run() {
   return await t
 }
 run()
-"#,
+",
         "42",
     );
 }
@@ -804,7 +812,7 @@ run()
 #[test]
 fn select_multi_ready_fairness() {
     let v = value(
-        r#"
+        r"
 let a = Channel(1)
 let b = Channel(1)
 a.send(1)
@@ -824,7 +832,7 @@ loop (200) {
   }
 }
 [ca, cb]
-"#,
+",
     );
     let Value::List(list) = v else {
         panic!("expected list");
@@ -847,14 +855,14 @@ loop (200) {
 #[test]
 fn select_recv_on_channel_stream_view() {
     assert_num(
-        r#"
+        r"
 let ch = Channel(1)
 ch.send(7)
 let s = ch.as_stream()
 select {
   case s.recv() as x { x }
 }
-"#,
+",
         "7",
     );
 }
@@ -862,14 +870,14 @@ select {
 #[test]
 fn stream_close_stops_take() {
     assert_num(
-        r#"
+        r"
 let s = std.async.stream_of([1, 2, 3, 4])
 let t = std.async.stream_take(s, 10)
 t.close()
 var n = 0
 for (x in t) { n = n + 1 }
 n
-"#,
+",
         "0",
     );
 }

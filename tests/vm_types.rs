@@ -1,24 +1,32 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::{assert_num, run_err};
 
 fn caught_type_error(source: &str) -> bool {
     let src = format!(
-        r#"
+        r"
 try {{
     {source}
     0
 }} catch (e: TypeError) {{
     1
 }}
-"#
+"
     );
     common::num(&src) == "1"
 }
 
 fn caught_type_or_name_error(source: &str) -> bool {
     let src = format!(
-        r#"
+        r"
 try {{
     {source}
     0
@@ -27,7 +35,7 @@ try {{
 }} catch (e: NameError) {{
     1
 }}
-"#
+"
     );
     common::num(&src) == "1"
 }
@@ -137,9 +145,9 @@ xs.append("a")
 #[test]
 fn never_rejects_all() {
     assert!(caught_type_error(
-        r#"
+        r"
 let x:: Never = 1
-"#
+"
     ));
 }
 
@@ -178,10 +186,10 @@ d["b"] = "oops"
 #[test]
 fn is_a_accepts_typespec_union() {
     assert_num(
-        r#"
+        r"
 use std.typing.{ Union }
 if is_a(1, Union(num, text)) then 1 else 0
-"#,
+",
         "1",
     );
 }
@@ -210,20 +218,20 @@ f(3)
 #[test]
 fn strong_return_rejects_mismatch() {
     assert!(caught_type_error(
-        r#"
+        r"
 func tag() => text { return 1 }
 tag()
-"#
+"
     ));
 }
 
 #[test]
 fn soft_return_allows_mismatch() {
     assert_num(
-        r#"
+        r"
 func retSoft(x) -> text { return x }
 retSoft(1)
-"#,
+",
         "1",
     );
 }
@@ -232,12 +240,12 @@ retSoft(1)
 fn typed_struct_arrow_return_is_soft() {
     // typed struct 不再把 `->` 升格为强；要强返回须写 `=>`。
     assert_num(
-        r#"
+        r"
 typed struct Box { var v: num
     func tag(self) -> text { return self.v }
 }
 Box(1).tag()
-"#,
+",
         "1",
     );
 }
@@ -245,21 +253,21 @@ Box(1).tag()
 #[test]
 fn strong_return_with_wrapper_checks_outer() {
     assert!(caught_type_error(
-        r#"
+        r"
 variant Result {
     typed Ok(value: num)
     Err = typed struct { value: text }
 }
 func bad() => num : Result(_) { return 1 }
 bad()
-"#
+"
     ));
 }
 
 #[test]
 fn strong_return_wrapper_ok_when_outer_matches() {
     assert_num(
-        r#"
+        r"
 variant Result {
     typed Ok(value: num)
     Err = typed struct { value: text }
@@ -267,7 +275,7 @@ variant Result {
 func good() => Result : Result(_) { return Result.Ok(1) }
 r = good()
 1
-"#,
+",
         "1",
     );
 }
@@ -285,10 +293,10 @@ Point("a", 2)
 #[test]
 fn typed_struct_accepts_valid() {
     assert_num(
-        r#"
+        r"
 typed struct Point { let x: num let y: num }
 Point(3, 4).x
-"#,
+",
         "3",
     );
 }
@@ -350,10 +358,10 @@ let xs:: list[num] = [1, "two"]
 #[test]
 fn list_element_type_accepts_valid() {
     assert_num(
-        r#"
+        r"
 let xs:: list[num] = [1, 2, 3]
 xs[0]
-"#,
+",
         "1",
     );
 }
@@ -361,10 +369,10 @@ xs[0]
 #[test]
 fn union_type_accepts_member() {
     assert_num(
-        r#"
+        r"
 func f(x:: Union[num, text]) { return 1 }
 f(42)
-"#,
+",
         "1",
     );
 }
@@ -372,20 +380,20 @@ f(42)
 #[test]
 fn union_type_rejects_non_member() {
     assert!(caught_type_error(
-        r#"
+        r"
 func f(x:: Union[num, text]) { return 1 }
 f(true)
-"#
+"
     ));
 }
 
 #[test]
 fn maybe_accepts_none() {
     assert_num(
-        r#"
+        r"
 let m:: Maybe[num] = none
 1
-"#,
+",
         "1",
     );
 }
@@ -393,10 +401,10 @@ let m:: Maybe[num] = none
 #[test]
 fn maybe_accepts_inner() {
     assert_num(
-        r#"
+        r"
 let m:: Maybe[num] = 5
 m
-"#,
+",
         "5",
     );
 }
@@ -404,10 +412,10 @@ m
 #[test]
 fn strong_param_passes_valid() {
     assert_num(
-        r#"
+        r"
 func hard(x:: num) { return x + 1 }
 hard(41)
-"#,
+",
         "42",
     );
 }
@@ -452,7 +460,7 @@ let d:: dict[text, num] = {"a": 1, "b": "x"}
 #[test]
 fn protocol_strong_binding_rejects() {
     assert!(caught_type_error(
-        r#"
+        r"
 protocol HasMul {
     func __mul__(self, other) { }
 }
@@ -460,14 +468,14 @@ protocol HasMul {
 struct Plain { let v }
 
 let x:: HasMul = Plain(1)
-"#
+"
     ));
 }
 
 #[test]
 fn protocol_strong_binding_accepts() {
     assert_num(
-        r#"
+        r"
 protocol HasMul {
     func __mul__(self, other) { }
 }
@@ -479,7 +487,7 @@ struct MulNum {
 
 let x:: HasMul = MulNum(3)
 1
-"#,
+",
         "1",
     );
 }
@@ -487,7 +495,7 @@ let x:: HasMul = MulNum(3)
 #[test]
 fn is_a_protocol_runtime() {
     assert_num(
-        r#"
+        r"
 protocol HasMul {
     func __mul__(self, other) { }
 }
@@ -498,7 +506,7 @@ struct MulNum {
 }
 
 if is_a(MulNum(2), HasMul) then 1 else 0
-"#,
+",
         "1",
     );
 }
@@ -524,10 +532,10 @@ try {
 #[test]
 fn help_documents_typing_sigils() {
     assert_num(
-        r#"
+        r"
 help()
 1
-"#,
+",
         "1",
     );
 }
@@ -535,11 +543,11 @@ help()
 #[test]
 fn strong_param_type_alias_resolves_at_def() {
     assert_num(
-        r#"
+        r"
 let T = num
 func f(x:: T) { return x }
 f(3)
-"#,
+",
         "3",
     );
 }
@@ -547,9 +555,9 @@ f(3)
 #[test]
 fn strong_param_unbound_type_name_errors_at_def() {
     assert!(caught_type_or_name_error(
-        r#"
+        r"
 func f(x:: NotAType) { return x }
-"#
+"
     ));
 }
 
@@ -566,10 +574,10 @@ func greet(name: str, greeting:: str) { greeting + " " + name }
 #[test]
 fn strong_param_accepts_type_of_function() {
     assert_num(
-        r#"
+        r"
 func f(x:: type(do() {})) { return 1 }
 f(do() { return 9 })
-"#,
+",
         "1",
     );
 }
@@ -577,9 +585,9 @@ f(do() { return 9 })
 #[test]
 fn strong_param_rejects_non_function_for_type_of_function() {
     assert!(caught_type_error(
-        r#"
+        r"
 func f(x:: type(do() {})) { return 1 }
 f(3)
-"#
+"
     ));
 }

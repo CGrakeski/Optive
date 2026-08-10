@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro
+)]
 mod common;
 
 use common::{assert_num, assert_text};
@@ -5,11 +13,11 @@ use common::{assert_num, assert_text};
 #[test]
 fn closure_captures_outer_let() {
     assert_num(
-        r#"
+        r"
 let base = 10
 let add = do(x) { return x + base }
 add(5)
-"#,
+",
         "15",
     );
 }
@@ -17,12 +25,12 @@ add(5)
 #[test]
 fn closure_capture_is_shared_mutable() {
     assert_num(
-        r#"
+        r"
 let n = 1
 let get = do() { return n }
 n = 5
 get()
-"#,
+",
         "5",
     );
 }
@@ -30,12 +38,12 @@ get()
 #[test]
 fn closure_mutates_outer_binding() {
     assert_num(
-        r#"
+        r"
 let n = 1
 let inc = do() { n = n + 1 }
 inc()
 n
-"#,
+",
         "2",
     );
 }
@@ -43,7 +51,7 @@ n
 #[test]
 fn closure_captures_function_local() {
     assert_num(
-        r#"
+        r"
 func outer() {
     let x = 1
     let inner = do() { return x }
@@ -51,7 +59,7 @@ func outer() {
     return inner()
 }
 outer()
-"#,
+",
         "2",
     );
 }
@@ -59,7 +67,7 @@ outer()
 #[test]
 fn nested_func_captures_outer_local() {
     assert_num(
-        r#"
+        r"
 func outer() {
     let x = 1
     func inner() {
@@ -69,7 +77,7 @@ func outer() {
     return inner()
 }
 outer()
-"#,
+",
         "2",
     );
 }
@@ -77,13 +85,13 @@ outer()
 #[test]
 fn decorator_on_func() {
     assert_num(
-        r#"
+        r"
 func double(f) {
     return do(x) { return f(x) * 2 }
 }
 double func inc(x) { return x + 1 }
 inc(20)
-"#,
+",
         "42",
     );
 }
@@ -91,7 +99,7 @@ inc(20)
 #[test]
 fn with_context_manager() {
     assert_num(
-        r#"
+        r"
 struct Ctx {
     var n
     func __enter__(self) {
@@ -107,7 +115,7 @@ let b = Ctx(0)
 with (b as v) {
     v
 }
-"#,
+",
         "1",
     );
 }
@@ -127,7 +135,7 @@ add(41)
 #[test]
 fn friend_func_best_match_subtype() {
     assert_num(
-        r#"
+        r"
 struct Base { var n: num }
 struct Sub : Base { var n: num }
 
@@ -136,7 +144,7 @@ f.__dispatch__.append(do(x:: Sub) { return 2 })
 
 let s = Sub(42)
 f(s)
-"#,
+",
         "2",
     );
 }
@@ -144,7 +152,7 @@ f(s)
 #[test]
 fn friend_func_best_match_base_type() {
     assert_num(
-        r#"
+        r"
 struct Base { var n: num }
 struct Sub : Base { var n: num }
 
@@ -153,16 +161,16 @@ f.__dispatch__.append(do(x:: Sub) { return 2 })
 
 let b = Base(42)
 f(b)
-"#,
+",
         "1",
     );
 }
 
-/// 嵌套函数对捕获的外层 local 赋值必须走 Cell/Store，不能 StoreGlobal。
+/// 嵌套函数对捕获的外层 local 赋值必须走 Cell/Store，不能 `StoreGlobal`。
 #[test]
 fn nested_func_mutates_outer_local() {
     assert_num(
-        r#"
+        r"
 func outer() {
     let x = 1
     func inc() { x = x + 1 }
@@ -170,7 +178,7 @@ func outer() {
     return x
 }
 outer()
-"#,
+",
         "2",
     );
 }
