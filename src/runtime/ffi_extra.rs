@@ -1124,7 +1124,7 @@ pub fn builtin_callback(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let boxed = Box::new(closure);
     let closure_ptr = Box::into_raw(boxed);
     // SAFETY: Closure<'a> with 'a tied to leaked CallbackData — both leaked until free.
-    let static_closure = closure_ptr as *mut Closure<'static>;
+    let static_closure: *mut Closure<'static> = closure_ptr;
 
     let id = CALLBACK_IDS.fetch_add(1, Ordering::Relaxed);
     CALLBACKS.lock().insert(

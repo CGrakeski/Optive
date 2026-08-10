@@ -34,19 +34,11 @@ pub(crate) enum TrackedWeak {
     Struct(ArcWeak<StructInstance>),
 }
 
+#[derive(Default)]
 struct TrackerData {
     weaks: Vec<TrackedWeak>,
     /// 主地址 / 别名（如 Struct 的 SyncCell 锁）→ `weaks` 下标；sweep/prune 后重建。
     by_addr: FxHashMap<usize, usize>,
-}
-
-impl Default for TrackerData {
-    fn default() -> Self {
-        Self {
-            weaks: Vec::new(),
-            by_addr: FxHashMap::default(),
-        }
-    }
 }
 
 /// GC 运行模式。
@@ -370,7 +362,7 @@ impl SharedGc {
                             if gray.is_empty() {
                                 break;
                             }
-                            let take = (gray.len() / 2).max(1).min(64);
+                            let take = (gray.len() / 2).clamp(1, 64);
                             let start = gray.len() - take;
                             local_work.extend(gray.drain(start..));
                         }
@@ -437,40 +429,37 @@ impl SharedGc {
     }
 
     /// 终止：重扫脏卡直至不动点，关闭屏障，返回 marked 快照供 sweep。
-    pub fn concurrent_terminate(&self, vm: &Vm) -> FxHashSet<usize> {
+    /// 若脏卡风暴在轮次上限后仍未收敛，返回 `None`，由调用方回退完整 STW。
+    pub fn concurrent_terminate(&self, vm: &Vm) -> Option<FxHashSet<usize>> {
         let _ = self.wait_ffi_quiescent();
-        // 再扫一次根 + FFI pins（mutator 可能写入新根）
         {
             let mut gray = self.gray.lock();
             vm.gc_push_all_roots(&mut gray);
             gray.extend(self.ffi_pins_snapshot());
         }
-        // 批量化脏卡重扫，压短 marked/dirty 临界区；轮次上限防 dirty 风暴拖死第二窗。
         const MAX_ROUNDS: usize = 48;
-        for round in 0..MAX_ROUNDS {
+        let mut converged = false;
+        for _ in 0..MAX_ROUNDS {
             while self.concurrent_flush_dirty_to_gray() > 0 {
                 self.mark_drain_local();
             }
             self.mark_drain_local();
             if self.dirty.lock().is_empty() && self.gray.lock().is_empty() {
+                converged = true;
                 break;
             }
-            if round + 1 == MAX_ROUNDS {
-                // 饱和：最后再拍根并排空，然后强制结束屏障。
-                let mut gray = self.gray.lock();
-                vm.gc_push_all_roots(&mut gray);
-                gray.extend(self.ffi_pins_snapshot());
-                drop(gray);
-                while self.concurrent_flush_dirty_to_gray() > 0 {
-                    self.mark_drain_local();
-                }
-                self.mark_drain_local();
-            }
+        }
+        if !converged {
+            self.set_marking(false);
+            self.dirty.lock().clear();
+            self.gray.lock().clear();
+            self.marked.lock().clear();
+            return None;
         }
         self.set_marking(false);
         self.dirty.lock().clear();
         self.gray.lock().clear();
-        std::mem::take(&mut *self.marked.lock())
+        Some(std::mem::take(&mut *self.marked.lock()))
     }
 
     #[inline]

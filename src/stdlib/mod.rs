@@ -1742,37 +1742,17 @@ fn async_stream_new(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     crate::concurrency::construct_stream(args)
 }
 
-/// `stream_of(xs)`：后台任务把可迭代元素送入无界 Stream 后关闭。
+/// `stream_of(xs)`：物化为拉取 Stream（按 `next` / `for-in` 消费，无后台推送竞态）。
 fn async_stream_of(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(crate::error::RuntimeError::type_err(
             "stream_of requires 1 iterable argument",
         ));
     }
-    let items = Arc::new(materialize_iter(vm, &args[0])?);
-    let stream = crate::concurrency::construct_stream(&[])?;
-    let Value::Stream(s) = &stream else {
-        unreachable!("construct_stream returns Stream");
-    };
-    let ch_task = crate::concurrency::stream_channel(s).expect("buffered stream");
-    let producer = Value::Builtin(Arc::new(move |vm: &mut Vm, _args: &[Value]| {
-        for item in items.iter() {
-            if let Err(e) = vm.fail_if_current_task_cancelled() {
-                ch_task.borrow_mut().closed = true;
-                vm.mn.notify_all();
-                return Err(e);
-            }
-            vm.channel_send(&ch_task, item.clone())?;
-            if vm.block_suspend {
-                return Ok(Value::None);
-            }
-        }
-        ch_task.borrow_mut().closed = true;
-        vm.mn.notify_all();
-        Ok(Value::None)
-    }));
-    let _ = vm.spawn_task(producer, vec![]);
-    Ok(stream)
+    let items = materialize_iter(vm, &args[0])?;
+    Ok(crate::concurrency::stream_from_iterator(Shared::new(
+        IteratorState::from_list(items),
+    )))
 }
 
 /// `stream_from_gen(g)`：按需从生成器/`Iterator` 拉取（不先物化全集）。

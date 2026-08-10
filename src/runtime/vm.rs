@@ -450,6 +450,12 @@ pub struct Vm {
     /// 当前 select 轮次的伪随机 case 次序（`SelectBegin` / `SelectNextIndex`）。
     select_fair_order: Vec<usize>,
     select_fair_pos: usize,
+    /// select 公平性 PRNG 状态。
+    select_rng: u64,
+    /// 任务纤程命中调试停点；主解释循环应返回 `DebugBreak`。
+    debug_break_requested: bool,
+    /// 因调试而停住的任务（不在就绪队列，待 continue 再入队）。
+    debug_paused_tasks: Vec<Shared<TaskInner>>,
     /// STW 失败后的自动 GC 冷却：在此之前且 tracked_count 未超过记录值时跳过。
     gc_auto_cooldown_until: Option<std::time::Instant>,
     /// 冷却期内允许提前重试的下限：仅当 `tracked_count >` 此值时才无视时间冷却。
@@ -755,6 +761,10 @@ impl Vm {
             mn_idle_rounds: 0,
             select_fair_order: Vec::new(),
             select_fair_pos: 0,
+            select_rng: 0x00C0_FFEE_u64
+                ^ std::time::Instant::now().elapsed().as_nanos() as u64,
+            debug_break_requested: false,
+            debug_paused_tasks: Vec::new(),
             gc_auto_cooldown_until: None,
             gc_auto_cooldown_hold_count: 0,
             sched_depth: 0,
@@ -919,7 +929,7 @@ impl Vm {
             // 握手失败：冷却后重试，不永久跳过环收集。
             let n = self.mn.note_stw_failure();
             gc.stw_fallback_count.fetch_add(1, Ordering::Relaxed);
-            if n == 1 || n % 64 == 0 {
+            if n == 1 || n.is_multiple_of(64) {
                 eprintln!(
                     "optive: GC stop-the-world 超时（累计 {n} 次），本轮回退冷却后重试"
                 );
@@ -987,7 +997,7 @@ impl Vm {
             self.gc.set_marking(false);
             let n = self.mn.note_stw_failure();
             self.gc.stw_fallback_count.fetch_add(1, Ordering::Relaxed);
-            if n == 1 || n % 64 == 0 {
+            if n == 1 || n.is_multiple_of(64) {
                 eprintln!(
                     "optive: GC terminate STW 超时（累计 {n} 次），本轮回退冷却后重试"
                 );
@@ -1010,8 +1020,13 @@ impl Vm {
             self.gc.last_stw_ns.store(stw_ns, Ordering::Relaxed);
             return cleared;
         }
-        let marked = self.gc.concurrent_terminate(self);
-        let cleared = self.gc.sweep_marked(&marked);
+        let cleared = match self.gc.concurrent_terminate(self) {
+            Some(marked) => self.gc.sweep_marked(&marked),
+            None => {
+                // 脏卡未收敛：完整 STW 收集，避免带着不完整 marked 清扫。
+                self.gc.collect_stw_inner(self)
+            }
+        };
         stw_ns += term_t0.elapsed().as_nanos() as u64;
         self.gc.last_stw_ns.store(stw_ns, Ordering::Relaxed);
         // 保持 STW，由外层 end_stw
@@ -2914,6 +2929,7 @@ impl Vm {
 
     /// 调试会话：跑到断点/步进停点，或程序结束。
     pub fn run_until_debug_break(&mut self) -> Result<Option<Value>> {
+        self.resume_debug_paused_tasks();
         match self.run_interpreter(None)? {
             InterpResult::Value(Some(v)) => Ok(Some(v)),
             InterpResult::Value(None) => Ok(Some(self.stack_top())),
@@ -2925,6 +2941,43 @@ impl Vm {
                 "internal error: generator yield outside iterator",
             )),
         }
+    }
+
+    fn resume_debug_paused_tasks(&mut self) {
+        let paused = std::mem::take(&mut self.debug_paused_tasks);
+        self.debug_break_requested = false;
+        for task in paused {
+            {
+                let mut inner = task.borrow_mut();
+                inner.debug_paused = false;
+            }
+            self.enqueue_task(task);
+        }
+    }
+
+    /// 任务命中调试停点：挂起纤程且不入就绪队列，并通知主循环。
+    fn park_task_for_debug(&mut self) {
+        let Some(ctx) = self.task_ctx.take() else {
+            self.debug_break_requested = true;
+            return;
+        };
+        let task = ctx.task.clone();
+        let key = Self::task_ptr_key(&task);
+        let fiber = self.capture_fiber(&ctx);
+        self.fiber_insert(key, fiber);
+        {
+            let mut inner = task.borrow_mut();
+            inner.state = TaskState::Suspended;
+            inner.debug_paused = true;
+        }
+        if !self
+            .debug_paused_tasks
+            .iter()
+            .any(|t| Shared::ptr_eq(t, &task))
+        {
+            self.debug_paused_tasks.push(task);
+        }
+        self.debug_break_requested = true;
     }
 
     #[inline]
@@ -2949,6 +3002,10 @@ impl Vm {
             let code_len = ops.len();
 
             'hot: loop {
+                if self.debug_break_requested && self.task_ctx.is_none() {
+                    self.debug_break_requested = false;
+                    return Ok(InterpResult::DebugBreak);
+                }
                 if self.pending_suspend {
                     return self.complete_task_suspend();
                 }
@@ -4323,6 +4380,14 @@ impl Vm {
             StepAction::Await => {
                 let v = self.pop()?;
                 let result = self.await_value(v.clone())?;
+                if self.debug_break_requested {
+                    // 任务内调试停点：回绕 Await，让主循环返回 DebugBreak。
+                    self.push_value(v);
+                    if self.pc > 0 {
+                        self.pc -= 1;
+                    }
+                    return Ok(());
+                }
                 if self.block_suspend {
                     self.block_suspend = false;
                     self.push_value(v);
@@ -4353,8 +4418,34 @@ impl Vm {
             }
             StepAction::SelectTryRecv => {
                 let ch = self.pop()?;
-                let Value::Channel(inner) = ch else {
-                    return Err(RuntimeError::type_err("select recv expects Channel"));
+                let inner = match ch {
+                    Value::Channel(inner) => inner,
+                    Value::Stream(s) => match &*s.borrow() {
+                        crate::value::StreamInner::Channel(inner) => inner.clone(),
+                        crate::value::StreamInner::Iter(it) => {
+                            match select_try_recv_from_iter(it)? {
+                                Some(Some(v)) => {
+                                    self.push_value(v);
+                                    self.push_value(Value::Bool(true));
+                                    return Ok(());
+                                }
+                                Some(None) => {
+                                    self.push_value(Value::None);
+                                    self.push_value(Value::Bool(true));
+                                    return Ok(());
+                                }
+                                None => {
+                                    self.push_value(Value::Bool(false));
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    },
+                    _ => {
+                        return Err(RuntimeError::type_err(
+                            "select recv expects Channel or Stream",
+                        ));
+                    }
                 };
                 let outcome = inner.borrow_mut().try_recv();
                 match outcome {
@@ -4429,19 +4520,10 @@ impl Vm {
             StepAction::SelectBegin(n) => {
                 self.select_fair_order.clear();
                 self.select_fair_order.extend(0..n);
-                // Fisher–Yates；种子混入单调时钟，避免多就绪时永远偏向书写顺序。
-                let mut seed = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0)
-                    ^ (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                    ^ (self.pc as u64);
+                // Fisher–Yates + 无偏取模（Lemire），避免书写顺序饿死。
                 if n > 1 {
                     for i in (1..n).rev() {
-                        seed = seed
-                            .wrapping_mul(6364136223846793005)
-                            .wrapping_add(1);
-                        let j = (seed >> 33) as usize % (i + 1);
+                        let j = self.select_rng_below(i + 1);
                         self.select_fair_order.swap(i, j);
                     }
                 }
@@ -6356,6 +6438,35 @@ impl Vm {
         self.task_ctx.as_ref().map(|c| c.task.clone())
     }
 
+    /// 无偏 `0..bound`（bound > 0）；xorshift* + Lemire。
+    fn select_rng_below(&mut self, bound: usize) -> usize {
+        debug_assert!(bound > 0);
+        let mut x = self.select_rng;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        if x == 0 {
+            x = 0xA5A5_A5A5_A5A5_A5A5;
+        }
+        self.select_rng = x;
+        let bound = bound as u64;
+        let mut m = (x as u128) * (bound as u128);
+        let mut lo = m as u64;
+        if lo < bound {
+            let thresh = bound.wrapping_neg() % bound;
+            while lo < thresh {
+                x = self.select_rng;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.select_rng = x;
+                m = (x as u128) * (bound as u128);
+                lo = m as u64;
+            }
+        }
+        (m >> 64) as usize
+    }
+
     pub fn debug_build_stack_frames(&self) -> Vec<ErrorStackFrame> {
         let mut frames = Vec::new();
         for (i, ucf) in self.user_call_frames.iter().enumerate() {
@@ -6953,6 +7064,10 @@ impl Vm {
             mn_idle_rounds: 0,
             select_fair_order: Vec::new(),
             select_fair_pos: 0,
+            select_rng: 0x00C0_FFEE_u64
+                ^ std::time::Instant::now().elapsed().as_nanos() as u64,
+            debug_break_requested: false,
+            debug_paused_tasks: Vec::new(),
             gc_auto_cooldown_until: None,
             gc_auto_cooldown_hold_count: 0,
             sched_depth: 0,
@@ -7022,12 +7137,18 @@ impl Vm {
     /// - 否则先跑就绪队列；M:N 下再短等。
     pub(crate) fn wait_or_deadlock(&mut self, msg: &str) -> Result<()> {
         self.poll_gc_safepoint();
+        if self.debug_break_requested {
+            return Ok(());
+        }
         // 任务内阻塞：立即挂起并回绕 Call，由外层（主纤程/其它 worker）推进。
         if self.sched_depth > 0 && self.task_ctx.is_some() {
             self.block_suspend = true;
             return Ok(());
         }
         if self.scheduler_run_one()? {
+            return Ok(());
+        }
+        if self.debug_break_requested {
             return Ok(());
         }
         if self.mn_parallel {
@@ -7433,7 +7554,10 @@ impl Vm {
                             Ok(Some(v.unwrap_or(Value::None)))
                         }
                         InterpResult::Suspended => Ok(None),
-                        InterpResult::DebugBreak => Ok(None),
+                        InterpResult::DebugBreak => {
+                            self.park_task_for_debug();
+                            Ok(None)
+                        }
                         InterpResult::Yielded(v) => {
                             if let Some(ctx) = self.task_ctx.take() {
                                 let _ = self.capture_fiber(&ctx);
@@ -7462,7 +7586,10 @@ impl Vm {
                             Ok(Some(v.unwrap_or(Value::None)))
                         }
                         InterpResult::Suspended => Ok(None),
-                        InterpResult::DebugBreak => Ok(None),
+                        InterpResult::DebugBreak => {
+                            self.park_task_for_debug();
+                            Ok(None)
+                        }
                         InterpResult::Yielded(v) => {
                             if let Some(ctx) = self.task_ctx.take() {
                                 let _ = self.capture_fiber(&ctx);
@@ -7617,11 +7744,14 @@ impl Vm {
                     return Ok(Value::None);
                 }
                 TaskState::Pending { .. } | TaskState::Suspended => {
+                    if task.borrow().debug_paused || self.debug_break_requested {
+                        return Ok(Value::None);
+                    }
                     self.ensure_task_runnable(&task);
                     self.wait_or_deadlock(
                         "no runnable tasks while awaiting",
                     )?;
-                    if self.block_suspend {
+                    if self.block_suspend || self.debug_break_requested {
                         return Ok(Value::None);
                     }
                 }
@@ -7629,7 +7759,7 @@ impl Vm {
                     self.wait_or_deadlock(
                         "no runnable tasks while awaiting",
                     )?;
-                    if self.block_suspend {
+                    if self.block_suspend || self.debug_break_requested {
                         return Ok(Value::None);
                     }
                 }
@@ -7639,6 +7769,9 @@ impl Vm {
 
     /// 确保任务在就绪队列中（不阻塞等待完成）。
     pub(crate) fn ensure_task_runnable(&mut self, task: &Shared<TaskInner>) {
+        if task.borrow().debug_paused {
+            return;
+        }
         let state = task.borrow().state.clone();
         if matches!(
             state,
@@ -9103,6 +9236,46 @@ fn num_to_isize(n: &Num) -> Result<isize> {
                 Err(RuntimeError::type_err("index must be integer"))
             }
         }
+    }
+}
+
+/// select 非阻塞试收：沿拉取包装找到底层 Channel；纯列表流视为立即就绪。
+fn select_try_recv_from_iter(
+    it: &Shared<IteratorState>,
+) -> Result<Option<Option<Value>>> {
+    use crate::value::IteratorKind;
+    match &mut it.borrow_mut().kind {
+        IteratorKind::Channel { channel } => Ok(channel.borrow_mut().try_recv()),
+        IteratorKind::Take { remaining, source } => {
+            if *remaining == 0 {
+                return Ok(Some(None));
+            }
+            let source = source.clone();
+            match select_try_recv_from_iter(&source)? {
+                Some(Some(v)) => {
+                    *remaining -= 1;
+                    Ok(Some(Some(v)))
+                }
+                other => Ok(other),
+            }
+        }
+        IteratorKind::List { items, index } => {
+            if *index >= items.len() {
+                Ok(Some(None))
+            } else {
+                let v = items[*index].clone();
+                *index += 1;
+                Ok(Some(Some(v)))
+            }
+        }
+        IteratorKind::Map { .. } | IteratorKind::Filter { .. } | IteratorKind::GenExpr { .. } => {
+            Err(RuntimeError::type_err(
+                "select recv on mapped/filtered Stream is unsupported; use Channel or bare stream",
+            ))
+        }
+        _ => Err(RuntimeError::type_err(
+            "select recv expects Channel-backed Stream",
+        )),
     }
 }
 

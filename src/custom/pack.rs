@@ -42,22 +42,12 @@ pub struct LayoutSet {
 }
 
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct Layout {
     pub repl: ReplLayout,
     pub parse: ParseLayout,
     pub traceback: TracebackLayout,
     pub exception: ExceptionLayout,
-}
-
-impl Default for Layout {
-    fn default() -> Self {
-        Self {
-            repl: ReplLayout::default(),
-            parse: ParseLayout::default(),
-            traceback: TracebackLayout::default(),
-            exception: ExceptionLayout::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

@@ -486,6 +486,8 @@ pub struct TaskInner {
     pub task_group: Option<Shared<SyncInner>>,
     /// 协作式取消请求；在 await / sleep / 调度入口等检查点生效。
     pub cancelled: bool,
+    /// 调试器停在该任务上：勿入就绪队列，直至会话 `continue`。
+    pub debug_paused: bool,
 }
 
 impl TaskInner {
@@ -494,6 +496,7 @@ impl TaskInner {
             state: TaskState::Pending { callable, args },
             task_group: None,
             cancelled: false,
+            debug_paused: false,
         }
     }
 
@@ -502,6 +505,7 @@ impl TaskInner {
             state: TaskState::Done(value),
             task_group: None,
             cancelled: false,
+            debug_paused: false,
         }
     }
 
@@ -1737,6 +1741,7 @@ pub fn value_to_iterable(v: &Value) -> crate::Result<IteratorState> {
                     channel: ch.clone(),
                 },
             }),
+            // 拉取游标不可克隆：调用方应走 `value_to_iterator_shared`。
             StreamInner::Iter(it) => Ok(it.borrow().clone()),
         },
         Value::Dict(d) => {

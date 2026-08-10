@@ -414,6 +414,11 @@ impl<T> SharedVec<T> {
     }
 
     #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.inner.read().is_empty()
+    }
+
+    #[inline]
     pub fn with_ref<R>(&self, f: impl FnOnce(&Vec<T>) -> R) -> R {
         f(&self.inner.read())
     }

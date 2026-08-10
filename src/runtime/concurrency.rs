@@ -5,7 +5,8 @@
 use crate::error::RuntimeError;
 use crate::shared::Shared;
 use crate::value::{
-    expect_i64, ChannelInner, MutexInner, Num, StreamInner, SyncGuardInner, SyncInner, Value,
+    expect_i64, ChannelInner, IteratorKind, IteratorState, MutexInner, Num, StreamInner,
+    SyncGuardInner, SyncInner, Value,
 };
 use crate::Result;
 use std::sync::Arc;
@@ -61,6 +62,50 @@ pub fn get_channel_method(ch: &Shared<ChannelInner>, field: &str) -> Result<Valu
     }
 }
 
+fn close_stream_iterator(it: &Shared<IteratorState>, vm: &mut crate::vm::Vm) {
+    let mut nested: Vec<Shared<IteratorState>> = Vec::new();
+    {
+        let mut st = it.borrow_mut();
+        match &mut st.kind {
+            IteratorKind::Channel { channel } => {
+                channel.borrow_mut().closed = true;
+                vm.mn.notify_all();
+            }
+            IteratorKind::Take { remaining, source } => {
+                *remaining = 0;
+                nested.push(source.clone());
+            }
+            IteratorKind::Map { source, .. }
+            | IteratorKind::Filter { source, .. }
+            | IteratorKind::GenExpr { source, .. } => {
+                nested.push(source.clone());
+            }
+            IteratorKind::List { items, index } => {
+                *index = items.len();
+            }
+            IteratorKind::Range { current, stop, .. } => {
+                *current = *stop;
+            }
+            IteratorKind::Repeat { remaining, .. } => {
+                *remaining = Some(0);
+            }
+            IteratorKind::Zip { children } => {
+                nested.extend(children.iter().cloned());
+            }
+            IteratorKind::Cycle { items, index } => {
+                *index = 0;
+                items.clear();
+            }
+            IteratorKind::Generator { exhausted, .. } => {
+                *exhausted = true;
+            }
+        }
+    }
+    for child in nested {
+        close_stream_iterator(&child, vm);
+    }
+}
+
 /// Stream：只拉取（`next`/`recv`/`close`）；禁止 `send`。
 pub fn get_stream_method(stream: &Shared<StreamInner>, field: &str) -> Result<Value> {
     match field {
@@ -73,33 +118,26 @@ pub fn get_stream_method(stream: &Shared<StreamInner>, field: &str) -> Result<Va
                     "Stream.next/recv takes no arguments",
                 ));
             }
-            match &*stream.borrow() {
-                StreamInner::Channel(ch) => vm.channel_recv(ch),
-                StreamInner::Iter(it) => {
-                    let it = it.clone();
-                    match vm.advance_iterator(&it)? {
-                        Some(v) => Ok(v),
-                        None => Ok(Value::None),
-                    }
-                }
+            let body = stream.borrow().clone();
+            match body {
+                StreamInner::Channel(ch) => vm.channel_recv(&ch),
+                StreamInner::Iter(it) => match vm.advance_iterator(&it)? {
+                    Some(v) => Ok(v),
+                    None => Ok(Value::None),
+                },
             }
         }),
         "close" => method!(stream, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err("Stream.close takes no arguments"));
             }
-            match &*stream.borrow() {
+            let body = stream.borrow().clone();
+            match body {
                 StreamInner::Channel(ch) => {
                     ch.borrow_mut().closed = true;
                     vm.mn.notify_all();
                 }
-                StreamInner::Iter(it) => {
-                    // 拉取流：耗尽 take / 关闭底层 channel（若有）。
-                    if let crate::value::IteratorKind::Channel { channel } = &it.borrow().kind {
-                        channel.borrow_mut().closed = true;
-                        vm.mn.notify_all();
-                    }
-                }
+                StreamInner::Iter(it) => close_stream_iterator(&it, vm),
             }
             Ok(Value::None)
         }),
@@ -800,7 +838,7 @@ pub fn construct_timeout_ctx(args: &[Value]) -> Result<Value> {
         ));
     }
     // 负数视为 0；过大有限值钳到可构造 Duration / Instant 的上界。
-    let secs = secs.max(0.0).min(MAX_TIMEOUT_SECS);
+    let secs = secs.clamp(0.0, MAX_TIMEOUT_SECS);
     let dur = std::time::Duration::from_secs_f64(secs);
     let now = std::time::Instant::now();
     let deadline = now.checked_add(dur).unwrap_or(now);

@@ -1,7 +1,7 @@
 //! Custom Pack：合并、渲染与身份不变量。
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use optive::custom::{
@@ -45,7 +45,7 @@ fn tempfile_dir() -> PathBuf {
     p
 }
 
-fn install_catgirl(home: &PathBuf) {
+fn install_catgirl(home: &Path) {
     let dest = home.join("custom/catgirl");
     fs::create_dir_all(&dest).unwrap();
     fs::copy(

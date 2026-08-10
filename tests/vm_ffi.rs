@@ -621,7 +621,7 @@ C.ptr_live(p)
 fn ptr_live_false_for_unsafe_foreign() {
     // 外来登记可 peek，但不是 Optive Owned → ptr_live false
     use optive::ptr_registry::{self, PtrEntry, PtrKind};
-    let addr = 0x_0000_0000_0F00_ba5eusize;
+    let addr = 0x_0000_0000_0f00_ba5e_usize;
     ptr_registry::unregister(addr);
     ptr_registry::register(PtrEntry {
         addr,

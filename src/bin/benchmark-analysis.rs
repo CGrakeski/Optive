@@ -320,6 +320,7 @@ fn parse_args() -> (Vec<&'static Bench>, usize, usize, Option<usize>) {
     (selected, iters, warmup, workers_override)
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Prepared {
     Source(&'static str),
     VmReady(Vm),

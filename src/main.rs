@@ -257,7 +257,7 @@ fn main() {
     repl();
 }
 
-fn parse_caps_or_exit(args: &Vec<String>) -> (Capabilities, Vec<String>) {
+fn parse_caps_or_exit(args: &[String]) -> (Capabilities, Vec<String>) {
     let (caps, rest) = match cli::caps::parse_caps(&args[2..]) {
         Ok(v) => v,
         Err(e) => {

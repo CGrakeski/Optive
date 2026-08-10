@@ -3143,7 +3143,7 @@ impl Generator {
         let free: HashSet<String> = free_vars::free_vars_in_block(body, bound)
             .into_iter()
             .collect();
-        for name in assigned.intersection(&free) {
+        if let Some(name) = assigned.intersection(&free).next() {
             return Err(RuntimeError::msg(format!(
                 "cannot assign to '{name}' across par/go tasks; use Mutex / Channel / Atomic"
             )));
@@ -3170,7 +3170,7 @@ impl Generator {
             }
         }
 
-        // 每轮：打乱 case 次序再依次 poll，多就绪时不再固定偏向书写顺序。
+        // 每轮打乱 case 次序再 poll（多就绪公平）。
         self.cg.mark_label(start);
         self.cg
             .emit(Instruction::SelectBegin(cases.len()));

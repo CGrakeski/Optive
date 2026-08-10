@@ -63,10 +63,22 @@ pub struct DebugState {
     pub started: bool,
     /// 未捕获异常停下时暂存错误文案。
     pub last_uncaught: Option<String>,
-    /// 步进/断点焦点纤程；`None` 表示主纤程（无 task_ctx）。
-    pub focus_fiber: Option<Shared<TaskInner>>,
-    /// `fiber N` 所选列表下标（仅展示）。
+    /// 步进/断点焦点；默认 `All`（任意纤程均可停）。
+    pub step_focus: StepFocus,
+    /// `fiber N` 列表下标（仅展示；`All`/`Main` 时为 `None`）。
     pub focus_fiber_index: Option<usize>,
+}
+
+/// 调试器步进与断点的纤程焦点。
+#[derive(Clone, Default)]
+pub enum StepFocus {
+    /// 任意纤程（默认）。
+    #[default]
+    All,
+    /// 仅主纤程。
+    Main,
+    /// 指定任务纤程。
+    Fiber(Shared<TaskInner>),
 }
 
 impl Default for DebugState {
@@ -85,7 +97,7 @@ impl Default for DebugState {
             stop_on_entry: true,
             started: false,
             last_uncaught: None,
-            focus_fiber: None,
+            step_focus: StepFocus::All,
             focus_fiber_index: None,
         }
     }
@@ -206,9 +218,10 @@ fn func_bp_matches(bp: &str, name: &str) -> bool {
 }
 
 fn fiber_focus_allows(vm: &Vm, state: &DebugState) -> bool {
-    match &state.focus_fiber {
-        None => vm.debug_current_task().is_none(),
-        Some(focus) => vm
+    match &state.step_focus {
+        StepFocus::All => true,
+        StepFocus::Main => vm.debug_current_task().is_none(),
+        StepFocus::Fiber(focus) => vm
             .debug_current_task()
             .as_ref()
             .is_some_and(|t| Shared::ptr_eq(t, focus)),
@@ -555,33 +568,59 @@ pub fn list_locals(vm: &Vm) -> Vec<(String, Value)> {
     vm.debug_list_locals()
 }
 
-/// 解析 `break` 规格：`[file:]N [if <expr>|log <expr>]`
+fn break_spec_next_kw(s: &str) -> Option<usize> {
+    let i = s.find(" if ");
+    let l = s.find(" log ");
+    match (i, l) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn take_break_clause<'a>(trail: &'a str, kw: &str) -> Option<(&'a str, &'a str)> {
+    let rest = trail.strip_prefix(kw)?;
+    match break_spec_next_kw(rest) {
+        Some(e) => Some((rest[..e].trim(), rest[e..].trim())),
+        None => Some((rest.trim(), "")),
+    }
+}
+
+/// 解析 `break` 规格：`[file:]N [if <expr>] [log <expr>]`（顺序不限，可同时出现）。
 pub fn parse_break_spec(spec: &str) -> Option<(String, usize, Option<String>, Option<String>)> {
     let spec = spec.trim();
     if spec.is_empty() {
         return None;
     }
-    let (loc_part, rest) = if let Some(idx) = spec.find(" if ") {
-        (&spec[..idx], Some(("if", spec[idx + 4..].trim())))
-    } else if let Some(idx) = spec.find(" log ") {
-        (&spec[..idx], Some(("log", spec[idx + 5..].trim())))
-    } else {
-        (spec, None)
+    let (loc_part, mut trail) = match break_spec_next_kw(spec) {
+        Some(c) => (spec[..c].trim(), spec[c..].trim()),
+        None => (spec, ""),
     };
-    let loc_part = loc_part.trim();
+    let mut condition = None;
+    let mut log = None;
+    while !trail.is_empty() {
+        if let Some((expr, after)) = take_break_clause(trail, "if ") {
+            if expr.is_empty() || condition.is_some() {
+                return None;
+            }
+            condition = Some(expr.to_string());
+            trail = after;
+        } else if let Some((expr, after)) = take_break_clause(trail, "log ") {
+            if expr.is_empty() || log.is_some() {
+                return None;
+            }
+            log = Some(expr.to_string());
+            trail = after;
+        } else {
+            return None;
+        }
+    }
     let (file, line) = if let Ok(line) = loc_part.parse::<usize>() {
         (String::new(), line)
-    } else if let Some((file_part, line_s)) = loc_part.rsplit_once(':') {
-        let line = line_s.parse::<usize>().ok()?;
-        (file_part.to_string(), line)
     } else {
-        return None;
-    };
-    let (condition, log) = match rest {
-        Some(("if", e)) if !e.is_empty() => (Some(e.to_string()), None),
-        Some(("log", e)) if !e.is_empty() => (None, Some(e.to_string())),
-        None => (None, None),
-        _ => return None,
+        let (file_part, line_s) = loc_part.rsplit_once(':')?;
+        (file_part.to_string(), line_s.parse().ok()?)
     };
     Some((file, line, condition, log))
 }

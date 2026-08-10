@@ -365,5 +365,43 @@ fn debug_parse_break_spec() {
     let (_, _, c2, g2) = debug::parse_break_spec("foo.tive:3 log x").unwrap();
     assert_eq!(c2, None);
     assert_eq!(g2.as_deref(), Some("x"));
+    let (_, _, c3, g3) = debug::parse_break_spec("8 if n > 0 log n").unwrap();
+    assert_eq!(c3.as_deref(), Some("n > 0"));
+    assert_eq!(g3.as_deref(), Some("n"));
+    let (_, _, c4, g4) = debug::parse_break_spec("8 log n if n > 0").unwrap();
+    assert_eq!(c4.as_deref(), Some("n > 0"));
+    assert_eq!(g4.as_deref(), Some("n"));
+}
+
+#[test]
+fn debug_breakpoint_hits_go_task_by_default() {
+    let mut vm = Vm::new();
+    let state = Shared::new(DebugState {
+        stop_on_entry: false,
+        ..Default::default()
+    });
+    debug::attach(&mut vm, state.clone());
+    load(
+        &mut vm,
+        r#"
+use std.debug.{ breakpoint }
+let t = go do {
+  breakpoint()
+  return 1
+}
+await t
+"#,
+    );
+    match vm.run_until_debug_break() {
+        Ok(None) => {}
+        Ok(Some(v)) => panic!("expected pause, finished with {}", v.display_string()),
+        Err(e) => panic!("run error: {}", e.message()),
+    }
+    assert_eq!(
+        state.borrow().stop_reason,
+        Some(StopReason::Explicit),
+        "uncaught={:?}",
+        state.borrow().last_uncaught
+    );
 }
 

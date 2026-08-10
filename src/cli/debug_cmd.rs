@@ -9,7 +9,8 @@ use optive::codegen::Generator;
 use optive::shared::Shared;
 use optive::debug::{
     self, debug_set, eval_in_paused_vm, format_location, format_source_window, list_fibers,
-    list_locals, parse_break_spec, reason_label, stack_frames, DebugState, StepMode, StopReason,
+    list_locals, parse_break_spec, reason_label, stack_frames, DebugState, StepFocus, StepMode,
+    StopReason,
 };
 use optive::diagnostics;
 use optive::opcode::Instruction;
@@ -380,12 +381,13 @@ fn run_debug_session(
 
             "fibers" => {
                 let list = list_fibers(vm);
-                let focus = state.borrow().focus_fiber_index;
+                let st = state.borrow();
+                let focus_idx = st.focus_fiber_index;
                 if list.is_empty() {
-                    println!("(no tasks; focus=main)");
+                    println!("(no tasks)");
                 } else {
-                    for f in list {
-                        let mark = if focus == Some(f.index) { "*" } else { " " };
+                    for f in &list {
+                        let mark = if focus_idx == Some(f.index) { "*" } else { " " };
                         if f.detail.is_empty() {
                             println!("{mark}#{} {}", f.index, f.state);
                         } else {
@@ -393,29 +395,40 @@ fn run_debug_session(
                         }
                     }
                 }
-                if state.borrow().focus_fiber.is_none() {
-                    println!("  focus: main fiber");
-                }
+                let label = match &st.step_focus {
+                    StepFocus::All => "all (default)".to_string(),
+                    StepFocus::Main => "main".to_string(),
+                    StepFocus::Fiber(_) => match focus_idx {
+                        Some(i) => format!("fiber #{i}"),
+                        None => "fiber".to_string(),
+                    },
+                };
+                println!("  focus: {label}");
             }
 
             "fiber" => {
-                if rest.is_empty() || rest[0] == "main" {
+                if rest.is_empty() || rest[0] == "all" {
                     let mut st = state.borrow_mut();
-                    st.focus_fiber = None;
+                    st.step_focus = StepFocus::All;
                     st.focus_fiber_index = None;
-                    println!("focus: main fiber");
+                    println!("focus: all");
+                } else if rest[0] == "main" {
+                    let mut st = state.borrow_mut();
+                    st.step_focus = StepFocus::Main;
+                    st.focus_fiber_index = None;
+                    println!("focus: main");
                 } else if let Ok(n) = rest[0].parse::<usize>() {
                     let list = list_fibers(vm);
                     if let Some(f) = list.into_iter().find(|f| f.index == n) {
                         let mut st = state.borrow_mut();
-                        st.focus_fiber = Some(f.task);
+                        st.step_focus = StepFocus::Fiber(f.task);
                         st.focus_fiber_index = Some(n);
                         println!("focus: fiber #{n}");
                     } else {
                         println!("fiber #{n} not found; use `fibers`");
                     }
                 } else {
-                    println!("usage: fiber N | fiber main");
+                    println!("usage: fiber all | fiber main | fiber N");
                 }
             }
 
@@ -506,9 +519,8 @@ fn print_help() {
   locals / globals      List variables
   set name = expr       Set local/global or deep path (a.b / a[i])
   fibers                List tasks (* = step focus)
-  fiber N | fiber main  Focus stepping on task N or main
+  fiber all|main|N      Break/step focus (default: all)
   list / l [N]          Show source ±N lines (default 3)
-  quit / q              Exit debugger
-  (DAP adapter is a later milestone; use this CLI for now)"
+  quit / q              Exit debugger"
     );
 }

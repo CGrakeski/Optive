@@ -840,8 +840,38 @@ loop (200) {
         _ => panic!("cb"),
     };
     assert_eq!(ca + cb, 200, "ca={ca} cb={cb}");
-    assert!(ca >= 40 && cb >= 40, "unfair ca={ca} cb={cb}");
-    assert!((ca - cb).abs() <= 120, "skew ca={ca} cb={cb}");
+    assert!(ca >= 60 && cb >= 60, "unfair ca={ca} cb={cb}");
+    assert!((ca - cb).abs() <= 80, "skew ca={ca} cb={cb}");
+}
+
+#[test]
+fn select_recv_on_channel_stream_view() {
+    assert_num(
+        r#"
+let ch = Channel(1)
+ch.send(7)
+let s = ch.as_stream()
+select {
+  case s.recv() as x { x }
+}
+"#,
+        "7",
+    );
+}
+
+#[test]
+fn stream_close_stops_take() {
+    assert_num(
+        r#"
+let s = std.async.stream_of([1, 2, 3, 4])
+let t = std.async.stream_take(s, 10)
+t.close()
+var n = 0
+for (x in t) { n = n + 1 }
+n
+"#,
+        "0",
+    );
 }
 
 /// B12：多 sleep case 时短周期应先就绪，不被长 sleep / Suspend 饿死。
