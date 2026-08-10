@@ -621,7 +621,7 @@ fn math_range(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
             )))
         }
     };
-    Ok(IteratorState::from_range(start, stop, step).as_value())
+    Ok(IteratorState::from_range(start, stop, step).into_value())
 }
 
 fn io_read_file(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -858,7 +858,7 @@ fn iter_iter(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     expect_arity("iter", args, 1)?;
     match &args[0] {
         Value::Iterator(it) => Ok(Value::Iterator(it.clone())),
-        other => Ok(crate::value::value_to_iterable(other)?.as_value()),
+        other => Ok(crate::value::value_to_iterable(other)?.into_value()),
     }
 }
 
@@ -2244,7 +2244,7 @@ fn coll_reversed(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
     let mut items = materialize_iter(vm, &args[0])?;
     items.reverse();
-    Ok(IteratorState::from_list(items).as_value())
+    Ok(IteratorState::from_list(items).into_value())
 }
 
 fn coll_min(vm: &mut Vm, args: &[Value]) -> Result<Value> {

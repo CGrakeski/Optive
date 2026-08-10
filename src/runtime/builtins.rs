@@ -467,7 +467,7 @@ fn builtin_iter(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
     match &args[0] {
         Value::Iterator(it) => Ok(Value::Iterator(it.clone())),
-        other => Ok(crate::value::value_to_iterable(other)?.as_value()),
+        other => Ok(crate::value::value_to_iterable(other)?.into_value()),
     }
 }
 

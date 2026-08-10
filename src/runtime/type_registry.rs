@@ -1104,7 +1104,7 @@ fn construct_bytes(arg: &Value) -> Result<Value> {
 
 fn construct_iterator(arg: &Value) -> Result<Value> {
     match arg {
-        Value::List(lst) => Ok(IteratorState::from_list(lst.borrow().clone()).as_value()),
+        Value::List(lst) => Ok(IteratorState::from_list(lst.borrow().clone()).into_value()),
         Value::Iterator(it) => Ok(Value::Iterator(it.clone())),
         other => Err(type_ctor_error("iterator", other)),
     }
@@ -1195,15 +1195,15 @@ fn convert_to_bytes(arg: &Value) -> Result<Value> {
 
 fn convert_to_iterator(arg: &Value) -> Result<Value> {
     match arg {
-        Value::List(lst) => Ok(IteratorState::from_list(lst.borrow().clone()).as_value()),
-        Value::Tuple(t) => Ok(IteratorState::from_list(t.to_vec()).as_value()),
+        Value::List(lst) => Ok(IteratorState::from_list(lst.borrow().clone()).into_value()),
+        Value::Tuple(t) => Ok(IteratorState::from_list(t.to_vec()).into_value()),
         Value::Set(s) => {
             let items: Vec<Value> = s
                 .borrow()
                 .iter()
                 .map(crate::value::value_key_to_value)
                 .collect();
-            Ok(IteratorState::from_list(items).as_value())
+            Ok(IteratorState::from_list(items).into_value())
         }
         Value::Iterator(it) => Ok(Value::Iterator(it.clone())),
         other => Err(type_convert_error("iterator", other)),

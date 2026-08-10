@@ -6733,7 +6733,7 @@ impl Vm {
                 yield_from: None,
             },
         }
-        .as_value())
+        .into_value())
     }
 
     fn resume_generator(
@@ -8458,7 +8458,7 @@ impl Vm {
             let state = crate::value::value_to_iterable(&it)?;
             children.push(Shared::new(state));
         }
-        Ok(IteratorState::from_zip(children).as_value())
+        Ok(IteratorState::from_zip(children).into_value())
     }
 }
 

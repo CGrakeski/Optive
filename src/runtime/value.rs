@@ -1528,7 +1528,7 @@ impl IteratorState {
         }
     }
 
-    pub fn as_value(self) -> Value {
+    pub fn into_value(self) -> Value {
         Value::Iterator(Shared::new(self))
     }
 
