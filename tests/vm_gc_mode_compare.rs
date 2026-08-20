@@ -150,4 +150,9 @@ fn compare_stw_vs_concurrent() {
         conc.mut_ops,
         stw.mut_ops
     );
+    // 小阈值风暴下 concurrent 自适应 STW；墙钟仅作诊断，不作通过条件。
+    println!(
+        "wall conc={:.2}ms stw={:.2}ms",
+        conc.wall_ms, stw.wall_ms
+    );
 }

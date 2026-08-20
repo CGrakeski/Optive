@@ -127,7 +127,7 @@ pub enum CallConv {
     Stdcall,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AbiType {
     Void,
     Bool,
@@ -148,6 +148,13 @@ pub enum AbiType {
     CharPtr,
     /// 指针宽度；`extern` 可从 `text` 临时编成 UTF-16 NUL 结尾。
     WCharPtr,
+    /// `typed struct : <layout>` 按值传递 / 返回。
+    CStruct {
+        name: String,
+        field_abis: Vec<AbiType>,
+        size: usize,
+        align: usize,
+    },
 }
 
 impl AbiType {
@@ -160,11 +167,8 @@ impl AbiType {
             return Ok(Self::Pointer);
         }
         if let Some(def) = vm.struct_defs.get(&name) {
-            if def.c_layout.is_some() {
-                return Err(RuntimeError::type_err(format!(
-                    "unsupported C ABI type: {name} (struct by-value not supported; \
-                     use C.types.ptr[{name}] or C.types.void_ptr)"
-                )));
+            if let Some(layout) = &def.native_layout {
+                return Ok(Self::from_c_layout(&name, layout));
             }
         }
         Self::from_type_name(&name)
@@ -186,11 +190,8 @@ impl AbiType {
                     return Ok(Self::Pointer);
                 }
                 if let Some(def) = vm.struct_defs.get(&name) {
-                    if def.c_layout.is_some() {
-                        return Err(RuntimeError::type_err(format!(
-                            "unsupported C ABI type: {name} (struct by-value not supported; \
-                             use C.types.ptr[{name}] or C.types.void_ptr)"
-                        )));
+                    if let Some(layout) = &def.native_layout {
+                        return Ok(Self::from_c_layout(&name, layout));
                     }
                 }
                 Self::from_type_name(&name)
@@ -204,7 +205,16 @@ impl AbiType {
         })
     }
 
-    pub(crate) fn ffi_type(self) -> FfiType {
+    fn from_c_layout(name: &str, layout: &crate::ffi_extra::CStructLayout) -> Self {
+        Self::CStruct {
+            name: name.to_string(),
+            field_abis: layout.fields.iter().map(|f| f.abi.clone()).collect(),
+            size: layout.size,
+            align: layout.align,
+        }
+    }
+
+    pub(crate) fn ffi_type(&self) -> FfiType {
         match self {
             Self::Void => FfiType::void(),
             Self::Bool | Self::I8 => FfiType::i8(),
@@ -231,13 +241,16 @@ impl AbiType {
             }
             Self::F32 => FfiType::f32(),
             Self::F64 => FfiType::f64(),
+            Self::CStruct { field_abis, .. } => {
+                FfiType::structure(field_abis.iter().map(|a| a.ffi_type()))
+            }
         }
     }
 }
 
 /// `(size, align)` in bytes for layout / `C.sizeof`.
 #[must_use]
-pub const fn abi_size_align(abi: AbiType) -> (usize, usize) {
+pub fn abi_size_align(abi: &AbiType) -> (usize, usize) {
     match abi {
         AbiType::Void => (0, 1),
         AbiType::Bool | AbiType::I8 | AbiType::U8 => (1, 1),
@@ -252,6 +265,7 @@ pub const fn abi_size_align(abi: AbiType) -> (usize, usize) {
             let w = std::mem::size_of::<usize>();
             (w, w)
         }
+        AbiType::CStruct { size, align, .. } => (*size, *align),
     }
 }
 
@@ -260,7 +274,7 @@ fn type_annotation_name(vm: &Vm, ty: &Expr) -> Result<String> {
 }
 
 pub fn load_library(vm: &mut Vm, path: &str) -> Result<Value> {
-    vm.caps.check_ffi("C.frompath")?;
+    vm.caps.check_ffi("frompath")?;
     let lib = unsafe { Library::new(path) }.map_err(|e| {
         RuntimeError::msg(format!("failed to load dynamic library '{path}': {e}"))
     })?;
@@ -292,7 +306,7 @@ pub fn builtin_extern(vm: &mut Vm, args: &[Value]) -> Result<Value> {
         Value::DllHandle(h) => h.clone(),
         _ => {
             return Err(RuntimeError::type_err(
-                "extern: first argument must be a library handle from C.frompath",
+                "extern: first argument must be a library handle from frompath",
             ))
         }
     };
@@ -326,7 +340,7 @@ pub fn builtin_extern(vm: &mut Vm, args: &[Value]) -> Result<Value> {
             }
         }
     }
-    Ok(Value::Builtin(Arc::new(move |vm, deco_args| {
+    Ok(Value::builtin("extern", move |vm, deco_args| {
         if deco_args.len() != 1 {
             return Err(RuntimeError::type_err(
                 "extern decorator requires 1 argument (function)",
@@ -342,7 +356,7 @@ pub fn builtin_extern(vm: &mut Vm, args: &[Value]) -> Result<Value> {
             }
         };
         bind_extern_function(vm, handle.clone(), symbol_override.clone(), conv, func)
-    })))
+    }))
 }
 
 fn bind_extern_function(
@@ -390,7 +404,7 @@ fn bind_extern_function(
         None => AbiType::Void,
     };
 
-    let arg_ffi: Vec<FfiType> = arg_abis.iter().copied().map(AbiType::ffi_type).collect();
+    let arg_ffi: Vec<FfiType> = arg_abis.iter().map(AbiType::ffi_type).collect();
     let mut cif = Cif::new(arg_ffi, ret_abi.ffi_type());
     apply_call_conv(&mut cif, conv)?;
     let ffi = Arc::new(FfiCallable {
@@ -402,7 +416,7 @@ fn bind_extern_function(
     let params = func.params.clone();
     let return_wrapper = func.return_wrapper.clone();
     let return_type = func.return_type.clone();
-    let return_strong = func.return_strong;
+    let return_strong = func.return_strong();
     let func_name = func.name.clone();
     // 绑定后保留库句柄：调用性与用户侧句柄变量解耦，但库本身不得被卸载。
     let keep_lib = handle;
@@ -462,7 +476,7 @@ fn bind_extern_function(
         let mut storage: Vec<ArgStorage> = converted
             .iter()
             .zip(arg_abis.iter())
-            .map(|(v, abi)| value_to_storage(v, *abi))
+            .map(|(v, abi)| value_to_storage(v, abi))
             .collect::<Result<_>>()?;
 
         // 卸荷完成重入：取回结果，不再调 C。
@@ -470,7 +484,7 @@ fn bind_extern_function(
             match pending {
                 Ok((raw, errno)) => {
                     super::ffi_extra::set_last_errno(errno);
-                    let mut out = abi_to_value(raw, ret_abi)?;
+                    let mut out = abi_to_value(vm, raw, &ret_abi)?;
                     if let Some(ref wrapper_expr) = return_wrapper {
                         out = eval_wrapper_expr(vm, wrapper_expr, out)?;
                     }
@@ -504,7 +518,7 @@ fn bind_extern_function(
             let pending = crate::ffi_pool::submit_call(
                 ffi.clone(),
                 storage,
-                ret_abi,
+                ret_abi.clone(),
                 use_serial,
                 vm.ffi_threads(),
                 vm.gc.clone(),
@@ -514,11 +528,11 @@ fn bind_extern_function(
             return Ok(Value::None);
         } else {
             super::ffi_extra::with_active_vm(vm, || {
-                invoke_native_call(&ffi, &mut storage, ret_abi, use_serial)
+                invoke_native_call(&ffi, &mut storage, ret_abi.clone(), use_serial)
             })?
         };
 
-        let mut out = abi_to_value(raw, ret_abi)?;
+        let mut out = abi_to_value(vm, raw, &ret_abi)?;
         if let Some(ref wrapper_expr) = return_wrapper {
             out = eval_wrapper_expr(vm, wrapper_expr, out)?;
         }
@@ -536,7 +550,10 @@ fn bind_extern_function(
         Ok(out)
     });
 
-    Ok(Value::Builtin(wrapper))
+    Ok(Value::Builtin(crate::value::BuiltinObject::new(
+        "extern",
+        wrapper,
+    )))
 }
 
 fn apply_call_conv(cif: &mut Cif, conv: CallConv) -> Result<()> {
@@ -576,10 +593,10 @@ pub(crate) fn invoke_native_call(
         let ffi_args: Vec<Arg> = storage.iter_mut().map(ArgStorage::as_arg).collect();
         let raw = if use_serial {
             let _guard = FFI_CALL_LOCK.lock();
-            unsafe { call_cif(&ffi.cif, ffi.code, &ffi_args, ret_abi) }?
+            unsafe { call_cif(&ffi.cif, ffi.code, &ffi_args, &ret_abi) }?
         } else {
             let _guard = ffi.lock.lock();
-            unsafe { call_cif(&ffi.cif, ffi.code, &ffi_args, ret_abi) }?
+            unsafe { call_cif(&ffi.cif, ffi.code, &ffi_args, &ret_abi) }?
         };
         super::ffi_extra::sample_error_codes();
         Ok(raw)
@@ -600,10 +617,10 @@ pub(crate) fn invoke_native_call_sampled(
         let ffi_args: Vec<Arg> = storage.iter_mut().map(ArgStorage::as_arg).collect();
         let raw = if use_serial {
             let _guard = FFI_CALL_LOCK.lock();
-            unsafe { call_cif(&ffi.cif, ffi.code, &ffi_args, ret_abi) }?
+            unsafe { call_cif(&ffi.cif, ffi.code, &ffi_args, &ret_abi) }?
         } else {
             let _guard = ffi.lock.lock();
-            unsafe { call_cif(&ffi.cif, ffi.code, &ffi_args, ret_abi) }?
+            unsafe { call_cif(&ffi.cif, ffi.code, &ffi_args, &ret_abi) }?
         };
         let errno = super::ffi_extra::sample_error_codes_value();
         Ok((raw, errno))
@@ -627,6 +644,7 @@ pub(crate) enum ArgStorage {
     /// 缓冲 + 稳定指针槽（`as_arg` 取 `ptr`）。
     OwnedCString { buf: Vec<u8>, ptr: usize },
     OwnedWString { buf: Vec<u16>, ptr: usize },
+    CStruct(Vec<u8>),
 }
 
 impl ArgStorage {
@@ -651,11 +669,17 @@ impl ArgStorage {
                 *ptr = buf.as_ptr() as usize;
                 Arg::new(ptr)
             }
+            Self::CStruct(buf) => {
+                // ZST reference is valid at Vec::as_mut_ptr() even when len==0;
+                // libffi still wants a pointer, and unpacking uses the ABI size.
+                let ptr = buf.as_mut_ptr().cast::<()>();
+                Arg::new(unsafe { &mut *ptr })
+            }
         }
     }
 }
 
-fn value_to_storage(v: &Value, abi: AbiType) -> Result<ArgStorage> {
+fn value_to_storage(v: &Value, abi: &AbiType) -> Result<ArgStorage> {
     match abi {
         AbiType::Void => Err(RuntimeError::type_err("void cannot be a parameter")),
         AbiType::Bool => Ok(ArgStorage::I8(i8::from(v.is_truthy()))),
@@ -711,6 +735,27 @@ fn value_to_storage(v: &Value, abi: AbiType) -> Result<ArgStorage> {
         },
         AbiType::F32 => Ok(ArgStorage::F32(as_f64(v)? as f32)),
         AbiType::F64 => Ok(ArgStorage::F64(as_f64(v)?)),
+        AbiType::CStruct { name, .. } => match v {
+            Value::Struct(inst) => {
+                if inst.def.native_layout.is_none() {
+                    return Err(RuntimeError::type_err(format!(
+                        "cannot pass struct '{}' by value: missing native layout",
+                        inst.def.name
+                    )));
+                }
+                if inst.def.name != *name {
+                    return Err(RuntimeError::type_err(format!(
+                        "FFI struct by-value expected `{name}`, got `{}`",
+                        inst.def.name
+                    )));
+                }
+                Ok(ArgStorage::CStruct(crate::ffi_extra::pack_c_struct(inst)?))
+            }
+            other => Err(RuntimeError::type_err(format!(
+                "FFI struct `{name}` expects a struct instance, got {}",
+                other.type_name()
+            ))),
+        },
     }
 }
 
@@ -736,13 +781,14 @@ pub(crate) enum RetStorage {
     U64(u64),
     F32(f32),
     F64(f64),
+    CStruct(Vec<u8>),
 }
 
 unsafe fn call_cif(
     cif: &Cif,
     code: CodePtr,
     args: &[Arg],
-    ret: AbiType,
+    ret: &AbiType,
 ) -> Result<RetStorage> {
     Ok(match ret {
         AbiType::Void => {
@@ -773,10 +819,20 @@ unsafe fn call_cif(
         }
         AbiType::F32 => RetStorage::F32(cif.call::<f32>(code, args)),
         AbiType::F64 => RetStorage::F64(cif.call::<f64>(code, args)),
+        AbiType::CStruct { size, .. } => {
+            let mut buf = vec![0u8; (*size).max(std::mem::size_of::<libffi::raw::ffi_arg>())];
+            libffi::raw::ffi_call(
+                cif.as_raw_ptr(),
+                Some(*code.as_safe_fun()),
+                buf.as_mut_ptr().cast(),
+                args.as_ptr() as *mut *mut c_void,
+            );
+            RetStorage::CStruct(buf)
+        }
     })
 }
 
-const fn abi_to_value(ret: RetStorage, abi: AbiType) -> Result<Value> {
+fn abi_to_value(vm: &Vm, ret: RetStorage, abi: &AbiType) -> Result<Value> {
     Ok(match (ret, abi) {
         (RetStorage::Void, _) => Value::None,
         (RetStorage::I8(v), AbiType::Bool) => Value::Bool(v != 0),
@@ -796,6 +852,15 @@ const fn abi_to_value(ret: RetStorage, abi: AbiType) -> Result<Value> {
         (RetStorage::U64(v), _) => Value::Sized(SizedNum::U64(v)),
         (RetStorage::F32(v), _) => Value::Sized(SizedNum::F32(v)),
         (RetStorage::F64(v), _) => Value::Sized(SizedNum::F64(v)),
+        (RetStorage::CStruct(buf), AbiType::CStruct { name, size, .. }) => {
+            let n = (*size).min(buf.len());
+            return crate::ffi_extra::unpack_c_struct(vm, name, &buf[..n]);
+        }
+        (RetStorage::CStruct(_), _) => {
+            return Err(RuntimeError::type_err(
+                "internal: C struct return with non-struct ABI",
+            ));
+        }
     })
 }
 
@@ -871,7 +936,6 @@ fn eval_wrapper_expr(vm: &mut Vm, expr: &crate::ast::Expr, raw: Value) -> Result
                     .ok_or_else(|| {
                         RuntimeError::attr_err(format!("module has no export '{field}'"))
                     }),
-                Value::TypeRef(n) => Ok(Value::type_ref(format!("{n}.{field}"))),
                 other => vm.get_attr_value(&other, field),
             }
         }
@@ -888,11 +952,14 @@ fn eval_type_operand(expr: &crate::ast::Expr) -> Result<Value> {
         ExprKind::Member { object, field } => {
             let base = eval_type_operand(object)?;
             match base {
-                Value::TypeRef(n) => Ok(Value::type_ref(format!("{n}.{field}"))),
                 Value::Module(m) => m
                     .borrow()
                     .get_attr(field)
                     .ok_or_else(|| RuntimeError::attr_err(format!("no export '{field}'"))),
+                Value::TypeRef(n) => Err(RuntimeError::type_err(format!(
+                    "cannot resolve type member '{field}' on TypeRef '{n}' without getattr \
+                     (do not invent dotted type identities)"
+                ))),
                 other => Err(RuntimeError::type_err(format!(
                     "cannot resolve type member on {}",
                     other.type_name()
@@ -910,7 +977,7 @@ fn export_builtin(
     name: &str,
     f: fn(&mut Vm, &[Value]) -> Result<Value>,
 ) {
-    exports.insert(name.into(), Value::Builtin(Arc::new(f)));
+    exports.insert(name.into(), Value::builtin_fn(name, f));
 }
 
 /// 构建 `std.language.C` 模块（含 `types` 子模块）。
@@ -921,19 +988,27 @@ pub fn build_c_language_module() -> Shared<ModuleObject> {
     let mut exports = HashMap::new();
     exports.insert(
         "frompath".into(),
-        Value::Builtin(Arc::new(|vm, args| {
+        Value::builtin("frompath", |vm, args| {
             if args.len() != 1 {
-                return Err(RuntimeError::type_err("C.frompath requires 1 text path"));
+                return Err(RuntimeError::type_err(format!(
+                    "{} requires 1 text path",
+                    crate::value::builtin_repr("frompath")
+                )));
             }
             let path = match &args[0] {
                 Value::Text(s) => s.clone(),
-                _ => return Err(RuntimeError::type_err("C.frompath requires text path")),
+                _ => {
+                    return Err(RuntimeError::type_err(format!(
+                        "{} requires text path",
+                        crate::value::builtin_repr("frompath")
+                    )))
+                }
             };
             load_library(vm, &path)
-        })),
+        }),
     );
     exports.insert("types".into(), Value::Module(types));
-    exports.insert("layout".into(), Value::type_ref("C.layout"));
+    exports.insert("layout".into(), super::ffi_extra::c_layout_value());
     use super::ffi_extra as x;
     export_builtin(&mut exports, "alloc", x::builtin_alloc);
     export_builtin(&mut exports, "alloc_array", x::builtin_alloc_array);
@@ -964,7 +1039,6 @@ pub fn build_c_language_module() -> Shared<ModuleObject> {
     export_builtin(&mut exports, "callback_free", x::builtin_callback_free);
     Shared::new(ModuleObject {
         name: "C".into(),
-        full_name: "std.language.C".into(),
         exports,
         children,
         is_user: false,
@@ -974,7 +1048,7 @@ pub fn build_c_language_module() -> Shared<ModuleObject> {
 fn build_c_types_module() -> Shared<ModuleObject> {
     let mut exports = HashMap::new();
     for entry in crate::c_types::C_TYPES {
-        let ty = Value::type_ref(entry.full_name());
+        let ty = Value::type_ref(entry.type_ref_name());
         exports.insert(entry.c_name.to_string(), ty.clone());
         for alias in entry.export_aliases {
             exports.insert((*alias).to_string(), ty.clone());
@@ -983,7 +1057,6 @@ fn build_c_types_module() -> Shared<ModuleObject> {
 
     Shared::new(ModuleObject {
         name: "types".into(),
-        full_name: "std.language.C.types".into(),
         exports,
         children: HashMap::new(),
         is_user: false,
@@ -999,7 +1072,6 @@ pub fn build_language_module() -> Shared<ModuleObject> {
     exports.insert("C".into(), Value::Module(c));
     Shared::new(ModuleObject {
         name: "language".into(),
-        full_name: "std.language".into(),
         exports,
         children,
         is_user: false,

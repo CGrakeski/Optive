@@ -1,16 +1,17 @@
-//! `C.types.*` 目录的单一数据源：ABI、模块导出、转换表共用此表。
+//! `C.types` 模块导出的 ABI 类型表：模块属性短键 → TypeRef（规范 `c_name`）。
+//! 用户写 `C.types.int` 只是 getattr；实现里不维护 `"C.types.int"` 身份串。
 
 use crate::ffi::AbiType;
 
 /// 一条 C 类型登记。
 pub struct CTypeDef {
-    /// 规范名（挂在 `C.types.` 下，如 `int`、`unsigned long`、`void*`）。
+    /// 规范名（模块导出键 / TypeRef 身份，如 `int`、`unsigned long`、`void*`）。
     pub c_name: &'static str,
     /// 本机 ABI。
     pub abi: fn() -> AbiType,
-    /// getattr 别名 → 仍指向 `C.types.{c_name}`（如 `unsigned_int`）。
+    /// getattr 别名 → 与规范名同一 TypeRef（如 `unsigned_int`）。
     pub export_aliases: &'static [&'static str],
-    /// 额外可被 `from_type_name` 识别的名字（不含 `C.types.` 前缀），不单独导出。
+    /// 额外可被 `from_type_name` 识别的名字，不单独导出。
     pub type_name_alts: &'static [&'static str],
 }
 
@@ -253,7 +254,7 @@ pub static C_TYPES: &[CTypeDef] = &[
         export_aliases: &["void_ptr"],
         type_name_alts: &[],
     },
-    // 护照指针（与 void* 同宽）；可写 `ptr[T]` / `C.types.ptr[T]` 作类型形式。
+    // 护照指针（与 void* 同宽）；可写 `ptr[T]` / `C.types.ptr[T]`（getattr）作类型形式。
     CTypeDef {
         c_name: "ptr",
         abi: abi_ptr,
@@ -291,7 +292,7 @@ const fn abi_wchar_ptr() -> AbiType {
     AbiType::WCharPtr
 }
 
-/// 语言侧可直接作 ABI 注解的名字（非 `C.types.*`）。
+/// 语言侧可直接作 ABI 注解的名字（定宽 / ptr 等，非 C.types 模块导出）。
 type LangAbiEntry = (&'static str, fn() -> AbiType);
 static LANG_ABI_NAMES: &[LangAbiEntry] = &[
     ("void", abi_void),
@@ -316,24 +317,24 @@ static LANG_ABI_NAMES: &[LangAbiEntry] = &[
 ];
 
 impl CTypeDef {
+    /// TypeRef / 转换表使用的规范身份（短名，非点分路径）。
     #[must_use]
-    pub fn full_name(&self) -> String {
-        format!("C.types.{}", self.c_name)
+    pub fn type_ref_name(&self) -> &'static str {
+        self.c_name
     }
 }
 
-/// 按类型名解析到表项（接受 `int` / `C.types.int` / alt / export alias）。
+/// 按类型名解析到表项（规范名 / 别名 / alt）。
 #[must_use]
 pub fn lookup_c_type(name: &str) -> Option<&'static CTypeDef> {
-    let bare = name.strip_prefix("C.types.").unwrap_or(name);
     C_TYPES.iter().find(|e| {
-        e.c_name == bare
-            || e.export_aliases.contains(&bare)
-            || e.type_name_alts.contains(&bare)
+        e.c_name == name
+            || e.export_aliases.contains(&name)
+            || e.type_name_alts.contains(&name)
     })
 }
 
-/// ABI 解析：语言定宽名 + `C.types.*` 表。
+/// ABI 解析：语言定宽名 + C.types 表。
 pub fn abi_from_type_name(name: &str) -> Option<AbiType> {
     if let Some((_, abi)) = LANG_ABI_NAMES.iter().find(|(n, _)| *n == name) {
         return Some(abi());
@@ -341,14 +342,14 @@ pub fn abi_from_type_name(name: &str) -> Option<AbiType> {
     lookup_c_type(name).map(|e| (e.abi)())
 }
 
-/// 所有应安装 `__convert__` 的 `C.types.*` 全名（含 `type_name_alts`）。
+/// 所有应安装 `__convert__` 的 C ABI 类型名（规范名 + alt）。
 #[must_use]
 pub fn all_c_type_convert_names() -> Vec<String> {
     let mut out = Vec::new();
     for e in C_TYPES {
-        out.push(e.full_name());
+        out.push(e.c_name.to_string());
         for alt in e.type_name_alts {
-            out.push(format!("C.types.{alt}"));
+            out.push((*alt).to_string());
         }
     }
     out

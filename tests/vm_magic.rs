@@ -228,6 +228,53 @@ len(Box([1, 2, 3]))
 }
 
 #[test]
+fn struct_iter_next_protocol() {
+    assert_text(
+        r#"
+struct Count {
+    var n
+    var stop
+    func __iter__(self) { return self }
+    func __next__(self) {
+        if (self.n >= self.stop) { throw StopIteration("done") }
+        let v = self.n
+        self.n = self.n + 1
+        return v
+    }
+}
+use std.iter.{ to_list, map, take }
+str(to_list(Count(0, 3))) + str(to_list(take(map(do(x) { return x * 10 }, Count(1, 4)), 2)))
+"#,
+        "[0, 1, 2][10, 20]",
+    );
+}
+
+#[test]
+fn struct_iter_for_in_and_contains() {
+    assert_num(
+        r#"
+struct Count {
+    var n
+    var stop
+    func __iter__(self) { return self }
+    func __next__(self) {
+        if (self.n >= self.stop) { throw StopIteration("done") }
+        let v = self.n
+        self.n = self.n + 1
+        return v
+    }
+}
+var s = 0
+for (x in Count(0, 4)) { s = s + x }
+let hit = 0
+if (2 in Count(0, 3)) { hit = 100 }
+s + hit
+"#,
+        "106",
+    );
+}
+
+#[test]
 fn struct_init_magic() {
     assert_num(
         r"

@@ -135,6 +135,7 @@ fn lex_placeholder() {
 #[test]
 fn lex_ellipsis() {
     assert_kinds!("...", Ellipsis);
+    assert_kinds!("{...}", LBrace, Ellipsis, RBrace);
 }
 
 #[test]

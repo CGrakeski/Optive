@@ -38,13 +38,14 @@ enum StackVal {
 
 /// 热循环控制流（模块级；不可放在 impl 内）。
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 enum HotFlow {
-    Cont,
-    Cold,
-    PendingRet,
-    Fail,
+    Cont = 0,
+    Cold = 1,
+    PendingRet = 2,
+    Fail = 3,
     /// 已切换 `hot_ops`（如轻量 `Call`），外层须 `continue 'outer` 刷新切片。
-    Switched,
+    Switched = 4,
 }
 
 /// `run_interpreter` 出口：正常值、任务已挂起、或调试器请求暂停。
@@ -495,6 +496,8 @@ pub struct Vm {
     pub(crate) debug_active: bool,
     /// `!const_names.is_empty()` 的布尔缓存，热路径 `StoreFast` 零额外加载。
     pub(crate) has_const_names: bool,
+    /// `!pending_const.is_empty()` 缓存，避免热 `StoreGlobal` 每次查 HashSet。
+    pub(crate) has_pending_const: bool,
     /// 运行时能力隔离：网络 / 文件系统 / 环境变量网关。默认全开。
     pub caps: crate::caps::Capabilities,
     /// 若设置，`std.os.args()` 返回此列表（`run`/`up` 注入入口可见 argv）。
@@ -631,7 +634,8 @@ enum StepAction {
     TypeCheck,
     /// 栈顶 Function：定义处求值并缓存类型注解。
     ResolveFuncTypes,
-    FindMod(String),
+    FindMod(Vec<String>),
+    FindModFile(String),
     RegisterExport(String),
     GoCall { argc: usize },
     GoValue,
@@ -681,9 +685,38 @@ impl Vm {
         self
     }
 
+    /// 覆盖协作切片预算（测试用；勿用进程级 `OPTIVE_SUSPEND_BUDGET`，以免污染并行测试）。
+    pub fn with_suspend_budget(mut self, budget: usize) -> Self {
+        let b = clamp_suspend_budget(budget);
+        self.suspend_budget = b;
+        self.budget_left = b;
+        self
+    }
+
     /// 指定 worker 数与 GC 模式（helper 与主线程共享同一 `SharedGc`）。
     #[must_use]
     pub fn with_workers_gc(workers: usize, gc_mode: crate::gc::GcMode) -> Self {
+        Self::with_workers_gc_shared(
+            workers,
+            std::sync::Arc::new(crate::gc::SharedGc::with_mode(gc_mode)),
+        )
+    }
+
+    /// 同 [`Self::with_workers_gc`]，并固定并行 marker 线程数（测试 / 基准）。
+    #[must_use]
+    pub fn with_workers_gc_markers(
+        workers: usize,
+        gc_mode: crate::gc::GcMode,
+        markers: usize,
+    ) -> Self {
+        Self::with_workers_gc_shared(
+            workers,
+            std::sync::Arc::new(crate::gc::SharedGc::with_mode_markers(gc_mode, markers)),
+        )
+    }
+
+    #[must_use]
+    fn with_workers_gc_shared(workers: usize, gc: std::sync::Arc<crate::gc::SharedGc>) -> Self {
         let workers = workers.max(1);
         let mut vm = Self {
             code: Arc::new(Vec::new()),
@@ -744,7 +777,7 @@ impl Vm {
             pending_ret: None,
             hot_failed: false,
             hot_error: None,
-            gc: std::sync::Arc::new(crate::gc::SharedGc::with_mode(gc_mode)),
+            gc,
             gc_threshold: gc_auto_threshold(),
             list_element_contracts: FxHashMap::default(),
             dict_contracts: FxHashMap::default(),
@@ -786,6 +819,7 @@ impl Vm {
             debug: None,
             debug_active: false,
             has_const_names: false,
+            has_pending_const: false,
             caps: crate::caps::Capabilities::full(),
             argv_override: None,
         };
@@ -903,8 +937,8 @@ impl Vm {
     }
 
     /// 标记-清扫环收集：从根出发标记可达堆对象，再清空不可达容器内部。
-    /// - `OPTIVE_GC_MODE=stw`：完整 STW 标记+清扫
-    /// - `concurrent`：短 STW 拍根 → 并发/并行标记 → 短 STW 终止+清扫；握手失败回退 STW（不跳过）
+    /// - `OPTIVE_GC_MODE=concurrent`（默认）：M:N 大堆走并发协议；M:1/小堆自适应 STW
+    /// - `OPTIVE_GC_MODE=stw`：强制完整 STW 标记+清扫
     /// - M:N helper 调用时转为 `request_gc` + `prune_dead`（仅 primary 做 STW）
     pub fn gc_collect(&mut self) -> usize {
         use crate::gc::GcMode;
@@ -965,8 +999,22 @@ impl Vm {
 
     /// concurrent：Prepare(STW 中) → 放行 mutator 并并行标记 → Terminate+Sweep(再 STW)。
     /// `last_stw_ns` 只累计真实停顿（prepare + terminate/sweep），不含并发标记段。
+    ///
+    /// 自适应：无并行 mutator，或跟踪对象过少时，并发协议的握手/线程开销大于收益，
+    /// 直接走与 `stw` 相同的 `collect_stw_inner`，使默认 `concurrent` 在常见负载下接近 STW。
     fn gc_collect_concurrent_phased(&mut self) -> usize {
         use std::sync::atomic::Ordering;
+
+        // M:1：没有可与标记重叠的 mutator，STW 严格更优。
+        if !self.mn_parallel {
+            return self.gc.collect_stw_inner(self);
+        }
+        // 小堆：thread spawn + 双段握手主导墙钟。
+        const CONCURRENT_MIN_TRACKED: usize = 256;
+        if self.gc.tracked_count() < CONCURRENT_MIN_TRACKED {
+            return self.gc.collect_stw_inner(self);
+        }
+
         let mut stw_ns = 0u64;
 
         // Prepare（已在外层 STW 中）
@@ -975,9 +1023,7 @@ impl Vm {
         stw_ns += prep_t0.elapsed().as_nanos() as u64;
 
         // 放行 mutator，进入并发标记（此段不算 STW）
-        if self.mn_parallel {
-            self.mn.end_stw();
-        }
+        self.mn.end_stw();
         self.gc.concurrent_mark_drain();
         // 终止前在 mutator 仍跑时尽量排空脏卡，缩短第二段 STW。
         for _ in 0..8 {
@@ -989,11 +1035,7 @@ impl Vm {
 
         // 终止 + 清扫：再停世界
         let term_t0 = std::time::Instant::now();
-        let stw2 = if self.mn_parallel {
-            self.mn.begin_stw()
-        } else {
-            true
-        };
+        let stw2 = self.mn.begin_stw();
         if !stw2 {
             self.gc.set_marking(false);
             let n = self.mn.note_stw_failure();
@@ -1007,11 +1049,7 @@ impl Vm {
             self.gc_auto_cooldown_hold_count = hold;
             self.gc_auto_cooldown_until =
                 Some(std::time::Instant::now() + Self::gc_stw_cooldown());
-            let stw3 = if self.mn_parallel {
-                self.mn.begin_stw()
-            } else {
-                true
-            };
+            let stw3 = self.mn.begin_stw();
             let cleared = if stw3 {
                 self.gc.collect_stw_inner(self)
             } else {
@@ -1162,7 +1200,7 @@ impl Vm {
         }
     }
 
-    /// 完整根集：本地 + 就绪队列 + fiber 仓 + parked helper 根 + 已调度任务。
+    /// 完整根集：本地 + 就绪队列 + fiber 仓；M:N 再加 parked helper 根与已调度任务弱表。
     pub(crate) fn gc_push_all_roots(&self, worklist: &mut Vec<Value>) {
         self.gc_push_local_roots(worklist);
         for t in &self.ready_tasks {
@@ -1171,14 +1209,16 @@ impl Vm {
         for fiber in self.task_fibers.values() {
             Self::gc_push_fiber_roots(fiber, worklist);
         }
-        {
-            let fibers = self.mn.fibers.lock();
-            for fiber in fibers.values() {
-                Self::gc_push_fiber_roots(fiber, worklist);
+        if self.mn_parallel {
+            {
+                let fibers = self.mn.fibers.lock();
+                for fiber in fibers.values() {
+                    Self::gc_push_fiber_roots(fiber, worklist);
+                }
             }
+            worklist.extend(self.mn.take_parked_roots());
+            worklist.extend(self.mn.scheduled_task_values());
         }
-        worklist.extend(self.mn.take_parked_roots());
-        worklist.extend(self.mn.scheduled_task_values());
     }
 
     /// 兼容旧接口：推根并标记。
@@ -1234,6 +1274,7 @@ impl Vm {
         self.const_names.clear();
         self.has_const_names = false;
         self.pending_const.clear();
+        self.has_pending_const = false;
         self.op_clear();
         self.locals_stack.clear();
         self.name_to_slot.clear();
@@ -1697,9 +1738,10 @@ impl Vm {
     fn op_push(&mut self, v: StackVal) {
         let sp = self.stack_sp;
         if sp < self.stack.len() {
-            // 覆盖旧槽：Heap 会被 Drop，Int/Bool/Empty 无开销。
             // SAFETY: sp < stack.len() 刚检查。
-            self.stack[sp] = v;
+            unsafe {
+                *self.stack.get_unchecked_mut(sp) = v;
+            }
         } else {
             self.stack.push(v);
         }
@@ -1711,7 +1753,9 @@ impl Vm {
         let sp = self.stack_sp;
         if sp < self.stack.len() {
             // SAFETY: sp < stack.len() 刚检查。
-            self.stack[sp] = StackVal::Int(n);
+            unsafe {
+                *self.stack.get_unchecked_mut(sp) = StackVal::Int(n);
+            }
         } else {
             self.stack.push(StackVal::Int(n));
         }
@@ -1723,7 +1767,9 @@ impl Vm {
         let sp = self.stack_sp;
         if sp < self.stack.len() {
             // SAFETY: sp < stack.len() 刚检查。
-            self.stack[sp] = StackVal::Bool(b);
+            unsafe {
+                *self.stack.get_unchecked_mut(sp) = StackVal::Bool(b);
+            }
         } else {
             self.stack.push(StackVal::Bool(b));
         }
@@ -1949,7 +1995,10 @@ impl Vm {
             if idx >= self.lw_sp {
                 self.lw_sp = idx + 1;
             }
-            self.lw_slots[idx] = val;
+            // SAFETY: 上面已保证 idx < lw_slots.len()。
+            unsafe {
+                *self.lw_slots.get_unchecked_mut(idx) = val;
+            }
             return;
         }
         if let Some(frame) = self.locals_stack.last_mut() {
@@ -1969,7 +2018,7 @@ impl Vm {
             let idx = self.lw_base + slot;
             if idx < self.lw_sp {
                 // SAFETY: idx < lw_sp <= lw_slots.len()。
-                return self.lw_slots[idx].copy_imm();
+                return unsafe { self.lw_slots.get_unchecked(idx).copy_imm() };
             }
             return StackVal::Empty;
         }
@@ -2212,14 +2261,14 @@ impl Vm {
     }
 
     /// 紧凑 u8 热分派。Int 热路径就地改栈，轻量 Ret 不搬返回值。
+    /// 必须 `inline(always)`：每指令一次调用的开销在空循环上远大于 I-cache 压力。
     #[inline(always)]
     fn dispatch_hot_u8(&mut self, ops: &[u8], hot_args: &[i64], pc: usize) -> HotFlow {
         use crate::hot_code::{H_PUSH_SMALL, H_LOAD_FAST, H_STORE_FAST, H_LOAD_FAST_SUB_IMM, H_LOAD_FAST_LE_IMM, H_ADD_NUM, H_SUB_NUM, H_MUL_NUM, H_DIV_NUM, H_MOD_NUM, H_LE, H_LT, H_GT, H_GE, H_EQ, H_NE, H_GOTO, H_LOOP_COUNTDOWN, H_GOTO_IF_NOT, H_GOTO_IF, H_LABEL, H_CALL_SELF, H_RET, H_RET_LEAVE, H_RET_FAST, H_ADD_TEXT, H_ADD_LIST, H_LOAD_GLOBAL, H_STORE_GLOBAL, H_CALL, H_CALL_GLOBAL};
         // SAFETY（已由外层 `'hot` 循环 `if pc >= code_len { break }` 保证）：
         // 进入本函数时 `pc < ops.len()`，且 `HotCode::encode` 保证 `ops.len() == hot_args.len()`。
-        // 此处用安全索引替代 `get_unchecked`：边界已隐式满足，分支可被优化器消除。
-        let op = ops[pc];
-        let arg = hot_args[pc];
+        let op = unsafe { *ops.get_unchecked(pc) };
+        let arg = unsafe { *hot_args.get_unchecked(pc) };
         match op {
             H_PUSH_SMALL => {
                 self.pc = pc + 1;
@@ -2269,7 +2318,8 @@ impl Vm {
                 if self.lw_depth != 0 {
                     let idx = self.lw_base + slot;
                     if idx < self.lw_sp {
-                        if let StackVal::Int(n) = &self.lw_slots[idx] {
+                        // SAFETY: idx < lw_sp <= lw_slots.len()。
+                        if let StackVal::Int(n) = unsafe { self.lw_slots.get_unchecked(idx) } {
                             self.pc = pc + 1;
                             let (r, ov) = n.overflowing_sub(imm);
                             if ov {
@@ -2304,7 +2354,8 @@ impl Vm {
                 if self.lw_depth != 0 {
                     let idx = self.lw_base + slot;
                     if idx < self.lw_sp {
-                        if let StackVal::Int(n) = &self.lw_slots[idx] {
+                        // SAFETY: idx < lw_sp <= lw_slots.len()。
+                        if let StackVal::Int(n) = unsafe { self.lw_slots.get_unchecked(idx) } {
                             self.pc = pc + 1;
                             self.op_push_bool(*n <= imm);
                             HotFlow::Cont
@@ -2532,6 +2583,7 @@ impl Vm {
             }
             H_GOTO => {
                 self.pc = arg as usize;
+                self.tick_budget();
                 HotFlow::Cont
             }
             H_LOOP_COUNTDOWN => {
@@ -2543,9 +2595,11 @@ impl Vm {
                             self.stack_sp = sp - 1;
                             self.pc = arg as usize;
                         } else {
-                            *n -= 1;
+                            // wrapping：release 也曾开 overflow-checks；热循环避免检查开销。
+                            *n = n.wrapping_sub(1);
                             self.pc = pc + 1;
                         }
+                        self.tick_budget();
                         return HotFlow::Cont;
                     }
                 }
@@ -2630,7 +2684,7 @@ impl Vm {
                         self.set_hot_error(RuntimeError::msg("CallSelf outside function"));
                         return HotFlow::Fail;
                     };
-                    if !func.lightweight || self.debug_active {
+                    if !func.lightweight() || self.debug_active {
                         return HotFlow::Cold;
                     }
                     self.lw_entry_pc = func.entry_pc;
@@ -2696,81 +2750,43 @@ impl Vm {
             H_LOAD_GLOBAL => {
                 self.pc = pc + 1;
                 let idx = arg as usize;
-                // 顶层：平行槽 + Int 特化，避开 SharedMap 读锁/clone。
+                // Fast: top-level Small Int from parallel slot.
                 if self.user_call_frames.is_empty() && idx < self.script_globals.len() {
-                    // SAFETY: idx < script_globals.len()。
-                    let sv = match unsafe { self.script_globals.get_unchecked(idx) } {
-                        Value::Num(Num::Small(n)) => {
-                            self.op_push_int(*n);
-                            return HotFlow::Cont;
-                        }
-                        // `None` 可能是 NewVar 初值，也可能是 `del` 清空后的槽；
-                        // 走完整 LoadGlobal，已删除的名字会 NameError。
-                        Value::None => {
-                            return match self.load_script_global(idx) {
-                                Ok(v) => {
-                                    self.op_push(StackVal::from_value(v));
-                                    HotFlow::Cont
-                                }
-                                Err(e) => {
-                                    self.set_hot_error(e);
-                                    HotFlow::Fail
-                                }
-                            };
-                        }
-                        Value::Bool(b) => StackVal::Bool(*b),
-                        Value::Function(f) => StackVal::Func(f.clone()),
-                        Value::Cell(c) => StackVal::from_value(c.borrow().clone()),
-                        other => StackVal::from_value(other.clone()),
-                    };
-                    self.op_push(sv);
-                    return HotFlow::Cont;
-                }
-                match self.load_script_global(idx) {
-                    Ok(v) => {
-                        self.op_push(StackVal::from_value(v));
-                        HotFlow::Cont
-                    }
-                    Err(e) => {
-                        self.set_hot_error(e);
-                        HotFlow::Fail
+                    // SAFETY: idx < script_globals.len().
+                    if let Value::Num(Num::Small(n)) =
+                        unsafe { self.script_globals.get_unchecked(idx) }
+                    {
+                        self.op_push_int(*n);
+                        return HotFlow::Cont;
                     }
                 }
+                self.dispatch_hot_load_global_slow(idx)
             }
             H_STORE_GLOBAL => {
                 self.pc = pc + 1;
                 let idx = arg as usize;
                 let v = self.pop_hot();
-                if self.user_call_frames.is_empty() {
-                    // 顶层快路径：平行槽是 LoadGlobal 的权威来源。
-                    // M:1 下跳过 SharedMap 同步（每迭代一次 write 锁会毁掉 arith/call 微基准）；
-                    // M:N 下其它 worker 只见 SharedMap，必须立即同步。
-                    if !self.has_const_names
-                        && self.pending_const.is_empty()
-                        && idx < self.script_globals.len()
-                        && idx < self.script_global_names.len()
-                        && !self.script_global_names[idx].is_empty()
-                    {
-                        if let StackVal::Int(n) = v {
-                            // SAFETY: idx 已界检。
-                            unsafe {
-                                *self.script_globals.get_unchecked_mut(idx) =
-                                    Value::Num(Num::Small(n));
-                            }
-                            if self.mn_parallel {
-                                let num = Value::Num(Num::Small(n));
-                                if !self.globals.set_inplace(
-                                    self.script_global_names[idx].as_str(),
-                                    num.clone(),
-                                ) {
-                                    self.globals
-                                        .insert(self.script_global_names[idx].clone(), num);
-                                }
-                            } else {
-                                self.script_globals_map_dirty = true;
-                            }
-                            return HotFlow::Cont;
+                // Fast: top-level Int into parallel slot (M:1 dirty bit; no SharedMap lock).
+                if self.user_call_frames.is_empty()
+                    && !self.has_const_names
+                    && !self.has_pending_const
+                    && idx < self.script_globals.len()
+                    && self
+                        .script_global_names
+                        .get(idx)
+                        .is_some_and(|n| !n.is_empty())
+                {
+                    if let StackVal::Int(n) = v {
+                        // SAFETY: idx < script_globals.len(); name non-empty checked above.
+                        unsafe {
+                            *self.script_globals.get_unchecked_mut(idx) =
+                                Value::Num(Num::Small(n));
                         }
+                        if self.mn_parallel {
+                            return self.dispatch_hot_store_global_mn(idx, n);
+                        }
+                        self.script_globals_map_dirty = true;
+                        return HotFlow::Cont;
                     }
                 }
                 if let Err(e) = self.exec_store_global(idx, v.into_value()) {
@@ -2779,100 +2795,165 @@ impl Vm {
                 }
                 HotFlow::Cont
             }
-            H_CALL => {
-                let argc = arg as usize;
-                if self.debug_active {
-                    return HotFlow::Cold;
-                }
-                // 栈顶为 callee，其下为 argc 个参数（最后一参最靠近顶）。
-                if self.stack_sp < argc + 1 {
-                    self.set_hot_error(RuntimeError::msg("stack underflow"));
-                    return HotFlow::Fail;
-                }
-                let callee_idx = self.stack_sp - 1;
-                // SAFETY: callee_idx < stack_sp <= stack.len()。
-                let is_lw = unsafe {
-                    match self.stack.get_unchecked(callee_idx) {
-                        StackVal::Func(f) => Self::func_is_hot_callable(f, argc),
-                        StackVal::Heap(v) => match v.as_ref() {
-                            Value::Function(f) => Self::func_is_hot_callable(f, argc),
-                            _ => false,
-                        },
-                        _ => false,
-                    }
-                };
-                if !is_lw {
-                    return HotFlow::Cold;
-                }
-                self.pc = pc + 1;
-                let func = match self.pop_hot() {
-                    StackVal::Func(f) => f,
-                    StackVal::Heap(b) => if let Value::Function(f) = *b { f } else {
-                        self.set_hot_error(RuntimeError::msg(
-                            "internal: H_CALL lightweight mismatch",
-                        ));
-                        return HotFlow::Fail;
-                    },
-                    _ => {
-                        self.set_hot_error(RuntimeError::msg(
-                            "internal: H_CALL lightweight mismatch",
-                        ));
-                        return HotFlow::Fail;
-                    }
-                };
-                if self.try_elide_ret_fast_call(&func, argc) {
-                    return HotFlow::Cont;
-                }
-                if let Err(e) = self.setup_lightweight_user_call_stack(func, argc) {
-                    self.set_hot_error(e);
-                    return HotFlow::Fail;
-                }
-                HotFlow::Switched
-            }
+            H_CALL => self.dispatch_hot_call(pc, arg as usize),
             H_CALL_GLOBAL => {
                 let (global_idx, argc_i) = crate::hot_code::decode_slot_imm(arg);
-                let argc = argc_i as usize;
-                if self.debug_active {
-                    return HotFlow::Cold;
-                }
-                if self.stack_sp < argc {
-                    self.set_hot_error(RuntimeError::msg("stack underflow"));
-                    return HotFlow::Fail;
-                }
-                let func = match self.resolve_global_function_hot(global_idx) {
-                    Ok(Some(f)) if Self::func_is_hot_callable(&f, argc) => f,
-                    Ok(Some(_) | None) => return HotFlow::Cold,
-                    Err(e) => {
-                        self.set_hot_error(e);
-                        return HotFlow::Fail;
-                    }
-                };
-                self.pc = pc + 1;
-                // `return x` / `RetFast(0)` 单指令体：就地整理参数栈，不切代码。
-                if self.try_elide_ret_fast_call(&func, argc) {
-                    return HotFlow::Cont;
-                }
-                if let Err(e) = self.setup_lightweight_user_call_stack(func, argc) {
-                    self.set_hot_error(e);
-                    return HotFlow::Fail;
-                }
-                HotFlow::Switched
+                self.dispatch_hot_call_global(pc, global_idx, argc_i as usize)
             }
             _ => HotFlow::Cold,
         }
     }
 
+    /// Call / CallGlobal 体较大；`inline(never)` 避免撑爆热分派 I-cache。
+    #[inline(never)]
+    fn dispatch_hot_call(&mut self, pc: usize, argc: usize) -> HotFlow {
+        if self.debug_active {
+            return HotFlow::Cold;
+        }
+        // 栈顶为 callee，其下为 argc 个参数（最后一参最靠近顶）。
+        if self.stack_sp < argc + 1 {
+            self.set_hot_error(RuntimeError::msg("stack underflow"));
+            return HotFlow::Fail;
+        }
+        let callee_idx = self.stack_sp - 1;
+        // SAFETY: callee_idx < stack_sp <= stack.len()。
+        let is_lw = unsafe {
+            match self.stack.get_unchecked(callee_idx) {
+                StackVal::Func(f) => Self::func_is_hot_callable(f, argc),
+                StackVal::Heap(v) => match v.as_ref() {
+                    Value::Function(f) => Self::func_is_hot_callable(f, argc),
+                    _ => false,
+                },
+                _ => false,
+            }
+        };
+        if !is_lw {
+            return HotFlow::Cold;
+        }
+        self.pc = pc + 1;
+        let func = match self.pop_hot() {
+            StackVal::Func(f) => f,
+            StackVal::Heap(b) => {
+                if let Value::Function(f) = *b {
+                    f
+                } else {
+                    self.set_hot_error(RuntimeError::msg(
+                        "internal: H_CALL lightweight mismatch",
+                    ));
+                    return HotFlow::Fail;
+                }
+            }
+            _ => {
+                self.set_hot_error(RuntimeError::msg(
+                    "internal: H_CALL lightweight mismatch",
+                ));
+                return HotFlow::Fail;
+            }
+        };
+        if self.try_elide_ret_fast_call(&func, argc) {
+            return HotFlow::Cont;
+        }
+        if let Err(e) = self.setup_lightweight_user_call_stack(func, argc) {
+            self.set_hot_error(e);
+            return HotFlow::Fail;
+        }
+        HotFlow::Switched
+    }
+
+    #[inline(never)]
+    fn dispatch_hot_call_global(&mut self, pc: usize, global_idx: usize, argc: usize) -> HotFlow {
+        if self.debug_active {
+            return HotFlow::Cold;
+        }
+        if self.stack_sp < argc {
+            self.set_hot_error(RuntimeError::msg("stack underflow"));
+            return HotFlow::Fail;
+        }
+        let func = match self.resolve_global_function_hot(global_idx) {
+            Ok(Some(f)) if Self::func_is_hot_callable(&f, argc) => f,
+            Ok(Some(_) | None) => return HotFlow::Cold,
+            Err(e) => {
+                self.set_hot_error(e);
+                return HotFlow::Fail;
+            }
+        };
+        self.pc = pc + 1;
+        // `return x` / `RetFast(0)` 单指令体：就地整理参数栈，不切代码。
+        if self.try_elide_ret_fast_call(&func, argc) {
+            return HotFlow::Cont;
+        }
+        if let Err(e) = self.setup_lightweight_user_call_stack(func, argc) {
+            self.set_hot_error(e);
+            return HotFlow::Fail;
+        }
+        HotFlow::Switched
+    }
+
+
+    #[inline(never)]
+    fn dispatch_hot_load_global_slow(&mut self, idx: usize) -> HotFlow {
+        if self.user_call_frames.is_empty() && idx < self.script_globals.len() {
+            // SAFETY: idx < len
+            let sv = match unsafe { self.script_globals.get_unchecked(idx) } {
+                Value::None => {
+                    return match self.load_script_global(idx) {
+                        Ok(v) => {
+                            self.op_push(StackVal::from_value(v));
+                            HotFlow::Cont
+                        }
+                        Err(e) => {
+                            self.set_hot_error(e);
+                            HotFlow::Fail
+                        }
+                    };
+                }
+                Value::Bool(b) => StackVal::Bool(*b),
+                Value::Function(f) => StackVal::Func(f.clone()),
+                Value::Cell(c) => StackVal::from_value(c.borrow().clone()),
+                other => StackVal::from_value(other.clone()),
+            };
+            self.op_push(sv);
+            return HotFlow::Cont;
+        }
+        match self.load_script_global(idx) {
+            Ok(v) => {
+                self.op_push(StackVal::from_value(v));
+                HotFlow::Cont
+            }
+            Err(e) => {
+                self.set_hot_error(e);
+                HotFlow::Fail
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn dispatch_hot_store_global_mn(&mut self, idx: usize, n: i64) -> HotFlow {
+        let num = Value::Num(Num::Small(n));
+        let Some(name) = self.script_global_names.get(idx) else {
+            self.set_hot_error(RuntimeError::msg(format!(
+                "internal: StoreGlobal({idx}) out of range for script global table (len {})",
+                self.script_global_names.len()
+            )));
+            return HotFlow::Fail;
+        };
+        if name.is_empty() {
+            self.set_hot_error(RuntimeError::msg(format!(
+                "internal: StoreGlobal({idx}) resolves to empty global name"
+            )));
+            return HotFlow::Fail;
+        }
+        let name = name.clone();
+        if !self.globals.set_inplace(name.as_str(), num.clone()) {
+            self.globals.insert(name, num);
+        }
+        HotFlow::Cont
+    }
+
     #[inline(always)]
     fn func_is_hot_callable(f: &FunctionObject, argc: usize) -> bool {
-        f.lightweight
-            && !f.is_generator
-            && f.captured.is_none()
-            && f.variadic_param_index.is_none()
-            && f.kwvariadic_param_index.is_none()
-            && argc == f.params.len()
-            && f.defaults.iter().all(std::option::Option::is_none)
-            // 强类型 / implicit 须走 `setup_user_call`（含 check_strong_params）。
-            && !f.params.iter().any(|p| p.type_strong || p.implicit)
+        // 构造/闭包捕获时已缓存；热路径一次 u16 比较。
+        (f.hot_call_argc as usize) == argc
     }
 
     /// 体为单条 `RetFast(slot)` 时：把栈上参数收成返回值，跳过调用帧。
@@ -3035,50 +3116,26 @@ impl Vm {
             let code_len = ops.len();
 
             'hot: loop {
-                if self.debug_break_requested && self.task_ctx.is_none() {
-                    self.debug_break_requested = false;
-                    return Ok(InterpResult::DebugBreak);
-                }
-                if self.pending_suspend {
-                    return self.complete_task_suspend();
-                }
+                // Skip debug branches when inactive (empty/nested loop microbench path).
                 if self.debug_active {
+                    if self.debug_break_requested && self.task_ctx.is_none() {
+                        self.debug_break_requested = false;
+                        return Ok(InterpResult::DebugBreak);
+                    }
                     if let Some(r) = self.check_debug_pause() {
                         return Ok(r);
                     }
+                }
+                if self.pending_suspend {
+                    return self.complete_task_suspend();
                 }
                 let pc = self.pc;
                 if pc >= code_len {
                     break 'hot;
                 }
                 match self.dispatch_hot_u8(ops, args, pc) {
-                    HotFlow::Cont if self.hot_failed => {
-                        self.hot_failed = false;
-                        let e = self
-                            .hot_error
-                            .take()
-                            .unwrap_or_else(|| RuntimeError::msg("hot path error"));
-                        if self.handle_or_promote_error(&e)? { continue 'outer }
-                        self.record_error_stack();
-                        self.unwind_user_calls_on_error()?;
-                        return self.finish_uncaught(e);
-                    }
-                    HotFlow::Cont => {
-                        self.tick_budget();
-                        if self.pending_suspend {
-                            return self.complete_task_suspend();
-                        }
-                        if self.pending_main_yield {
-                            self.pending_main_yield = false;
-                            if let Err(e) = self.scheduler_yield() {
-                                if self.handle_or_promote_error(&e)? { continue 'outer }
-                                self.record_error_stack();
-                                self.unwind_user_calls_on_error()?;
-                                return self.finish_uncaught(e);
-                            }
-                        }
-                        continue 'hot;
-                    }
+                    // Cont first, no guard: empty/nested loops hit this every insn.
+                    HotFlow::Cont => continue 'hot,
                     HotFlow::Fail => {
                         self.hot_failed = false;
                         let e = self
@@ -3091,7 +3148,6 @@ impl Vm {
                         return self.finish_uncaught(e);
                     }
                     HotFlow::PendingRet => {
-                        // 轻量 `Call` 入口用 lw 帧且不推 fast_ret；Ret 走 PendingRet 时需先拆 lw。
                         if self.lw_depth > 0 && self.fast_ret_sp == 0 {
                             self.pop_lightweight_frame();
                         }
@@ -3109,6 +3165,19 @@ impl Vm {
                         continue 'outer;
                     }
                     HotFlow::Switched => {
+                        self.tick_budget();
+                        if self.pending_suspend {
+                            return self.complete_task_suspend();
+                        }
+                        if self.pending_main_yield {
+                            self.pending_main_yield = false;
+                            if let Err(e) = self.scheduler_yield() {
+                                if self.handle_or_promote_error(&e)? { continue 'outer }
+                                self.record_error_stack();
+                                self.unwind_user_calls_on_error()?;
+                                return self.finish_uncaught(e);
+                            }
+                        }
                         continue 'outer;
                     }
                     HotFlow::Cold => {
@@ -3215,7 +3284,7 @@ impl Vm {
                 break;
             };
             self.leave_scope();
-            if ucf.func.track_frames {
+            if ucf.func.track_frames() {
                 self.func_frames.pop();
             }
             if ucf.pushed_func_stack {
@@ -3379,7 +3448,8 @@ impl Vm {
             I::Rethrow => StepAction::Rethrow,
             I::TypeCheck => StepAction::TypeCheck,
             I::ResolveFuncTypes => StepAction::ResolveFuncTypes,
-            I::FindMod(name) => StepAction::FindMod(name.clone()),
+            I::FindMod(parts) => StepAction::FindMod(parts.clone()),
+            I::FindModFile(path) => StepAction::FindModFile(path.clone()),
             I::RegisterExport(name) => StepAction::RegisterExport(name.clone()),
             I::GoCall(argc) => StepAction::GoCall { argc: *argc },
             I::GoValue => StepAction::GoValue,
@@ -3736,6 +3806,7 @@ impl Vm {
             }
             StepAction::NewVar { name, is_const } => {
                 if is_const {
+                    self.has_pending_const = true;
                     self.pending_const.insert(name.clone());
                 }
                 if self.locals_stack.is_empty() {
@@ -3923,7 +3994,7 @@ impl Vm {
                     .last()
                     .cloned()
                     .ok_or_else(|| RuntimeError::msg("CallSelf outside function"))?;
-                if func.lightweight && !self.debug_active {
+                if func.lightweight() && !self.debug_active {
                     self.call_self_lightweight(argc, func.entry_pc, func.frame_slots);
                 } else {
                     self.call_args_buf.clear();
@@ -4134,7 +4205,7 @@ impl Vm {
             }
             StepAction::IterNew => {
                 let obj = self.pop()?;
-                let rc = crate::value::value_to_iterator_shared(&obj)?;
+                let rc = self.to_iterator_shared(&obj)?;
                 self.gc.track_iter(&rc);
                 self.iterators.push(ActiveIter {
                     state: rc,
@@ -4339,7 +4410,7 @@ impl Vm {
                         "ResolveFuncTypes expects a function",
                     ));
                 };
-                if f.types_resolved {
+                if f.types_resolved() {
                     self.push_value(Value::Function(f));
                 } else {
                     let mut func = (*f).clone();
@@ -4347,8 +4418,13 @@ impl Vm {
                     self.push_value(Value::Function(Arc::new(func)));
                 }
             }
-            StepAction::FindMod(name) => {
-                let module = module::find_module(self, &name)?;
+            StepAction::FindMod(parts) => {
+                // 首段走 loader；其余段按 getattr 链取子模块。
+                let cur = module::find_module_segments(self, &parts)?;
+                self.push_value(cur);
+            }
+            StepAction::FindModFile(path) => {
+                let module = module::load_string_module(self, &path)?;
                 self.push_value(module);
             }
             StepAction::RegisterExport(name) => {
@@ -4572,9 +4648,7 @@ impl Vm {
     }
 
     pub(crate) fn register_enum_def(&mut self, name: String, def: Arc<crate::value::EnumDef>) {
-        for (func_name, func) in crate::enum_variant::builtin_enum_method_entries(&name, &def) {
-            self.functions.insert(func_name, func);
-        }
+        // EnumDef.methods 已在构建时挂好（builtin + 用户定义）。
         self.enum_defs.insert(name, def);
     }
 
@@ -4679,6 +4753,7 @@ impl Vm {
 
     fn finalize_const_init(&mut self, name: &str) {
         if self.pending_const.remove(name) {
+            self.has_pending_const = !self.pending_const.is_empty();
             self.const_names.insert(name.to_string());
             self.has_const_names = true;
         }
@@ -4769,8 +4844,7 @@ impl Vm {
         let Value::Struct(s) = obj else {
             return false;
         };
-        self.functions
-            .contains_key(&format!("{}.{}", s.def.name, method))
+        s.def.methods.contains_key(method) || s.def.overloads.contains_key(method)
     }
 
     pub(crate) fn try_call_magic(
@@ -4857,14 +4931,20 @@ impl Vm {
         let Value::Struct(s) = obj else {
             return Err(RuntimeError::msg("expected struct instance"));
         };
-        let method_name = format!("{}.{}", s.def.name, method);
-        let func = self
-            .functions
-            .get(&method_name)
-            .ok_or_else(|| RuntimeError::attr_err(format!("no method {method_name}")))?;
-        let mut full_args = vec![obj.clone()];
-        full_args.extend(args);
-        self.call_user_function(func, full_args)
+        if let Some(func) = s.def.methods.get(method).cloned() {
+            let mut full_args = vec![obj.clone()];
+            full_args.extend(args);
+            return self.call_user_function(func, full_args);
+        }
+        if let Some(overloads) = s.def.overloads.get(method).cloned() {
+            let mut full_args = vec![obj.clone()];
+            full_args.extend(args);
+            return self.dispatch_overload(&overloads, &full_args);
+        }
+        Err(RuntimeError::attr_err(format!(
+            "{} has no method {method}",
+            s.def.name
+        )))
     }
 
     pub(crate) fn get_attr_value(&mut self, obj: &Value, field: &str) -> Result<Value> {
@@ -4897,33 +4977,26 @@ impl Vm {
             Value::Struct(ref _s) if self.struct_has_method(&callee, "__call__") => {
                 self.call_struct_method(&callee, "__call__", args)
             }
-            Value::Builtin(f) => {
-                let out = f(self, &args)?;
+            Value::Builtin(b) => {
+                let out = b.call(self, &args)?;
                 if self.block_suspend {
                     self.block_suspend = false;
-                    self.arm_call_retry(Value::Builtin(f), args);
+                    self.arm_call_retry(Value::Builtin(b), args);
                     return Ok(Value::None);
                 }
                 Ok(out)
             }
             Value::Function(func) => {
                 if kwargs.is_empty()
-                    && func.lightweight
                     && !self.debug_active
-                    && !func.is_generator
-                    && func.captured.is_none()
-                    && func.variadic_param_index.is_none()
-                    && func.kwvariadic_param_index.is_none()
-                    && args.len() == func.params.len()
-                    && func.defaults.iter().all(std::option::Option::is_none)
-                    && !func.params.iter().any(|p| p.type_strong || p.implicit)
+                    && (func.hot_call_argc as usize) == args.len()
                 {
                     self.setup_lightweight_user_call(func, args)?;
                     self.user_call_deferred = true;
                     return Ok(Value::None);
                 }
                 let bound = self.bind_call_arguments(&func, args, kwargs)?;
-                if func.is_generator {
+                if func.is_generator() {
                     return self.make_generator_iterator(func, bound);
                 }
                 self.setup_user_call(func, bound, false)?;
@@ -4934,7 +5007,7 @@ impl Vm {
                 let type_args = infer_generic_type_args_from_values(self, &template, &args)?;
                 let func = specialize_generic_runtime(self, &template, type_args)?;
                 let bound = self.bind_call_arguments(&func, args, kwargs)?;
-                if func.is_generator {
+                if func.is_generator() {
                     return self.make_generator_iterator(func, bound);
                 }
                 self.setup_user_call(func, bound, false)?;
@@ -5307,33 +5380,62 @@ impl Vm {
                 _ => Ok(false),
             },
             _ => {
-                if let Value::List(v) = self.iterable_values(container)? {
-                    for elem in v.borrow().iter() {
-                        if self.dispatch_eq(elem, item)? {
-                            return Ok(true);
-                        }
+                // 用户类型：走 `__iter__` / `__next__` 协议，不要求先物化为 list。
+                let it = self.to_iterator_shared(container)?;
+                while let Some(elem) = self.advance_iterator(&it)? {
+                    if self.dispatch_eq(&elem, item)? {
+                        return Ok(true);
                     }
-                    Ok(false)
-                } else {
-                    Ok(false)
                 }
+                Ok(false)
             }
         }
     }
 
-    fn iterable_values(&mut self, val: &Value) -> Result<Value> {
-        if let Some(r) = self.try_call_magic(val, "__iter__", vec![]) {
-            let iter_val = r?;
-            if let Value::List(l) = iter_val {
-                return Ok(Value::List(l));
+    /// 将任意可迭代对象转为共享 iterator 状态。
+    /// 内置序列走内建游标；用户 `struct` 走 `__iter__` / `__next__` 协议。
+    pub(crate) fn to_iterator_shared(&mut self, v: &Value) -> Result<Shared<IteratorState>> {
+        match v {
+            Value::Iterator(it) => Ok(it.clone()),
+            Value::Stream(_) => crate::value::value_to_iterator_shared(v),
+            other => {
+                if let Some(r) = self.try_call_magic(other, "__iter__", vec![]) {
+                    let it_val = r?;
+                    return self.iterator_from_protocol_value(it_val);
+                }
+                if self.struct_has_method(other, "__next__") {
+                    return self.wrap_user_iterator(other.clone());
+                }
+                crate::value::value_to_iterator_shared(other)
             }
         }
-        match val {
-            Value::List(l) => Ok(Value::List(l.clone())),
-            Value::Text(s) => Ok(Value::List(Shared::new(
-                s.chars().map(|c| Value::Text(c.to_string())).collect(),
-            ))),
-            _ => Err(RuntimeError::type_err("object is not iterable")),
+    }
+
+    fn wrap_user_iterator(&mut self, obj: Value) -> Result<Shared<IteratorState>> {
+        if !self.struct_has_method(&obj, "__next__") {
+            return Err(RuntimeError::type_err(
+                "__iter__ must return an object with __next__",
+            ));
+        }
+        let it = Shared::new(IteratorState {
+            kind: IteratorKind::User { obj },
+        });
+        self.gc.track_iter(&it);
+        Ok(it)
+    }
+
+    fn iterator_from_protocol_value(&mut self, it_val: Value) -> Result<Shared<IteratorState>> {
+        match it_val {
+            Value::Iterator(it) => Ok(it),
+            Value::List(_)
+            | Value::Tuple(_)
+            | Value::Set(_)
+            | Value::Bytes(_)
+            | Value::Text(_)
+            | Value::Dict(_)
+            | Value::Channel(_)
+            | Value::Stream(_) => Ok(Shared::new(crate::value::value_to_iterable(&it_val)?)),
+            other => self.wrap_user_iterator(other),
         }
     }
 
@@ -5371,7 +5473,7 @@ impl Vm {
     fn call_dispatch(&mut self, table: &Shared<DispatchTable>, args: Vec<Value>) -> Result<Value> {
         enum DispatchTarget {
             Function(Arc<FunctionObject>),
-            Builtin(BuiltinFn),
+            Builtin(Arc<crate::value::BuiltinObject>),
         }
 
         let handlers = table.borrow().handlers.borrow().clone();
@@ -5385,7 +5487,7 @@ impl Vm {
                     };
                     (score, DispatchTarget::Function(func))
                 }
-                Value::Builtin(f) => (usize::MAX, DispatchTarget::Builtin(f.clone())),
+                Value::Builtin(b) => (usize::MAX, DispatchTarget::Builtin(b.clone())),
                 _ => continue,
             };
             match &best {
@@ -5400,11 +5502,11 @@ impl Vm {
         if let Some((_, _, target)) = best {
             return match target {
                 DispatchTarget::Function(func) => self.call_user_function(func, args),
-                DispatchTarget::Builtin(f) => {
-                    let out = f(self, &args)?;
+                DispatchTarget::Builtin(b) => {
+                    let out = b.call(self, &args)?;
                     if self.block_suspend {
                         self.block_suspend = false;
-                        self.arm_call_retry(Value::Builtin(f), args);
+                        self.arm_call_retry(Value::Builtin(b), args);
                         return Ok(Value::None);
                     }
                     Ok(out)
@@ -5587,7 +5689,7 @@ impl Vm {
         &mut self,
         func: Arc<FunctionObject>,
     ) -> Result<Arc<FunctionObject>> {
-        if func.types_resolved {
+        if func.types_resolved() {
             return Ok(func);
         }
         let mut f = (*func).clone();
@@ -5738,7 +5840,7 @@ impl Vm {
         args: Vec<Value>,
     ) -> Result<InterpResult> {
         let bound = self.bind_call_arguments(&func, args, DictMap::new())?;
-        if func.is_generator {
+        if func.is_generator() {
             return Ok(InterpResult::Value(Some(
                 self.make_generator_iterator(func, bound)?,
             )));
@@ -5776,7 +5878,7 @@ impl Vm {
             return Ok(());
         }
 
-        if func.track_frames {
+        if func.track_frames() {
             let call_line = self.current_line();
             self.func_frames.push(FuncFrame {
                 name: func.name.clone(),
@@ -5789,7 +5891,7 @@ impl Vm {
             self.func_stack.push(func.clone());
         }
 
-        if func.uses_name_map {
+        if func.uses_name_map() {
             self.name_to_slot.push(Some(FxHashMap::default()));
         } else {
             self.name_to_slot.push(None);
@@ -5802,7 +5904,7 @@ impl Vm {
         let mut locals = self.alloc_local_frame(frame_size);
 
         let mut slot = func.params.len();
-        if func.uses_name_map {
+        if func.uses_name_map() {
             if let Some(names) = self.name_to_slot.last_mut().and_then(|m| m.as_mut()) {
                 if let Some(captured) = &func.captured {
                     let mut caps: Vec<_> = captured.iter().collect();
@@ -5838,7 +5940,7 @@ impl Vm {
             if i < locals.len() {
                 locals[i] = val;
             }
-            if func.uses_name_map {
+            if func.uses_name_map() {
                 if let Some(names) = self.name_to_slot.last_mut().and_then(|m| m.as_mut()) {
                     if let Some(param) = func.params.get(i) {
                         names.insert(param.name.clone(), i);
@@ -5847,7 +5949,7 @@ impl Vm {
             }
         }
         // 确保所有形参名都在 name map 中（含仅默认值 / *args / **kwargs）。
-        if func.uses_name_map {
+        if func.uses_name_map() {
             if let Some(names) = self.name_to_slot.last_mut().and_then(|m| m.as_mut()) {
                 for (i, param) in func.params.iter().enumerate() {
                     names.entry(param.name.clone()).or_insert(i);
@@ -5992,12 +6094,12 @@ impl Vm {
             .pop()
             .expect("user_call_frames non-empty on return (theoretically unreachable)");
         let func = frame.func.clone();
-        if func.return_strong {
+        if func.return_strong() {
             if let Some(ref ty) = func.return_type_value {
                 if let Some(detail) = types::type_check_error(self, &result, ty) {
                     let msg = format!("return: {detail}");
                     self.leave_scope();
-                    if frame.func.track_frames {
+                    if frame.func.track_frames() {
                         self.func_frames.pop();
                     }
                     if frame.pushed_func_stack {
@@ -6013,7 +6115,7 @@ impl Vm {
         }
 
         self.leave_scope();
-        if frame.func.track_frames {
+        if frame.func.track_frames() {
             self.func_frames.pop();
         }
         if frame.pushed_func_stack {
@@ -6036,7 +6138,7 @@ impl Vm {
         }
         while let Some(frame) = self.user_call_frames.pop() {
             self.leave_scope();
-            if frame.func.track_frames {
+            if frame.func.track_frames() {
                 self.func_frames.pop();
             }
             if frame.pushed_func_stack {
@@ -6668,6 +6770,58 @@ impl Vm {
                         None => return Ok(None),
                     }
                 }
+                IteratorKind::Skip { remaining, source } => {
+                    let source = source.clone();
+                    while *remaining > 0 {
+                        match self.advance_iterator(&source)? {
+                            Some(_) => *remaining -= 1,
+                            None => return Ok(None),
+                        }
+                    }
+                    return self.advance_iterator(&source);
+                }
+                IteratorKind::Enumerate { index, source } => {
+                    let source = source.clone();
+                    match self.advance_iterator(&source)? {
+                        Some(item) => {
+                            let i = *index;
+                            *index = index.saturating_add(1);
+                            return Ok(Some(Value::List(Shared::new(vec![
+                                Value::Num(Num::Small(i as i64)),
+                                item,
+                            ]))));
+                        }
+                        None => return Ok(None),
+                    }
+                }
+                IteratorKind::Chain { sources, current } => {
+                    while *current < sources.len() {
+                        let src = sources[*current].clone();
+                        match self.advance_iterator(&src)? {
+                            Some(v) => return Ok(Some(v)),
+                            None => *current += 1,
+                        }
+                    }
+                    return Ok(None);
+                }
+                IteratorKind::User { obj } => {
+                    let obj = obj.clone();
+                    match self.try_call_magic(&obj, "__next__", vec![]) {
+                        Some(Ok(v)) => return Ok(Some(v)),
+                        Some(Err(e))
+                            if e.kind() == crate::error::ExceptionKind::StopIteration =>
+                        {
+                            self.active_exception = None;
+                            return Ok(None);
+                        }
+                        Some(Err(e)) => return Err(e),
+                        None => {
+                            return Err(RuntimeError::type_err(
+                                "iterator protocol requires __next__",
+                            ));
+                        }
+                    }
+                }
                 IteratorKind::Generator { .. } => {
                     unreachable!("generators handled before advance_iterator loop");
                 }
@@ -6693,7 +6847,7 @@ impl Vm {
         let captured_len = func.captured.as_ref().map_or(0, std::collections::HashMap::len);
         let frame_size = func.frame_slots.max(func.params.len() + captured_len);
         let mut locals = vec![Value::None; frame_size];
-        let mut name_map = if func.uses_name_map {
+        let mut name_map = if func.uses_name_map() {
             Some(FxHashMap::default())
         } else {
             None
@@ -6790,7 +6944,7 @@ impl Vm {
             self.active_generator = Some(state.clone());
             self.generator_resuming = true;
 
-            if func.track_frames {
+            if func.track_frames() {
                 let call_line = self.current_line();
                 self.func_frames.push(FuncFrame {
                     name: func.name.clone(),
@@ -6868,10 +7022,7 @@ impl Vm {
                 "`yield from` is only valid inside a generator function or do",
             ));
         }
-        let iter = match iterable {
-            Value::Iterator(it) => it,
-            other => Shared::new(crate::value::value_to_iterable(&other)?),
-        };
+        let iter = self.to_iterator_shared(&iterable)?;
         // 内层生成器的 resume 会改写 active_generator / generator_resuming，需保存外层。
         let saved_active = self.active_generator.clone();
         let saved_resuming = self.generator_resuming;
@@ -6932,7 +7083,7 @@ impl Vm {
         if frame.pushed_func_stack {
             self.func_stack.pop();
         }
-        if frame.func.track_frames {
+        if frame.func.track_frames() {
             self.func_frames.pop();
         }
         self.restore_user_call_frame(frame);
@@ -6948,11 +7099,13 @@ impl Vm {
     }
 
     fn enqueue_task(&mut self, task: Shared<TaskInner>) {
-        self.mn.note_scheduled_task(&task);
         if self.mn_parallel {
+            // M:N：injector 不可遍历，靠弱表给 GC 补根；挂起重入队是热路径。
+            self.mn.note_scheduled_task(&task);
             self.local_worker.push(task);
             self.mn.notify_one();
         } else {
+            // M:1：就绪队列 + task_fibers 已是完整根，避免每次挂起抢 scheduled_tasks 锁。
             self.ready_tasks.push_back(task);
         }
     }
@@ -7088,6 +7241,7 @@ impl Vm {
             debug: self.debug.clone(),
             debug_active: self.debug_active,
             has_const_names: self.has_const_names,
+            has_pending_const: self.has_pending_const,
             caps: self.caps.clone(),
             argv_override: self.argv_override.clone(),
         }
@@ -7206,15 +7360,17 @@ impl Vm {
 
     #[inline(always)]
     fn tick_budget(&mut self) {
-        // 预算扣减总是执行；常态下仅在预算耗尽时查 safepoint。
-        // STW 已请求时每条指令都停，缩短握手尾延迟、降低超时。
-        self.budget_left -= 1;
+        // wrapping_sub: avoid per-insn overflow-check branches; refill when exhausted.
+        self.budget_left = self.budget_left.wrapping_sub(1);
         if self.budget_left != 0 {
-            if self.mn_parallel
-                && self
-                    .mn
-                    .stw_requested
-                    .load(std::sync::atomic::Ordering::Acquire)
+            // M:1: no STW — shortest hot return.
+            if !self.mn_parallel {
+                return;
+            }
+            if self
+                .mn
+                .stw_requested
+                .load(std::sync::atomic::Ordering::Relaxed)
             {
                 self.poll_gc_safepoint();
             }
@@ -7223,7 +7379,6 @@ impl Vm {
         self.budget_left = clamp_suspend_budget(self.suspend_budget);
         if self.mn_parallel {
             self.poll_gc_safepoint();
-            // 仅在 helper 请求时由 primary 拾取；阈值触发仍走 track_value→maybe_auto_gc。
             if self.mn_primary && self.mn.gc_request_pending() {
                 self.maybe_auto_gc();
             }
@@ -7231,7 +7386,6 @@ impl Vm {
         if self.task_ctx.is_some() {
             self.pending_suspend = true;
         } else if self.mn_parallel || !self.ready_tasks.is_empty() {
-            // M:1 且就绪队列空：主纤程空转 yield 无收益，跳过。
             self.pending_main_yield = true;
         }
     }
@@ -7788,7 +7942,7 @@ impl Vm {
     fn call_value_poll(&mut self, callee: Value, args: Vec<Value>) -> Result<InterpResult> {
         match callee {
             Value::Function(f) => self.call_user_function_poll(f, args),
-            Value::Builtin(f) => Ok(InterpResult::Value(Some(f(self, &args)?))),
+            Value::Builtin(b) => Ok(InterpResult::Value(Some(b.call(self, &args)?))),
             other => {
                 let stop = self.user_call_frames.len();
                 let result = self.call_value(other, args)?;
@@ -8282,6 +8436,15 @@ impl Vm {
         Ok(result)
     }
 
+    /// M:1：主纤程释放 barrier 后跑一轮就绪任务，让挂起方先从 `wait` 返回。
+    #[inline]
+    fn yield_after_barrier_release(&mut self) -> Result<()> {
+        if self.mn_parallel || self.task_ctx.is_some() {
+            return Ok(());
+        }
+        self.scheduler_yield()
+    }
+
     pub(crate) fn barrier_wait(
         &mut self,
         s: &Shared<crate::value::SyncInner>,
@@ -8313,6 +8476,9 @@ impl Vm {
                     drop(inner);
                     self.sync_wait_resume = None;
                     self.mn.notify_all();
+                    // 主纤程作为最后一方释放时，须让出给已挂起的其它方，
+                    // 否则对方 barrier 后代码（如写共享变量）可能永远跑不到。
+                    self.yield_after_barrier_release()?;
                     return Ok(Value::None);
                 }
                 *generation
@@ -8334,6 +8500,7 @@ impl Vm {
                 drop(inner);
                 self.sync_wait_resume = None;
                 self.mn.notify_all();
+                self.yield_after_barrier_release()?;
                 return Ok(Value::None);
             }
             *generation
@@ -8452,11 +8619,10 @@ impl Vm {
         Ok(Value::None)
     }
 
-    pub(crate) fn zip_iterables(iterables: Vec<Value>) -> Result<Value> {
+    pub(crate) fn zip_iterables(&mut self, iterables: Vec<Value>) -> Result<Value> {
         let mut children = Vec::new();
         for it in iterables {
-            let state = crate::value::value_to_iterable(&it)?;
-            children.push(Shared::new(state));
+            children.push(self.to_iterator_shared(&it)?);
         }
         Ok(IteratorState::from_zip(children).into_value())
     }
@@ -8917,9 +9083,9 @@ fn variant_type_attr(vm: &mut Vm, variant_name: &str, field: &str) -> Result<Val
         .ok_or_else(|| RuntimeError::msg(format!("unknown variant: {variant_name}")))?;
     if let Some(case) = vdef.cases.iter().find(|c| c.name == field) {
         let struct_name = case.struct_name.clone();
-        return Ok(Value::Builtin(Arc::new(move |vm, args| {
+        return Ok(Value::builtin(field, move |vm, args| {
             make_struct(vm, &struct_name, args.to_vec(), None)
-        })));
+        }));
     }
     Err(RuntimeError::attr_err(format!(
         "variant {variant_name} has no case {field}"
@@ -8931,21 +9097,20 @@ fn enum_type_attr(vm: &mut Vm, enum_name: &str, field: &str) -> Result<Value> {
         .enum_defs
         .get(enum_name)
         .ok_or_else(|| RuntimeError::msg(format!("unknown enum: {enum_name}")))?;
-    let method_name = format!("{enum_name}.{field}");
-    if let Some(func) = vm.functions.get(&method_name) {
+    if let Some(func) = def.methods.get(field) {
         let cls = Value::type_ref(enum_name);
-        let func = func;
-        return Ok(Value::Builtin(Arc::new(move |vm, args| {
+        let func = func.clone();
+        return Ok(Value::builtin(field, move |vm, args| {
             let mut full_args = vec![cls.clone()];
             full_args.extend_from_slice(args);
             vm.call_user_function(func.clone(), full_args)
-        })));
+        }));
     }
     if field == "name_of" {
         let enum_name = enum_name.to_string();
-        return Ok(Value::Builtin(Arc::new(move |vm, args| {
+        return Ok(Value::builtin("name_of", move |vm, args| {
             crate::enum_variant::enum_name_of(vm, &enum_name, args)
-        })));
+        }));
     }
     if let Some(idx) = def.members.iter().position(|m| m.name == field) {
         return Ok(crate::enum_variant::enum_member_value(&def, idx));
@@ -8961,11 +9126,11 @@ fn type_spec_attr(
 ) -> Result<Value> {
     if let Some(vdef) = vm.variant_defs.get(name) {
         if vdef.cases.iter().any(|c| c.name == field) {
-            let struct_name = format!("{name}.{field}");
+            let struct_name = crate::enum_variant::case_struct_name(name, field);
             let generic_args = type_args.to_vec();
-            return Ok(Value::Builtin(Arc::new(move |vm, args| {
+            return Ok(Value::builtin(field, move |vm, args| {
                 make_struct(vm, &struct_name, args.to_vec(), Some(generic_args.clone()))
-            })));
+            }));
         }
     }
     if vm.struct_defs.contains_key(name) {
@@ -9021,24 +9186,23 @@ fn get_attr(vm: &mut Vm, obj: &Value, field: &str) -> Result<Value> {
             if let Some(idx) = s.def.fields.iter().position(|f| f == field) {
                 return Ok(s.slots.borrow()[idx].clone());
             }
-            let method_name = format!("{}.{}", s.def.name, field);
-            if let Some(func) = vm.functions.get(&method_name) {
+            if let Some(func) = s.def.methods.get(field) {
                 let self_val = obj.clone();
-                let func = func;
-                return Ok(Value::Builtin(Arc::new(move |vm, args| {
+                let func = func.clone();
+                return Ok(Value::builtin(field, move |vm, args| {
                     let mut full_args = vec![self_val.clone()];
                     full_args.extend_from_slice(args);
                     vm.call_user_function(func.clone(), full_args)
-                })));
+                }));
             }
-            if let Some(overloads) = vm.overload_tables.get(&method_name) {
+            if let Some(overloads) = s.def.overloads.get(field) {
                 let self_val = obj.clone();
-                let overloads = overloads;
-                return Ok(Value::Builtin(Arc::new(move |vm, args| {
+                let overloads = overloads.clone();
+                return Ok(Value::builtin(field, move |vm, args| {
                     let mut full_args = vec![self_val.clone()];
                     full_args.extend_from_slice(args);
                     vm.dispatch_overload(&overloads, &full_args)
-                })));
+                }));
             }
             Err(RuntimeError::attr_err(format!("no field {field}")))
         }
@@ -9193,8 +9357,7 @@ fn make_struct(
     vm.track_value(&val);
     if let Value::Struct(s) = &val {
         if vm.struct_has_method(&val, "__init__") {
-            let init_name = format!("{}.__init__", s.def.name);
-            let init_args = if let Some(func) = vm.functions.get(&init_name) {
+            let init_args = if let Some(func) = s.def.methods.get("__init__") {
                 let n_bind = func
                     .params
                     .iter()
@@ -9259,6 +9422,17 @@ fn select_try_recv_from_iter(
                 other => Ok(other),
             }
         }
+        IteratorKind::Skip { remaining, source } => {
+            let source = source.clone();
+            while *remaining > 0 {
+                match select_try_recv_from_iter(&source)? {
+                    Some(Some(_)) => *remaining -= 1,
+                    Some(None) => return Ok(Some(None)),
+                    None => return Ok(None),
+                }
+            }
+            select_try_recv_from_iter(&source)
+        }
         IteratorKind::List { items, index } => {
             if *index >= items.len() {
                 Ok(Some(None))
@@ -9268,7 +9442,12 @@ fn select_try_recv_from_iter(
                 Ok(Some(Some(v)))
             }
         }
-        IteratorKind::Map { .. } | IteratorKind::Filter { .. } | IteratorKind::GenExpr { .. } => {
+        IteratorKind::Map { .. }
+        | IteratorKind::Filter { .. }
+        | IteratorKind::GenExpr { .. }
+        | IteratorKind::Enumerate { .. }
+        | IteratorKind::Chain { .. }
+        | IteratorKind::User { .. } => {
             Err(RuntimeError::type_err(
                 "select recv on mapped/filtered Stream is unsupported; use Channel or bare stream",
             ))
@@ -9342,21 +9521,51 @@ fn infer_generic_type_args_from_values(
     template: &crate::opcode::GenericFunctionTemplate,
     args: &[Value],
 ) -> Result<Vec<Value>> {
-    if template.type_params.len() != 1 {
-        return Err(RuntimeError::msg(format!(
-            "cannot infer {} type parameter(s) for `{}`; use {}[...](...)",
-            template.type_params.len(),
-            template.name,
-            template.name
-        )));
+    use crate::ast::ExprKind;
+    let mut inferred: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    for (param, arg) in template.params.iter().zip(args.iter()) {
+        let Some(ty_expr) = &param.type_expr else {
+            continue;
+        };
+        let ExprKind::Var(name) = &ty_expr.kind else {
+            continue;
+        };
+        if !template.type_params.iter().any(|(p, _)| p == name) {
+            continue;
+        }
+        let ty = types::value_to_type_value(vm, arg);
+        if let Some(prev) = inferred.get(name) {
+            if !types::type_values_equal(prev, &ty) {
+                return Err(RuntimeError::msg(format!(
+                    "conflicting inferences for type parameter `{name}` at call to `{}`",
+                    template.name
+                )));
+            }
+        } else {
+            inferred.insert(name.clone(), ty);
+        }
     }
-    if args.is_empty() {
-        return Err(RuntimeError::type_err(format!(
-            "{} expects at least one argument for type inference",
-            template.name
-        )));
+    if inferred.is_empty() && template.type_params.len() == 1 && !args.is_empty() {
+        inferred.insert(
+            template.type_params[0].0.clone(),
+            types::value_to_type_value(vm, &args[0]),
+        );
     }
-    Ok(vec![types::value_to_type_value(vm, &args[0])])
+    let mut out = Vec::with_capacity(template.type_params.len());
+    for (name, _) in &template.type_params {
+        match inferred.get(name) {
+            Some(v) => out.push(v.clone()),
+            None => {
+                return Err(RuntimeError::msg(format!(
+                    "cannot infer {} type parameter(s) for `{}`; use {}[...](...)",
+                    template.type_params.len(),
+                    template.name,
+                    template.name
+                )));
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn type_args_from_runtime_index(idx: &Value) -> Result<Vec<Value>> {

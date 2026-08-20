@@ -157,7 +157,7 @@ fn write_project_and_global_use() {
         fs::create_dir_all(&proj).unwrap();
         fs::write(
             proj.join("Optive.toml"),
-            "[package]\nname = \"t\"\nversion = \"0.1.0\"\n",
+            "[package]\nname = \"t\"\n",
         )
         .unwrap();
         let custom_toml = proj.join(PROJECT_CUSTOM_FILE);

@@ -87,7 +87,6 @@ fn install_std_macros(vm: &mut Vm, std_mod: &Shared<ModuleObject>) -> Result<()>
     )?;
     let macros_mod = Shared::new(ModuleObject {
         name: "macros".into(),
-        full_name: "std.macros".into(),
         exports,
         children: HashMap::new(),
         is_user: false,
@@ -115,6 +114,53 @@ pub fn find_module(vm: &mut Vm, module_name: &str) -> Result<Value> {
         return Ok(Value::Module(mod_val));
     }
     load_user_module(vm, module_name)
+}
+
+/// 按路径段解析用户模块；加载后挂到父 `children`，使 `a.b.c` 的 getattr 链命中。
+pub fn find_module_segments(vm: &mut Vm, parts: &[String]) -> Result<Value> {
+    if parts.is_empty() {
+        return Err(RuntimeError::msg("empty module path"));
+    }
+    let first = &parts[0];
+    // 根段：命中缓存 / builtin / 用户根模块。
+    let mut cur_val = if let Some(cached) = vm.module_cache.get(first) {
+        Value::Module(cached.clone())
+    } else if let Some(root) = vm.builtin_modules.get(first.as_str()) {
+        Value::Module(root.clone())
+    } else {
+        load_user_module_segments(vm, &parts[..1])?
+    };
+    // 逐级 getattr；若中间缺 children 且还没加载，尝试按需加载后挂上。
+    for (i, seg) in parts.iter().enumerate().skip(1) {
+        let Value::Module(m) = &cur_val else {
+            return Err(RuntimeError::attr_err(format!(
+                "module segment `{}` is not a module",
+                seg
+            )));
+        };
+        let next = { m.borrow().get_attr(seg) };
+        if let Some(next) = next {
+            cur_val = next;
+            continue;
+        }
+        // 尝试按需加载剩余段对应文件，成功后挂到当前 children。
+        let sub = load_user_module_segments(vm, &parts[..=i])?;
+        if let Value::Module(subm) = &sub {
+            m.borrow_mut()
+                .children
+                .insert(seg.clone(), subm.clone());
+        }
+        cur_val = sub;
+    }
+    Ok(cur_val)
+}
+
+fn load_user_module_segments(vm: &mut Vm, parts: &[String]) -> Result<Value> {
+    let dotted = parts.join(".");
+    if let Some(cached) = vm.module_cache.get(&dotted) {
+        return Ok(Value::Module(cached.clone()));
+    }
+    load_user_module(vm, &dotted)
 }
 
 fn resolve_builtin_path(vm: &Vm, module_name: &str) -> Option<Shared<ModuleObject>> {
@@ -233,7 +279,12 @@ fn run_module_source(
         .with_ref(|m| {
             m.iter()
                 .filter(|(k, _)| !snap.struct_defs.contains_key(*k))
-                .map(|(k, v)| (k.clone(), v.clone()))
+                .map(|(k, v)| {
+                    // 模块新增 StructDef：其 methods/overloads 也需挂到模块 env，
+                    // 否则模块内 struct 方法体看不到本模块的 let/use 绑定。
+                    let rebound = rebound_struct_def_methods(v.clone(), &module_env);
+                    (k.clone(), rebound)
+                })
                 .collect()
         });
     vm.finish_module_init(
@@ -244,6 +295,26 @@ fn run_module_source(
         new_overloads,
     );
     Ok(export_map)
+}
+
+/// 将 `StructDef.methods` / `overloads` 里的函数重绑到模块全局 env。
+fn rebound_struct_def_methods(
+    def: Arc<crate::value::StructDef>,
+    module_env: &Arc<ModuleGlobalEnv>,
+) -> Arc<crate::value::StructDef> {
+    if def.methods.is_empty() && def.overloads.is_empty() {
+        return def;
+    }
+    let mut d = (*def).clone();
+    for f in d.methods.values_mut() {
+        *f = function_with_module_env(f, module_env);
+    }
+    for list in d.overloads.values_mut() {
+        for f in list.iter_mut() {
+            *f = function_with_module_env(f, module_env);
+        }
+    }
+    Arc::new(d)
 }
 
 fn load_user_module(vm: &mut Vm, module_name: &str) -> Result<Value> {
@@ -300,8 +371,7 @@ fn load_user_module(vm: &mut Vm, module_name: &str) -> Result<Value> {
     }
 
     Err(RuntimeError::msg(format!(
-        "Module not found: {}",
-        path_components.join(".")
+        "Module not found: {first} (searched under package root / project search paths)"
     )))
 }
 
@@ -320,9 +390,9 @@ fn load_from_package(
         })?
     } else {
         locate_under_root(&binding.path, &path_components[1..]).ok_or_else(|| {
+            let rest = path_components[1..].join("/");
             RuntimeError::msg(format!(
-                "Module not found: {} (under package root {})",
-                path_components.join("."),
+                "Module not found: '{rest}' under package root {}",
                 binding.path.display()
             ))
         })?
@@ -347,10 +417,7 @@ fn load_file_as_module(
     package_root: Option<PathBuf>,
 ) -> Result<Value> {
     let source = read_module_file(file_path)?;
-    let placeholder = Shared::new(ModuleObject::new_user(
-        last.to_string(),
-        module_name.to_string(),
-    ));
+    let placeholder = Shared::new(ModuleObject::new_user(last.to_string()));
     vm.module_cache
         .insert(module_name.to_string(), placeholder.clone());
     let import_base = file_path
@@ -468,9 +535,10 @@ fn locate_module_file(path_components: &[&str]) -> Result<PathBuf> {
             return Ok(package_candidate);
         }
     }
+    let first = path_components[0];
+    let rest = path_components[1..].join("/");
     Err(RuntimeError::msg(format!(
-        "Module not found: {}",
-        path_components.join(".")
+        "Module not found: '{first}' (then '{rest}') under project search paths"
     )))
 }
 
@@ -551,15 +619,22 @@ fn module_search_paths(base_dir: Option<&Path>) -> Vec<PathBuf> {
     paths
 }
 
-fn load_string_module(vm: &mut Vm, path: &str) -> Result<Value> {
-    let cache_key = format!("@str:{path}");
-    if let Some(cached) = vm.module_cache.get(&cache_key) {
-        return Ok(Value::Module(cached.clone()));
+pub fn load_string_module(vm: &mut Vm, path: &str) -> Result<Value> {
+    // `import "example-proj"` / `import "example-proj.src.lib"`：包名可含 `-`，
+    // 不能写成点号标识符；字符串若不像文件路径则按依赖模块解析。
+    if looks_like_package_spec(path) {
+        let parts: Vec<String> = path
+            .split('.')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if !parts.is_empty() {
+            return find_module_segments(vm, &parts);
+        }
     }
     let file_path = resolve_import_path(path, &vm.import_base)?;
     let canonical = file_path.to_string_lossy().to_string();
-    let cache_key = format!("@str:{canonical}");
-    if let Some(cached) = vm.module_cache.get(&cache_key) {
+    if let Some(cached) = vm.module_cache.get(&canonical) {
         return Ok(Value::Module(cached.clone()));
     }
     let source = read_module_file(&file_path)?;
@@ -580,11 +655,27 @@ fn load_string_module(vm: &mut Vm, path: &str) -> Result<Value> {
     )?;
     let module = Shared::new(ModuleObject {
         name: alias.clone(),
-        full_name: canonical,
         exports,
         children: HashMap::new(),
         is_user: true,
     });
-    vm.module_cache.insert(cache_key, module.clone());
+    vm.module_cache.insert(canonical, module.clone());
     Ok(Value::Module(module))
+}
+
+fn looks_like_package_spec(path: &str) -> bool {
+    let p = path.trim();
+    if p.is_empty() {
+        return false;
+    }
+    if p.starts_with("./") || p.starts_with("../") {
+        return false;
+    }
+    if p.contains('/') || p.contains('\\') {
+        return false;
+    }
+    if p.ends_with(".tive") {
+        return false;
+    }
+    true
 }

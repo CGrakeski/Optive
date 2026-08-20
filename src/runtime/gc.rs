@@ -7,8 +7,9 @@
 //! 清空不可达对象内部。真正释放仍由 `Arc` 引用计数完成。
 //!
 //! 模式（`OPTIVE_GC_MODE`）：
-//! - `stw`（默认）：完整 stop-the-world 标记+清扫
-//! - `concurrent`：短 STW 握手 + 并发三色标记（脏卡写屏障）+ 并行 marker + 短 STW 清扫
+//! - `concurrent`（**默认**）：短 STW 握手 + 并发三色标记（脏卡写屏障）+ 并行 marker + 短 STW 清扫；
+//!   M:1 或跟踪对象很少时自适应回退为与 `stw` 相同的完整 STW 收集（避免协议/线程开销）。
+//! - `stw`：强制完整 stop-the-world 标记+清扫（对照 / 回退）
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -51,13 +52,19 @@ pub enum GcMode {
 impl GcMode {
     #[must_use]
     pub fn from_env() -> Self {
-        match std::env::var("OPTIVE_GC_MODE")
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "concurrent" | "conc" | "parallel" => Self::Concurrent,
-            _ => Self::Stw,
+        Self::from_env_str(
+            &std::env::var("OPTIVE_GC_MODE").unwrap_or_default(),
+        )
+    }
+
+    /// 解析 `OPTIVE_GC_MODE` 字符串（测试 / 嵌入可直接调用）。
+    #[must_use]
+    pub fn from_env_str(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            // 显式 STW：对照基准 / 紧急回退。
+            "stw" | "stop" | "stop-the-world" | "serial" => Self::Stw,
+            // 默认 concurrent（含未设置 / 无法识别）；M:1/小堆在收集路径上自适应回退 STW。
+            _ => Self::Concurrent,
         }
     }
 }
@@ -114,6 +121,12 @@ impl SharedGc {
             .and_then(|s| s.parse().ok())
             .filter(|&n: &usize| n > 0)
             .unwrap_or_else(|| num_cpus::get().clamp(1, 4));
+        Self::with_mode_markers(mode, markers)
+    }
+
+    /// 指定并行 marker 数（测试 / 基准用；`markers == 0` 视为 1）。
+    #[must_use]
+    pub fn with_mode_markers(mode: GcMode, markers: usize) -> Self {
         Self {
             data: Mutex::new(TrackerData::default()),
             collect_lock: Mutex::new(()),
@@ -131,7 +144,7 @@ impl SharedGc {
             total_stw_ns: AtomicU64::new(0),
             total_collect_ns: AtomicU64::new(0),
             total_cleared: AtomicUsize::new(0),
-            marker_threads: markers,
+            marker_threads: markers.max(1),
         }
     }
 
@@ -349,8 +362,16 @@ impl SharedGc {
     }
 
     /// 并发/并行 drain 灰表；可在无 STW 下运行。
+    /// 灰表较小时单线程标记，避免 Windows 上反复 `thread::scope` 拉起 marker 的固定开销。
     pub fn concurrent_mark_drain(&self) {
-        let markers = self.marker_threads.max(1);
+        let gray_len = self.gray.lock().len();
+        // 经验阈值：小于此规模时 spawn 成本高于并行收益。
+        const PARALLEL_GRAY_MIN: usize = 512;
+        let markers = if gray_len < PARALLEL_GRAY_MIN {
+            1
+        } else {
+            self.marker_threads.max(1)
+        };
         if markers == 1 {
             self.mark_drain_local();
             return;
@@ -359,8 +380,14 @@ impl SharedGc {
             for _ in 0..markers {
                 scope.spawn(|| {
                     let mut local_work = Vec::new();
+                    // 线程本地 marked：整批标记不占全局锁；steal 间隙合并。
+                    let mut local_marked = FxHashSet::default();
                     loop {
                         if local_work.is_empty() {
+                            {
+                                let mut marked = self.marked.lock();
+                                marked.extend(local_marked.iter().copied());
+                            }
                             let mut gray = self.gray.lock();
                             if gray.is_empty() {
                                 break;
@@ -369,11 +396,12 @@ impl SharedGc {
                             let start = gray.len() - take;
                             local_work.extend(gray.drain(start..));
                         }
-                        let mut marked = self.marked.lock();
                         while let Some(v) = local_work.pop() {
-                            mark_value(&v, &mut marked, &mut local_work);
+                            mark_value(&v, &mut local_marked, &mut local_work);
                         }
                     }
+                    let mut marked = self.marked.lock();
+                    marked.extend(local_marked);
                 });
             }
         });
@@ -382,6 +410,7 @@ impl SharedGc {
 
     fn mark_drain_local(&self) {
         let mut local_work = Vec::new();
+        let mut local_marked = FxHashSet::default();
         loop {
             {
                 let mut gray = self.gray.lock();
@@ -390,10 +419,13 @@ impl SharedGc {
                 }
                 local_work.append(&mut gray);
             }
-            let mut marked = self.marked.lock();
             while let Some(v) = local_work.pop() {
-                mark_value(&v, &mut marked, &mut local_work);
+                mark_value(&v, &mut local_marked, &mut local_work);
             }
+        }
+        if !local_marked.is_empty() {
+            let mut marked = self.marked.lock();
+            marked.extend(local_marked);
         }
     }
 
@@ -432,9 +464,13 @@ impl SharedGc {
     }
 
     /// 终止：重扫脏卡直至不动点，关闭屏障，返回 marked 快照供 sweep。
-    /// 若脏卡风暴在轮次上限后仍未收敛，返回 `None`，由调用方回退完整 STW。
+    /// 若 FFI 未静默或脏卡风暴在轮次上限后仍未收敛，返回 `None`，由调用方回退完整 STW。
     pub fn concurrent_terminate(&self, vm: &Vm) -> Option<FxHashSet<usize>> {
-        let _ = self.wait_ffi_quiescent();
+        if !self.wait_ffi_quiescent() {
+            self.abort_concurrent_mark();
+            self.stw_fallback_count.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
         {
             let mut gray = self.gray.lock();
             vm.gc_push_all_roots(&mut gray);
@@ -453,16 +489,22 @@ impl SharedGc {
             }
         }
         if !converged {
-            self.set_marking(false);
-            self.dirty.lock().clear();
-            self.gray.lock().clear();
-            self.marked.lock().clear();
+            self.abort_concurrent_mark();
+            self.stw_fallback_count.fetch_add(1, Ordering::Relaxed);
             return None;
         }
         self.set_marking(false);
         self.dirty.lock().clear();
         self.gray.lock().clear();
         Some(std::mem::take(&mut *self.marked.lock()))
+    }
+
+    /// 放弃本轮并发标记状态（不 sweep），供 STW 回退前清理。
+    fn abort_concurrent_mark(&self) {
+        self.set_marking(false);
+        self.dirty.lock().clear();
+        self.gray.lock().clear();
+        self.marked.lock().clear();
     }
 
     #[inline]
@@ -640,6 +682,16 @@ pub fn clear_current_gc() {
     });
 }
 
+/// 当前线程 GC 是否处于并发标记期（`SharedMap` 等热路径快判）。
+#[inline]
+pub fn is_marking() -> bool {
+    CURRENT_GC.with(|c| {
+        c.borrow()
+            .as_ref()
+            .is_some_and(|gc| gc.marking.load(Ordering::Relaxed))
+    })
+}
+
 /// 写屏障：非标记期仅 TLS + 原子 load；标记期才登记脏卡。
 #[inline]
 pub fn write_barrier_addr(addr: usize) {
@@ -653,6 +705,50 @@ pub fn write_barrier_addr(addr: usize) {
         }
         gc.note_dirty_addr(addr);
     });
+}
+
+/// Dijkstra 插入屏障：向已扫描根（如 globals/`SharedMap`）写入新引用时染灰。
+/// 非堆容器值（Num/Text/…）直接跳过。
+#[inline]
+pub fn write_barrier_new_ref(v: &Value) {
+    if !value_needs_mark(v) {
+        return;
+    }
+    CURRENT_GC.with(|c| {
+        let guard = c.borrow();
+        let Some(gc) = guard.as_ref() else {
+            return;
+        };
+        if !gc.marking.load(Ordering::Relaxed) {
+            return;
+        }
+        gc.gray.lock().push(v.clone());
+    });
+}
+
+#[inline]
+fn value_needs_mark(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::List(_)
+            | Value::Dict(_)
+            | Value::Set(_)
+            | Value::Iterator(_)
+            | Value::Cell(_)
+            | Value::Struct(_)
+            | Value::Tuple(_)
+            | Value::Variant(_)
+            | Value::Module(_)
+            | Value::Dispatch(_)
+            | Value::Task(_)
+            | Value::Function(_)
+            | Value::Channel(_)
+            | Value::Stream(_)
+            | Value::Mutex(_)
+            | Value::MutexGuard(_)
+            | Value::Sync(_)
+            | Value::SyncGuard(_)
+    )
 }
 
 #[inline]
@@ -833,7 +929,7 @@ crate::value::Num::Small(_)) | Value::None | Value::Bool(_) | Value::Sized(_)
 | Value::Ptr(_) | Value::DllHandle(_) | Value::Text(_) | Value::TypeRef(_) |
 Value::Bytes(_) | Value::GenericFunction(_) | Value::Macro(_) |
 Value::Builtin(_) | Value::RuntimeAst(_) | Value::TypeSpec(_) |
-Value::EnumMember(_) => {}
+Value::EnumMember(_) | Value::Layout(_) => {}
     }
 }
 
@@ -853,8 +949,18 @@ fn mark_iterator_children(state: &IteratorState, worklist: &mut Vec<Value>) {
         IteratorKind::Map { source, .. }
         | IteratorKind::Filter { source, .. }
         | IteratorKind::GenExpr { source, .. }
-        | IteratorKind::Take { source, .. } => {
+        | IteratorKind::Take { source, .. }
+        | IteratorKind::Skip { source, .. }
+        | IteratorKind::Enumerate { source, .. } => {
             worklist.push(Value::Iterator(source.clone()));
+        }
+        IteratorKind::Chain { sources, .. } => {
+            for s in sources {
+                worklist.push(Value::Iterator(s.clone()));
+            }
+        }
+        IteratorKind::User { obj } => {
+            worklist.push(obj.clone());
         }
         IteratorKind::Repeat { value, .. } => {
             worklist.push(value.clone());

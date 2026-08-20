@@ -430,7 +430,20 @@ fn parse_placeholder_only_in_pipeline_or_wrapper() {
 fn parse_ellipsis_empty_block() {
     parse_ok("func f() ...");
     parse_ok("func f() { }");
-    parse_err("func f() { ... }");
+    parse_ok("func f() { ... }");
+    parse_ok("if (true) ...");
+    parse_ok("if (true) { ... }");
+
+    let program = parse_program("func f() ...").expect("parse");
+    match &program.stmts[0].stmt {
+        optive::ast::Stmt::FuncDecl { body, .. } => {
+            assert!(body.is_empty(), "bare ... in block position is empty block");
+        }
+        other => panic!("expected FuncDecl, got {other:?}"),
+    }
+
+    parse_err("let x = ...");
+    parse_ok("try { } catch (e: ...) { }");
 }
 
 #[test]

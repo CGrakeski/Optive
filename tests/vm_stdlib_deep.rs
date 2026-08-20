@@ -54,6 +54,21 @@ replace("ababa", "a", "x") + (if startswith("hello", "he") then "Y" else "N") + 
 }
 
 #[test]
+fn std_text_extended() {
+    assert_text(
+        r#"
+use std.text.{ split, split_ws, join, substring, reverse, capitalize, Builder }
+let parts = split("a-b-c", "-", 1)
+let ws = split_ws("  a  b  ")
+let b = Builder("hi")
+b.append("!")
+join(",", parts) + "|" + join(",", ws) + "|" + substring("hello", 1, 4) + "|" + reverse("ab") + "|" + capitalize("hELLO") + "|" + b.to_text()
+"#,
+        "a,b-c|a,b|ell|ba|Hello|hi!",
+    );
+}
+
+#[test]
 fn std_json_object() {
     assert_num(
         r#"
@@ -70,7 +85,7 @@ fn std_iter_take_skip() {
     assert_text(
         r"
 use std.iter.{ take, skip, to_list }
-str(take([1, 2, 3, 4, 5], 2)) + str(skip([1, 2, 3, 4], 2))
+str(to_list(take([1, 2, 3, 4, 5], 2))) + str(to_list(skip([1, 2, 3, 4], 2)))
 ",
         "[1, 2][3, 4]",
     );
@@ -179,9 +194,21 @@ fn std_iter_cycle_take_fold() {
     assert_text(
         r#"
 use std.iter.{ cycle, take, fold, repeat, to_list }
-str(take(cycle([1, 2]), 5)) + str(fold(do(a, b) { return a + b }, 0, [1, 2, 3])) + str(to_list(repeat("x", 3)))
+str(to_list(take(cycle([1, 2]), 5))) + str(fold(do(a, b) { return a + b }, 0, [1, 2, 3])) + str(to_list(repeat("x", 3)))
 "#,
         "[1, 2, 1, 2, 1]6[\"x\", \"x\", \"x\"]",
+    );
+}
+
+#[test]
+fn std_iter_enumerate_chain_lazy() {
+    assert_text(
+        r#"
+use std.iter.{ enumerate, chain, take, map, to_list }
+use std.math.{ range }
+str(to_list(enumerate(["a", "b"]))) + str(to_list(chain([1], range(2, 4)))) + str(to_list(take(map(do(x) { return x * 10 }, range(100)), 2)))
+"#,
+        "[[0, \"a\"], [1, \"b\"]][1, 2, 3][0, 10]",
     );
 }
 

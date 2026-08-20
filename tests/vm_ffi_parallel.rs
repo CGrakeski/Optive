@@ -134,10 +134,7 @@ use std.language.{{ C }}
 let h = C.frompath({path})
 extern(h, "sleep_ms") func sleep_ms(implicit ms: C.types.uint32_t) ...
 var progressed = 0
-let sleeper = go do {{
-    sleep_ms(300)
-    return 1
-}}
+let sleeper = go sleep_ms(300)
 let ticker = go do {{
     var i = 0
     while (i < 50) {{

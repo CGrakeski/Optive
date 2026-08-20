@@ -147,7 +147,10 @@ pub enum Instruction {
     TypeCheck,
     /// 栈顶 `Function`：在定义处求值并绑定所有参数/返回类型注解（须为类型值）。
     ResolveFuncTypes,
-    FindMod(String),
+    /// 按模块段解析：首段 `find_module`，其后逐段 `GetAttr`。
+    FindMod(Vec<String>),
+    /// 按文件路径加载模块（`import "path"`）。
+    FindModFile(String),
     RegisterExport(String),
     /// `go f(args)`：栈为 args… + callee → Task。
     GoCall(usize),
@@ -614,44 +617,110 @@ pub struct GenericFunctionTemplate {
     pub source_file: String,
 }
 
+/// 函数调用/帧相关布尔标志打包（原 8×bool → 1 字节），热路径随 `hot`/`entry_pc` 同缓存行。
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct FuncFlags(u8);
+
+impl FuncFlags {
+    pub const LIGHTWEIGHT: u8 = 1 << 0;
+    pub const NEEDS_ARG_CHECKS: u8 = 1 << 1;
+    pub const IS_GENERATOR: u8 = 1 << 2;
+    pub const TRACK_FRAMES: u8 = 1 << 3;
+    pub const USES_NAME_MAP: u8 = 1 << 4;
+    pub const RETURN_STRONG: u8 = 1 << 5;
+    pub const TYPES_RESOLVED: u8 = 1 << 6;
+    pub const IS_BUILTIN_BODY: u8 = 1 << 7;
+
+    #[inline(always)]
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    #[inline(always)]
+    pub const fn from_bits(bits: u8) -> Self {
+        Self(bits)
+    }
+
+    #[inline(always)]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    #[inline(always)]
+    pub const fn contains(self, bit: u8) -> bool {
+        self.0 & bit != 0
+    }
+
+    #[inline(always)]
+    pub fn set(&mut self, bit: u8, on: bool) {
+        if on {
+            self.0 |= bit;
+        } else {
+            self.0 &= !bit;
+        }
+    }
+
+    #[must_use]
+    pub fn pack(
+        lightweight: bool,
+        needs_arg_checks: bool,
+        is_generator: bool,
+        track_frames: bool,
+        uses_name_map: bool,
+        return_strong: bool,
+        types_resolved: bool,
+        is_builtin_body: bool,
+    ) -> Self {
+        let mut f = Self::empty();
+        f.set(Self::LIGHTWEIGHT, lightweight);
+        f.set(Self::NEEDS_ARG_CHECKS, needs_arg_checks);
+        f.set(Self::IS_GENERATOR, is_generator);
+        f.set(Self::TRACK_FRAMES, track_frames);
+        f.set(Self::USES_NAME_MAP, uses_name_map);
+        f.set(Self::RETURN_STRONG, return_strong);
+        f.set(Self::TYPES_RESOLVED, types_resolved);
+        f.set(Self::IS_BUILTIN_BODY, is_builtin_body);
+        f
+    }
+}
+
+/// `hot_call_argc == u16::MAX` 表示不可走热轻量调用。
+pub const HOT_CALL_ARGC_NONE: u16 = u16::MAX;
+
+/// 用户函数对象。`#[repr(C)]` 固定热字段在前，便于 `Arc` 解引用时同缓存行命中。
 #[derive(Clone)]
+#[repr(C)]
 pub struct FunctionObject {
+    // --- 热路径簇（Call / CallSelf / LoadFast 帧建立）---
+    /// 与 `body` 等长的紧凑热操作码（`u8` + 操作数），供热循环使用。
+    pub hot: crate::hot_code::HotCode,
+    /// 已预解析的 `entry_label` PC。
+    pub entry_pc: usize,
+    /// 局部帧 `Vec` 大小（`max(fast slot index) + 1`）。
+    pub frame_slots: usize,
+    pub fast_locals: usize,
+    pub entry_label: usize,
+    /// 热路径可轻量调用的固定 argc；`HOT_CALL_ARGC_NONE` 表示不可。
+    pub hot_call_argc: u16,
+    pub flags: FuncFlags,
+    // --- 冷路径 / 元数据 ---
     pub name: String,
     pub params: Vec<crate::ast::FuncParam>,
     pub body: Arc<Vec<Instruction>>,
-    /// 与 `body` 等长的紧凑热操作码（`u8` + 操作数），供热循环使用。
-    pub hot: crate::hot_code::HotCode,
     pub line_map: Arc<Vec<usize>>,
     pub column_map: Arc<Vec<usize>>,
-    pub entry_label: usize,
-    pub fast_locals: usize,
-    pub is_builtin_body: bool,
     pub variadic_param_index: Option<usize>,
     pub kwvariadic_param_index: Option<usize>,
     /// 与 `params` 等长；有默认值的槽在定义时由 `__attach_defaults__` 填入。
     pub defaults: Vec<Option<Value>>,
     pub captured: Option<HashMap<String, Value>>,
     pub return_type: Option<crate::ast::Expr>,
-    pub return_strong: bool,
     pub return_wrapper: Option<crate::ast::Expr>,
     /// 定义时求值后的参数类型（与 `params` 等长；无注解为 `None`）。
     pub param_types: Vec<Option<Value>>,
     /// 定义时求值后的返回类型。
     pub return_type_value: Option<Value>,
-    /// 是否已在定义处完成注解求值与校验。
-    pub types_resolved: bool,
-    /// 局部帧 `Vec` 大小（`max(fast slot index) + 1`）。
-    pub frame_slots: usize,
-    /// 运行时是否需为本函数维护 name→slot 映射。
-    pub uses_name_map: bool,
-    /// 每次调用是否压入 `func_frames`（traceback）。
-    pub track_frames: bool,
-    /// 已预解析的 `entry_label` PC。
-    pub entry_pc: usize,
-    /// `CallSelf` 时用 `fast_ret_pcs` 而非完整 `UserCallFrame`。
-    pub lightweight: bool,
-    /// 体含 `yield` / `yield from`：调用返回 iterator，不立即执行体。
-    pub is_generator: bool,
     /// 若设置，`LoadGlobal` 相对本模块环境解析，而非调用方的 `script_global_names` / `globals`。
     pub module_env: Option<Arc<ModuleGlobalEnv>>,
     /// 定义本函数的源码（供运行时错误展示上下文；REPL 分多段定义时必需）。
@@ -661,34 +730,118 @@ pub struct FunctionObject {
 }
 
 impl FunctionObject {
+    #[inline(always)]
+    pub fn lightweight(&self) -> bool {
+        self.flags.contains(FuncFlags::LIGHTWEIGHT)
+    }
+    #[inline(always)]
+    pub fn needs_arg_checks(&self) -> bool {
+        self.flags.contains(FuncFlags::NEEDS_ARG_CHECKS)
+    }
+    #[inline(always)]
+    pub fn is_generator(&self) -> bool {
+        self.flags.contains(FuncFlags::IS_GENERATOR)
+    }
+    #[inline(always)]
+    pub fn track_frames(&self) -> bool {
+        self.flags.contains(FuncFlags::TRACK_FRAMES)
+    }
+    #[inline(always)]
+    pub fn uses_name_map(&self) -> bool {
+        self.flags.contains(FuncFlags::USES_NAME_MAP)
+    }
+    #[inline(always)]
+    pub fn return_strong(&self) -> bool {
+        self.flags.contains(FuncFlags::RETURN_STRONG)
+    }
+    #[inline(always)]
+    pub fn types_resolved(&self) -> bool {
+        self.flags.contains(FuncFlags::TYPES_RESOLVED)
+    }
+    #[inline(always)]
+    pub fn is_builtin_body(&self) -> bool {
+        self.flags.contains(FuncFlags::IS_BUILTIN_BODY)
+    }
+
+    #[inline(always)]
+    pub fn set_types_resolved(&mut self, on: bool) {
+        self.flags.set(FuncFlags::TYPES_RESOLVED, on);
+    }
+
+    /// 根据当前标志/捕获/默认值重算热调用 argc（闭包捕获或挂默认值后调用）。
+    pub fn refresh_hot_call_argc(&mut self) {
+        self.hot_call_argc = Self::compute_hot_call_argc(
+            self.lightweight(),
+            self.is_generator(),
+            self.needs_arg_checks(),
+            self.params.len(),
+            self.captured.is_some(),
+            self.variadic_param_index.is_some(),
+            self.kwvariadic_param_index.is_some(),
+            self.defaults.iter().any(std::option::Option::is_some),
+        );
+    }
+
+    #[must_use]
+    pub fn compute_hot_call_argc(
+        lightweight: bool,
+        is_generator: bool,
+        needs_arg_checks: bool,
+        params_len: usize,
+        has_captured: bool,
+        has_variadic: bool,
+        has_kwvariadic: bool,
+        has_defaults: bool,
+    ) -> u16 {
+        if lightweight
+            && !is_generator
+            && !needs_arg_checks
+            && !has_captured
+            && !has_variadic
+            && !has_kwvariadic
+            && !has_defaults
+            && params_len < HOT_CALL_ARGC_NONE as usize
+        {
+            params_len as u16
+        } else {
+            HOT_CALL_ARGC_NONE
+        }
+    }
+
     pub fn new(name: impl Into<String>, params: Vec<FuncParam>, body: Vec<Instruction>) -> Self {
         let hot = crate::hot_code::HotCode::encode(&body);
+        let needs_arg_checks = params.iter().any(|p| p.type_strong || p.implicit);
+        let flags = FuncFlags::pack(
+            false, // lightweight
+            needs_arg_checks,
+            false, // is_generator
+            true,  // track_frames
+            true,  // uses_name_map
+            false, // return_strong
+            false, // types_resolved
+            false, // is_builtin_body
+        );
         Self {
+            hot,
+            entry_pc: 0,
+            frame_slots: 0,
+            fast_locals: 0,
+            entry_label: 0,
+            hot_call_argc: HOT_CALL_ARGC_NONE,
+            flags,
             name: name.into(),
             params,
             body: Arc::new(body),
-            hot,
             line_map: Arc::new(Vec::new()),
             column_map: Arc::new(Vec::new()),
-            entry_label: 0,
-            fast_locals: 0,
-            is_builtin_body: false,
             variadic_param_index: None,
             kwvariadic_param_index: None,
             defaults: Vec::new(),
             captured: None,
             return_type: None,
-            return_strong: false,
             return_wrapper: None,
             param_types: Vec::new(),
             return_type_value: None,
-            types_resolved: false,
-            frame_slots: 0,
-            uses_name_map: true,
-            track_frames: true,
-            entry_pc: 0,
-            lightweight: false,
-            is_generator: false,
             module_env: None,
             source: None,
             source_file: "<script>".into(),

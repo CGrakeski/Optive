@@ -231,7 +231,7 @@ pub enum Stmt {
         base: Option<String>,
         fields: Vec<StructField>,
         methods: Vec<StructMethod>,
-        /// 尾部注解，如 `} : C.layout`。
+        /// 尾部注解，如 `} : C.layout`（经属性链解析到一等 Layout）。
         layout: Option<Expr>,
     },
     MacroDecl {

@@ -68,7 +68,6 @@ fn run_project_with_manifest_no_deps() {
         r#"
 [package]
 name = "demo_no_deps"
-version = "0.1.0"
 entry = "src/main.tive"
 "#,
     )
@@ -198,7 +197,6 @@ fn run_with_forced_color_emits_ansi() {
         r#"
 [package]
 name = "demo_color"
-version = "0.0.1"
 entry = "src/main.tive"
 "#,
     )
@@ -394,7 +392,6 @@ fn run_dashdash_uses_cwd_and_passes_script_args() {
         r#"
 [package]
 name = "run_dashdash"
-version = "0.1.0"
 entry = "src/main.tive"
 "#,
     )
@@ -426,7 +423,6 @@ fn run_path_then_dashdash_script_args() {
         r#"
 [package]
 name = "run_path_dash"
-version = "0.1.0"
 entry = "src/main.tive"
 "#,
     )
@@ -462,7 +458,6 @@ fn run_sandbox_before_dashdash() {
         r#"
 [package]
 name = "run_sandbox_dash"
-version = "0.1.0"
 entry = "src/main.tive"
 "#,
     )
@@ -488,7 +483,6 @@ fn run_rejects_multiple_args_before_dashdash() {
         r#"
 [package]
 name = "run_multi_pre_dash"
-version = "0.1.0"
 entry = "src/main.tive"
 "#,
     )
@@ -501,6 +495,130 @@ entry = "src/main.tive"
     assert_eq!(code, 2, "stderr={stderr}");
     assert!(
         stderr.contains("too many arguments before '--'") || stderr.contains("Error:"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn help_lists_test_and_index_sync() {
+    let root = tempfile_project("help_cmds");
+    let (code, stdout, stderr) = run_optive(&["--help"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(
+        stdout.contains("index sync"),
+        "help should mention index sync:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Optive test"),
+        "help should mention test:\n{stdout}"
+    );
+}
+
+#[test]
+fn test_command_runs_tive_files() {
+    let root = tempfile_project("tive_tests");
+    fs::write(
+        root.join("Optive.toml"),
+        r#"
+[package]
+name = "tive_tests"
+entry = "src/main.tive"
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/main.tive"), "print(1)\n").unwrap();
+    fs::create_dir_all(root.join("tests")).unwrap();
+    fs::write(
+        root.join("tests/ok.tive"),
+        "use std.test.{ assert_eq }\nassert_eq(1 + 1, 2)\n",
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["test"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(stdout.contains("ok.tive"), "stdout={stdout}");
+    assert!(stdout.contains("test result: ok"), "stdout={stdout}");
+}
+
+#[test]
+fn test_command_fails_on_assertion() {
+    let root = tempfile_project("tive_tests_fail");
+    fs::write(
+        root.join("Optive.toml"),
+        r#"
+[package]
+name = "tive_tests_fail"
+entry = "src/main.tive"
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/main.tive"), "print(1)\n").unwrap();
+    fs::create_dir_all(root.join("tests")).unwrap();
+    fs::write(
+        root.join("tests/bad.tive"),
+        "use std.test.{ assert_eq }\nassert_eq(1, 2)\n",
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["test"], &root);
+    assert_ne!(code, 0, "expected failure, stdout={stdout} stderr={stderr}");
+    assert!(
+        stdout.contains("FAILED") || stderr.contains("failed"),
+        "stdout={stdout}\nstderr={stderr}"
+    );
+}
+
+#[test]
+fn test_command_passes_script_args_after_dashdash() {
+    let root = tempfile_project("tive_tests_args");
+    fs::write(
+        root.join("Optive.toml"),
+        r#"
+[package]
+name = "tive_tests_args"
+entry = "src/main.tive"
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/main.tive"), "print(1)\n").unwrap();
+    fs::create_dir_all(root.join("tests")).unwrap();
+    fs::write(
+        root.join("tests/args.tive"),
+        r#"
+use std.test.{ assert_eq }
+let a = std.os.args()
+assert_eq(a[len(a) - 1], "from-test")
+"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["test", "--", "from-test"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(stdout.contains("test result: ok"), "stdout={stdout}");
+}
+
+#[test]
+fn test_command_rejects_extra_positionals_without_dashdash() {
+    let root = tempfile_project("tive_tests_extra");
+    fs::write(
+        root.join("Optive.toml"),
+        r#"
+[package]
+name = "tive_tests_extra"
+entry = "src/main.tive"
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/main.tive"), "print(1)\n").unwrap();
+
+    let (code, _stdout, stderr) = run_optive(&["test", "a", "b"], &root);
+    assert_eq!(code, 2, "stderr={stderr}");
+    assert!(
+        stderr.contains("too many arguments") || stderr.contains("Error:"),
         "stderr={stderr}"
     );
 }

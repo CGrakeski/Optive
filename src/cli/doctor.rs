@@ -22,6 +22,34 @@ pub fn print_env() {
     println!("custom/:                 {}", home::custom_dir().display());
     println!("Config.toml:             {}", home::global_config_path().display());
     println!("index.db:                {}", home::index_db_path().display());
+    println!("index dir:               {}", super::registry::index_dir().display());
+    let index_json = super::registry::index_json_path();
+    println!(
+        "index.json:               {} ({})",
+        index_json.display(),
+        if index_json.is_file() {
+            "present"
+        } else {
+            "missing"
+        }
+    );
+    if let Some(origin) = super::git_ops::origin_fetch_url(&super::registry::index_dir()) {
+        println!("index checkout origin:   {origin}");
+    }
+    println!(
+        "index.url file:          {}",
+        super::main_index::index_url_config_path().display()
+    );
+    match super::main_index::resolve_index_url() {
+        Ok((u, src)) => {
+            println!("index remote:            {u}");
+            println!("index remote source:     {}", src.label());
+        }
+        Err(e) => println!("index remote:            (error: {e})"),
+    }
+    if let Ok(v) = std::env::var("OPTIVE_INDEX_URL") {
+        println!("OPTIVE_INDEX_URL (env):  {v}");
+    }
     println!(
         "OPTIVE_USE_LOCAL_DEPS:   {}",
         if home::use_local_deps() {
@@ -98,13 +126,44 @@ fn doctor_project(
     project: &Project,
     verbose: bool,
     errors: &mut i32,
-    _warnings: &mut i32,
+    warnings: &mut i32,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let ver_label = super::repo_meta::project_version_label(&project.root)
+        .unwrap_or_else(|| "(no git)".into());
     println!(
-        "project: {} ({})",
+        "project: {} {} ({})",
         project.manifest.package.name,
+        ver_label,
         project.root.display()
     );
+
+    if super::repo_meta::package_toml_has_legacy_version(&project.root) {
+        *errors += 1;
+        println!(
+            "error: [package].version in Optive.toml is forbidden (tag-only); remove it and use `Optive publish <version>`"
+        );
+    }
+
+    match super::repo_meta::head_exact_tag(&project.root) {
+        Some(tag) => println!("git tag at HEAD: {tag}"),
+        None => {
+            *warnings += 1;
+            println!("git tag at HEAD: (none) — release with `Optive publish <version>`");
+        }
+    }
+
+    match super::repo_meta::is_worktree_dirty(&project.root) {
+        Ok(true) => {
+            *warnings += 1;
+            println!("worktree: dirty (publish requires a clean worktree)");
+        }
+        Ok(false) => println!("worktree: clean"),
+        Err(e) => {
+            if verbose {
+                println!("worktree: (could not check: {e})");
+            }
+        }
+    }
 
     if let Some(lock) = LockFile::load(&project.lock_path())? {
         if lock.matches_root_intent(&project.manifest) {
@@ -251,13 +310,6 @@ pub fn list_deps(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     for (name, dep) in &project.manifest.dependencies {
         let edge = root_edges.get(name.as_str()).copied();
         let (path, present) = resolve_dep_path(&project, name, edge, store.as_ref());
-        let pkg_ver = if present {
-            path.as_ref()
-                .and_then(|p| read_pkg_version(p))
-                .unwrap_or_else(|| "—".into())
-        } else {
-            "—".into()
-        };
         let effective = edge.map_or_else(|| "—".into(), |e| short_rev(&e.rev));
         let mode = rev_mode_label(&dep.rev);
         let path_disp = match (&path, present) {
@@ -269,12 +321,11 @@ pub fn list_deps(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "  {}  {}",
             color::purple(name),
-            color::cyan(&pkg_ver)
+            color::cyan(&effective)
         );
         println!(
-            "    {}  {}  ·  {}",
-            color::dim("rev"),
-            effective,
+            "    {}  {}",
+            color::dim("mode"),
             color::dim(&mode)
         );
         println!("    {}  {}", color::dim("git"), dep.git);
@@ -320,6 +371,7 @@ fn rev_mode_label(rev: &RevSpec) -> String {
         RevSpec::Tag(t) => format!("tag {t}"),
         RevSpec::Branch(b) => format!("branch {b}"),
         RevSpec::None => "tip (trackable)".into(),
+        RevSpec::IndexVersion(v) => format!("index {v}"),
     }
 }
 
@@ -333,7 +385,7 @@ fn short_rev(rev: &str) -> String {
 
 fn short_id(id: &str) -> String {
     if id.len() > 12 {
-        format!("{}…", &id[..12])
+        format!("{}...", &id[..12])
     } else {
         id.to_string()
     }
@@ -341,7 +393,7 @@ fn short_id(id: &str) -> String {
 
 fn short_git(git: &str) -> String {
     if git.len() > 48 {
-        format!("{}…", &git[..45])
+        format!("{}...", &git[..45])
     } else {
         git.to_string()
     }
@@ -380,21 +432,4 @@ fn resolve_dep_path(
         return (Some(p), ok);
     }
     (None, false)
-}
-
-fn read_pkg_version(package_root: &Path) -> Option<String> {
-    for name in ["Optive.toml"] {
-        let p = package_root.join(name);
-        if !p.is_file() {
-            continue;
-        }
-        let text = fs::read_to_string(&p).ok()?;
-        let val: toml::Value = text.parse().ok()?;
-        return val
-            .get("package")?
-            .get("version")?
-            .as_str()
-            .map(std::string::ToString::to_string);
-    }
-    None
 }

@@ -39,7 +39,7 @@ sha2 = "0.10"
 hex = "0.4"
 digest = "0.10"
 hmac = "0.12"
-gix = { version = "0.85", features = ["blocking-network-client", "worktree-mutation", "blocking-http-transport-reqwest-rust-tls"] }
+gix = { version = "0.85", features = ["blocking-network-client", "worktree-mutation", "blocking-http-transport-reqwest-rust-tls", "merge"] }
 reqwest = { version = "0.11", features = ["rustls-tls-native-roots", "blocking"] }
 indicatif = "0"
 libloading = "0.8"
@@ -70,9 +70,11 @@ path = "benches/optive.rs"
 [profile.release]
 lto = "thin"
 strip = true
-codegen-units = 4
+# 单 CGU 让热分派/栈操作更易跨函数内联，微基准对 CGU=4 极敏感。
+codegen-units = 1
 debug-assertions = false
-overflow-checks = true
+# 热循环大量 `-= 1`；溢出检查会给空循环/fib 增加可观开销。语义用 wrapping/显式检查覆盖。
+overflow-checks = false
 
 ## 保留符号，供 samply / ETW 采样定位函数热点。
 [profile.profiling]

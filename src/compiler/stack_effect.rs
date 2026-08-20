@@ -128,6 +128,7 @@ impl Instruction {
             | Self::LoadFastSubImm { .. }
             | Self::LoadFastLeImm { .. }
             | Self::FindMod(_)
+            | Self::FindModFile(_)
             | Self::PushExc
             | Self::ExcMatch(_) => Adjust {
                 pop: 0,

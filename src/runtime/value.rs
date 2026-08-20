@@ -252,10 +252,43 @@ impl fmt::Display for Num {
 
 pub type BuiltinFn = Arc<dyn Fn(&mut crate::vm::Vm, &[Value]) -> Result<Value> + Send + Sync>;
 
+/// 具名内建：短名用于 repr（`<builtin alloc>`），不含模块点分路径。
+#[derive(Clone)]
+pub struct BuiltinObject {
+    pub name: Arc<str>,
+    pub func: BuiltinFn,
+}
+
+impl BuiltinObject {
+    pub fn new(
+        name: impl Into<Arc<str>>,
+        func: BuiltinFn,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            name: name.into(),
+            func,
+        })
+    }
+
+    pub fn call(&self, vm: &mut crate::vm::Vm, args: &[Value]) -> Result<Value> {
+        (self.func)(vm, args)
+    }
+
+    #[must_use]
+    pub fn repr(&self) -> String {
+        builtin_repr(&self.name)
+    }
+}
+
+/// 与 [`BuiltinObject::repr`] 同形：诊断前缀用短名，禁止手写 `"<builtin …>"` 字面量漂移。
+#[must_use]
+pub fn builtin_repr(name: &str) -> String {
+    format!("<builtin {name}>")
+}
+
 #[derive(Clone)]
 pub struct ModuleObject {
     pub name: String,
-    pub full_name: String,
     pub exports: HashMap<String, Value>,
     pub children: HashMap<String, Shared<Self>>,
     pub is_user: bool,
@@ -263,10 +296,9 @@ pub struct ModuleObject {
 
 impl ModuleObject {
     #[must_use]
-    pub fn new_user(name: String, full_name: String) -> Self {
+    pub fn new_user(name: String) -> Self {
         Self {
             name,
-            full_name,
             exports: HashMap::new(),
             children: HashMap::new(),
             is_user: true,
@@ -338,10 +370,29 @@ pub enum IteratorKind {
     Channel {
         channel: Shared<ChannelInner>,
     },
-    /// `stream_take` / 惰性 take：最多产出 `remaining` 个元素。
+    /// `stream_take` / `std.iter.take`：最多产出 `remaining` 个元素。
     Take {
         remaining: usize,
         source: Shared<IteratorState>,
+    },
+    /// `std.iter.skip` / `drop`：先丢弃 `remaining` 个，再透传源。
+    Skip {
+        remaining: usize,
+        source: Shared<IteratorState>,
+    },
+    /// `std.iter.enumerate`：产出 `[index, item]`（index 从 0）。
+    Enumerate {
+        index: usize,
+        source: Shared<IteratorState>,
+    },
+    /// `std.iter.chain`：依次耗尽多个源。
+    Chain {
+        sources: Vec<Shared<IteratorState>>,
+        current: usize,
+    },
+    /// 用户类型迭代器协议：对 `obj` 反复调用 `__next__`；耗尽时抛 `StopIteration`。
+    User {
+        obj: Value,
     },
     /// 用户生成器：调用含 `yield` 的 func/do 得到的惰性迭代器。
     Generator {
@@ -741,7 +792,7 @@ pub enum Value {
     Function(Arc<FunctionObject>),
     GenericFunction(Arc<crate::opcode::GenericFunctionTemplate>),
     Macro(Arc<MacroObject>),
-    Builtin(BuiltinFn),
+    Builtin(Arc<BuiltinObject>),
     Struct(Arc<StructInstance>),
     Module(Shared<ModuleObject>),
     RuntimeAst(Arc<RuntimeAstNode>),
@@ -767,6 +818,8 @@ pub enum Value {
     Sync(Shared<SyncInner>),
     /// `RWMutex` 读/写守卫。
     SyncGuard(Shared<SyncGuardInner>),
+    /// 一等布局对象（模块属性如 `C.layout`）：规定 struct 字段的存放顺序/对齐规则。
+    Layout(std::sync::Arc<crate::ffi_extra::LayoutObject>),
 }
 
 /// [`Value::TypeSpec`] 的堆载荷 — 移出 `Value` 枚举以保持栈表示紧凑。
@@ -829,13 +882,14 @@ pub struct EnumMemberInfo {
 pub struct EnumDef {
     pub name: String,
     pub members: Vec<EnumMemberInfo>,
+    /// 类型自身的方法表；`Enum.method` 在此查。
+    pub methods: std::collections::HashMap<String, std::sync::Arc<crate::opcode::FunctionObject>>,
 }
 
 #[derive(Clone)]
 pub struct EnumMemberData {
     pub def: Arc<EnumDef>,
     pub member_index: usize,
-    pub type_name: String,
 }
 
 #[derive(Clone)]
@@ -875,8 +929,11 @@ pub struct StructDef {
     pub typed: bool,
     pub field_types: Vec<FieldTypeInfo>,
     pub type_params: Vec<(String, Option<crate::ast::Expr>)>,
-    /// `typed struct … : C.layout` 时填充；供 `C.load` / `C.store` / `C.alloc(T)`。
-    pub c_layout: Option<std::sync::Arc<crate::ffi_extra::CStructLayout>>,
+    /// `typed struct ... : <layout>` 计算出的本地布局；供 load / store / by-value FFI。
+    pub native_layout: Option<std::sync::Arc<crate::ffi_extra::NativeStructLayout>>,
+    /// 类型自身的方法表；`a.b` 在此查 `b`，不走全局点分键。
+    pub methods: std::collections::HashMap<String, std::sync::Arc<crate::opcode::FunctionObject>>,
+    pub overloads: std::collections::HashMap<String, Vec<std::sync::Arc<crate::opcode::FunctionObject>>>,
 }
 
 #[derive(Clone)]
@@ -894,6 +951,22 @@ impl Value {
 
     pub fn type_ref(name: impl Into<String>) -> Self {
         Self::TypeRef(name.into())
+    }
+
+    /// 具名内建（短名；repr 为 `<builtin name>`）。
+    pub fn builtin(
+        name: impl Into<Arc<str>>,
+        f: impl Fn(&mut crate::vm::Vm, &[Value]) -> Result<Value> + Send + Sync + 'static,
+    ) -> Self {
+        Self::Builtin(BuiltinObject::new(name, Arc::new(f)))
+    }
+
+    /// 由 `fn` 指针构造具名内建。
+    pub fn builtin_fn(
+        name: impl Into<Arc<str>>,
+        f: fn(&mut crate::vm::Vm, &[Value]) -> Result<Value>,
+    ) -> Self {
+        Self::Builtin(BuiltinObject::new(name, Arc::new(f)))
     }
 
     /// 索引 / 注解用的类型名操作数（`TypeRef`，以及旧式 `Text`）。
@@ -934,7 +1007,7 @@ impl Value {
             Self::RuntimeAst(_) => "AST",
             Self::Cell(_) => "cell",
             Self::TypeSpec(_) => "type",
-            Self::EnumMember(m) => &m.type_name,
+            Self::EnumMember(m) => m.def.name.as_str(),
             Self::Variant(v) => &v.inst_name,
             Self::Task(_) => "Task",
             Self::Channel(_) => "Channel",
@@ -956,6 +1029,7 @@ impl Value {
                 SyncGuardInner::Read { .. } => "RWMutexReadGuard",
                 SyncGuardInner::Write { .. } => "RWMutexWriteGuard",
             },
+            Self::Layout(_) => "Layout",
         }
     }
 
@@ -1044,8 +1118,8 @@ impl Value {
             Self::GenericFunction(g) => format!("<generic function {}>", g.name),
             Self::Macro(m) => format!("<macro {}>", m.name),
             Self::Dispatch(d) => format!("<friend func {}>", d.borrow().name),
-            Self::Builtin(_) => "<builtin function>".to_string(),
-            Self::Module(m) => format!("<module {}>", m.borrow().full_name),
+            Self::Builtin(b) => b.repr(),
+            Self::Module(m) => format!("<module {}>", m.borrow().name),
             Self::Struct(s) => {
                 let parts: Vec<_> = s
                     .def
@@ -1105,6 +1179,7 @@ impl Value {
                 SyncGuardInner::Read { .. } => "<RWMutexReadGuard>".to_string(),
                 SyncGuardInner::Write { .. } => "<RWMutexWriteGuard>".to_string(),
             },
+            Self::Layout(_) => "<Layout>".to_string(),
         }
     }
 
@@ -1290,6 +1365,10 @@ impl Value {
                 Ok(crate::enum_variant::enum_member_numeric_value(m).eq_num(n))
             }
             (Self::Variant(a), Self::Variant(b)) => Ok(Arc::ptr_eq(a, b)),
+            (Self::Layout(a), Self::Layout(b)) => Ok(Arc::ptr_eq(a, b) || a.strategy == b.strategy),
+            (Self::Builtin(a), Self::Builtin(b)) => Ok(Arc::ptr_eq(a, b)),
+            (Self::Function(a), Self::Function(b)) => Ok(Arc::ptr_eq(a, b)),
+            (Self::GenericFunction(a), Self::GenericFunction(b)) => Ok(Arc::ptr_eq(a, b)),
             _ => Err(RuntimeError::unsupported(format!(
                 "unsupported == between {} and {}",
                 self.type_name(),
@@ -1328,11 +1407,12 @@ pub fn values_identical(a: &Value, b: &Value) -> bool {
         (Value::SyncGuard(x), Value::SyncGuard(y)) => Shared::ptr_eq(x, y),
         (Value::Function(x), Value::Function(y)) => Arc::ptr_eq(x, y),
         (Value::GenericFunction(x), Value::GenericFunction(y)) => Arc::ptr_eq(x, y),
-        (Value::Builtin(x), Value::Builtin(y)) => std::ptr::eq(x, y),
+        (Value::Builtin(x), Value::Builtin(y)) => Arc::ptr_eq(x, y),
         (Value::Module(x), Value::Module(y)) => Shared::ptr_eq(x, y),
         (Value::TypeSpec(a), Value::TypeSpec(b)) => a.as_ref() == b.as_ref(),
         (Value::EnumMember(x), Value::EnumMember(y)) => Arc::ptr_eq(x, y),
         (Value::Variant(x), Value::Variant(y)) => Arc::ptr_eq(x, y),
+        (Value::Layout(x), Value::Layout(y)) => Arc::ptr_eq(x, y),
         _ => false,
     }
 }
@@ -1687,6 +1767,60 @@ impl IteratorState {
                         Ok(Some(v))
                     }
                     None => Ok(None),
+                }
+            }
+            IteratorKind::Skip { remaining, source } => {
+                let source = source.clone();
+                while *remaining > 0 {
+                    let next = source.borrow_mut().next_value(vm)?;
+                    match next {
+                        Some(_) => *remaining -= 1,
+                        None => return Ok(None),
+                    }
+                }
+                let next = source.borrow_mut().next_value(vm)?;
+                Ok(next)
+            }
+            IteratorKind::Enumerate { index, source } => {
+                let source = source.clone();
+                let next = source.borrow_mut().next_value(vm)?;
+                match next {
+                    Some(item) => {
+                        let i = *index;
+                        *index = index.saturating_add(1);
+                        Ok(Some(Value::List(Shared::new(vec![
+                            Value::Num(Num::Small(i as i64)),
+                            item,
+                        ]))))
+                    }
+                    None => Ok(None),
+                }
+            }
+            IteratorKind::Chain { sources, current } => loop {
+                if *current >= sources.len() {
+                    return Ok(None);
+                }
+                let src = sources[*current].clone();
+                let next = src.borrow_mut().next_value(vm)?;
+                match next {
+                    Some(v) => return Ok(Some(v)),
+                    None => *current += 1,
+                }
+            },
+            IteratorKind::User { obj } => {
+                let obj = obj.clone();
+                match vm.try_call_magic(&obj, "__next__", vec![]) {
+                    Some(Ok(v)) => Ok(Some(v)),
+                    Some(Err(e))
+                        if e.kind() == crate::error::ExceptionKind::StopIteration =>
+                    {
+                        vm.active_exception = None;
+                        Ok(None)
+                    }
+                    Some(Err(e)) => Err(e),
+                    None => Err(RuntimeError::type_err(
+                        "iterator protocol requires __next__",
+                    )),
                 }
             }
             IteratorKind::Generator { .. } => Err(RuntimeError::msg(

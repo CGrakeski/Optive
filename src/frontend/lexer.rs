@@ -258,7 +258,8 @@ impl Lexer {
             return self.read_ident(line, col);
         }
 
-        // 三点省略号：空块（≡ `{}`）、catch 通配 / 类型省略
+        // 三点省略号：保留为 Ellipsis。仅在语法需要块的位置（如 `func f() ...`）
+        // 由解析器当成空块 `{}`；`catch (e: ...)` 等处保持原义。
         if self.source[self.pos..].starts_with("...") {
             self.pos += 3;
             self.column += 3;

@@ -19,6 +19,8 @@ pub enum RevSpec {
     Branch(String),
     /// 裸 URL：可追默认 tip
     None,
+    /// 包名在 toml 键里，值是版本号；git URL 从 index.json 查
+    IndexVersion(String),
 }
 
 impl RevSpec {
@@ -42,8 +44,6 @@ pub struct Manifest {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Package {
     pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// 入口脚本；默认依次尝试 `src/main.tive`、`main.tive`。
@@ -76,6 +76,20 @@ impl Dependency {
     pub fn with_tag(git: impl Into<String>, tag: impl Into<String>) -> Self {
         Self::with_rev(git, RevSpec::Tag(tag.into()))
     }
+
+    pub fn from_index_version(version: impl Into<String>) -> Self {
+        Self {
+            git: String::new(),
+            rev: RevSpec::IndexVersion(version.into()),
+        }
+    }
+
+    pub fn from_git_version(git: impl Into<String>, version: impl Into<String>) -> Self {
+        Self {
+            git: git.into(),
+            rev: RevSpec::IndexVersion(version.into()),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for Dependency {
@@ -88,7 +102,8 @@ impl<'de> Deserialize<'de> for Dependency {
         enum Raw {
             Url(String),
             Table {
-                git: String,
+                #[serde(default)]
+                git: Option<String>,
                 #[serde(default)]
                 rev: Option<String>,
                 #[serde(default)]
@@ -100,10 +115,16 @@ impl<'de> Deserialize<'de> for Dependency {
             },
         }
         match Raw::deserialize(deserializer)? {
-            Raw::Url(git) => Ok(Self {
-                git,
-                rev: RevSpec::None,
-            }),
+            Raw::Url(s) => {
+                if super::git_ops::looks_like_git_url(&s) {
+                    Ok(Self {
+                        git: s,
+                        rev: RevSpec::None,
+                    })
+                } else {
+                    Ok(Self::from_index_version(s))
+                }
+            }
             Raw::Table {
                 git,
                 rev,
@@ -111,6 +132,7 @@ impl<'de> Deserialize<'de> for Dependency {
                 tag,
                 version,
             } => {
+                let git = git.filter(|s| !s.trim().is_empty());
                 let set = [
                     rev.is_some(),
                     branch.is_some(),
@@ -125,19 +147,35 @@ impl<'de> Deserialize<'de> for Dependency {
                         "dependency may set only one of rev / branch / tag / version",
                     ));
                 }
-                let rev = if let Some(r) = rev {
-                    RevSpec::Commit(r)
-                } else if let Some(b) = branch {
-                    RevSpec::Branch(b)
-                } else if let Some(t) = tag {
-                    RevSpec::Tag(t)
-                } else if let Some(v) = version {
-                    // legacy alias → treat as tag/commit pin
-                    RevSpec::Commit(v)
-                } else {
-                    RevSpec::None
-                };
-                Ok(Self { git, rev })
+                match git {
+                    None => {
+                        if rev.is_some() || branch.is_some() || tag.is_some() {
+                            return Err(serde::de::Error::custom(
+                                "rev / branch / tag require a git URL",
+                            ));
+                        }
+                        let Some(v) = version else {
+                            return Err(serde::de::Error::custom(
+                                "dependency table needs git or version",
+                            ));
+                        };
+                        Ok(Self::from_index_version(v))
+                    }
+                    Some(git) => {
+                        let rev = if let Some(r) = rev {
+                            RevSpec::Commit(r)
+                        } else if let Some(b) = branch {
+                            RevSpec::Branch(b)
+                        } else if let Some(t) = tag {
+                            RevSpec::Tag(t)
+                        } else if let Some(v) = version {
+                            return Ok(Self::from_git_version(git, v));
+                        } else {
+                            RevSpec::None
+                        };
+                        Ok(Self { git, rev })
+                    }
+                }
             }
         }
     }
@@ -151,6 +189,16 @@ impl Serialize for Dependency {
         use serde::ser::SerializeMap;
         match &self.rev {
             RevSpec::None => serializer.serialize_str(&self.git),
+            RevSpec::IndexVersion(v) => {
+                if self.git.is_empty() {
+                    serializer.serialize_str(v)
+                } else {
+                    let mut m = serializer.serialize_map(Some(2))?;
+                    m.serialize_entry("git", &self.git)?;
+                    m.serialize_entry("version", v)?;
+                    m.end()
+                }
+            }
             RevSpec::Commit(r) => {
                 let mut m = serializer.serialize_map(Some(2))?;
                 m.serialize_entry("git", &self.git)?;
@@ -329,6 +377,16 @@ pub fn set_track_latest(manifest_path: &Path, value: bool) -> Result<(), String>
 fn dependency_to_item(dep: &Dependency) -> toml_edit::Item {
     match &dep.rev {
         RevSpec::None => toml_edit::value(dep.git.as_str()),
+        RevSpec::IndexVersion(v) => {
+            if dep.git.is_empty() {
+                toml_edit::value(v.as_str())
+            } else {
+                let mut t = toml_edit::InlineTable::new();
+                t.insert("git", dep.git.as_str().into());
+                t.insert("version", v.as_str().into());
+                toml_edit::Item::Value(toml_edit::Value::InlineTable(t))
+            }
+        }
         RevSpec::Commit(r) => {
             let mut t = toml_edit::InlineTable::new();
             t.insert("git", dep.git.as_str().into());
@@ -391,6 +449,7 @@ pub fn load_project(manifest_path: &Path) -> Result<Project, String> {
     let text = fs::read_to_string(manifest_path).map_err(|e| {
         format!("cannot read {}: {e}", manifest_path.display())
     })?;
+    reject_forbidden_package_version(&text, manifest_path)?;
     let manifest: Manifest = toml::from_str(&text).map_err(|e| {
         format!("invalid {}: {e}", manifest_path.display())
     })?;
@@ -409,6 +468,26 @@ pub fn load_project(manifest_path: &Path) -> Result<Project, String> {
         manifest_path: strip_windows_verbatim(manifest_path.to_path_buf()),
         manifest,
     })
+}
+
+/// `[package].version` 已废除：存在即失败（tag-only，无兼容期）。
+fn reject_forbidden_package_version(text: &str, manifest_path: &Path) -> Result<(), String> {
+    let val: toml::Value = text.parse().map_err(|e| {
+        format!("invalid {}: {e}", manifest_path.display())
+    })?;
+    if val
+        .get("package")
+        .and_then(|p| p.as_table())
+        .is_some_and(|t| t.contains_key("version"))
+    {
+        return Err(format!(
+            "{}: [package].version is not supported.\n\
+             Package version is defined only by git tags. Remove the field, then release with:\n\
+               Optive publish <version>",
+            manifest_path.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Windows `canonicalize` 会得到 `\\?\D:\...`；用户可见路径去掉此前缀。
@@ -432,7 +511,6 @@ mod tests {
         let src = r#"
 [package]
 name = "demo"
-version = "0.1.0"
 entry = "src/main.tive"
 
 [dependencies]
@@ -440,6 +518,9 @@ helper = "https://github.com/example/helper.git"
 other = { git = "https://github.com/example/other", rev = "abc123" }
 branched = { git = "https://github.com/example/b", branch = "main" }
 tagged = { git = "https://github.com/example/t", tag = "v1" }
+indexed = "0.1.2"
+indexed_table = { version = "1.2.3" }
+git_version = { git = "https://github.com/example/gv.git", version = "^0.1.0" }
 "#;
         let m: Manifest = toml::from_str(src).unwrap();
         assert_eq!(m.package.name, "demo");
@@ -461,6 +542,53 @@ tagged = { git = "https://github.com/example/t", tag = "v1" }
             m.dependencies["tagged"].rev,
             RevSpec::Tag(ref s) if s == "v1"
         ));
+        assert!(matches!(
+            m.dependencies["indexed"].rev,
+            RevSpec::IndexVersion(ref s) if s == "0.1.2"
+        ));
+        assert!(m.dependencies["indexed"].git.is_empty());
+        assert!(matches!(
+            m.dependencies["indexed_table"].rev,
+            RevSpec::IndexVersion(ref s) if s == "1.2.3"
+        ));
+        assert_eq!(
+            m.dependencies["git_version"].git,
+            "https://github.com/example/gv.git"
+        );
+        assert!(matches!(
+            m.dependencies["git_version"].rev,
+            RevSpec::IndexVersion(ref s) if s == "^0.1.0"
+        ));
+        let round = toml::to_string(&m).unwrap();
+        assert!(
+            round.contains("version") && round.contains("github.com/example/gv"),
+            "git+version must round-trip git URL, got:\n{round}"
+        );
+    }
+
+    #[test]
+    fn package_version_field_is_rejected() {
+        let dir = std::env::temp_dir().join(format!(
+            "optive_forbid_ver_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Optive.toml");
+        fs::write(
+            &path,
+            r#"
+[package]
+name = "demo"
+version = "0.1.0"
+entry = "src/main.tive"
+"#,
+        )
+        .unwrap();
+        let err = load_project(&path).unwrap_err();
+        assert!(err.contains("[package].version is not supported"), "{err}");
+        assert!(err.contains("Optive publish"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

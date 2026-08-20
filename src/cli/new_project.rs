@@ -47,8 +47,8 @@ pub fn create_project(parent: &Path, name: &str) -> Result<PathBuf, String> {
     let manifest = format!(
         r#"[package]
 name = "{name}"
-version = "0.0.1"
 entry = "src/main.tive"
+# Version is defined by git tags (e.g. v0.1.0), not in this file.
 
 [dependencies]
 "#
@@ -81,5 +81,20 @@ mod tests {
         assert!(validate_project_name("a/b").is_err());
         assert!(validate_project_name(".hidden").is_err());
         assert!(validate_project_name("ok_Name-1").is_ok());
+    }
+
+    #[test]
+    fn template_has_no_version_field() {
+        let parent = std::env::temp_dir().join(format!(
+            "optive_new_tpl_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&parent);
+        fs::create_dir_all(&parent).unwrap();
+        let root = create_project(&parent, "TplDemo").unwrap();
+        let text = fs::read_to_string(root.join("Optive.toml")).unwrap();
+        assert!(!text.lines().any(|l| l.trim_start().starts_with("version")));
+        assert!(text.contains("git tags"));
+        let _ = fs::remove_dir_all(&parent);
     }
 }

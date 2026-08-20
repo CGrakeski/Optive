@@ -172,8 +172,10 @@ fn type_has_method_ctx(ctx: &TypeCheckContext, type_name: &str, method: &str) ->
     if type_registry::protocol_has_method(type_name, method) {
         return true;
     }
-    let key = format!("{type_name}.{method}");
-    ctx.functions.contains_key(&key)
+    if let Some(def) = ctx.struct_defs.get(type_name) {
+        return def.methods.contains_key(method) || def.overloads.contains_key(method);
+    }
+    false
 }
 
 fn type_has_field_ctx(ctx: &TypeCheckContext, type_name: &str, field: &str, mutable: bool) -> bool {

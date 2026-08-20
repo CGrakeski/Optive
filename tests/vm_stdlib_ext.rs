@@ -185,6 +185,68 @@ fn xml_parse() {
 }
 
 #[test]
+fn toml_yaml_xml_stringify_roundtrip() {
+    let v = value(r#"std.toml.parse(std.toml.stringify({"x": 1, "y": "hi"}))"#);
+    match v {
+        Value::Dict(d) => {
+            let d = d.borrow();
+            match d.get(&optive::value::ValueKey::Text("x".into())) {
+                Some(Value::Num(n)) => assert_eq!(n.to_i64(), Some(1)),
+                other => panic!("expected x=1, got {other:?}"),
+            }
+            match d.get(&optive::value::ValueKey::Text("y".into())) {
+                Some(Value::Text(s)) => assert_eq!(s, "hi"),
+                other => panic!("expected y=\"hi\", got {other:?}"),
+            }
+        }
+        other => panic!("{}", other.display_string()),
+    }
+    let v = value(r#"std.yaml.parse(std.yaml.stringify({"x": 1}))"#);
+    match v {
+        Value::Dict(d) => {
+            match d.borrow().get(&optive::value::ValueKey::Text("x".into())) {
+                Some(Value::Num(n)) => assert_eq!(n.to_i64(), Some(1)),
+                other => panic!("expected x=1, got {other:?}"),
+            }
+        }
+        other => panic!("{}", other.display_string()),
+    }
+    let xml = value(
+        r#"std.xml.stringify({"tag": "root", "attrs": {"a": "1"}, "text": "hi", "children": []})"#,
+    );
+    match xml {
+        Value::Text(s) => {
+            assert!(s.contains("<root"), "{s}");
+            assert!(s.contains("a=\"1\""), "{s}");
+            assert!(s.contains("hi"), "{s}");
+        }
+        other => panic!("{}", other.display_string()),
+    }
+}
+
+#[test]
+fn xml_stringify_rejects_invalid_qname() {
+    for src in [
+        r#"std.xml.stringify({"tag": ":root", "attrs": {}, "text": "", "children": []})"#,
+        r#"std.xml.stringify({"tag": "xml:", "attrs": {}, "text": "", "children": []})"#,
+        r#"std.xml.stringify({"tag": "a:b:c", "attrs": {}, "text": "", "children": []})"#,
+        r#"std.xml.stringify({"tag": "xml:1foo", "attrs": {}, "text": "", "children": []})"#,
+    ] {
+        assert!(
+            optive::run_source(src).is_err(),
+            "expected invalid tag error for: {src}"
+        );
+    }
+    let ok = value(
+        r#"std.xml.stringify({"tag": "xml:root", "attrs": {}, "text": "", "children": []})"#,
+    );
+    match ok {
+        Value::Text(s) => assert!(s.contains("<xml:root"), "{s}"),
+        other => panic!("{}", other.display_string()),
+    }
+}
+
+#[test]
 fn math_atan2_and_divmod() {
     let v = value("std.math.divmod(7, 3)");
     match v {

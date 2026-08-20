@@ -12,6 +12,7 @@ use super::lock::{self, LockEdge, LockFile, ROOT_PARENT};
 use super::manifest::{
     read_deps_if_exists, Dependency, Project, RevSpec,
 };
+use super::registry;
 use super::store::{self, Store};
 
 /// 包身份：根或 content id。
@@ -160,6 +161,7 @@ pub fn ensure_graph(
     }
 
     while let Some((parent, name, dep)) = queue.pop_front() {
+        let dep = bind_index_source(&name, dep)?;
         let effective_rev = resolve_effective_rev(
             &dep,
             force_fetch_tips,
@@ -250,7 +252,7 @@ pub fn ensure_graph(
                 _ => None,
             },
             tag: match &dep.rev {
-                RevSpec::Tag(t) => Some(t.clone()),
+                RevSpec::Tag(t) | RevSpec::IndexVersion(t) => Some(t.clone()),
                 _ => None,
             },
             pinned: matches!(dep.rev, RevSpec::Commit(_)),
@@ -364,7 +366,15 @@ fn ensure_from_lock(
             }
             path
         };
-        cache.put(&edge.git, None, &edge.rev, Some(&edge.id));
+        // 仅 tip/branch 写入 tip 缓存；tag/commit pin 不得污染 tip 槽。
+        if !edge.pinned && edge.tag.is_none() {
+            cache.put(
+                &edge.git,
+                edge.branch.as_deref(),
+                &edge.rev,
+                Some(&edge.id),
+            );
+        }
         dep_map.insert(
             (edge.parent.clone(), edge.name.clone()),
             DepBinding {
@@ -506,6 +516,16 @@ fn materialize_lock_subtree(
     Ok(())
 }
 
+fn bind_index_source(
+    name: &str,
+    mut dep: Dependency,
+) -> Result<Dependency, Box<dyn std::error::Error>> {
+    if matches!(dep.rev, RevSpec::IndexVersion(_)) && dep.git.is_empty() {
+        dep.git = registry::lookup_pack_url(name)?;
+    }
+    Ok(dep)
+}
+
 fn resolve_effective_rev(
     dep: &Dependency,
     force_fetch_tips: bool,
@@ -516,6 +536,7 @@ fn resolve_effective_rev(
         RevSpec::Commit(r) => Ok(r.clone()),
         // tag → 剥皮为 commit SHA，保证 CAS id / lock 可复现。
         RevSpec::Tag(t) => git_ops::resolve_tag_commit(&dep.git, t),
+        RevSpec::IndexVersion(v) => git_ops::resolve_version_commit(&dep.git, v),
         RevSpec::Branch(b) => {
             if force_fetch_tips || mode == ResolveMode::DryRun {
                 git_ops::resolve_remote_tip(&dep.git, Some(b))

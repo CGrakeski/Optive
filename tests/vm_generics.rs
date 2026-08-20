@@ -213,3 +213,39 @@ fn generic_func_repl_print_type_param() {
     let v = run_source_in_vm(&mut vm, "a[num](1)", "<repl>").expect("explicit call");
     assert!(matches!(v, optive::value::Value::None));
 }
+
+#[test]
+fn infer_from_list_and_arith() {
+    assert_text(
+        r"
+func id[T](x: T) {
+    return T
+}
+text(id([1, 2]))
+",
+        "list",
+    );
+    assert_text(
+        r"
+func id[T](x: T) {
+    return T
+}
+text(id(1 + 2))
+",
+        "num",
+    );
+}
+
+#[test]
+fn infer_two_type_params() {
+    assert_text(
+        r#"
+func pair[A, B](a: A, b: B) {
+    return [A, B]
+}
+let t = pair(1, "hi")
+text(t[0]) + "," + text(t[1])
+"#,
+        "num,text",
+    );
+}

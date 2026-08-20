@@ -114,6 +114,11 @@ impl Parser {
         }
     }
 
+    /// 语法上此处需要一个块：`{ ... }` 或空块糖 `...`。
+    fn check_block_start(&self) -> bool {
+        matches!(self.current().kind, TokenKind::LBrace | TokenKind::Ellipsis)
+    }
+
     fn expect(&mut self, kind: TokenKind, msg: &str) -> Result<Token, ParseError> {
         while matches!(
             self.current().kind,
@@ -289,6 +294,11 @@ impl Parser {
         let vis = self.parse_visibility();
         let is_const = self.match_kind(TokenKind::KwConst);
 
+        // 语句位置也可以写块；`...` 在此同样是空块（故 `{...}` 自然是 `{{}}`）。
+        if vis == Visibility::Default && !is_const && self.match_kind(TokenKind::Ellipsis) {
+            return Ok(Stmt::Block(Block::new()));
+        }
+
         if self.match_kind(TokenKind::KwWith) && self.check(TokenKind::LParen) {
             return self.parse_with_stmt();
         }
@@ -378,7 +388,7 @@ impl Parser {
             let saved = self.pos;
             self.advance();
             let cond = self.parse_is_ex(false)?;
-            if self.check(TokenKind::LBrace) {
+            if self.check_block_start() {
                 let then_block = self.parse_block()?;
                 let mut elifs = Vec::new();
                 loop {
@@ -392,7 +402,7 @@ impl Parser {
                     if self.match_kind(TokenKind::KwElse) {
                         if self.match_kind(TokenKind::KwIf) {
                             let c = self.parse_is_ex(false)?;
-                            if !self.check(TokenKind::LBrace) {
+                            if !self.check_block_start() {
                                 return Err(self.error("expected '{' after else-if condition"));
                             }
                             elifs.push((c, self.parse_block()?));
@@ -886,8 +896,8 @@ impl Parser {
     }
 
     fn parse_do_func_expr(&mut self, loc: SourceLoc) -> Result<Expr, ParseError> {
-        // `do { ... }` ≈ `do() { ... } ()` — 无参 IIFE 糖。
-        if self.check(TokenKind::LBrace) {
+        // `do { ... }` ≈ `do() { ... } ()` — 无参 IIFE 糖。`do ...` 即空体。
+        if self.check_block_start() {
             let body = self.parse_block()?;
             let do_func = Expr::new(
                 loc,
@@ -1318,14 +1328,13 @@ impl Parser {
     }
 
     fn parse_block(&mut self) -> Result<Block, ParseError> {
-        // 裸 `...` 等价于空块 `{}`（不是花括号内的语句）。
-        let bf_pos = self.pos;
-        (*self).skip_newlines();
-        if (*self).check(TokenKind::Ellipsis) {
-            self.pos += 1;
+        // 需要块的位置：`...` ≡ 空块 `{}`。catch 模式等不走这里，故不会误展开。
+        let saved = self.pos;
+        self.skip_newlines();
+        if self.match_kind(TokenKind::Ellipsis) {
             return Ok(Block::new());
         }
-        self.pos = bf_pos;
+        self.pos = saved;
         self.parse_block_inner()
     }
 

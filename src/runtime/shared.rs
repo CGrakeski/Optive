@@ -191,6 +191,7 @@ impl SharedMap {
         key: String,
         value: crate::value::Value,
     ) -> Option<crate::value::Value> {
+        crate::gc::write_barrier_new_ref(&value);
         self.inner.write().insert(key, value)
     }
 
@@ -203,8 +204,11 @@ impl SharedMap {
             return false;
         };
         if let crate::value::Value::Cell(cell) = slot {
+            // Cell::borrow_mut 已记脏卡；仍对写入值做插入屏障。
+            crate::gc::write_barrier_new_ref(&value);
             *cell.borrow_mut() = value;
         } else {
+            crate::gc::write_barrier_new_ref(&value);
             *slot = value;
         }
         true
@@ -233,7 +237,12 @@ impl SharedMap {
         key: String,
         f: impl FnOnce() -> crate::value::Value,
     ) {
-        self.inner.write().entry(key).or_insert_with(f);
+        let mut g = self.inner.write();
+        g.entry(key).or_insert_with(|| {
+            let v = f();
+            crate::gc::write_barrier_new_ref(&v);
+            v
+        });
     }
 
     #[inline]
@@ -269,6 +278,9 @@ impl SharedMap {
 
     #[inline]
     pub fn replace_with(&self, map: FxHashMap<String, crate::value::Value>) {
+        for v in map.values() {
+            crate::gc::write_barrier_new_ref(v);
+        }
         *self.inner.write() = map;
     }
 
@@ -277,7 +289,14 @@ impl SharedMap {
         &self,
         f: impl FnOnce(&mut FxHashMap<String, crate::value::Value>) -> R,
     ) -> R {
-        f(&mut self.inner.write())
+        let mut g = self.inner.write();
+        let out = f(&mut g);
+        if crate::gc::is_marking() {
+            for v in g.values() {
+                crate::gc::write_barrier_new_ref(v);
+            }
+        }
+        out
     }
 
     #[inline]

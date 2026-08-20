@@ -9,27 +9,30 @@ use crate::value::{
     SyncGuardInner, SyncInner, Value,
 };
 use crate::Result;
-use std::sync::Arc;
 
-/// 创建方法的辅助宏：克隆捕获变量并包装为 `Value::Builtin`。
-/// 使用方式：`method!(捕获变量, vm_param, { 闭包体 })`
+/// 创建方法的辅助宏：克隆捕获变量并包装为具名 `Value::builtin`。
+/// `method!("send", cap, vm, |args| { ... })` 或 `method!(field, cap, vm, |args| { ... })`。
 macro_rules! method {
-    ($cap:ident, $vm:ident, |$arg:ident| $body:block) => {{
+    ($name:expr, $cap:ident, $vm:ident, |$arg:ident| $body:block) => {{
         let $cap = $cap.clone();
-        Ok(Value::Builtin(Arc::new(move |$vm: &mut crate::vm::Vm, $arg: &[Value]| $body)))
+        let __name: &str = $name;
+        Ok(Value::builtin(
+            __name,
+            move |$vm: &mut crate::vm::Vm, $arg: &[Value]| $body,
+        ))
     }};
 }
 
 pub fn get_channel_method(ch: &Shared<ChannelInner>, field: &str) -> Result<Value> {
     match field {
-        "send" => method!(ch, vm, |args| {
+        "send" => method!("send", ch, vm, |args| {
             if args.len() != 1 {
                 return Err(RuntimeError::type_err("Channel.send requires 1 argument"));
             }
             vm.channel_send(&ch, args[0].clone())?;
             Ok(Value::None)
         }),
-        "recv" | "next" => method!(ch, vm, |args| {
+        "recv" | "next" => method!("recv", ch, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err(
                     "Channel.recv/next takes no arguments",
@@ -37,7 +40,7 @@ pub fn get_channel_method(ch: &Shared<ChannelInner>, field: &str) -> Result<Valu
             }
             vm.channel_recv(&ch)
         }),
-        "close" => method!(ch, vm, |args| {
+        "close" => method!("close", ch, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err("Channel.close takes no arguments"));
             }
@@ -47,14 +50,14 @@ pub fn get_channel_method(ch: &Shared<ChannelInner>, field: &str) -> Result<Valu
         }),
         "as_stream" => {
             let ch = ch.clone();
-            Ok(Value::Builtin(Arc::new(move |_vm, args| {
+            Ok(Value::builtin("as_stream", move |_vm, args| {
                 if !args.is_empty() {
                     return Err(RuntimeError::type_err(
                         "Channel.as_stream takes no arguments",
                     ));
                 }
                 Ok(Value::Stream(Shared::new(StreamInner::Channel(ch.clone()))))
-            })))
+            }))
         }
         _ => Err(RuntimeError::attr_err(format!(
             "Channel has no method {field}"
@@ -75,11 +78,21 @@ fn close_stream_iterator(it: &Shared<IteratorState>, vm: &mut crate::vm::Vm) {
                 *remaining = 0;
                 nested.push(source.clone());
             }
-            IteratorKind::Map { source, .. }
-            | IteratorKind::Filter { source, .. }
-            | IteratorKind::GenExpr { source, .. } => {
+            IteratorKind::Skip { remaining, source } => {
+                *remaining = 0;
                 nested.push(source.clone());
             }
+            IteratorKind::Map { source, .. }
+            | IteratorKind::Filter { source, .. }
+            | IteratorKind::GenExpr { source, .. }
+            | IteratorKind::Enumerate { source, .. } => {
+                nested.push(source.clone());
+            }
+            IteratorKind::Chain { sources, current } => {
+                *current = sources.len();
+                nested.extend(sources.iter().cloned());
+            }
+            IteratorKind::User { .. } => {}
             IteratorKind::List { items, index } => {
                 *index = items.len();
             }
@@ -112,7 +125,7 @@ pub fn get_stream_method(stream: &Shared<StreamInner>, field: &str) -> Result<Va
         "send" => Err(RuntimeError::attr_err(
             "Stream has no method send (pull-only; use Channel to produce)",
         )),
-        "recv" | "next" => method!(stream, vm, |args| {
+        "recv" | "next" => method!(field, stream, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err(
                     "Stream.next/recv takes no arguments",
@@ -127,7 +140,7 @@ pub fn get_stream_method(stream: &Shared<StreamInner>, field: &str) -> Result<Va
                 },
             }
         }),
-        "close" => method!(stream, vm, |args| {
+        "close" => method!(field, stream, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err("Stream.close takes no arguments"));
             }
@@ -149,7 +162,7 @@ pub fn get_stream_method(stream: &Shared<StreamInner>, field: &str) -> Result<Va
 
 pub fn get_mutex_method(m: &Shared<MutexInner>, field: &str) -> Result<Value> {
     match field {
-        "lock" => method!(m, vm, |args| {
+        "lock" => method!(field, m, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err("Mutex.lock takes no arguments"));
             }
@@ -163,32 +176,32 @@ pub fn get_mutex_method(m: &Shared<MutexInner>, field: &str) -> Result<Value> {
 
 pub fn get_mutex_guard_method(g: &Shared<crate::value::MutexGuardInner>, field: &str) -> Result<Value> {
     match field {
-        "get" => method!(g, _vm, |args| {
+        "get" => method!(field, g, _vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err("MutexGuard.get takes no arguments"));
             }
             Ok(g.borrow().mutex().borrow().value.clone())
         }),
-        "set" => method!(g, _vm, |args| {
+        "set" => method!(field, g, _vm, |args| {
             if args.len() != 1 {
                 return Err(RuntimeError::type_err("MutexGuard.set requires 1 argument"));
             }
             g.borrow().mutex().borrow_mut().value = args[0].clone();
             Ok(Value::None)
         }),
-        "__enter__" => method!(g, _vm, |args| {
+        "__enter__" => method!(field, g, _vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err("__enter__ takes no arguments"));
             }
             Ok(Value::MutexGuard(g.clone()))
         }),
-        "__exit__" => method!(g, vm, |args| {
+        "__exit__" => method!(field, g, vm, |args| {
             let _ = args;
             g.borrow().release();
             vm.mn.notify_all();
             Ok(Value::None)
         }),
-        "unlock" => method!(g, vm, |args| {
+        "unlock" => method!(field, g, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err(
                     "MutexGuard.unlock takes no arguments",
@@ -218,20 +231,20 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
     };
     match (kind, field) {
         // --- RWMutex ---
-        ("RWMutex", "read") => method!(s, vm, |args| {
+        ("RWMutex", "read") => method!(field, s, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err("RWMutex.read takes no arguments"));
             }
             vm.rwmutex_read(&s)
         }),
-        ("RWMutex", "write") => method!(s, vm, |args| {
+        ("RWMutex", "write") => method!(field, s, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err("RWMutex.write takes no arguments"));
             }
             vm.rwmutex_write(&s)
         }),
         // --- WaitGroup ---
-        ("WaitGroup", "add") => method!(s, _vm, |args| {
+        ("WaitGroup", "add") => method!(field, s, _vm, |args| {
             if args.len() != 1 {
                 return Err(RuntimeError::type_err("WaitGroup.add requires 1 argument"));
             }
@@ -250,7 +263,7 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
             }
             Ok(Value::None)
         }),
-        ("WaitGroup", "done") => method!(s, vm, |args| {
+        ("WaitGroup", "done") => method!(field, s, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err("WaitGroup.done takes no arguments"));
             }
@@ -271,14 +284,14 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
             }
             Ok(Value::None)
         }),
-        ("WaitGroup", "wait") => method!(s, vm, |args| {
+        ("WaitGroup", "wait") => method!(field, s, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err("WaitGroup.wait takes no arguments"));
             }
             vm.waitgroup_wait(&s)
         }),
         // --- Semaphore ---
-        ("Semaphore", "acquire") => method!(s, vm, |args| {
+        ("Semaphore", "acquire") => method!(field, s, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err(
                     "Semaphore.acquire takes no arguments",
@@ -286,7 +299,7 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
             }
             vm.semaphore_acquire(&s)
         }),
-        ("Semaphore", "release") => method!(s, vm, |args| {
+        ("Semaphore", "release") => method!(field, s, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err(
                     "Semaphore.release takes no arguments",
@@ -300,7 +313,7 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
             Ok(Value::None)
         }),
         // --- Once ---
-        ("Once", "run" | "do") => method!(s, vm, |args| {
+        ("Once", "run" | "do") => method!(field, s, vm, |args| {
             if args.len() != 1 {
                 return Err(RuntimeError::type_err(
                     "Once.run requires 1 callable argument",
@@ -309,14 +322,14 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
             vm.once_do(&s, args[0].clone())
         }),
         // --- Barrier ---
-        ("Barrier", "wait") => method!(s, vm, |args| {
+        ("Barrier", "wait") => method!(field, s, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err("Barrier.wait takes no arguments"));
             }
             vm.barrier_wait(&s)
         }),
         // --- Cond ---
-        ("Cond", "wait") => method!(s, vm, |args| {
+        ("Cond", "wait") => method!(field, s, vm, |args| {
             // Cond.wait(mutex_guard) — 释放 Mutex 再等待，唤醒后重新加锁
             if args.len() != 1 {
                 return Err(RuntimeError::type_err(
@@ -330,7 +343,7 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
             };
             vm.cond_wait(&s, guard)
         }),
-        ("Cond", "signal") => method!(s, vm, |args| {
+        ("Cond", "signal") => method!(field, s, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err("Cond.signal takes no arguments"));
             }
@@ -345,7 +358,7 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
             vm.mn.notify_all();
             Ok(Value::None)
         }),
-        ("Cond", "broadcast") => method!(s, vm, |args| {
+        ("Cond", "broadcast") => method!(field, s, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err(
                     "Cond.broadcast takes no arguments",
@@ -361,19 +374,19 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
             Ok(Value::None)
         }),
         // --- TaskGroup ---
-        ("TaskGroup", "__enter__") => method!(s, _vm, |args| {
+        ("TaskGroup", "__enter__") => method!(field, s, _vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err("__enter__ takes no arguments"));
             }
             Ok(Value::Sync(s.clone()))
         }),
-        ("TaskGroup", "__exit__") => method!(s, vm, |args| {
+        ("TaskGroup", "__exit__") => method!(field, s, vm, |args| {
             let _ = args;
             // 正常退出 join 全部；首错会在 notify 时 cancel 兄弟任务。
             // 主动提前取消请用 g.cancel()。
             vm.taskgroup_wait(&s)
         }),
-        ("TaskGroup", "run") => method!(s, vm, |args| {
+        ("TaskGroup", "run") => method!(field, s, vm, |args| {
             if args.len() != 1 {
                 return Err(RuntimeError::type_err(
                     "TaskGroup.run requires 1 callable argument",
@@ -381,13 +394,13 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
             }
             vm.taskgroup_run(&s, args[0].clone())
         }),
-        ("TaskGroup", "wait") => method!(s, vm, |args| {
+        ("TaskGroup", "wait") => method!(field, s, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err("TaskGroup.wait takes no arguments"));
             }
             vm.taskgroup_wait(&s)
         }),
-        ("TaskGroup", "cancel") => method!(s, vm, |args| {
+        ("TaskGroup", "cancel") => method!(field, s, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err(
                     "TaskGroup.cancel takes no arguments",
@@ -397,17 +410,17 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
             Ok(Value::None)
         }),
         // --- TimeoutCtx ---
-        ("TimeoutCtx", "__enter__") => method!(s, _vm, |args| {
+        ("TimeoutCtx", "__enter__") => method!(field, s, _vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err("__enter__ takes no arguments"));
             }
             Ok(Value::Sync(s.clone()))
         }),
-        ("TimeoutCtx", "__exit__") => method!(s, _vm, |args| {
+        ("TimeoutCtx", "__exit__") => method!(field, s, _vm, |args| {
             let _ = (&s, args);
             Ok(Value::None)
         }),
-        ("TimeoutCtx", "expired" | "cancelled") => method!(s, _vm, |args| {
+        ("TimeoutCtx", "expired" | "cancelled") => method!(field, s, _vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err(
                     "TimeoutCtx.expired takes no arguments",
@@ -420,7 +433,7 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
                 _ => unreachable!(),
             }
         }),
-        ("TimeoutCtx", "check") => method!(s, vm, |args| {
+        ("TimeoutCtx", "check") => method!(field, s, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err(
                     "TimeoutCtx.check takes no arguments",
@@ -437,7 +450,7 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
             Ok(Value::None)
         }),
         // --- Atomic ---
-        ("Atomic", "get") => method!(s, _vm, |args| {
+        ("Atomic", "get") => method!(field, s, _vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err("Atomic.get takes no arguments"));
             }
@@ -446,7 +459,7 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
                 _ => unreachable!(),
             }
         }),
-        ("Atomic", "set") => method!(s, _vm, |args| {
+        ("Atomic", "set") => method!(field, s, _vm, |args| {
             if args.len() != 1 {
                 return Err(RuntimeError::type_err("Atomic.set requires 1 argument"));
             }
@@ -458,7 +471,7 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
                 _ => unreachable!(),
             }
         }),
-        ("Atomic", "swap") => method!(s, _vm, |args| {
+        ("Atomic", "swap") => method!(field, s, _vm, |args| {
             if args.len() != 1 {
                 return Err(RuntimeError::type_err("Atomic.swap requires 1 argument"));
             }
@@ -467,7 +480,7 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
                 _ => unreachable!(),
             }
         }),
-        ("Atomic", "add") => method!(s, _vm, |args| {
+        ("Atomic", "add") => method!(field, s, _vm, |args| {
             if args.len() != 1 {
                 return Err(RuntimeError::type_err("Atomic.add requires 1 argument"));
             }
@@ -494,14 +507,14 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
 /// `Task.cancel` / `cancelled` / `done`。
 pub fn get_task_method(task: &Shared<crate::value::TaskInner>, field: &str) -> Result<Value> {
     match field {
-        "cancel" => method!(task, vm, |args| {
+        "cancel" => method!(field, task, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err("Task.cancel takes no arguments"));
             }
             vm.cancel_task(&task);
             Ok(Value::None)
         }),
-        "cancelled" => method!(task, _vm, |args| {
+        "cancelled" => method!(field, task, _vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err(
                     "Task.cancelled takes no arguments",
@@ -509,7 +522,7 @@ pub fn get_task_method(task: &Shared<crate::value::TaskInner>, field: &str) -> R
             }
             Ok(Value::Bool(task.borrow().is_cancelled()))
         }),
-        "done" => method!(task, _vm, |args| {
+        "done" => method!(field, task, _vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err("Task.done takes no arguments"));
             }
@@ -527,7 +540,7 @@ pub fn get_task_method(task: &Shared<crate::value::TaskInner>, field: &str) -> R
 
 pub fn get_sync_guard_method(g: &Shared<SyncGuardInner>, field: &str) -> Result<Value> {
     match field {
-        "get" => method!(g, _vm, |args| {
+        "get" => method!(field, g, _vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err(
                     "RWMutexGuard.get takes no arguments",
@@ -545,7 +558,7 @@ pub fn get_sync_guard_method(g: &Shared<SyncGuardInner>, field: &str) -> Result<
                 _ => Err(RuntimeError::msg("internal: bad RWMutex guard")),
             }
         }),
-        "set" => method!(g, _vm, |args| {
+        "set" => method!(field, g, _vm, |args| {
             if args.len() != 1 {
                 return Err(RuntimeError::type_err(
                     "RWMutexGuard.set requires 1 argument",
@@ -571,13 +584,13 @@ pub fn get_sync_guard_method(g: &Shared<SyncGuardInner>, field: &str) -> Result<
                 _ => Err(RuntimeError::msg("internal: bad RWMutex guard")),
             }
         }),
-        "__enter__" => method!(g, _vm, |args| {
+        "__enter__" => method!(field, g, _vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err("__enter__ takes no arguments"));
             }
             Ok(Value::SyncGuard(g.clone()))
         }),
-        "__exit__" => method!(g, vm, |args| {
+        "__exit__" => method!(field, g, vm, |args| {
             let _ = args;
             let (mu, is_write) = {
                 let guard = g.borrow();

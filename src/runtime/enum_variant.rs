@@ -58,22 +58,19 @@ pub fn eval_const_num(expr: &Expr) -> Result<Num> {
 
 #[must_use]
 pub fn build_enum_def(name: &str, members: Vec<EnumMemberInfo>) -> Arc<EnumDef> {
-    Arc::new(EnumDef { name: name.to_string(), members })
+    Arc::new(EnumDef {
+        name: name.to_string(),
+        members,
+        methods: HashMap::new(),
+    })
 }
 
 #[must_use]
 pub fn enum_member_value(def: &Arc<EnumDef>, index: usize) -> Value {
-    let type_name = enum_member_type_name(def, &def.members[index].name);
     Value::EnumMember(Arc::new(EnumMemberData {
         def: def.clone(),
         member_index: index,
-        type_name,
     }))
-}
-
-#[must_use]
-pub fn enum_member_type_name(def: &EnumDef, member_name: &str) -> String {
-    format!("{}.{}", def.name, member_name)
 }
 
 #[must_use]
@@ -81,9 +78,10 @@ pub fn enum_member_numeric_value(member: &EnumMemberData) -> Num {
     member.def.members[member.member_index].value.clone()
 }
 
+/// 内部 case-struct 键（仅作 `struct_defs` 键与内部匹配，不展示）。
 #[must_use]
 pub fn case_struct_name(variant_name: &str, case_name: &str) -> String {
-    format!("{variant_name}.{case_name}")
+    format!("{variant_name}\u{1f}{case_name}")
 }
 
 #[must_use]
@@ -125,7 +123,9 @@ pub fn build_variant_def(
                 typed: true,
                 field_types,
                 type_params: type_params.clone(),
-                c_layout: None,
+                native_layout: None,
+                methods: HashMap::new(),
+                overloads: HashMap::new(),
             }),
         ));
     }
@@ -181,7 +181,6 @@ pub fn builtin_enum_method_entries(
     enum_name: &str,
     def: &Arc<EnumDef>,
 ) -> Vec<(String, Arc<FunctionObject>)> {
-    let members_name = format!("{enum_name}.members");
     let def_members = def.clone();
     let members_body = vec![
         Instruction::Push(Value::List(Shared::new(
@@ -195,7 +194,7 @@ pub fn builtin_enum_method_entries(
         Instruction::Ret,
     ];
     vec![(
-        members_name,
+        "members".to_string(),
         Arc::new(FunctionObject::new(
             format!("{enum_name}.members"),
             vec![crate::ast::FuncParam {
@@ -212,14 +211,19 @@ pub fn builtin_enum_method_entries(
     )]
 }
 
-pub fn install_builtin_enum_methods(
-    enum_name: &str,
-    def: &Arc<EnumDef>,
-    functions: &mut HashMap<String, Arc<FunctionObject>>,
-) {
-    for (name, func) in builtin_enum_method_entries(enum_name, def) {
-        functions.insert(name, func);
+/// 数值 enum 自带 `members` 等方法；装入 `EnumDef.methods`，不再写全局 `functions`。
+#[must_use]
+pub fn enum_def_with_builtin_methods(name: &str, members: Vec<EnumMemberInfo>) -> Arc<EnumDef> {
+    let mut def = EnumDef {
+        name: name.to_string(),
+        members,
+        methods: HashMap::new(),
+    };
+    let def_arc = Arc::new(def.clone());
+    for (mname, func) in builtin_enum_method_entries(name, &def_arc) {
+        def.methods.insert(mname, func);
     }
+    Arc::new(def)
 }
 
 pub fn finalize_enum_from_dict(
@@ -254,7 +258,7 @@ pub fn finalize_enum_from_dict(
             "__generate__ result has extra keys not in enum declaration",
         ));
     }
-    let def = build_enum_def(enum_name, member_infos);
+    let def = enum_def_with_builtin_methods(enum_name, member_infos);
     vm.register_enum_def(enum_name.to_string(), def);
     Ok(())
 }

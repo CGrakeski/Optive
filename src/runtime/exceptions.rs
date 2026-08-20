@@ -15,7 +15,9 @@ fn exc_def(name: &str, base: Option<&str>) -> Arc<StructDef> {
         typed: false,
         field_types: vec![FieldTypeInfo::default(), FieldTypeInfo::default()],
         type_params: Vec::new(),
-        c_layout: None,
+        native_layout: None,
+        methods: std::collections::HashMap::new(),
+        overloads: std::collections::HashMap::new(),
     })
 }
 

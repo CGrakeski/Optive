@@ -331,8 +331,10 @@ n
 #[test]
 fn budget_interleaves_cpu_task() {
     // 强制小预算：无显式 suspend 时，长循环任务仍应能被 await 跑完。
-    std::env::set_var("OPTIVE_SUSPEND_BUDGET", "64");
-    let v = value(
+    // 用 Vm API 设预算，避免 set_var 污染并行跑的其它用例。
+    let mut vm = optive::vm::Vm::with_workers(1).with_suspend_budget(64);
+    let v = optive::run_source_in_vm(
+        &mut vm,
         r"
 var n = 0
 let t = go do {
@@ -343,8 +345,9 @@ let t = go do {
 }
 await t
 ",
-    );
-    std::env::remove_var("OPTIVE_SUSPEND_BUDGET");
+        "<test>",
+    )
+    .expect("run");
     match v {
         Value::Num(n) => assert_eq!(n.to_string(), "300"),
         other => panic!("expected 200, got {other:?}"),
@@ -558,6 +561,17 @@ let ys = par for (x in [1, 2, 3]) { x * 10 }
 ys[0] + ys[1] + ys[2]
 ",
         "60",
+    );
+}
+
+#[test]
+fn par_for_zips_multiple_iterators() {
+    assert_num(
+        r"
+let ys = par for (x in [1, 2, 3], y in [10, 20, 30]) { x + y }
+ys[0] + ys[1] + ys[2]
+",
+        "66",
     );
 }
 

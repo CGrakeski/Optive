@@ -101,25 +101,35 @@ impl LockFile {
 }
 
 fn intent_matches_edge(dep: &Dependency, edge: &LockEdge) -> bool {
-    if normalize_cmp(&dep.git) != normalize_cmp(&edge.git) {
-        return false;
-    }
     match &dep.rev {
-        RevSpec::Commit(r) => {
-            // 钉死 commit：必须标记 pinned，且 rev 一致。
-            edge.pinned && r == &edge.rev && edge.branch.is_none() && edge.tag.is_none()
-        }
-        RevSpec::Tag(t) => {
-            edge.tag.as_deref() == Some(t.as_str())
+        // 索引依赖：意图是「包名 + 版本」；lock 里的 git URL 来自当时的 index.json。
+        RevSpec::IndexVersion(v) => {
+            edge.tag.as_deref() == Some(v.as_str())
                 && edge.branch.is_none()
                 && !edge.pinned
+                && (dep.git.is_empty() || normalize_cmp(&dep.git) == normalize_cmp(&edge.git))
         }
-        RevSpec::Branch(b) => {
-            edge.branch.as_deref() == Some(b.as_str()) && edge.tag.is_none() && !edge.pinned
-        }
-        RevSpec::None => {
-            // tip：无 branch/tag，且非 commit pin。
-            !edge.pinned && edge.branch.is_none() && edge.tag.is_none()
+        _ => {
+            if normalize_cmp(&dep.git) != normalize_cmp(&edge.git) {
+                return false;
+            }
+            match &dep.rev {
+                RevSpec::Commit(r) => {
+                    edge.pinned && r == &edge.rev && edge.branch.is_none() && edge.tag.is_none()
+                }
+                RevSpec::Tag(t) => {
+                    edge.tag.as_deref() == Some(t.as_str())
+                        && edge.branch.is_none()
+                        && !edge.pinned
+                }
+                RevSpec::Branch(b) => {
+                    edge.branch.as_deref() == Some(b.as_str())
+                        && edge.tag.is_none()
+                        && !edge.pinned
+                }
+                RevSpec::None => !edge.pinned && edge.branch.is_none() && edge.tag.is_none(),
+                RevSpec::IndexVersion(_) => unreachable!(),
+            }
         }
     }
 }
@@ -132,4 +142,45 @@ pub fn dependency_matches_lock_edge(dep: &Dependency, edge: &LockEdge) -> bool {
 fn normalize_cmp(url: &str) -> String {
     // 与 CAS 使用同一套规范化（file:// 保大小写，网络 URL 整段小写）。
     super::store::normalize_git_url(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::manifest::Dependency;
+
+    fn edge(git: &str, tag: Option<&str>) -> LockEdge {
+        LockEdge {
+            parent: ROOT_PARENT.into(),
+            name: "p".into(),
+            git: git.into(),
+            rev: "abc".into(),
+            id: "id".into(),
+            branch: None,
+            tag: tag.map(str::to_string),
+            pinned: false,
+        }
+    }
+
+    #[test]
+    fn index_version_with_git_must_match_url() {
+        let dep = Dependency::from_git_version("https://example.com/a.git", "0.1.0");
+        assert!(intent_matches_edge(
+            &dep,
+            &edge("https://example.com/a.git", Some("0.1.0"))
+        ));
+        assert!(!intent_matches_edge(
+            &dep,
+            &edge("https://example.com/b.git", Some("0.1.0"))
+        ));
+    }
+
+    #[test]
+    fn index_version_without_git_ignores_url() {
+        let dep = Dependency::from_index_version("0.1.0");
+        assert!(intent_matches_edge(
+            &dep,
+            &edge("https://anywhere.example/x.git", Some("0.1.0"))
+        ));
+    }
 }

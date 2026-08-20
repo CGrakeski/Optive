@@ -251,3 +251,25 @@ m.probe_c()
         "1",
     );
 }
+
+#[test]
+fn string_import_undeclared_dep_is_explicit() {
+    use optive::run_source_in_vm;
+    use optive::vm::{DepPackage, Vm};
+
+    let mut vm = Vm::new();
+    vm.dep_map.insert(
+        ("__root__".into(), "real-pack".into()),
+        DepPackage {
+            path: std::path::PathBuf::from("/nonexistent-pack"),
+            id: "id".into(),
+        },
+    );
+    let err = run_source_in_vm(&mut vm, r#"import "missing-pack""#, "<test>")
+        .expect_err("should reject undeclared pack");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("undeclared dependency") && msg.contains("missing-pack"),
+        "got: {msg}"
+    );
+}

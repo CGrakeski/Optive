@@ -55,6 +55,16 @@ pub unsafe extern "C" fn point_sum(p: *const Point) -> i32 {
 }
 
 #[no_mangle]
+pub extern "C" fn point_sum_by_value(p: Point) -> i32 {
+    p.x + p.y
+}
+
+#[no_mangle]
+pub extern "C" fn point_ident(p: Point) -> Point {
+    p
+}
+
+#[no_mangle]
 pub extern "C" fn apply_binop(
     a: i32,
     b: i32,
@@ -159,7 +169,7 @@ C.types.int
 ",
     );
     match v {
-        Value::TypeRef(n) => assert_eq!(n, "C.types.int"),
+        Value::TypeRef(n) => assert_eq!(n, "int"),
         other => panic!("expected TypeRef, got {}", other.type_name()),
     }
 }
@@ -332,7 +342,7 @@ C.types.void_ptr
 ",
     );
     match v {
-        Value::TypeRef(n) => assert_eq!(n, "C.types.void*"),
+        Value::TypeRef(n) => assert_eq!(n, "void*"),
         other => panic!("expected TypeRef, got {}", other.type_name()),
     }
 }
@@ -687,7 +697,7 @@ t
 }
 
 #[test]
-fn c_layout_struct_as_extern_param_rejected() {
+fn c_layout_struct_as_extern_param_by_value() {
     let path = dll_path_literal();
     let src = format!(
         r#"
@@ -697,13 +707,34 @@ typed struct Point {{
   let y: i32
 }} : C.layout
 let h = C.frompath({path})
-extern(h, "point_sum") func point_sum(
+extern(h, "point_sum_by_value") func point_sum_by_value(
     implicit p: Point
 ) -> C.types.int : num.(i32.(_)) ...
-point_sum
+point_sum_by_value(Point(3i32, 4i32))
 "#
     );
-    common::run_err(&src);
+    assert_num(&src, "7");
+}
+
+#[test]
+fn c_layout_struct_as_extern_return_by_value() {
+    let path = dll_path_literal();
+    let src = format!(
+        r#"
+use std.language.{{ C }}
+typed struct Point {{
+  let x: i32
+  let y: i32
+}} : C.layout
+let h = C.frompath({path})
+extern(h, "point_ident") func point_ident(
+    implicit p: Point
+) -> Point ...
+let q = point_ident(Point(3i32, 4i32))
+num.(q.x) + num.(q.y)
+"#
+    );
+    assert_num(&src, "7");
 }
 
 #[test]
@@ -773,4 +804,69 @@ C.types.ptr[i32]
         }
         other => panic!("expected TypeSpec, got {other:?}"),
     }
+}
+
+#[test]
+fn c_layout_is_first_class_layout_value() {
+    let v = value(
+        r"
+use std.language.{ C }
+C.layout
+",
+    );
+    match v {
+        Value::Layout(_) => {}
+        other => panic!("expected Layout, got {}", other.type_name()),
+    }
+    let ty = value(
+        r"
+use std.language.{ C }
+type(C.layout)
+",
+    );
+    assert_eq!(ty.display_string(), "Layout");
+}
+
+#[test]
+fn unknown_layout_annotation_is_neutral() {
+    let err = run_source(
+        r"
+typed struct Bad {
+  let x: i32
+} : NotALayout
+",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("unknown or unsupported layout") || err.contains("unknown layout"),
+        "err={err}"
+    );
+    assert!(
+        !err.contains("expected C.layout"),
+        "must not hardcode expected C.layout: {err}"
+    );
+}
+
+#[test]
+fn alloc_without_layout_is_neutral() {
+    let err = run_source(
+        r#"
+use std.language.{ C }
+typed struct Plain {
+  let x: i32
+}
+C.alloc(Plain)
+"#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("has no layout") || err.contains("no layout"),
+        "err={err}"
+    );
+    assert!(
+        !err.contains("declare `typed struct"),
+        "must not specialize recovery to C.layout: {err}"
+    );
 }

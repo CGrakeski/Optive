@@ -25,6 +25,7 @@ use rustyline::{Completer, Editor, Helper, Hinter, Validator};
 use cli::color;
 use cli::repl_highlight::{self, LineHighlightCache};
 use cli::resolve::{EnsureResult};
+use cli::main_index;
 use optive::caps::Capabilities;
 use crate::cli::debug_cmd::inject_dep_map;
 
@@ -39,6 +40,10 @@ struct ReplHelper {
 }
 
 impl Highlighter for ReplHelper {
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+        self.line_cache.get_or_highlight(line)
+    }
+
     fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
         &'s self,
         prompt: &'p str,
@@ -49,10 +54,6 @@ impl Highlighter for ReplHelper {
         } else {
             Cow::Borrowed(prompt)
         }
-    }
-
-    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
-        self.line_cache.get_or_highlight(line)
     }
 
     fn highlight_char(&self, _line: &str, _pos: usize, _kind: CmdKind) -> bool {
@@ -144,6 +145,13 @@ fn main() {
                 }
                 return;
             }
+            "search" => {
+                if let Err(e) = cmd_search(&args[2..]) {
+                    color::eprint_error(format!("Error: {e}"));
+                    process::exit(1);
+                }
+                return;
+            }
             "remove" => {
                 if args.len() != 3 {
                     color::eprint_error("usage: Optive remove <name>");
@@ -162,15 +170,20 @@ fn main() {
                 }
                 return;
             }
+            "publish" => {
+                if args.len() != 3 {
+                    color::eprint_error("usage: Optive publish <version>");
+                    process::exit(2);
+                }
+                if let Err(e) = cli::publish::publish(&args[2]) {
+                    color::eprint_error(format!("Error: {e}"));
+                    process::exit(1);
+                }
+                return;
+            }
             "up" => {
                 let (caps, rest) = parse_caps_or_exit(&args);
-                let (path, script_args) = match split_project_and_script_args(&rest) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        color::eprint_error(format!("Error: {e}"));
-                        process::exit(2);
-                    }
-                };
+                let (path, script_args) = parse_project_path_and_script_args(&rest);
                 if let Err(e) = cmd_up(path.as_deref(), caps, &script_args) {
                     color::eprint_error(format!("Error: {e}"));
                     process::exit(1);
@@ -179,13 +192,7 @@ fn main() {
             }
             "run" => {
                 let (caps, rest) = parse_caps_or_exit(&args);
-                let (path, script_args) = match split_project_and_script_args(&rest) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        color::eprint_error(format!("Error: {e}"));
-                        process::exit(2);
-                    }
-                };
+                let (path, script_args) = parse_project_path_and_script_args(&rest);
                 if let Err(e) = cmd_run(path.as_deref(), caps, &script_args) {
                     color::eprint_error(format!("Error: {e}"));
                     process::exit(1);
@@ -242,10 +249,42 @@ fn main() {
                 }
                 return;
             }
+            "test" => {
+                let (caps, rest) = parse_caps_or_exit(&args);
+                let (path, script_args) = parse_project_path_and_script_args(&rest);
+                if let Err(e) = cli::test_cmd::cmd_test(path.as_deref(), caps, &script_args) {
+                    color::eprint_error(format!("Error: {e}"));
+                    process::exit(1);
+                }
+                return;
+            }
             "custom" => {
                 if let Err(e) = cli::custom_cmd::run(&args[2..]) {
                     color::eprint_error(format!("Error: {e}"));
                     process::exit(1);
+                }
+                return;
+            }
+            "index" => {
+                match args.get(2).map(String::as_str) {
+                    Some("sync") if args.len() == 3 => {
+                        if let Err(e) = main_index::sync_index() {
+                            color::eprint_error(format!("Sync failed: {e}"));
+                            process::exit(1);
+                        }
+                    }
+                    Some("change") if args.len() == 4 => {
+                        if let Err(e) = main_index::change_index(&args[3]) {
+                            color::eprint_error(format!("Change failed: {e}"));
+                            process::exit(1);
+                        }
+                    }
+                    _ => {
+                        color::eprint_error(
+                            "usage: Optive index sync | Optive index change <url>",
+                        );
+                        process::exit(2);
+                    }
                 }
                 return;
             }
@@ -263,6 +302,17 @@ fn main() {
     }
 
     repl();
+}
+
+fn parse_project_path_and_script_args(rest: &Vec<String>) -> (Option<PathBuf>, Vec<String>) {
+    let (path, script_args) = match split_project_and_script_args(&rest) {
+        Ok(v) => v,
+        Err(e) => {
+            color::eprint_error(format!("Error: {e}"));
+            process::exit(2);
+        }
+    };
+    (path, script_args)
 }
 
 fn parse_caps_or_exit(args: &[String]) -> (Capabilities, Vec<String>) {
@@ -466,7 +516,7 @@ fn cmd_update(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 fn cmd_add(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // args[0] == "add"
-    let mut url = None;
+    let mut target = None;
     let mut name = None;
     let mut branch = None;
     let mut tag = None;
@@ -494,27 +544,62 @@ fn cmd_add(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 tag = Some(args.get(i).ok_or("--tag requires a value")?.clone());
             }
             s if !s.starts_with('-') => {
-                if url.is_some() {
-                    return Err("usage: Optive add <git-url> [--name N] [--branch B|--tag T]".into());
+                if target.is_some() {
+                    return Err(
+                        "usage: Optive add <git-url|pack[@version]> [--name N] [--branch B|--tag T]"
+                            .into(),
+                    );
                 }
-                url = Some(s.to_string());
+                target = Some(s.to_string());
             }
             other => return Err(format!("unknown add flag: {other}").into()),
         }
         i += 1;
     }
-    let url = url.ok_or("usage: Optive add <git-url> [--name N] [--branch B|--tag T]")?;
+    let target = target.ok_or(
+        "usage: Optive add <git-url|pack[@version]> [--name N] [--branch B|--tag T]",
+    )?;
     let project = cli::manifest::find_project(None)?;
     let msg = cli::commands::cmd_add(
         &project,
         cli::commands::AddOptions {
-            url,
+            target,
             name,
             branch,
             tag,
         },
     )?;
     color::status_line(&msg);
+    Ok(())
+}
+
+fn cmd_search(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let query = args.first().map(String::as_str);
+    let hits = cli::registry::search_packs(query)?;
+    const SOFT_LIMIT: usize = 200;
+    if hits.is_empty() {
+        if let Some(q) = query {
+            println!("(no packs matching `{q}`)");
+        } else {
+            println!("(index is empty)");
+        }
+        return Ok(());
+    }
+    let show = hits.len().min(SOFT_LIMIT);
+    let name_width = hits[..show]
+        .iter()
+        .map(|(n, _)| n.len())
+        .max()
+        .unwrap_or(0);
+    for (name, url) in hits.iter().take(show) {
+        println!("{name:<name_width$}  {url}");
+    }
+    if hits.len() > SOFT_LIMIT {
+        eprintln!(
+            "... {} more; narrow with a query (e.g. Optive search foo)",
+            hits.len() - SOFT_LIMIT
+        );
+    }
     Ok(())
 }
 
@@ -526,7 +611,7 @@ fn cmd_remove(name: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn cmd_cache(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    match args.first().map(std::string::String::as_str) {
+    match args.first().map(String::as_str) {
         Some("gc") => {
             let dry = args.iter().any(|a| a == "--dry-run");
             cli::doctor::cache_gc(dry)?;
@@ -537,7 +622,7 @@ fn cmd_cache(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn cmd_deps(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    match args.first().map(std::string::String::as_str) {
+    match args.first().map(String::as_str) {
         None => cli::doctor::list_deps(false),
         Some("-v" | "--verbose") if args.len() == 1 => cli::doctor::list_deps(true),
         Some("list") => {
@@ -576,11 +661,18 @@ fn cmd_change(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn print_project_header(project: &cli::manifest::Project) {
-    let headline = match &project.manifest.package.version {
-        Some(ver) => format!(
-            "Project {} v{} ({})",
+    let ver = cli::repo_meta::project_version_label(&project.root);
+    let headline = match ver {
+        Some(v) if v.starts_with("(unreleased)") => format!(
+            "Project {} {} ({})",
             project.manifest.package.name,
-            ver,
+            v,
+            project.root.display()
+        ),
+        Some(v) => format!(
+            "Project {} {} ({})",
+            project.manifest.package.name,
+            v,
             project.root.display()
         ),
         None => format!(
@@ -681,8 +773,10 @@ fn print_help() {
     println!("{}", t_cli(CliMsg::HelpRun));
     println!("{}", t_cli(CliMsg::HelpUp));
     println!("{}", t_cli(CliMsg::HelpAdd));
+    println!("{}", t_cli(CliMsg::HelpSearch));
     println!("{}", t_cli(CliMsg::HelpRemove));
     println!("{}", t_cli(CliMsg::HelpUpdate));
+    println!("{}", t_cli(CliMsg::HelpPublish));
     println!("{}", t_cli(CliMsg::HelpCache));
     println!("{}", t_cli(CliMsg::HelpDeps));
     println!("{}", t_cli(CliMsg::HelpDepsDoctor));
@@ -690,6 +784,9 @@ fn print_help() {
     println!("{}", t_cli(CliMsg::HelpChange));
     println!("{}", t_cli(CliMsg::HelpFmt));
     println!("{}", t_cli(CliMsg::HelpDebug));
+    println!("{}", t_cli(CliMsg::HelpTest));
+    println!("{}", t_cli(CliMsg::HelpIndex));
+    println!("{}", t_cli(CliMsg::HelpIndexChange));
     println!("{}", t_cli(CliMsg::HelpCustom));
     println!();
     println!("{}", t_cli(CliMsg::HelpCapsHeader));
@@ -705,6 +802,7 @@ fn print_help() {
     println!("{}", t_cli(CliMsg::HelpOptiveHome));
     println!("{}", t_cli(CliMsg::HelpLocalDeps));
     println!("{}", t_cli(CliMsg::HelpOptiveCustomEnv));
+    println!("{}", t_cli(CliMsg::HelpOptiveIndexUrl));
     println!();
     println!("{}", t_cli(CliMsg::HelpFiles));
 }

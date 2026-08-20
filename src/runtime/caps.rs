@@ -28,7 +28,7 @@ pub struct Capabilities {
     pub fs: FsPolicy,
     /// 是否允许 `std.os.setenv` / `chdir` 等改变进程环境的操作。
     pub env: bool,
-    /// 是否允许 `C.frompath` / `extern` 加载并调用本地动态库。
+    /// 是否允许 `frompath` / `extern` 加载并调用本地动态库。
     pub ffi: bool,
 }
 
@@ -61,24 +61,26 @@ impl Capabilities {
         }
     }
 
-    /// FFI 网关：`C.frompath` / `extern` 绑定时先过此关。
+    /// FFI 网关：`frompath` / `extern` 绑定时先过此关。
     pub fn check_ffi(&self, op: &str) -> Result<(), RuntimeError> {
         if self.ffi {
             Ok(())
         } else {
             Err(RuntimeError::io_err(format!(
-                "{op}: native FFI disabled (sandbox; pass --allow-ffi to enable)"
+                "{}: native FFI disabled (sandbox; pass --allow-ffi to enable)",
+                crate::value::builtin_repr(op)
             )))
         }
     }
 
-    /// 网络网关：`std.http.*` 调用前先过此关。
+    /// 网络网关：`std.http` 模块调用前先过此关。
     pub fn check_network(&self, op: &str) -> Result<(), RuntimeError> {
         if self.network {
             Ok(())
         } else {
             Err(RuntimeError::io_err(format!(
-                "{op}: network access disabled (sandbox / --no-network)"
+                "{}: network access disabled (sandbox / --no-network)",
+                crate::value::builtin_repr(op)
             )))
         }
     }
@@ -89,7 +91,8 @@ impl Capabilities {
             Ok(())
         } else {
             Err(RuntimeError::io_err(format!(
-                "{op}: environment mutation disabled (sandbox)"
+                "{}: environment mutation disabled (sandbox)",
+                crate::value::builtin_repr(op)
             )))
         }
     }
@@ -100,7 +103,8 @@ impl Capabilities {
             Ok(())
         } else {
             Err(RuntimeError::io_err(format!(
-                "{op}: process spawn disabled (sandbox)"
+                "{}: process spawn disabled (sandbox)",
+                crate::value::builtin_repr(op)
             )))
         }
     }
@@ -114,7 +118,8 @@ impl Capabilities {
         };
         if roots.is_empty() {
             return Err(RuntimeError::io_err(format!(
-                "{op}: filesystem access disabled (sandbox has no allowed paths)"
+                "{}: filesystem access disabled (sandbox has no allowed paths)",
+                crate::value::builtin_repr(op)
             )));
         }
         let normalized = normalize_path(path);
@@ -125,7 +130,8 @@ impl Capabilities {
             }
         }
         Err(RuntimeError::io_err(format!(
-            "{op}: path '{path}' outside sandbox (allowed roots: {})",
+            "{}: path '{path}' outside sandbox (allowed roots: {})",
+            crate::value::builtin_repr(op),
             roots
                 .iter()
                 .map(|r| r.display().to_string())
@@ -180,7 +186,7 @@ mod tests {
     #[test]
     fn full_allows_everything() {
         let c = Capabilities::full();
-        assert!(c.check_network("http.get").is_ok());
+        assert!(c.check_network("get").is_ok());
         assert!(c.check_fs("read_file", "/etc/passwd").is_ok());
         assert!(c.check_env("setenv").is_ok());
     }
@@ -188,9 +194,9 @@ mod tests {
     #[test]
     fn sandbox_blocks_network_and_env() {
         let c = Capabilities::sandbox(vec![PathBuf::from(".")]);
-        assert!(c.check_network("http.get").is_err());
+        assert!(c.check_network("get").is_err());
         assert!(c.check_env("setenv").is_err());
-        assert!(c.check_ffi("C.frompath").is_err());
+        assert!(c.check_ffi("frompath").is_err());
     }
 
     #[test]

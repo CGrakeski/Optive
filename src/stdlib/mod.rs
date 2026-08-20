@@ -5,14 +5,18 @@ use num_bigint::BigInt;
 use num_traits::Zero;
 
 use crate::runtime_ast;
-use crate::value::{IteratorKind, IteratorState, ModuleObject, Num, Value, ValueKey, DictMap};
+use crate::value::{builtin_repr, IteratorKind, IteratorState, ModuleObject, Num, Value, ValueKey, DictMap};
 use crate::vm::Vm;
 use crate::Result;
 
 use crate::shared::{Shared, SyncCell};
+
+mod text;
+
 /// `format_num` / `format` 字段的默认小数精度。
 const DEFAULT_NUM_PRECISION: usize = 6;
-/// `take` / `skip` 等迭代器物化的预分配初始容量。
+/// `to_list` / `to_set` / `cycle` 等物化路径的预分配提示（保留作文档锚点）。
+#[allow(dead_code)]
 const ITER_MATERIALIZE_INIT_CAP: usize = 64;
 
 pub fn build_std_module() -> Shared<ModuleObject> {
@@ -178,7 +182,7 @@ pub fn build_std_module() -> Shared<ModuleObject> {
     std_children.insert("time".into(), build_time_module());
     std_children.insert("sync".into(), build_sync_module());
     std_children.insert("async".into(), build_async_module());
-    std_children.insert("text".into(), build_text_module());
+    std_children.insert("text".into(), text::build_text_module());
     std_children.insert("path".into(), build_path_module());
     std_children.insert("fs".into(), build_fs_module());
     std_children.insert("os".into(), build_os_module());
@@ -199,7 +203,6 @@ pub fn build_std_module() -> Shared<ModuleObject> {
 
     Shared::new(ModuleObject {
         name: "std".into(),
-        full_name: "std".into(),
         exports: exports(&[("concat", builtin(std_concat))]),
         children: std_children,
         is_user: false,
@@ -223,25 +226,37 @@ fn math_const_e() -> Value {
 fn exports(entries: &[(&str, Value)]) -> HashMap<String, Value> {
     entries
         .iter()
-        .map(|(k, v)| (k.to_string(), v.clone()))
+        .map(|(k, v)| {
+            let named = match v {
+                Value::Builtin(b) if b.name.as_ref() == "<anon>" => {
+                    Value::Builtin(crate::value::BuiltinObject::new(*k, b.func.clone()))
+                }
+                other => other.clone(),
+            };
+            ((*k).to_string(), named)
+        })
         .collect()
 }
 
-fn builtin(f: fn(&mut Vm, &[Value]) -> Result<Value>) -> Value {
-    Value::Builtin(Arc::new(f))
+/// 未具名的 fn 指针 builtin；经 [`exports`] / [`submodule`] 时用导出名覆盖。
+pub(crate) fn builtin(f: fn(&mut Vm, &[Value]) -> Result<Value>) -> Value {
+    Value::builtin_fn("<anon>", f)
 }
 
-fn submodule(name: &str, entries: &[(&str, Value)]) -> Shared<ModuleObject> {
+pub(crate) fn named_builtin(name: &str, f: fn(&mut Vm, &[Value]) -> Result<Value>) -> Value {
+    Value::builtin_fn(name, f)
+}
+
+pub(crate) fn submodule(name: &str, entries: &[(&str, Value)]) -> Shared<ModuleObject> {
     Shared::new(ModuleObject {
         name: name.into(),
-        full_name: format!("std.{name}"),
         exports: exports(entries),
         children: HashMap::new(),
         is_user: false,
     })
 }
 
-fn expect_arity(name: &str, args: &[Value], n: usize) -> Result<()> {
+pub(crate) fn expect_arity(name: &str, args: &[Value], n: usize) -> Result<()> {
     if args.len() != n {
         return Err(crate::error::RuntimeError::type_err(format!(
             "{name} requires {n} argument{}",
@@ -267,14 +282,14 @@ fn expect_num_f64(name: &str, args: &[Value], idx: usize) -> Result<f64> {
     expect_num_value(name, args, idx)?.to_f64_checked()
 }
 
-fn expect_int(name: &str, args: &[Value], idx: usize) -> Result<i64> {
+pub(crate) fn expect_int(name: &str, args: &[Value], idx: usize) -> Result<i64> {
     let v = args.get(idx).ok_or_else(|| {
         crate::error::RuntimeError::type_err(format!("{name}: missing argument {idx}"))
     })?;
     crate::value::expect_i64(name, v)
 }
 
-fn expect_text(name: &str, args: &[Value], idx: usize) -> Result<String> {
+pub(crate) fn expect_text(name: &str, args: &[Value], idx: usize) -> Result<String> {
     match args.get(idx) {
         Some(Value::Text(s)) => Ok(s.clone()),
         _ => Err(crate::error::RuntimeError::type_err(format!(
@@ -854,12 +869,9 @@ fn format_indent(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     Ok(Value::Text(out.join("\n")))
 }
 
-fn iter_iter(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn iter_iter(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     expect_arity("iter", args, 1)?;
-    match &args[0] {
-        Value::Iterator(it) => Ok(Value::Iterator(it.clone())),
-        other => Ok(crate::value::value_to_iterable(other)?.into_value()),
-    }
+    Ok(Value::Iterator(vm.to_iterator_shared(&args[0])?))
 }
 
 fn iter_to_list(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -880,35 +892,40 @@ fn iter_to_set(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     Ok(Value::Set(Shared::new(set)))
 }
 
-fn iter_enumerate(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn iter_enumerate(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(crate::error::RuntimeError::type_err("enumerate requires 1 argument"));
     }
-    let items = value_to_list(&args[0])?;
-    let pairs: Vec<Value> = items
-        .into_iter()
-        .enumerate()
-        .map(|(i, item)| {
-            Value::List(Shared::new(vec![
-                Value::Num(Num::Small(i as i64)),
-                item,
-            ]))
-        })
-        .collect();
-    Ok(Value::List(Shared::new(pairs)))
+    let source = value_to_iterator_rc(vm, &args[0])?;
+    // 跟踪源游标；enumerate 包装自身也需可被 GC 看见。
+    vm.gc.track_iter(&source);
+    let it = Shared::new(IteratorState {
+        kind: IteratorKind::Enumerate { index: 0, source },
+    });
+    vm.gc.track_iter(&it);
+    Ok(Value::Iterator(it))
 }
 
-fn iter_chain(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn iter_chain(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.is_empty() {
         return Err(crate::error::RuntimeError::type_err(
             "chain requires at least 1 argument",
         ));
     }
-    let mut merged = Vec::new();
+    let mut sources = Vec::with_capacity(args.len());
     for arg in args {
-        merged.extend(value_to_list(arg)?);
+        let src = value_to_iterator_rc(vm, arg)?;
+        vm.gc.track_iter(&src);
+        sources.push(src);
     }
-    Ok(Value::List(Shared::new(merged)))
+    let it = Shared::new(IteratorState {
+        kind: IteratorKind::Chain {
+            sources,
+            current: 0,
+        },
+    });
+    vm.gc.track_iter(&it);
+    Ok(Value::Iterator(it))
 }
 
 fn iter_take(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -916,15 +933,16 @@ fn iter_take(vm: &mut Vm, args: &[Value]) -> Result<Value> {
         return Err(crate::error::RuntimeError::type_err("take requires 2 arguments"));
     }
     let n = expect_int("take", args, 1)?.max(0) as usize;
-    let state = value_to_iterator_rc(&args[0])?;
-    let mut out = Vec::with_capacity(n.min(ITER_MATERIALIZE_INIT_CAP));
-    for _ in 0..n {
-        match vm.advance_iterator(&state)? {
-            Some(v) => out.push(v),
-            None => break,
-        }
-    }
-    Ok(Value::List(Shared::new(out)))
+    let source = value_to_iterator_rc(vm, &args[0])?;
+    vm.gc.track_iter(&source);
+    let it = Shared::new(IteratorState {
+        kind: IteratorKind::Take {
+            remaining: n,
+            source,
+        },
+    });
+    vm.gc.track_iter(&it);
+    Ok(Value::Iterator(it))
 }
 
 fn iter_skip(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -932,23 +950,23 @@ fn iter_skip(vm: &mut Vm, args: &[Value]) -> Result<Value> {
         return Err(crate::error::RuntimeError::type_err("skip requires 2 arguments"));
     }
     let n = expect_int("skip", args, 1)?.max(0) as usize;
-    let state = value_to_iterator_rc(&args[0])?;
-    for _ in 0..n {
-        if vm.advance_iterator(&state)?.is_none() {
-            return Ok(Value::List(Shared::new(Vec::new())));
-        }
-    }
-    Ok(Value::List(Shared::new(materialize_iter(
-        vm,
-        &Value::Iterator(state),
-    )?)))
+    let source = value_to_iterator_rc(vm, &args[0])?;
+    vm.gc.track_iter(&source);
+    let it = Shared::new(IteratorState {
+        kind: IteratorKind::Skip {
+            remaining: n,
+            source,
+        },
+    });
+    vm.gc.track_iter(&it);
+    Ok(Value::Iterator(it))
 }
 
 fn iter_next(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.is_empty() {
         return Err(crate::error::RuntimeError::type_err("next requires an iterator"));
     }
-    let state = value_to_iterator_rc(&args[0])?;
+    let state = value_to_iterator_rc(vm, &args[0])?;
     match vm.advance_iterator(&state)? {
         Some(v) => Ok(v),
         None => {
@@ -971,7 +989,8 @@ fn iter_fold(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
     let func = expect_function("fold", args, 0)?;
     let mut acc = args[1].clone();
-    for item in materialize_iter(vm, &args[2])? {
+    let state = value_to_iterator_rc(vm, &args[2])?;
+    while let Some(item) = vm.advance_iterator(&state)? {
         acc = vm.call_user_function(func.clone(), vec![acc, item])?;
     }
     Ok(acc)
@@ -998,6 +1017,7 @@ fn iter_cycle(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(crate::error::RuntimeError::type_err("cycle requires 1 argument"));
     }
+    // cycle 需要可回放的有限序列，因此物化源一次。
     let items = materialize_iter(vm, &args[0])?;
     Ok(Value::Iterator(Shared::new(IteratorState {
         kind: IteratorKind::Cycle { items, index: 0 },
@@ -1008,9 +1028,12 @@ fn iter_count(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(crate::error::RuntimeError::type_err("count requires 1 argument"));
     }
-    Ok(Value::Num(Num::Small(
-        materialize_iter(vm, &args[0])?.len() as i64,
-    )))
+    let state = value_to_iterator_rc(vm, &args[0])?;
+    let mut n = 0i64;
+    while vm.advance_iterator(&state)?.is_some() {
+        n = n.saturating_add(1);
+    }
+    Ok(Value::Num(Num::Small(n)))
 }
 
 fn iter_find(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -1020,7 +1043,8 @@ fn iter_find(vm: &mut Vm, args: &[Value]) -> Result<Value> {
         ));
     }
     let pred = expect_function("find", args, 1)?;
-    for item in materialize_iter(vm, &args[0])? {
+    let state = value_to_iterator_rc(vm, &args[0])?;
+    while let Some(item) = vm.advance_iterator(&state)? {
         if vm
             .call_user_function(pred.clone(), vec![item.clone()])?
             .is_truthy()
@@ -1038,7 +1062,8 @@ fn iter_any(vm: &mut Vm, args: &[Value]) -> Result<Value> {
         ));
     }
     let pred = expect_function("any", args, 1)?;
-    for item in materialize_iter(vm, &args[0])? {
+    let state = value_to_iterator_rc(vm, &args[0])?;
+    while let Some(item) = vm.advance_iterator(&state)? {
         if vm
             .call_user_function(pred.clone(), vec![item])?
             .is_truthy()
@@ -1056,7 +1081,8 @@ fn iter_all(vm: &mut Vm, args: &[Value]) -> Result<Value> {
         ));
     }
     let pred = expect_function("all", args, 1)?;
-    for item in materialize_iter(vm, &args[0])? {
+    let state = value_to_iterator_rc(vm, &args[0])?;
+    while let Some(item) = vm.advance_iterator(&state)? {
         if !vm
             .call_user_function(pred.clone(), vec![item])?
             .is_truthy()
@@ -1218,7 +1244,7 @@ fn dict_setdefault(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     Ok(args[2].clone())
 }
 
-fn value_to_list(v: &Value) -> Result<Vec<Value>> {
+pub(crate) fn value_to_list(v: &Value) -> Result<Vec<Value>> {
     match v {
         Value::List(list) => Ok(list.borrow().clone()),
         Value::Text(s) => Ok(s.chars().map(|c| Value::Text(c.to_string())).collect()),
@@ -1297,10 +1323,10 @@ fn decos_log(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         return Err(crate::error::RuntimeError::type_err("log requires 1 argument"));
     }
     let inner = expect_function("log", args, 0)?;
-    Ok(Value::Builtin(Arc::new(move |vm, call_args| {
+    Ok(Value::builtin("log", move |vm, call_args| {
         eprintln!("log: call({})", call_args.len());
         vm.call_user_function(inner.clone(), call_args.to_vec())
-    })))
+    }))
 }
 
 fn decos_once(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -1310,7 +1336,7 @@ fn decos_once(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let inner = expect_function("once", args, 0)?;
     let cached = SyncCell::new(None::<Value>);
     let called = SyncCell::new(false);
-    Ok(Value::Builtin(Arc::new(move |vm, call_args| {
+    Ok(Value::builtin("once", move |vm, call_args| {
         if *called.borrow() {
             return cached
                 .borrow()
@@ -1321,14 +1347,14 @@ fn decos_once(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         *cached.borrow_mut() = Some(result.clone());
         *called.borrow_mut() = true;
         Ok(result)
-    })))
+    }))
 }
 
 fn decos_memoize(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     expect_arity("memoize", args, 1)?;
     let inner = expect_function("memoize", args, 0)?;
     let cache = SyncCell::new(HashMap::<Vec<ValueKey>, Value>::new());
-    Ok(Value::Builtin(Arc::new(move |vm, call_args| {
+    Ok(Value::builtin("memoize", move |vm, call_args| {
         let key: Vec<ValueKey> = call_args
             .iter()
             .map(ValueKey::from_value)
@@ -1339,7 +1365,7 @@ fn decos_memoize(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         let result = vm.call_user_function(inner.clone(), call_args.to_vec())?;
         cache.borrow_mut().insert(key, result.clone());
         Ok(result)
-    })))
+    }))
 }
 
 // --- 其余 std 子模块 ---
@@ -1348,7 +1374,7 @@ fn build_typing_module() -> Shared<ModuleObject> {
     fn type_ctor(name: &str) -> Value {
         let name = name.to_string();
         let is_form = crate::type_registry::is_type_form(&name);
-        Value::Builtin(Arc::new(move |_vm, args| {
+        Value::builtin(name.clone(), move |_vm, args| {
             if args.is_empty() {
                 if is_form {
                     return Ok(Value::TypeSpec(crate::value::TypeSpecData::new(
@@ -1366,10 +1392,10 @@ fn build_typing_module() -> Shared<ModuleObject> {
                 name.clone(),
                 params,
             )))
-        }))
+        })
     }
     fn type_ctor_literal() -> Value {
-        Value::Builtin(Arc::new(move |_vm, args| {
+        Value::builtin("Literal", move |_vm, args| {
             if args.is_empty() {
                 return Err(crate::error::RuntimeError::type_err(
                     "Literal requires at least 1 argument",
@@ -1383,7 +1409,7 @@ fn build_typing_module() -> Shared<ModuleObject> {
                 "Literal".to_string(),
                 params,
             )))
-        }))
+        })
     }
     submodule(
         "typing",
@@ -1553,7 +1579,6 @@ fn build_sync_module() -> Shared<ModuleObject> {
     );
     Shared::new(ModuleObject {
         name: "sync".into(),
-        full_name: "std.sync".into(),
         exports: exports(&[
             ("Channel", Value::type_ref("Channel")),
             ("Mutex", Value::type_ref("Mutex")),
@@ -1756,33 +1781,36 @@ fn async_stream_of(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 }
 
 /// `stream_from_gen(g)`：按需从生成器/`Iterator` 拉取（不先物化全集）。
+///
+/// `g` 可为：
+/// - 无参 `gen` 函数（自动调用得到 iterator）
+/// - 已启动的 generator iterator（如 `count()`）
+/// - 其它可迭代对象
 fn async_stream_from_gen(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(crate::error::RuntimeError::type_err(
             "stream_from_gen requires 1 iterable/generator argument",
         ));
     }
-    let iter = match &args[0] {
-        Value::Iterator(it) => it.clone(),
-        Value::Function(f) if f.is_generator => {
-            match vm.call_value(args[0].clone(), vec![])? {
-                Value::Iterator(it) => it,
-                other => crate::value::value_to_iterator_shared(&other)?,
-            }
+    let source = match &args[0] {
+        Value::Function(f) if f.is_generator() => {
+            // 无参 gen：`stream_from_gen(count)` ≡ `stream_from_gen(count())`
+            vm.call_user_function(f.clone(), vec![])?
         }
-        other => crate::value::value_to_iterator_shared(other)?,
+        other => other.clone(),
     };
+    let iter = vm.to_iterator_shared(&source)?;
     Ok(crate::concurrency::stream_from_iterator(iter))
 }
 
-fn async_stream_map(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn async_stream_map(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
         return Err(crate::error::RuntimeError::type_err(
             "stream_map(stream, f) requires 2 arguments",
         ));
     }
     let func = expect_function("stream_map", args, 1)?;
-    let source = crate::value::value_to_iterator_shared(&args[0])?;
+    let source = vm.to_iterator_shared(&args[0])?;
     Ok(crate::concurrency::stream_from_iterator(Shared::new(
         IteratorState {
             kind: IteratorKind::Map { func, source },
@@ -1790,14 +1818,14 @@ fn async_stream_map(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     )))
 }
 
-fn async_stream_filter(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn async_stream_filter(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
         return Err(crate::error::RuntimeError::type_err(
             "stream_filter(stream, pred) requires 2 arguments",
         ));
     }
     let pred = expect_function("stream_filter", args, 1)?;
-    let source = crate::value::value_to_iterator_shared(&args[0])?;
+    let source = vm.to_iterator_shared(&args[0])?;
     Ok(crate::concurrency::stream_from_iterator(Shared::new(
         IteratorState {
             kind: IteratorKind::Filter {
@@ -1808,7 +1836,7 @@ fn async_stream_filter(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     )))
 }
 
-fn async_stream_take(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn async_stream_take(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
         return Err(crate::error::RuntimeError::type_err(
             "stream_take(stream, n) requires 2 arguments",
@@ -1820,7 +1848,7 @@ fn async_stream_take(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
             "stream_take n must be non-negative",
         ));
     }
-    let source = crate::value::value_to_iterator_shared(&args[0])?;
+    let source = vm.to_iterator_shared(&args[0])?;
     Ok(crate::concurrency::stream_from_iterator(Shared::new(
         IteratorState {
             kind: IteratorKind::Take {
@@ -1846,31 +1874,6 @@ fn sync_yield(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
     vm.request_cooperative_yield();
     Ok(Value::None)
-}
-
-fn build_text_module() -> Shared<ModuleObject> {
-    submodule(
-        "text",
-        &[("upper", builtin(text_upper)),
-            ("lower", builtin(text_lower)),
-            ("strip", builtin(text_strip)),
-            ("split", builtin(text_split)),
-            ("contains", builtin(text_contains)),
-            ("len", builtin(text_len)),
-            ("replace", builtin(text_replace)),
-            ("startswith", builtin(text_startswith)),
-            ("endswith", builtin(text_endswith)),
-            ("find", builtin(text_find)),
-            ("join", builtin(text_join)),
-            ("repeat", builtin(text_repeat)),
-            ("count", builtin(text_count)),
-            ("lines", builtin(text_lines)),
-            ("is_digit", builtin(text_is_digit)),
-            ("is_alpha", builtin(text_is_alpha)),
-            ("is_space", builtin(text_is_space)),
-            ("ord", builtin(text_ord)),
-            ("chr", builtin(text_chr)),],
-    )
 }
 
 fn build_path_module() -> Shared<ModuleObject> {
@@ -1982,21 +1985,24 @@ fn io_read_line(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn decos_timer(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let inner = expect_function("timer", args, 0)?;
-    Ok(Value::Builtin(Arc::new(move |vm, call_args| {
+    Ok(Value::builtin("timer", move |vm, call_args| {
         let start = std::time::Instant::now();
         let result = vm.call_user_function(inner.clone(), call_args.to_vec())?;
         eprintln!("timer: {:?}", start.elapsed());
         Ok(result)
-    })))
+    }))
 }
 
 fn decos_debug(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let inner = expect_function("debug", args, 0)?;
-    Ok(Value::Builtin(Arc::new(move |vm, call_args| {
-        let preview: Vec<String> = call_args.iter().map(super::runtime::value::Value::print_string).collect();
+    Ok(Value::builtin("debug", move |vm, call_args| {
+        let preview: Vec<String> = call_args
+            .iter()
+            .map(super::runtime::value::Value::print_string)
+            .collect();
         eprintln!("debug: call({})", preview.join(", "));
         vm.call_user_function(inner.clone(), call_args.to_vec())
-    })))
+    }))
 }
 
 fn decos_retry(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -2012,7 +2018,7 @@ fn decos_retry(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     } else {
         3
     };
-    Ok(Value::Builtin(Arc::new(move |vm, call_args| {
+    Ok(Value::builtin("retry", move |vm, call_args| {
         let mut last_err = None;
         for _ in 0..attempts {
             match vm.call_user_function(inner.clone(), call_args.to_vec()) {
@@ -2021,7 +2027,7 @@ fn decos_retry(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
             }
         }
         Err(last_err.unwrap_or_else(|| crate::error::RuntimeError::msg("retry failed")))
-    })))
+    }))
 }
 
 fn decos_validate(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -2031,7 +2037,7 @@ fn decos_validate(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     } else {
         None
     };
-    Ok(Value::Builtin(Arc::new(move |vm, call_args| {
+    Ok(Value::builtin("validate", move |vm, call_args| {
         let result = if let Some(f) = &inner {
             vm.call_user_function(f.clone(), call_args.to_vec())?
         } else {
@@ -2042,7 +2048,7 @@ fn decos_validate(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
             return Err(crate::error::RuntimeError::msg("validation failed"));
         }
         Ok(result)
-    })))
+    }))
 }
 
 fn decos_catch(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -2052,7 +2058,7 @@ fn decos_catch(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     } else {
         None
     };
-    Ok(Value::Builtin(Arc::new(move |vm, call_args| {
+    Ok(Value::builtin("catch", move |vm, call_args| {
         match vm.call_user_function(inner.clone(), call_args.to_vec()) {
             Ok(v) => Ok(v),
             Err(_) => {
@@ -2063,26 +2069,26 @@ fn decos_catch(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
                 }
             }
         }
-    })))
+    }))
 }
 
 fn decos_deprecated(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() == 1 {
         if let Ok(inner) = expect_function("deprecated", args, 0) {
-            return Ok(Value::Builtin(Arc::new(move |vm, call_args| {
+            return Ok(Value::builtin("deprecated", move |vm, call_args| {
                 eprintln!("[deprecated]");
                 vm.call_user_function(inner.clone(), call_args.to_vec())
-            })));
+            }));
         }
         let msg = args[0].print_string();
-        return Ok(Value::Builtin(Arc::new(move |_vm, call_args| {
+        return Ok(Value::builtin("deprecated", move |_vm, call_args| {
             let inner = expect_function("deprecated", call_args, 0)?;
             let msg = msg.clone();
-            Ok(Value::Builtin(Arc::new(move |vm, args| {
+            Ok(Value::builtin("deprecated", move |vm, args| {
                 eprintln!("[deprecated] {msg}");
                 vm.call_user_function(inner.clone(), args.to_vec())
-            })))
-        })));
+            }))
+        }));
     }
     Err(crate::error::RuntimeError::type_err(
         "deprecated requires 1 argument (function or message)",
@@ -2091,19 +2097,22 @@ fn decos_deprecated(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn decos_trace(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let inner = expect_function("trace", args, 0)?;
-    Ok(Value::Builtin(Arc::new(move |vm, call_args| {
-        let shown: Vec<String> = call_args.iter().map(super::runtime::value::Value::print_string).collect();
+    Ok(Value::builtin("trace", move |vm, call_args| {
+        let shown: Vec<String> = call_args
+            .iter()
+            .map(super::runtime::value::Value::print_string)
+            .collect();
         eprintln!("trace: args={}", shown.join(", "));
         let result = vm.call_user_function(inner.clone(), call_args.to_vec())?;
         eprintln!("trace: => {}", result.print_string());
         Ok(result)
-    })))
+    }))
 }
 
 fn decos_singleton(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let factory = expect_function("singleton", args, 0)?;
     let cell = Shared::new(None::<Value>);
-    Ok(Value::Builtin(Arc::new(move |vm, _call_args| {
+    Ok(Value::builtin("singleton", move |vm, _call_args| {
         let mut slot = cell.borrow_mut();
         if let Some(v) = slot.as_ref() {
             return Ok(v.clone());
@@ -2111,14 +2120,11 @@ fn decos_singleton(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         let v = vm.call_user_function(factory.clone(), vec![])?;
         *slot = Some(v.clone());
         Ok(v)
-    })))
+    }))
 }
 
 fn materialize_iter(vm: &mut Vm, v: &Value) -> Result<Vec<Value>> {
-    let state = match v {
-        Value::Iterator(it) => it.clone(),
-        other => Shared::new(crate::value::value_to_iterable(other)?),
-    };
+    let state = vm.to_iterator_shared(v)?;
     let mut out = Vec::new();
     while let Some(item) = vm.advance_iterator(&state)? {
         out.push(item);
@@ -2126,40 +2132,37 @@ fn materialize_iter(vm: &mut Vm, v: &Value) -> Result<Vec<Value>> {
     Ok(out)
 }
 
-fn value_to_iterator_rc(v: &Value) -> Result<Shared<IteratorState>> {
-    match v {
-        Value::Iterator(it) => Ok(it.clone()),
-        other => Ok(Shared::new(crate::value::value_to_iterable(other)?)),
-    }
+fn value_to_iterator_rc(vm: &mut Vm, v: &Value) -> Result<Shared<IteratorState>> {
+    vm.to_iterator_shared(v)
 }
 
-fn func_map(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn func_map(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
         return Err(crate::error::RuntimeError::type_err("map requires 2 arguments"));
     }
     let func = expect_function("map", args, 0)?;
-    let source = value_to_iterator_rc(&args[1])?;
+    let source = value_to_iterator_rc(vm, &args[1])?;
     Ok(Value::Iterator(Shared::new(IteratorState {
         kind: IteratorKind::Map { func, source },
     })))
 }
 
-fn func_filter(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn func_filter(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
         return Err(crate::error::RuntimeError::type_err("filter requires 2 arguments"));
     }
     let pred = expect_function("filter", args, 0)?;
-    let source = value_to_iterator_rc(&args[1])?;
+    let source = value_to_iterator_rc(vm, &args[1])?;
     Ok(Value::Iterator(Shared::new(IteratorState {
         kind: IteratorKind::Filter { func: pred, source },
     })))
 }
 
-fn func_zip(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn func_zip(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
         return Err(crate::error::RuntimeError::type_err("zip requires at least 2 arguments"));
     }
-    crate::vm::Vm::zip_iterables(args.to_vec())
+    vm.zip_iterables(args.to_vec())
 }
 
 fn func_reduce(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -2181,10 +2184,10 @@ fn func_compose(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
     let f = expect_function("compose", args, 0)?;
     let g = expect_function("compose", args, 1)?;
-    Ok(Value::Builtin(Arc::new(move |vm, call_args| {
+    Ok(Value::builtin("compose", move |vm, call_args| {
         let mid = vm.call_user_function(g.clone(), call_args.to_vec())?;
         vm.call_user_function(f.clone(), vec![mid])
-    })))
+    }))
 }
 
 fn func_partial(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -2193,11 +2196,11 @@ fn func_partial(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
     let func = expect_function("partial", args, 0)?;
     let bound: Vec<Value> = args[1..].to_vec();
-    Ok(Value::Builtin(Arc::new(move |vm, call_args| {
+    Ok(Value::builtin("partial", move |vm, call_args| {
         let mut full = bound.clone();
         full.extend_from_slice(call_args);
         vm.call_user_function(func.clone(), full)
-    })))
+    }))
 }
 
 fn func_identity(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -2212,12 +2215,12 @@ fn func_const(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         return Err(crate::error::RuntimeError::type_err("const requires 1 argument"));
     }
     let x = args[0].clone();
-    Ok(Value::Builtin(Arc::new(move |_vm, _args| Ok(x.clone()))))
+    Ok(Value::builtin("const", move |_vm, _args| Ok(x.clone())))
 }
 
 fn func_flip(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let func = expect_function("flip", args, 0)?;
-    Ok(Value::Builtin(Arc::new(move |vm, call_args| {
+    Ok(Value::builtin("flip", move |vm, call_args| {
         if call_args.len() < 2 {
             return Err(crate::error::RuntimeError::type_err(
                 "flipped function requires at least 2 arguments",
@@ -2226,7 +2229,7 @@ fn func_flip(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         let mut full = call_args.to_vec();
         full.swap(0, 1);
         vm.call_user_function(func.clone(), full)
-    })))
+    }))
 }
 
 fn coll_sorted(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -2628,178 +2631,6 @@ fn time_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let days = days_from_civil(yi, mo, da);
     let secs = days * 86400 + i64::from(hh * 3600 + mi * 60 + se);
     Ok(Value::Num(Num::Small(secs)))
-}
-
-fn text_upper(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    Ok(Value::Text(expect_text("upper", args, 0)?.to_uppercase()))
-}
-
-fn text_lower(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    Ok(Value::Text(expect_text("lower", args, 0)?.to_lowercase()))
-}
-
-fn text_strip(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    Ok(Value::Text(expect_text("strip", args, 0)?.trim().to_string()))
-}
-
-fn text_split(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    let s = expect_text("split", args, 0)?;
-    let sep = if args.len() > 1 {
-        expect_text("split", args, 1)?
-    } else {
-        " ".into()
-    };
-    let parts: Vec<Value> = s.split(&sep).map(|p| Value::Text(p.to_string())).collect();
-    Ok(Value::List(Shared::new(parts)))
-}
-
-fn text_contains(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("contains requires 2 arguments"));
-    }
-    let hay = expect_text("contains", args, 0)?;
-    let needle = args[1].print_string();
-    Ok(Value::Bool(hay.contains(&needle)))
-}
-
-fn text_len(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    Ok(Value::Num(Num::Small(
-        expect_text("len", args, 0)?.chars().count() as i64,
-    )))
-}
-
-fn text_replace(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    if args.len() != 3 {
-        return Err(crate::error::RuntimeError::type_err(
-            "replace requires 3 arguments",
-        ));
-    }
-    let s = expect_text("replace", args, 0)?;
-    let from = expect_text("replace", args, 1)?;
-    let to = expect_text("replace", args, 2)?;
-    Ok(Value::Text(s.replace(&from, &to)))
-}
-
-fn text_startswith(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    text_affix_check("startswith", args, |s, affix| s.starts_with(affix))
-}
-
-fn text_endswith(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    text_affix_check("endswith", args, |s, affix| s.ends_with(affix))
-}
-
-fn text_affix_check(
-    name: &str,
-    args: &[Value],
-    check: impl FnOnce(&str, &str) -> bool,
-) -> Result<Value> {
-    if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err(format!(
-            "{name} requires 2 arguments"
-        )));
-    }
-    let s = expect_text(name, args, 0)?;
-    let affix = expect_text(name, args, 1)?;
-    Ok(Value::Bool(check(&s, &affix)))
-}
-
-fn text_find(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("find requires 2 arguments"));
-    }
-    let s = expect_text("find", args, 0)?;
-    let needle = expect_text("find", args, 1)?;
-    Ok(match s.find(&needle) {
-        Some(i) => Value::Num(Num::Small(s[..i].chars().count() as i64)),
-        None => Value::Num(Num::Small(-1)),
-    })
-}
-
-fn text_join(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("join requires 2 arguments"));
-    }
-    let sep = expect_text("join", args, 0)?;
-    let parts = value_to_list(&args[1])?;
-    let joined = parts
-        .iter()
-        .map(super::runtime::value::Value::print_string)
-        .collect::<Vec<_>>()
-        .join(&sep);
-    Ok(Value::Text(joined))
-}
-
-fn text_repeat(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("repeat requires 2 arguments"));
-    }
-    let s = expect_text("repeat", args, 0)?;
-    let n = expect_int("repeat", args, 1)?.max(0) as usize;
-    Ok(Value::Text(s.repeat(n)))
-}
-
-macro_rules! define_text_char_preds {
-    ($(($fn_name:ident, $api:literal, $pred:expr)),+ $(,)?) => {
-        $(
-            fn $fn_name(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-                text_char_predicate($api, args, $pred)
-            }
-        )+
-    };
-}
-
-define_text_char_preds! {
-    (text_is_digit, "is_digit", |c| c.is_ascii_digit()),
-    (text_is_alpha, "is_alpha", |c| c.is_ascii_alphabetic()),
-    (text_is_space, "is_space", char::is_whitespace),
-}
-
-fn text_char_predicate(
-    name: &str,
-    args: &[Value],
-    pred: impl Fn(char) -> bool,
-) -> Result<Value> {
-    let s = expect_text(name, args, 0)?;
-    Ok(Value::Bool(!s.is_empty() && s.chars().all(pred)))
-}
-
-fn text_count(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err(
-            "count requires 2 arguments (s, sub)",
-        ));
-    }
-    let s = expect_text("count", args, 0)?;
-    let sub = expect_text("count", args, 1)?;
-    if sub.is_empty() {
-        return Ok(Value::Num(Num::Small((s.chars().count() + 1) as i64)));
-    }
-    Ok(Value::Num(Num::Small(s.matches(&sub).count() as i64)))
-}
-
-fn text_lines(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    let s = expect_text("lines", args, 0)?;
-    let lines: Vec<Value> = s.lines().map(|l| Value::Text(l.to_string())).collect();
-    Ok(Value::List(Shared::new(lines)))
-}
-
-fn text_ord(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    let s = expect_text("ord", args, 0)?;
-    let ch = s.chars().next().ok_or_else(|| {
-        crate::error::RuntimeError::type_err("ord requires a non-empty text")
-    })?;
-    Ok(Value::Num(Num::Small(i64::from(ch as u32))))
-}
-
-fn text_chr(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    let n = expect_int("chr", args, 0)?;
-    if !(0..=0x0010_FFFF).contains(&n) {
-        return Err(crate::error::RuntimeError::value_err("chr code point out of range"));
-    }
-    let Some(ch) = char::from_u32(n as u32) else {
-        return Err(crate::error::RuntimeError::value_err("chr invalid code point"));
-    };
-    Ok(Value::Text(ch.to_string()))
 }
 
 fn path_join(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -3831,26 +3662,25 @@ fn re_compile(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let re_p = re;
     Ok(Value::Module(Shared::new(ModuleObject {
         name: "Pattern".into(),
-        full_name: format!("re.Pattern({pat})"),
         exports: exports(&[
             (
                 "match",
-                Value::Builtin(Arc::new(move |vm, a| re_match_impl(vm, &re_m, a))),
+                Value::builtin("match", move |vm, a| re_match_impl(vm, &re_m, a)),
             ),
             (
                 "findall",
-                Value::Builtin(Arc::new(move |_vm, a| {
+                Value::builtin("findall", move |_vm, a| {
                     let text = expect_text("findall", a, 0)?;
                     let out: Vec<Value> = re_f
                         .find_iter(&text)
                         .map(|m| Value::Text(m.as_str().to_string()))
                         .collect();
                     Ok(Value::List(Shared::new(out)))
-                })),
+                }),
             ),
             (
                 "sub",
-                Value::Builtin(Arc::new(move |_vm, a| {
+                Value::builtin("sub", move |_vm, a| {
                     if a.len() != 2 {
                         return Err(crate::error::RuntimeError::type_err(
                             "Pattern.sub requires (repl, text)",
@@ -3861,18 +3691,18 @@ fn re_compile(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
                     Ok(Value::Text(
                         re_s.replace_all(&text, repl.as_str()).into_owned(),
                     ))
-                })),
+                }),
             ),
             (
                 "split",
-                Value::Builtin(Arc::new(move |_vm, a| {
+                Value::builtin("split", move |_vm, a| {
                     let text = expect_text("split", a, 0)?;
                     let out: Vec<Value> = re_p
                         .split(&text)
                         .map(|s| Value::Text(s.to_string()))
                         .collect();
                     Ok(Value::List(Shared::new(out)))
-                })),
+                }),
             ),
             ("pattern", Value::Text(pat)),
         ]),
@@ -4045,13 +3875,13 @@ fn build_http_module() -> Shared<ModuleObject> {
     submodule(
         "http",
         &[
-            ("get", builtin(http_get)),
-            ("post", builtin(http_post)),
-            ("put", builtin(http_put)),
-            ("delete", builtin(http_delete)),
-            ("patch", builtin(http_patch)),
-            ("head", builtin(http_head)),
-            ("request", builtin(http_request)),
+            ("get", named_builtin("get", http_get)),
+            ("post", named_builtin("post", http_post)),
+            ("put", named_builtin("put", http_put)),
+            ("delete", named_builtin("delete", http_delete)),
+            ("patch", named_builtin("patch", http_patch)),
+            ("head", named_builtin("head", http_head)),
+            ("request", named_builtin("request", http_request)),
         ],
     )
 }
@@ -4208,18 +4038,19 @@ fn apply_auth(
 }
 
 fn http_get(vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    vm.caps.check_network("http.get")?;
-    let url = expect_text("http.get", args, 0)?;
+    vm.caps.check_network("get")?;
+    let op = builtin_repr("get");
+    let url = expect_text(&op, args, 0)?;
     let opts = args.get(1).cloned().unwrap_or(Value::None);
     let client = build_client(&opts)?;
     let mut req = client.get(url.as_str());
     if let Value::Dict(_) = &opts {
-        req = req.headers(extract_headers("http.get", &opts)?);
+        req = req.headers(extract_headers(&op, &opts)?);
     }
     req = apply_auth(req, &opts);
     let resp = req
         .send()
-        .map_err(|e| crate::error::RuntimeError::io_err(format!("http.get '{url}' failed: {e}")))?;
+        .map_err(|e| crate::error::RuntimeError::io_err(format!("{op} '{url}' failed: {e}")))?;
     let r = response_to_dict(resp);
     if r.is_ok() {
         vm.request_cooperative_yield();
@@ -4228,19 +4059,20 @@ fn http_get(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 }
 
 fn http_post(vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    vm.caps.check_network("http.post")?;
-    let url = expect_text("http.post", args, 0)?;
-    let body = expect_text("http.post", args, 1)?;
+    vm.caps.check_network("post")?;
+    let op = builtin_repr("post");
+    let url = expect_text(&op, args, 0)?;
+    let body = expect_text(&op, args, 1)?;
     let opts = args.get(2).cloned().unwrap_or(Value::None);
     let client = build_client(&opts)?;
     let mut req = client.post(url.as_str()).body(body);
     if let Value::Dict(_) = &opts {
-        req = req.headers(extract_headers("http.post", &opts)?);
+        req = req.headers(extract_headers(&op, &opts)?);
     }
     req = apply_auth(req, &opts);
     let resp = req
         .send()
-        .map_err(|e| crate::error::RuntimeError::io_err(format!("http.post '{url}' failed: {e}")))?;
+        .map_err(|e| crate::error::RuntimeError::io_err(format!("{op} '{url}' failed: {e}")))?;
     let r = response_to_dict(resp);
     if r.is_ok() {
         vm.request_cooperative_yield();
@@ -4249,19 +4081,20 @@ fn http_post(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 }
 
 fn http_put(vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    vm.caps.check_network("http.put")?;
-    let url = expect_text("http.put", args, 0)?;
-    let body = expect_text("http.put", args, 1)?;
+    vm.caps.check_network("put")?;
+    let op = builtin_repr("put");
+    let url = expect_text(&op, args, 0)?;
+    let body = expect_text(&op, args, 1)?;
     let opts = args.get(2).cloned().unwrap_or(Value::None);
     let client = build_client(&opts)?;
     let mut req = client.put(url.as_str()).body(body);
     if let Value::Dict(_) = &opts {
-        req = req.headers(extract_headers("http.put", &opts)?);
+        req = req.headers(extract_headers(&op, &opts)?);
     }
     req = apply_auth(req, &opts);
     let resp = req
         .send()
-        .map_err(|e| crate::error::RuntimeError::io_err(format!("http.put '{url}' failed: {e}")))?;
+        .map_err(|e| crate::error::RuntimeError::io_err(format!("{op} '{url}' failed: {e}")))?;
     let r = response_to_dict(resp);
     if r.is_ok() {
         vm.request_cooperative_yield();
@@ -4270,18 +4103,19 @@ fn http_put(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 }
 
 fn http_delete(vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    vm.caps.check_network("http.delete")?;
-    let url = expect_text("http.delete", args, 0)?;
+    vm.caps.check_network("delete")?;
+    let op = builtin_repr("delete");
+    let url = expect_text(&op, args, 0)?;
     let opts = args.get(1).cloned().unwrap_or(Value::None);
     let client = build_client(&opts)?;
     let mut req = client.delete(url.as_str());
     if let Value::Dict(_) = &opts {
-        req = req.headers(extract_headers("http.delete", &opts)?);
+        req = req.headers(extract_headers(&op, &opts)?);
     }
     req = apply_auth(req, &opts);
     let resp = req
         .send()
-        .map_err(|e| crate::error::RuntimeError::io_err(format!("http.delete '{url}' failed: {e}")))?;
+        .map_err(|e| crate::error::RuntimeError::io_err(format!("{op} '{url}' failed: {e}")))?;
     let r = response_to_dict(resp);
     if r.is_ok() {
         vm.request_cooperative_yield();
@@ -4290,19 +4124,20 @@ fn http_delete(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 }
 
 fn http_patch(vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    vm.caps.check_network("http.patch")?;
-    let url = expect_text("http.patch", args, 0)?;
-    let body = expect_text("http.patch", args, 1)?;
+    vm.caps.check_network("patch")?;
+    let op = builtin_repr("patch");
+    let url = expect_text(&op, args, 0)?;
+    let body = expect_text(&op, args, 1)?;
     let opts = args.get(2).cloned().unwrap_or(Value::None);
     let client = build_client(&opts)?;
     let mut req = client.patch(url.as_str()).body(body);
     if let Value::Dict(_) = &opts {
-        req = req.headers(extract_headers("http.patch", &opts)?);
+        req = req.headers(extract_headers(&op, &opts)?);
     }
     req = apply_auth(req, &opts);
     let resp = req
         .send()
-        .map_err(|e| crate::error::RuntimeError::io_err(format!("http.patch '{url}' failed: {e}")))?;
+        .map_err(|e| crate::error::RuntimeError::io_err(format!("{op} '{url}' failed: {e}")))?;
     let r = response_to_dict(resp);
     if r.is_ok() {
         vm.request_cooperative_yield();
@@ -4311,18 +4146,19 @@ fn http_patch(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 }
 
 fn http_head(vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    vm.caps.check_network("http.head")?;
-    let url = expect_text("http.head", args, 0)?;
+    vm.caps.check_network("head")?;
+    let op = builtin_repr("head");
+    let url = expect_text(&op, args, 0)?;
     let opts = args.get(1).cloned().unwrap_or(Value::None);
     let client = build_client(&opts)?;
     let mut req = client.head(url.as_str());
     if let Value::Dict(_) = &opts {
-        req = req.headers(extract_headers("http.head", &opts)?);
+        req = req.headers(extract_headers(&op, &opts)?);
     }
     req = apply_auth(req, &opts);
     let resp = req
         .send()
-        .map_err(|e| crate::error::RuntimeError::io_err(format!("http.head '{url}' failed: {e}")))?;
+        .map_err(|e| crate::error::RuntimeError::io_err(format!("{op} '{url}' failed: {e}")))?;
     let r = response_to_dict(resp);
     if r.is_ok() {
         vm.request_cooperative_yield();
@@ -4331,9 +4167,10 @@ fn http_head(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 }
 
 fn http_request(vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    vm.caps.check_network("http.request")?;
-    let method = expect_text("http.request", args, 0)?;
-    let url = expect_text("http.request", args, 1)?;
+    vm.caps.check_network("request")?;
+    let op = builtin_repr("request");
+    let method = expect_text(&op, args, 0)?;
+    let url = expect_text(&op, args, 1)?;
     let opts = args.get(2).cloned().unwrap_or(Value::None);
     let client = build_client(&opts)?;
     let m = method.to_uppercase();
@@ -4346,12 +4183,12 @@ fn http_request(vm: &mut Vm, args: &[Value]) -> Result<Value> {
         "HEAD" => client.head(url.as_str()),
         other => {
             return Err(crate::error::RuntimeError::type_err(format!(
-                "http.request: unsupported method '{other}'"
+                "{op}: unsupported method '{other}'"
             )));
         }
     };
     if let Value::Dict(_) = &opts {
-        req_builder = req_builder.headers(extract_headers("http.request", &opts)?);
+        req_builder = req_builder.headers(extract_headers(&op, &opts)?);
         if let Value::Dict(d) = &opts {
             if let Some(Value::Text(s)) = d.borrow().get(&ValueKey::Text("body".into())) {
                 req_builder = req_builder.body(s.clone());
@@ -4361,7 +4198,7 @@ fn http_request(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let req_builder = apply_auth(req_builder, &opts);
     let resp = req_builder
         .send()
-        .map_err(|e| crate::error::RuntimeError::io_err(format!("http.request '{m} {url}' failed: {e}")))?;
+        .map_err(|e| crate::error::RuntimeError::io_err(format!("{op} '{m} {url}' failed: {e}")))?;
     let r = response_to_dict(resp);
     if r.is_ok() {
         vm.request_cooperative_yield();
@@ -4522,7 +4359,6 @@ fn build_encoding_module() -> Shared<ModuleObject> {
 // 数据格式解析标准库 —— csv / toml / yaml / xml
 // ---------------------------------------------------------------------------
 
-/// `serde_json::Value` → Optive `Value`（供 toml/yaml 经 serde 中转后复用）。
 fn serde_json_to_optive(v: &serde_json::Value) -> Result<Value> {
     use serde_json::Value as J;
     Ok(match v {
@@ -4558,6 +4394,53 @@ fn serde_json_to_optive(v: &serde_json::Value) -> Result<Value> {
     })
 }
 
+/// Optive `Value` → `serde_json::Value`（toml/yaml stringify 中转）。
+fn optive_to_serde_json(v: &Value) -> Result<serde_json::Value> {
+    use serde_json::{Map, Number, Value as J};
+    Ok(match v {
+        Value::None => J::Null,
+        Value::Bool(b) => J::Bool(*b),
+        Value::Num(n) => {
+            if let Some(i) = n.to_i64() {
+                J::Number(i.into())
+            } else if let Ok(f) = n.to_f64_checked() {
+                Number::from_f64(f).map(J::Number).unwrap_or(J::Null)
+            } else {
+                J::String(n.to_string())
+            }
+        }
+        Value::Text(s) => J::String(s.clone()),
+        Value::List(l) => {
+            let items: Result<Vec<_>> = l.borrow().iter().map(optive_to_serde_json).collect();
+            J::Array(items?)
+        }
+        Value::Tuple(t) => {
+            let items: Result<Vec<_>> = t.iter().map(optive_to_serde_json).collect();
+            J::Array(items?)
+        }
+        Value::Dict(d) => {
+            let mut map = Map::new();
+            for (k, val) in d.borrow().iter() {
+                let key = match value_key_to_value(k) {
+                    Value::Text(s) => s,
+                    other => other.print_string(),
+                };
+                map.insert(key, optive_to_serde_json(val)?);
+            }
+            J::Object(map)
+        }
+        Value::Set(s) => {
+            let items: Result<Vec<_>> = s
+                .borrow()
+                .iter()
+                .map(|k| optive_to_serde_json(&value_key_to_value(k)))
+                .collect();
+            J::Array(items?)
+        }
+        other => J::String(other.print_string()),
+    })
+}
+
 // --- std.toml ---
 
 fn toml_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -4570,8 +4453,24 @@ fn toml_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     serde_json_to_optive(&jv)
 }
 
+fn toml_stringify(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    expect_arity("stringify", args, 1)?;
+    let jv = optive_to_serde_json(&args[0])?;
+    let toml_val = toml::Value::try_from(&jv)
+        .map_err(|e| crate::error::RuntimeError::value_err(format!("toml stringify: {e}")))?;
+    toml::to_string(&toml_val)
+        .map(Value::Text)
+        .map_err(|e| crate::error::RuntimeError::value_err(format!("toml stringify: {e}")))
+}
+
 fn build_toml_module() -> Shared<ModuleObject> {
-    submodule("toml", &[("parse", builtin(toml_parse))])
+    submodule(
+        "toml",
+        &[
+            ("parse", builtin(toml_parse)),
+            ("stringify", builtin(toml_stringify)),
+        ],
+    )
 }
 
 // --- std.yaml ---
@@ -4586,8 +4485,22 @@ fn yaml_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     serde_json_to_optive(&jv)
 }
 
+fn yaml_stringify(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    expect_arity("stringify", args, 1)?;
+    let jv = optive_to_serde_json(&args[0])?;
+    serde_yaml::to_string(&jv)
+        .map(Value::Text)
+        .map_err(|e| crate::error::RuntimeError::value_err(format!("yaml stringify: {e}")))
+}
+
 fn build_yaml_module() -> Shared<ModuleObject> {
-    submodule("yaml", &[("parse", builtin(yaml_parse))])
+    submodule(
+        "yaml",
+        &[
+            ("parse", builtin(yaml_parse)),
+            ("stringify", builtin(yaml_stringify)),
+        ],
+    )
 }
 
 // --- std.csv ---
@@ -4758,6 +4671,131 @@ fn xml_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     Ok(xml_element_to_value(doc.root_element()))
 }
 
+const XML_MAX_DEPTH: usize = 64;
+
+fn xml_stringify(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    expect_arity("stringify", args, 1)?;
+    Ok(Value::Text(xml_value_to_string(&args[0], 0)?))
+}
+
+fn xml_value_to_string(v: &Value, depth: usize) -> Result<String> {
+    if depth >= XML_MAX_DEPTH {
+        return Err(crate::error::RuntimeError::value_err(
+            "xml.stringify: document exceeds maximum nesting depth",
+        ));
+    }
+    let Value::Dict(d) = v else {
+        return Err(crate::error::RuntimeError::type_err(
+            "xml.stringify expects a dict {tag, attrs, text, children}",
+        ));
+    };
+    let d = d.borrow();
+    let tag = match d.get(&ValueKey::Text("tag".into())) {
+        Some(Value::Text(s)) if !s.is_empty() => s.clone(),
+        _ => {
+            return Err(crate::error::RuntimeError::value_err(
+                "xml.stringify: missing text field `tag`",
+            ))
+        }
+    };
+    if !xml_tag_is_valid(&tag) {
+        return Err(crate::error::RuntimeError::value_err(format!(
+            "xml.stringify: invalid tag `{tag}`"
+        )));
+    }
+    let mut out = String::new();
+    out.push('<');
+    out.push_str(&tag);
+    if let Some(Value::Dict(attrs)) = d.get(&ValueKey::Text("attrs".into())) {
+        for (k, val) in attrs.borrow().iter() {
+            let key = match k {
+                ValueKey::Text(s) => s.as_str(),
+                _ => continue,
+            };
+            let vs = match val {
+                Value::Text(s) => s.clone(),
+                Value::None => continue,
+                other => other.print_string(),
+            };
+            out.push(' ');
+            out.push_str(key);
+            out.push_str("=\"");
+            out.push_str(&xml_escape_attr(&vs));
+            out.push('"');
+        }
+    }
+    let text = match d.get(&ValueKey::Text("text".into())) {
+        Some(Value::Text(s)) => s.as_str(),
+        _ => "",
+    };
+    let children = match d.get(&ValueKey::Text("children".into())) {
+        Some(Value::List(l)) => l.borrow().clone(),
+        Some(Value::Tuple(t)) => t.iter().cloned().collect(),
+        _ => Vec::new(),
+    };
+    if text.is_empty() && children.is_empty() {
+        out.push_str("/>");
+        return Ok(out);
+    }
+    out.push('>');
+    if !text.is_empty() {
+        out.push_str(&xml_escape_text(text));
+    }
+    for child in children {
+        out.push_str(&xml_value_to_string(&child, depth + 1)?);
+    }
+    out.push_str("</");
+    out.push_str(&tag);
+    out.push('>');
+    Ok(out)
+}
+
+/// XML Name：ASCII 字母/`_` 开头；可含数字/`-`；至多一个 `:`（前缀/本地名各自合法）。
+fn xml_tag_is_valid(tag: &str) -> bool {
+    if tag.is_empty() {
+        return false;
+    }
+    let mut saw_colon = false;
+    let mut at_name_start = true;
+    for c in tag.chars() {
+        if c == ':' {
+            if saw_colon || at_name_start {
+                return false;
+            }
+            saw_colon = true;
+            at_name_start = true;
+            continue;
+        }
+        if at_name_start {
+            if !(c.is_ascii_alphabetic() || c == '_') {
+                return false;
+            }
+            at_name_start = false;
+            continue;
+        }
+        if !(c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            return false;
+        }
+    }
+    !at_name_start
+}
+
+fn xml_escape_text(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn xml_escape_attr(s: &str) -> String {
+    xml_escape_text(s).replace('"', "&quot;").replace('\'', "&apos;")
+}
+
 fn build_xml_module() -> Shared<ModuleObject> {
-    submodule("xml", &[("parse", builtin(xml_parse))])
+    submodule(
+        "xml",
+        &[
+            ("parse", builtin(xml_parse)),
+            ("stringify", builtin(xml_stringify)),
+        ],
+    )
 }

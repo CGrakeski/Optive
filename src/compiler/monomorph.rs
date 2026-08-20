@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::ast::{Expr, ExprKind, CallArg, FuncParam, Block, LocatedStmt, Stmt, ForItem, CatchClause, MatchCase, LValue, FStringPart, SelectCase, Pattern, PatternElem, DelTarget};
-use crate::types::{static_type_value_from_expr, type_value_display};
+use crate::types::{static_type_value_from_expr, type_value_display, type_values_equal};
 use crate::value::Value;
 
 pub fn type_args_from_index_expr(index: &Expr) -> Result<Vec<Value>, String> {
@@ -25,31 +25,129 @@ pub fn infer_type_args_from_call_args(
     template: &crate::opcode::GenericFunctionTemplate,
     args: &[CallArg],
 ) -> Result<Vec<Value>, String> {
-    if template.type_params.len() != 1 {
-        return Err(format!(
-            "cannot infer {} type parameter(s) from arguments; specify explicitly with {}[...](...)",
-            template.type_params.len(),
-            template.name
-        ));
+    infer_type_args_from_arg_exprs(
+        &template.name,
+        &template.type_params,
+        &template.params,
+        args,
+        |e| infer_type_from_expr(e, "x"),
+    )
+}
+
+pub fn infer_type_args_from_arg_exprs(
+    func_name: &str,
+    type_params: &[(String, Option<Expr>)],
+    params: &[FuncParam],
+    args: &[CallArg],
+    infer_arg: impl Fn(&Expr) -> Option<Value>,
+) -> Result<Vec<Value>, String> {
+    let mut inferred: HashMap<String, Value> = HashMap::new();
+    for (param, arg) in params.iter().zip(args.iter()) {
+        let Some(ty_expr) = &param.type_expr else {
+            continue;
+        };
+        let Some(tp) = type_param_in_annotation(ty_expr, type_params) else {
+            continue;
+        };
+        let Some(ty) = infer_arg(&arg.value) else {
+            continue;
+        };
+        if let Some(prev) = inferred.get(&tp) {
+            if !type_values_equal(prev, &ty) {
+                return Err(format!(
+                    "conflicting inferences for type parameter `{tp}` at call to `{func_name}`: {} vs {}",
+                    type_value_display(prev),
+                    type_value_display(&ty)
+                ));
+            }
+        } else {
+            inferred.insert(tp, ty);
+        }
     }
-    let param = template.params.first().ok_or("generic function has no parameters")?;
-    let arg_expr = &args
-        .first()
-        .ok_or_else(|| format!("{} expects at least one argument for type inference", template.name))?
-        .value;
-    let inferred = infer_type_from_expr(arg_expr, &param.name)
-        .ok_or_else(|| format!("cannot infer type parameter from argument at call to `{}`", template.name))?;
-    Ok(vec![inferred])
+    if inferred.is_empty() && type_params.len() == 1 && !args.is_empty() {
+        if let Some(ty) = infer_arg(&args[0].value) {
+            inferred.insert(type_params[0].0.clone(), ty);
+        }
+    }
+    let mut out = Vec::with_capacity(type_params.len());
+    for (name, _) in type_params {
+        match inferred.get(name) {
+            Some(v) => out.push(v.clone()),
+            None => {
+                return Err(format!(
+                    "cannot infer {} type parameter(s) for `{func_name}`; use {func_name}[...](...)",
+                    type_params.len()
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn type_param_in_annotation(
+    expr: &Expr,
+    type_params: &[(String, Option<Expr>)],
+) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Var(name) if type_params.iter().any(|(p, _)| p == name) => Some(name.clone()),
+        _ => None,
+    }
 }
 
 #[must_use]
 pub fn infer_type_from_expr(expr: &Expr, param_name: &str) -> Option<Value> {
     match &expr.kind {
         ExprKind::Number(_) => Some(Value::type_ref("num")),
-        ExprKind::String(_) => Some(Value::type_ref("text")),
-        ExprKind::FString(_) => Some(Value::type_ref("text")),
+        ExprKind::String(_) | ExprKind::FString(_) => Some(Value::type_ref("text")),
         ExprKind::Bool(_) => Some(Value::type_ref("bool")),
         ExprKind::None => Some(Value::type_ref("nonetype")),
+        ExprKind::List(_) | ExprKind::ListComp { .. } => Some(Value::type_ref("list")),
+        ExprKind::Dict(_) | ExprKind::DictComp { .. } => Some(Value::type_ref("dict")),
+        ExprKind::Set(_) | ExprKind::SetComp { .. } => Some(Value::type_ref("set")),
+        ExprKind::Tuple(_) => Some(Value::type_ref("tuple")),
+        ExprKind::Bytes(_) => Some(Value::type_ref("bytes")),
+        ExprKind::Unary { op, operand } => match op {
+            crate::ast::UnaryOp::Not | crate::ast::UnaryOp::TruthyNot => {
+                Some(Value::type_ref("bool"))
+            }
+            crate::ast::UnaryOp::Neg | crate::ast::UnaryOp::Invert => infer_type_from_expr(operand, param_name)
+                .or_else(|| Some(Value::type_ref("num"))),
+        },
+        ExprKind::Binary { op, left, right } => match op {
+            crate::ast::BinaryOp::Eq
+            | crate::ast::BinaryOp::Ne
+            | crate::ast::BinaryOp::Lt
+            | crate::ast::BinaryOp::Le
+            | crate::ast::BinaryOp::Gt
+            | crate::ast::BinaryOp::Ge
+            | crate::ast::BinaryOp::In
+            | crate::ast::BinaryOp::Is
+            | crate::ast::BinaryOp::IsNot
+            | crate::ast::BinaryOp::And
+            | crate::ast::BinaryOp::Or => Some(Value::type_ref("bool")),
+            _ => {
+                let l = infer_type_from_expr(left, param_name);
+                let r = infer_type_from_expr(right, param_name);
+                match (l, r) {
+                    (Some(a), Some(b)) if type_values_equal(&a, &b) => Some(a),
+                    (Some(a), None) | (None, Some(a)) => Some(a),
+                    _ => None,
+                }
+            }
+        },
+        ExprKind::IfThenElse {
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            let t = infer_type_from_expr(then_expr, param_name)?;
+            let e = infer_type_from_expr(else_expr, param_name)?;
+            if type_values_equal(&t, &e) {
+                Some(t)
+            } else {
+                None
+            }
+        }
         ExprKind::Var(name) if name == param_name => None,
         ExprKind::Var(_) => None,
         _ => None,

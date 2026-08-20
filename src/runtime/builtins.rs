@@ -63,7 +63,7 @@ pub fn install_globals(vm: &mut Vm) {
         ("__finalize_enum__", builtin_finalize_enum),
     ];
     for (name, f) in builtins {
-        vm.globals.insert(name.into(), Value::Builtin(Arc::new(f)));
+        vm.globals.insert(name.into(), Value::builtin_fn(name, f));
     }
 }
 fn builtin_print(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -265,6 +265,7 @@ fn builtin_make_closure(vm: &mut Vm, args: &[Value]) -> Result<Value> {
                 .insert(name.clone(), Value::Cell(cell));
         }
     }
+    f.refresh_hot_call_argc();
     Ok(Value::Function(Arc::new(f)))
 }
 
@@ -291,7 +292,7 @@ fn builtin_with_exit(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     // 若走 `call_method`→`call_value`，内层会清掉 suspend 并错误地 arm 内层方法。
     let method = vm.get_attr_value(ctx, "__exit__")?;
     match method {
-        Value::Builtin(f) => f(vm, &exit_args),
+        Value::Builtin(b) => b.call(vm, &exit_args),
         other => vm.call_value(other, exit_args),
     }
 }
@@ -460,24 +461,18 @@ fn builtin_id(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     Ok(Value::Num(Num::from_bigint((ptr as u64).into())))
 }
 
-fn builtin_iter(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn builtin_iter(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(crate::error::RuntimeError::type_err("iter requires 1 argument"));
     }
-    match &args[0] {
-        Value::Iterator(it) => Ok(Value::Iterator(it.clone())),
-        other => Ok(crate::value::value_to_iterable(other)?.into_value()),
-    }
+    Ok(Value::Iterator(vm.to_iterator_shared(&args[0])?))
 }
 
 fn builtin_next(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(crate::error::RuntimeError::type_err("next requires 1 argument"));
     }
-    let state = match &args[0] {
-        Value::Iterator(it) => it.clone(),
-        other => Shared::new(crate::value::value_to_iterable(other)?),
-    };
+    let state = vm.to_iterator_shared(&args[0])?;
     if let Some(v) = vm.advance_iterator(&state)? { Ok(v) } else {
         let exc = crate::exceptions::make_exception(vm, "StopIteration", "iterator exhausted")?;
         vm.throw_value(exc)?;
@@ -648,8 +643,8 @@ fn builtin_help(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.is_empty() {
         println!(
             "Optive help\n\
-             Builtins: print, len, type, range, iter, next, input, exit, help, eval, …\n\
-             Import std: use std.math / std.io / std.json / …\n\
+             Builtins: print, len, type, range, iter, next, input, exit, help, eval, ...\n\
+             Import std: use std.math / std.io / std.json / ...\n\
              Typing:\n\
                : T      soft annotation\n\
                :: T     strong runtime contract\n\
@@ -670,25 +665,22 @@ fn builtin_repr(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     Ok(Value::Text(args[0].display_string()))
 }
 
-fn builtin_zip_iter(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn builtin_zip_iter(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.is_empty() {
         return Err(crate::error::RuntimeError::type_err(
             "__zip_iter__ requires at least 1 argument",
         ));
     }
-    crate::vm::Vm::zip_iterables(args.to_vec())
+    vm.zip_iterables(args.to_vec())
 }
 
-fn builtin_make_genexpr(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn builtin_make_genexpr(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 3 {
         return Err(crate::error::RuntimeError::type_err(
             "__make_genexpr__ requires (source, elem_func, guards_list)",
         ));
     }
-    let source = match &args[0] {
-        Value::Iterator(it) => it.clone(),
-        other => Shared::new(crate::value::value_to_iterable(other)?),
-    };
+    let source = vm.to_iterator_shared(&args[0])?;
     let elem = match &args[1] {
         Value::Function(f) => f.clone(),
         _ => {
@@ -767,6 +759,7 @@ fn builtin_attach_defaults(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
             }
         })
         .collect();
+    func.refresh_hot_call_argc();
     Ok(Value::Function(Arc::new(func)))
 }
 

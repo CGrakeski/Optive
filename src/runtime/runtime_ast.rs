@@ -124,9 +124,17 @@ pub struct RuntimeAstNode {
 }
 
 impl RuntimeAstNode {
+    /// 消耗节点，装箱为运行时 `Value::RuntimeAst`。
     #[must_use]
-    pub fn into_value(self) -> Value {
+    pub fn to_value(self) -> Value {
         Value::RuntimeAst(Arc::new(self))
+    }
+
+    /// 兼容旧名。
+    #[must_use]
+    #[inline]
+    pub fn into_value(self) -> Value {
+        self.to_value()
     }
 }
 
@@ -1606,7 +1614,7 @@ fn make_struct_instance(vm: &Vm, name: &str, slots: Vec<Value>) -> Result<Value>
 
 pub fn register_ast_struct_types(vm: &mut Vm) {
     let defs = [
-        ("AstNode", None, vec![] as Vec<(&str, &str)>),
+        ("AstNode", None, vec![]),
         ("AstNumber", Some("AstNode"), vec![("value", "text")]),
         ("AstString", Some("AstNode"), vec![("value", "text")]),
         ("AstBool", Some("AstNode"), vec![("value", "bool")]),
@@ -1667,7 +1675,9 @@ pub fn register_ast_struct_types(vm: &mut Vm) {
                     .map(|_| FieldTypeInfo::default())
                     .collect(),
                 type_params: Vec::new(),
-                c_layout: None,
+                native_layout: None,
+                methods: std::collections::HashMap::new(),
+                overloads: std::collections::HashMap::new(),
             })
         });
         vm.globals

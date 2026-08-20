@@ -11,18 +11,10 @@ use crate::protocol::{self, TypeCheckContext};
 use crate::monomorph;
 use crate::runtime_ast;
 use crate::value::{FieldTypeInfo, Num, StructDef, Value};
-use crate::types::{static_type_value_from_expr, type_value_display};
+use crate::types::type_value_display;
 use crate::Result;
 
 use crate::shared::Shared;
-
-fn is_c_layout_annotation(ty: &Expr) -> bool {
-    static_type_value_from_expr(ty)
-        .is_some_and(|v| {
-            let s = type_value_display(&v);
-            s == "C.layout" || s.ends_with(".C.layout")
-        })
-}
 
 fn collect_assigned_names(body: &Block, out: &mut HashSet<String>) {
     for s in body {
@@ -430,8 +422,7 @@ impl Generator {
             .and_then(|slots| slots.get(name).copied());
         if local_binding.is_none()
             && (self.program.struct_defs.contains_key(name)
-                || crate::type_registry::is_registered_primitive(name)
-                || name.starts_with("C.types."))
+                || crate::type_registry::is_registered_primitive(name))
         {
             self.cg
                 .emit(Instruction::Push(Value::type_ref(name.to_string())));
@@ -1127,15 +1118,19 @@ impl Generator {
                         strict: Self::field_strict(*typed, f.type_strong, f.type_expr.as_ref()),
                     })
                     .collect();
-                let c_layout = if let Some(layout_ty) = layout {
-                    if !is_c_layout_annotation(layout_ty) {
+                let native_layout = if let Some(layout_ty) = layout {
+                    let Some(layout_obj) = crate::ffi_extra::resolve_layout_from_expr(layout_ty)
+                    else {
+                        let hint = crate::types::static_type_value_from_expr(layout_ty)
+                            .map(|v| crate::types::type_value_display(&v))
+                            .unwrap_or_else(|| format!("{layout_ty:?}"));
                         return Err(RuntimeError::type_err(format!(
-                            "struct '{name}': unsupported layout annotation (expected C.layout)"
+                            "struct '{name}': unknown or unsupported layout annotation `{hint}`"
                         )));
-                    }
+                    };
                     if !*typed {
                         return Err(RuntimeError::type_err(format!(
-                            "struct '{name}': C.layout requires `typed struct`"
+                            "struct '{name}': layout annotation requires `typed struct`"
                         )));
                     }
                     let tmp = StructDef {
@@ -1146,9 +1141,12 @@ impl Generator {
                         typed: *typed,
                         field_types: field_types.clone(),
                         type_params: type_params.clone(),
-                        c_layout: None,
+                        native_layout: None,
+                        methods: HashMap::new(),
+                        overloads: HashMap::new(),
                     };
-                    Some(Arc::new(crate::ffi_extra::layout_from_struct_def(&tmp)?))
+                    let computed = crate::ffi_extra::apply_layout(&layout_obj, &tmp)?;
+                    Some(Arc::new(computed))
                 } else {
                     None
                 };
@@ -1160,9 +1158,13 @@ impl Generator {
                     typed: *typed,
                     field_types,
                     type_params: type_params.clone(),
-                    c_layout,
+                    native_layout,
+                    methods: HashMap::new(),
+                    overloads: HashMap::new(),
                 });
                 self.program.struct_defs.insert(name.clone(), def);
+                let mut def_methods: HashMap<String, Arc<FunctionObject>> = HashMap::new();
+                let mut def_overloads: HashMap<String, Vec<Arc<FunctionObject>>> = HashMap::new();
                 for m in methods {
                     let full_name = if m.outside {
                         m.name.clone()
@@ -1199,27 +1201,22 @@ impl Generator {
                     )?;
                     let func_rc = Arc::new(func);
                     if m.outside {
-                        self.program
-                            .functions
-                            .insert(full_name.clone(), func_rc.clone());
-                        self.program.functions.insert(
-                            format!("{name}.{}", m.name),
-                            func_rc,
-                        );
-                    } else if m.overload {
-                        self.program.functions.insert(
-                            format!("{full_name}#{}", self.program.functions.len()),
-                            func_rc.clone(),
-                        );
-                        self.program
-                            .overload_tables
-                            .entry(full_name.clone())
-                            .or_default()
-                            .push(func_rc);
-                    } else {
                         self.program.functions.insert(full_name, func_rc);
+                    } else if m.overload {
+                        def_overloads.entry(m.name.clone()).or_default().push(func_rc);
+                    } else {
+                        def_methods.insert(m.name.clone(), func_rc);
                     }
                 }
+                // 方法挂到类型对象；`a.b` 经 getattr 查 StructDef.methods。
+                let def = self
+                    .program
+                    .struct_defs
+                    .get_mut(name)
+                    .expect("struct def inserted above");
+                let def = Arc::make_mut(def);
+                def.methods = def_methods;
+                def.overloads = def_overloads;
                 self.cg.emit(Instruction::Push(Value::type_ref(name.clone())));
                 self.cg.emit(Instruction::NewVar {
                     name: name.clone(),
@@ -1249,26 +1246,25 @@ impl Generator {
                 path_is_string,
                 alias,
             } => {
-                let bind = if *path_is_string {
-                    alias.clone().unwrap_or_else(|| {
+                if *path_is_string {
+                    let bind = alias.clone().unwrap_or_else(|| {
                         std::path::Path::new(path)
                             .file_stem()
                             .and_then(|s| s.to_str())
                             .unwrap_or("module")
                             .to_string()
-                    })
+                    });
+                    self.cg.emit(Instruction::FindModFile(path.clone()));
+                    self.emit_bind_name(&bind);
                 } else {
-                    alias
+                    let parts: Vec<String> =
+                        path.split('.').map(str::to_string).collect();
+                    let bind = alias
                         .clone()
-                        .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path).to_string())
-                };
-                let find = if *path_is_string {
-                    format!("@str:{path}")
-                } else {
-                    path.clone()
-                };
-                self.cg.emit(Instruction::FindMod(find));
-                self.emit_bind_name(&bind);
+                        .unwrap_or_else(|| parts.last().cloned().unwrap_or_default());
+                    self.cg.emit(Instruction::FindMod(parts));
+                    self.emit_bind_name(&bind);
+                }
             }
             Stmt::Use { module, items } => {
                 let temp = self.cg.fresh_temp("__use_mod");
@@ -1780,6 +1776,7 @@ impl Generator {
         top_level: bool,
     ) -> Result<()> {
         let mut generate_func = None;
+        let mut def_methods: HashMap<String, Arc<FunctionObject>> = HashMap::new();
 
         for method in methods {
             crate::enum_variant::validate_enum_method(method)?;
@@ -1799,9 +1796,7 @@ impl Generator {
             if method.name == "__generate__" {
                 generate_func = Some(Arc::new(func));
             } else {
-                self.program
-                    .functions
-                    .insert(full_name, Arc::new(func));
+                def_methods.insert(method.name.clone(), Arc::new(func));
             }
         }
 
@@ -1824,11 +1819,18 @@ impl Generator {
             self.cg.emit(Instruction::Call { argc: 3 });
         } else {
             let member_infos = crate::enum_variant::default_enum_values(members)?;
-            let def = crate::enum_variant::build_enum_def(name, member_infos);
-            self.program.enum_defs.insert(name.to_string(), def.clone());
-            for (name, func) in crate::enum_variant::builtin_enum_method_entries(name, &def) {
-                self.program.functions.insert(name, func);
+            let mut def = crate::value::EnumDef {
+                name: name.to_string(),
+                members: member_infos,
+                methods: def_methods,
+            };
+            for (mname, func) in crate::enum_variant::builtin_enum_method_entries(
+                name,
+                &Arc::new(def.clone()),
+            ) {
+                def.methods.insert(mname, func);
             }
+            self.program.enum_defs.insert(name.to_string(), Arc::new(def));
         }
 
         self.cg.emit(Instruction::Push(Value::type_ref(name.to_string())));
@@ -1859,11 +1861,10 @@ impl Generator {
     fn emit_load_module_ref(&mut self, module: &ModuleRef) {
         match module {
             ModuleRef::Qualified(parts) => {
-                self.cg.emit(Instruction::FindMod(parts.join(".")));
+                self.cg.emit(Instruction::FindMod(parts.clone()));
             }
             ModuleRef::FilePath { path, attrs } => {
-                self.cg
-                    .emit(Instruction::FindMod(format!("@str:{path}")));
+                self.cg.emit(Instruction::FindModFile(path.clone()));
                 for attr in attrs {
                     self.cg.emit(Instruction::GetAttr(attr.clone()));
                 }
@@ -2121,32 +2122,14 @@ impl Generator {
         template: &GenericFunctionTemplate,
         args: &[CallArg],
     ) -> Result<Vec<Value>> {
-        if template.type_params.len() != 1 {
-            return Err(RuntimeError::msg(format!(
-                "cannot infer {} type parameter(s) for `{}`; use {}[...](...)",
-                template.type_params.len(),
-                template.name,
-                template.name
-            )));
-        }
-        let arg_expr = &args
-            .first()
-            .ok_or_else(|| {
-                RuntimeError::type_err(format!(
-                    "{} expects at least one argument for type inference",
-                    template.name
-                ))
-            })?
-            .value;
-        let inferred = self
-            .infer_type_from_arg(arg_expr)
-            .ok_or_else(|| {
-                RuntimeError::msg(format!(
-                    "cannot infer type parameter for `{}` from argument; try `{}[type](...)`",
-                    template.name, template.name
-                ))
-            })?;
-        Ok(vec![inferred])
+        monomorph::infer_type_args_from_arg_exprs(
+            &template.name,
+            &template.type_params,
+            &template.params,
+            args,
+            |e| self.infer_type_from_arg(e),
+        )
+        .map_err(RuntimeError::msg)
     }
 
     fn infer_type_from_arg(&self, expr: &Expr) -> Option<Value> {
@@ -2318,32 +2301,49 @@ impl Generator {
                 finalized: false,
             }))
         };
+        let lw = lightweight && !is_generator;
+        let needs_arg_checks = params.iter().any(|p| p.type_strong || p.implicit);
+        let has_defaults = defaults.iter().any(std::option::Option::is_some);
+        let hot_call_argc = FunctionObject::compute_hot_call_argc(
+            lw,
+            is_generator,
+            needs_arg_checks,
+            params.len(),
+            false,
+            variadic_param_index.is_some(),
+            kwvariadic_param_index.is_some(),
+            has_defaults,
+        );
         Ok(FunctionObject {
+            hot,
+            entry_pc: 0,
+            frame_slots: sub.next_local_slot,
+            fast_locals: sub.next_local_slot,
+            entry_label: 0,
+            hot_call_argc,
+            flags: crate::opcode::FuncFlags::pack(
+                lw,
+                needs_arg_checks,
+                is_generator,
+                track_frames,
+                uses_name_map,
+                return_strong,
+                false,
+                false,
+            ),
             name: name.to_string(),
             params: params.to_vec(),
             body: Arc::new(body),
-            hot,
             line_map: Arc::new(func_line_map),
             column_map: Arc::new(func_column_map),
-            entry_label: 0,
-            fast_locals: sub.next_local_slot,
-            is_builtin_body: false,
             variadic_param_index,
             kwvariadic_param_index,
             defaults,
             captured: None,
             return_type: return_type.cloned(),
-            return_strong,
             return_wrapper: wrapper_for_func,
             param_types: Vec::new(),
             return_type_value: None,
-            types_resolved: false,
-            frame_slots: sub.next_local_slot,
-            uses_name_map,
-            track_frames,
-            entry_pc: 0,
-            lightweight: lightweight && !is_generator,
-            is_generator,
             module_env,
             source: None,
             source_file: "<script>".into(),
@@ -2863,7 +2863,8 @@ impl Generator {
                     self.cg.emit(Instruction::Load("__ast_type_convert__".into()));
                     self.cg.emit(Instruction::Call { argc: 2 });
                 } else {
-                    self.gen_type_convert_type_expr(type_expr)?;
+                    // 类型侧按普通表达式求值（getattr），不拼点分 TypeRef 路径。
+                    self.gen_expr(type_expr)?;
                     self.gen_expr(value)?;
                     self.cg.emit(Instruction::Load("convert".into()));
                     self.cg.emit(Instruction::Call { argc: 2 });
@@ -3029,30 +3030,86 @@ impl Generator {
     }
 
     /// `par for (x in xs) { body }` → `std.async.par_map(xs, do(x) { body })`
+    /// 多个迭代器时先 `__zip_iter__`，再在回调里按元组下标解包。
     fn gen_par_for(&mut self, items: &[ForItem], body: &Block) -> Result<()> {
         if items.is_empty() {
             return Err(RuntimeError::type_err(
                 "par for requires at least one iterator",
             ));
         }
-        if items.len() != 1 {
-            return Err(RuntimeError::msg(
-                "par for with multiple iterators is not yet supported; zip manually then par for",
-            ));
-        }
         let bound: HashSet<String> = items.iter().map(|i| i.name.clone()).collect();
         Self::check_par_no_shared_assign(body, &bound)?;
 
         let loc = items[0].iterable.loc;
-        let params = vec![FuncParam {
-            name: items[0].name.clone(),
-            is_variadic: false,
-            is_kwvariadic: false,
-            implicit: false,
-            type_expr: None,
-            type_strong: false,
-            default_expr: None,
-        }];
+        let (iterable, params, do_body) = if items.len() == 1 {
+            let params = vec![FuncParam {
+                name: items[0].name.clone(),
+                is_variadic: false,
+                is_kwvariadic: false,
+                implicit: false,
+                type_expr: None,
+                type_strong: false,
+                default_expr: None,
+            }];
+            (items[0].iterable.clone(), params, body.clone())
+        } else {
+            let zip_args: Vec<CallArg> = items
+                .iter()
+                .map(|item| CallArg {
+                    name: None,
+                    is_splat: false,
+                    is_kwsplat: false,
+                    value: item.iterable.clone(),
+                })
+                .collect();
+            let iterable = Expr::new(
+                loc,
+                ExprKind::Call {
+                    callee: Box::new(Expr::new(loc, ExprKind::Var("__zip_iter__".into()))),
+                    args: zip_args,
+                },
+            );
+            let zip_name = "__par_zip".to_string();
+            let mut prefix = Vec::new();
+            for (i, item) in items.iter().enumerate() {
+                if item.name == "_" {
+                    continue;
+                }
+                prefix.push(LocatedStmt {
+                    line: loc.line,
+                    column: loc.column,
+                    stmt: Stmt::VarDecl {
+                        visibility: Visibility::Default,
+                        is_const: false,
+                        is_var: false,
+                        name: item.name.clone(),
+                        type_expr: None,
+                        type_strong: false,
+                        init: Some(Expr::new(
+                            loc,
+                            ExprKind::Index {
+                                object: Box::new(Expr::new(
+                                    loc,
+                                    ExprKind::Var(zip_name.clone()),
+                                )),
+                                index: Box::new(Expr::new(loc, ExprKind::Number(i.to_string()))),
+                            },
+                        )),
+                    },
+                });
+            }
+            prefix.extend(body.iter().cloned());
+            let params = vec![FuncParam {
+                name: zip_name,
+                is_variadic: false,
+                is_kwvariadic: false,
+                implicit: false,
+                type_expr: None,
+                type_strong: false,
+                default_expr: None,
+            }];
+            (iterable, params, prefix)
+        };
         let do_fn = Expr::new(
             loc,
             ExprKind::DoFunc {
@@ -3060,14 +3117,10 @@ impl Generator {
                 return_type: None,
                 return_strong: false,
                 return_wrapper: None,
-                body: body.clone(),
+                body: do_body,
             },
         );
-        let call = Self::make_std_async_call(
-            loc,
-            "par_map",
-            vec![items[0].iterable.clone(), do_fn],
-        );
+        let call = Self::make_std_async_call(loc, "par_map", vec![iterable, do_fn]);
         self.gen_expr(&call)
     }
 
@@ -3619,12 +3672,6 @@ impl Generator {
         }
     }
 
-    fn gen_type_convert_type_expr(&mut self, expr: &Expr) -> Result<()> {
-        let name = type_convert_type_name(expr)?;
-        self.cg.emit(Instruction::Push(Value::type_ref(name)));
-        Ok(())
-    }
-
     fn gen_slice_bound(&mut self, bound: Option<&Expr>) -> Result<()> {
         if let Some(expr) = bound {
             self.gen_expr(expr)?;
@@ -3744,20 +3791,6 @@ fn collect_destruct_names(pattern: &DestructPattern, out: &mut Vec<String>) {
                 }
             }
         }
-    }
-}
-
-fn type_convert_type_name(expr: &Expr) -> Result<String> {
-    match &expr.kind {
-        ExprKind::Var(name) => Ok(name.clone()),
-        ExprKind::Member { object, field } => {
-            Ok(format!(
-                "{}.{}",
-                type_convert_type_name(object)?,
-                field
-            ))
-        }
-        _ => Err(RuntimeError::msg("expected type name in convert")),
     }
 }
 

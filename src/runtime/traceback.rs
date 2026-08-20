@@ -28,7 +28,9 @@ fn frame_def() -> Arc<StructDef> {
             FieldTypeInfo::default(),
         ],
         type_params: Vec::new(),
-        c_layout: None,
+        native_layout: None,
+        methods: std::collections::HashMap::new(),
+        overloads: std::collections::HashMap::new(),
     })
 }
 
@@ -41,7 +43,9 @@ fn traceback_def() -> Arc<StructDef> {
         typed: true,
         field_types: vec![FieldTypeInfo::default()],
         type_params: Vec::new(),
-        c_layout: None,
+        native_layout: None,
+        methods: std::collections::HashMap::new(),
+        overloads: std::collections::HashMap::new(),
     })
 }
 

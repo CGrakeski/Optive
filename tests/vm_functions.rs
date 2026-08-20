@@ -131,6 +131,16 @@ func noop() { return }
 }
 
 #[test]
+fn function_ellipsis_empty_body() {
+    let v = common::value("func f() ...\nf()");
+    assert!(
+        matches!(v, optive::value::Value::None),
+        "expected none, got {}",
+        v.display_string()
+    );
+}
+
+#[test]
 fn global_mutation_in_function() {
     assert_num(
         r"

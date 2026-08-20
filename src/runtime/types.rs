@@ -133,7 +133,7 @@ pub fn type_value_match_distance(vm: &Vm, val: &Value, ty: &Value) -> Option<usi
 /// 定义处求值并绑定函数上的全部类型注解；结果必须是类型值。
 /// 之后调用只比对 `param_types` / `return_type_value`，不再求值注解表达式。
 pub fn bind_function_annotations(vm: &mut Vm, func: &mut FunctionObject) -> crate::Result<()> {
-    if func.types_resolved {
+    if func.types_resolved() {
         return Ok(());
     }
     let prev = vm.annotation_bind_env.take();
@@ -163,7 +163,7 @@ pub fn bind_function_annotations(vm: &mut Vm, func: &mut FunctionObject) -> crat
         };
         func.param_types = param_types;
         func.return_type_value = return_type_value;
-        func.types_resolved = true;
+        func.set_types_resolved(true);
         Ok(())
     })();
     vm.annotation_bind_env = prev;
@@ -436,17 +436,26 @@ pub fn infer_generic_args(
     inferred
 }
 
-/// 将静态类型字面 Expr 折成类型值（`num`、`list[num]`、`C.types.int` 路径名）。
+/// 将静态类型字面 Expr 折成类型值（`num`、`list[num]`、`C.types.int` 经属性链 → TypeRef(`int`)）。
+/// 未知 Member 链不拼点分 TypeRef（禁止发明 `a.b.c` 身份）。
 #[must_use]
 pub fn static_type_value_from_expr(expr: &Expr) -> Option<Value> {
     match &expr.kind {
         ExprKind::Var(name) => Some(Value::type_ref(name.clone())),
-        ExprKind::Member { object, field } => {
-            let base = static_type_path(object)?;
-            Some(Value::type_ref(format!("{base}.{field}")))
+        ExprKind::Member { .. } => {
+            let parts = static_member_parts(expr)?;
+            let c_name = resolve_c_types_attr(&parts)?;
+            Some(Value::type_ref(c_name.to_string()))
         }
         ExprKind::Index { object, index } => {
-            let name = static_type_path(object)?;
+            let name = match &object.kind {
+                ExprKind::Var(n) => n.clone(),
+                ExprKind::Member { .. } => {
+                    let parts = static_member_parts(object)?;
+                    resolve_c_types_attr(&parts)?.to_string()
+                }
+                _ => return None,
+            };
             let args = static_type_args_from_index(index)?;
             Some(Value::TypeSpec(TypeSpecData::new(name, args)))
         }
@@ -454,11 +463,24 @@ pub fn static_type_value_from_expr(expr: &Expr) -> Option<Value> {
     }
 }
 
-fn static_type_path(expr: &Expr) -> Option<String> {
+fn static_member_parts(expr: &Expr) -> Option<Vec<String>> {
     match &expr.kind {
-        ExprKind::Var(name) => Some(name.clone()),
+        ExprKind::Var(name) => Some(vec![name.clone()]),
         ExprKind::Member { object, field } => {
-            Some(format!("{}.{}", static_type_path(object)?, field))
+            let mut parts = static_member_parts(object)?;
+            parts.push(field.clone());
+            Some(parts)
+        }
+        _ => None,
+    }
+}
+
+/// `….C.types.<attr>` → 规范 c_name（getattr，不拼点分 TypeRef）。
+#[must_use]
+pub fn resolve_c_types_attr(parts: &[String]) -> Option<&'static str> {
+    match parts {
+        [.., mod_c, types, attr] if mod_c == "C" && types == "types" => {
+            crate::c_types::lookup_c_type(attr).map(|e| e.c_name)
         }
         _ => None,
     }

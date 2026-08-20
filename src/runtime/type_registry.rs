@@ -79,7 +79,7 @@ pub fn is_builtin_base(name: &str) -> bool {
 
 pub fn supports_convert(vm: &Vm, type_name: &str) -> bool {
     is_registered_primitive(type_name)
-        || type_name.starts_with("C.types.")
+        || crate::c_types::lookup_c_type(type_name).is_some()
         || vm.struct_defs.contains_key(type_name)
         || vm.variant_defs.contains_key(type_name)
 }
@@ -103,18 +103,19 @@ pub fn check_primitive_instance(vm: &Vm, val: &Value, type_name: &str) -> Option
             Value::Function(_) | Value::Builtin(_) | Value::GenericFunction(_)
         ),
         "ptr" => matches!(val, Value::Ptr(_)),
+        "Layout" => matches!(val, Value::Layout(_)),
         n if crate::sized::SizedNum::ALL_NAMES.contains(&n) => {
             matches!(val, Value::Sized(s) if s.type_name() == n)
         }
-        n if n.starts_with("C.types.") => crate::ffi::AbiType::from_type_name(n)
+        n if crate::c_types::lookup_c_type(n).is_some() => crate::ffi::AbiType::from_type_name(n)
             .ok()
-            .is_some_and(|abi| value_matches_abi(val, abi)),
+            .is_some_and(|abi| value_matches_abi(val, &abi)),
         _ => return None,
     })
 }
 
-const fn value_matches_abi(val: &Value, abi: crate::ffi::AbiType) -> bool {
-    use crate::ffi::AbiType::{Void, Bool, I8, U8, I16, U16, I32, U32, I64, U64, Isize, Usize, F32, F64, Pointer, CharPtr, WCharPtr};
+fn value_matches_abi(val: &Value, abi: &crate::ffi::AbiType) -> bool {
+    use crate::ffi::AbiType::{Void, Bool, I8, U8, I16, U16, I32, U32, I64, U64, Isize, Usize, F32, F64, Pointer, CharPtr, WCharPtr, CStruct};
     match abi {
         Void => matches!(val, Value::None),
         Bool => matches!(val, Value::Bool(_)),
@@ -133,6 +134,7 @@ const fn value_matches_abi(val: &Value, abi: crate::ffi::AbiType) -> bool {
         Pointer | CharPtr | WCharPtr => {
             matches!(val, Value::Ptr(_) | Value::Text(_) | Value::None)
         }
+        CStruct { name, .. } => matches!(val, Value::Struct(s) if s.def.name == *name),
     }
 }
 
@@ -890,7 +892,7 @@ pub fn call_primitive_convert(vm: &mut Vm, type_name: &str, value: &Value) -> Op
         n if crate::sized::SizedNum::ALL_NAMES.contains(&n) => {
             Some(convert_to_sized(n, value))
         }
-        n if n.starts_with("C.types.") => Some(convert_to_c_type(n, value)),
+        n if crate::c_types::lookup_c_type(n).is_some() => Some(convert_to_c_type(n, value)),
         _ => None,
     }
 }
@@ -1042,6 +1044,11 @@ fn convert_to_c_type(type_name: &str, value: &Value) -> Result<Value> {
         crate::ffi::AbiType::Pointer
         | crate::ffi::AbiType::CharPtr
         | crate::ffi::AbiType::WCharPtr => "ptr",
+        crate::ffi::AbiType::CStruct { .. } => {
+            return Err(crate::error::RuntimeError::type_err(
+                "cannot convert to C struct type by name; construct the struct",
+            ));
+        }
     };
     if lang == "bool" {
         return Ok(Value::Bool(value.is_truthy()));
@@ -1731,22 +1738,22 @@ fn install_primitive_methods(vm: &mut Vm) {
 pub fn get_text_method(text: &str, field: &str) -> Result<Value> {
     let text = text.to_string();
     match field {
-        "len" => Ok(Value::Builtin(Arc::new(move |_vm, args| {
+        "len" => Ok(Value::builtin(field, move |_vm, args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err("len takes no arguments"));
             }
             Ok(Value::Num(Num::Small(text.chars().count() as i64)))
-        }))),
-        "upper" => Ok(Value::Builtin(Arc::new(move |_vm, _args| {
+        })),
+        "upper" => Ok(Value::builtin(field, move |_vm, _args| {
             Ok(Value::Text(text.to_uppercase()))
-        }))),
-        "lower" => Ok(Value::Builtin(Arc::new(move |_vm, _args| {
+        })),
+        "lower" => Ok(Value::builtin(field, move |_vm, _args| {
             Ok(Value::Text(text.to_lowercase()))
-        }))),
-        "strip" => Ok(Value::Builtin(Arc::new(move |_vm, _args| {
+        })),
+        "strip" => Ok(Value::builtin(field, move |_vm, _args| {
             Ok(Value::Text(text.trim().to_string()))
-        }))),
-        "split" => Ok(Value::Builtin(Arc::new(move |_vm, args| {
+        })),
+        "split" => Ok(Value::builtin(field, move |_vm, args| {
             let sep = if args.is_empty() {
                 " ".to_string()
             } else {
@@ -1760,14 +1767,14 @@ pub fn get_text_method(text: &str, field: &str) -> Result<Value> {
                 .map(|p| Value::Text(p.to_string()))
                 .collect();
             Ok(Value::List(Shared::new(parts)))
-        }))),
-        "contains" => Ok(Value::Builtin(Arc::new(move |_vm, args| {
+        })),
+        "contains" => Ok(Value::builtin(field, move |_vm, args| {
             if args.len() != 1 {
                 return Err(RuntimeError::type_err("contains requires 1 argument"));
             }
             let needle = args[0].print_string();
             Ok(Value::Bool(text.contains(&needle)))
-        }))),
+        })),
         _ => Err(RuntimeError::attr_err(format!("text has no method {field}"))),
     }
 }
@@ -1776,32 +1783,31 @@ pub fn get_list_method(list: &Shared<Vec<Value>>, field: &str) -> Result<Value> 
     match field {
         "len" => {
             let owned = list.clone();
-            Ok(Value::Builtin(Arc::new(move |_vm, args| {
+            Ok(Value::builtin(field, move |_vm, args| {
                 if !args.is_empty() {
                     return Err(RuntimeError::type_err("len takes no arguments"));
                 }
                 Ok(Value::Num(Num::Small(owned.borrow().len() as i64)))
-            })))
+            }))
         }
         "append" => {
             let owned = list.clone();
-            Ok(Value::Builtin(Arc::new(move |vm, args| {
+            Ok(Value::builtin(field, move |vm, args| {
                 if args.len() != 1 {
                     return Err(RuntimeError::type_err("append requires 1 argument"));
                 }
                 vm.check_list_element_write(&owned, &args[0])?;
                 owned.borrow_mut().push(args[0].clone());
                 Ok(Value::None)
-            })))
+            }))
         }
         "extend" => {
             let owned = list.clone();
-            Ok(Value::Builtin(Arc::new(move |vm, args| {
+            Ok(Value::builtin(field, move |vm, args| {
                 if args.len() != 1 {
                     return Err(RuntimeError::type_err("extend requires 1 argument"));
                 }
-                let state = crate::value::value_to_iterable(&args[0])?;
-                let state_rc = Shared::new(state);
+                let state_rc = vm.to_iterator_shared(&args[0])?;
                 let mut pending = Vec::new();
                 while let Some(v) = vm.advance_iterator(&state_rc)? {
                     vm.check_list_element_write(&owned, &v)?;
@@ -1809,11 +1815,11 @@ pub fn get_list_method(list: &Shared<Vec<Value>>, field: &str) -> Result<Value> 
                 }
                 owned.borrow_mut().extend(pending);
                 Ok(Value::None)
-            })))
+            }))
         }
         "pop" => {
             let owned = list.clone();
-            Ok(Value::Builtin(Arc::new(move |_vm, args| {
+            Ok(Value::builtin(field, move |_vm, args| {
                 let mut items = owned.borrow_mut();
                 if items.is_empty() {
                     return Err(RuntimeError::index_err("pop from empty list"));
@@ -1848,7 +1854,7 @@ pub fn get_list_method(list: &Shared<Vec<Value>>, field: &str) -> Result<Value> 
                     return Err(RuntimeError::index_err("pop index out of range"));
                 }
                 Ok(items.remove(idx))
-            })))
+            }))
         }
         _ => Err(RuntimeError::attr_err(format!("list has no method {field}"))),
     }
@@ -1858,16 +1864,16 @@ pub fn get_dict_method(dict: &Shared<DictMap>, field: &str) -> Result<Value> {
     match field {
         "len" => {
             let d = dict.clone();
-            Ok(Value::Builtin(Arc::new(move |_vm, args| {
+            Ok(Value::builtin(field, move |_vm, args| {
                 if !args.is_empty() {
                     return Err(RuntimeError::type_err("len takes no arguments"));
                 }
                 Ok(Value::Num(Num::Small(d.borrow().len() as i64)))
-            })))
+            }))
         }
         "get" => {
             let d = dict.clone();
-            Ok(Value::Builtin(Arc::new(move |_vm, args| {
+            Ok(Value::builtin(field, move |_vm, args| {
                 if args.is_empty() || args.len() > 2 {
                     return Err(RuntimeError::type_err("get requires 1 or 2 arguments"));
                 }
@@ -1879,11 +1885,11 @@ pub fn get_dict_method(dict: &Shared<DictMap>, field: &str) -> Result<Value> {
                     return Ok(args[1].clone());
                 }
                 Err(RuntimeError::key_err("key not found"))
-            })))
+            }))
         }
         "set" => {
             let d = dict.clone();
-            Ok(Value::Builtin(Arc::new(move |vm, args| {
+            Ok(Value::builtin(field, move |vm, args| {
                 if args.len() != 2 {
                     return Err(RuntimeError::type_err("set requires 2 arguments"));
                 }
@@ -1891,30 +1897,30 @@ pub fn get_dict_method(dict: &Shared<DictMap>, field: &str) -> Result<Value> {
                 let key = ValueKey::from_value(&args[0])?;
                 d.borrow_mut().insert(key, args[1].clone());
                 Ok(Value::None)
-            })))
+            }))
         }
         "keys" => {
             let d = dict.clone();
-            Ok(Value::Builtin(Arc::new(move |_vm, _args| {
+            Ok(Value::builtin(field, move |_vm, _args| {
                 let keys: Vec<Value> = d
                     .borrow()
                     .keys()
                     .map(crate::value::value_key_to_value)
                     .collect();
                 Ok(Value::List(Shared::new(keys)))
-            })))
+            }))
         }
         "values" => {
             let d = dict.clone();
-            Ok(Value::Builtin(Arc::new(move |_vm, _args| {
+            Ok(Value::builtin(field, move |_vm, _args| {
                 Ok(Value::List(Shared::new(
                     d.borrow().values().cloned().collect(),
                 )))
-            })))
+            }))
         }
         "items" => {
             let d = dict.clone();
-            Ok(Value::Builtin(Arc::new(move |_vm, _args| {
+            Ok(Value::builtin(field, move |_vm, _args| {
                 let pairs: Vec<Value> = d
                     .borrow()
                     .iter()
@@ -1926,7 +1932,7 @@ pub fn get_dict_method(dict: &Shared<DictMap>, field: &str) -> Result<Value> {
                     })
                     .collect();
                 Ok(Value::List(Shared::new(pairs)))
-            })))
+            }))
         }
         _ => Err(RuntimeError::attr_err(format!("dict has no method {field}"))),
     }
@@ -1936,27 +1942,27 @@ pub fn get_set_method(set: &Shared<crate::value::SetMap>, field: &str) -> Result
     match field {
         "len" => {
             let s = set.clone();
-            Ok(Value::Builtin(Arc::new(move |_vm, args| {
+            Ok(Value::builtin(field, move |_vm, args| {
                 if !args.is_empty() {
                     return Err(RuntimeError::type_err("len takes no arguments"));
                 }
                 Ok(Value::Num(Num::Small(s.borrow().len() as i64)))
-            })))
+            }))
         }
         "add" => {
             let s = set.clone();
-            Ok(Value::Builtin(Arc::new(move |vm, args| {
+            Ok(Value::builtin(field, move |vm, args| {
                 if args.len() != 1 {
                     return Err(RuntimeError::type_err("add requires 1 argument"));
                 }
                 vm.check_set_element_write(&s, &args[0])?;
                 s.borrow_mut().insert(ValueKey::from_value(&args[0])?);
                 Ok(Value::None)
-            })))
+            }))
         }
         "remove" => {
             let s = set.clone();
-            Ok(Value::Builtin(Arc::new(move |_vm, args| {
+            Ok(Value::builtin(field, move |_vm, args| {
                 if args.len() != 1 {
                     return Err(RuntimeError::type_err("remove requires 1 argument"));
                 }
@@ -1965,17 +1971,17 @@ pub fn get_set_method(set: &Shared<crate::value::SetMap>, field: &str) -> Result
                     return Err(RuntimeError::key_err("set.remove: element not found"));
                 }
                 Ok(Value::None)
-            })))
+            }))
         }
         "contains" => {
             let s = set.clone();
-            Ok(Value::Builtin(Arc::new(move |_vm, args| {
+            Ok(Value::builtin(field, move |_vm, args| {
                 if args.len() != 1 {
                     return Err(RuntimeError::type_err("contains requires 1 argument"));
                 }
                 let key = ValueKey::from_value(&args[0])?;
                 Ok(Value::Bool(s.borrow().contains(&key)))
-            })))
+            }))
         }
         _ => Err(RuntimeError::attr_err(format!("set has no method {field}"))),
     }
@@ -1985,12 +1991,12 @@ pub fn get_tuple_method(tuple: &Arc<[Value]>, field: &str) -> Result<Value> {
     match field {
         "len" => {
             let t = tuple.clone();
-            Ok(Value::Builtin(Arc::new(move |_vm, args| {
+            Ok(Value::builtin(field, move |_vm, args| {
                 if !args.is_empty() {
                     return Err(RuntimeError::type_err("len takes no arguments"));
                 }
                 Ok(Value::Num(Num::Small(t.len() as i64)))
-            })))
+            }))
         }
         _ => Err(RuntimeError::attr_err(format!("tuple has no method {field}"))),
     }
@@ -2000,33 +2006,33 @@ pub fn get_bytes_method(bytes: &Arc<Vec<u8>>, field: &str) -> Result<Value> {
     match field {
         "len" => {
             let b = bytes.clone();
-            Ok(Value::Builtin(Arc::new(move |_vm, args| {
+            Ok(Value::builtin(field, move |_vm, args| {
                 if !args.is_empty() {
                     return Err(RuntimeError::type_err("len takes no arguments"));
                 }
                 Ok(Value::Num(Num::Small(b.len() as i64)))
-            })))
+            }))
         }
         "decode" => {
             let b = bytes.clone();
-            Ok(Value::Builtin(Arc::new(move |_vm, args| {
+            Ok(Value::builtin(field, move |_vm, args| {
                 if !args.is_empty() {
                     return Err(RuntimeError::type_err("decode takes no arguments"));
                 }
                 String::from_utf8(b.as_ref().clone())
                     .map(Value::Text)
                     .map_err(|_| RuntimeError::type_err("TypeError: bytes are not valid UTF-8"))
-            })))
+            }))
         }
         "hex" => {
             let b = bytes.clone();
-            Ok(Value::Builtin(Arc::new(move |_vm, _args| {
+            Ok(Value::builtin(field, move |_vm, _args| {
                 let mut out = String::with_capacity(b.len() * 2);
                 for byte in b.iter() {
                     out.push_str(&format!("{byte:02x}"));
                 }
                 Ok(Value::Text(out))
-            })))
+            }))
         }
         _ => Err(RuntimeError::attr_err(format!("bytes has no method {field}"))),
     }
@@ -2117,7 +2123,9 @@ fn install_primitive_convert_handlers(vm: &mut Vm) {
             } else {
                 dynamic_convert_handler(ty.clone())
             };
-            table.borrow().handlers.borrow_mut().push(Value::Builtin(handler));
+            table.borrow().handlers.borrow_mut().push(Value::Builtin(
+                crate::value::BuiltinObject::new("convert", handler),
+            ));
         }
     }
 }

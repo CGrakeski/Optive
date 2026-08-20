@@ -363,7 +363,7 @@ pub(crate) fn specialize_with_entry(code: &mut [Instruction], entry_env: &[Optio
             Instruction::ResolveFuncTypes => {
                 // 栈顶仍为 Function。
             }
-            Instruction::FindMod(_) => {
+            Instruction::FindMod(_) | Instruction::FindModFile(_) => {
                 stack.push(None);
             }
             Instruction::RegisterExport(_) => {}

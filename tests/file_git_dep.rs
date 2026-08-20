@@ -107,7 +107,6 @@ fn file_url_add_and_run_imports_local_git_dep() {
         greeter.join("Optive.toml"),
         r#"[package]
 name = "greeter"
-version = "0.1.0"
 entry = "src/main.tive"
 
 [dependencies]
