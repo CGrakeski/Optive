@@ -1,3 +1,5 @@
+//noinspection RsDetachedFile
+//! cargo-fuzz crate root (`[[bin]]` in `tools/fuzz/Cargo.toml`), not an optive module.
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 

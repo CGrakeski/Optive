@@ -22,7 +22,9 @@
 
 1. 在 VS Code 里 `Ctrl/Cmd+Shift+P` → `Preferences: Open Settings (JSON)`，加入：
    ```json
-   "files.associations": { "*.tive": "optive" }
+   {
+     "files.associations": { "*.tive": "optive" }
+   }
    ```
 2. 安装任意支持 TextMate 语法加载的扩展（如 *TextMate Languages*），把 `tive.tmLanguage.json` 注册为 `source.tive`。
 
