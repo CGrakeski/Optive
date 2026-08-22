@@ -149,18 +149,14 @@ len(sha256("hello"))
 #[test]
 fn import_relative_path() {
     let path = fixture("things.tive");
-    let src = format!(
-        "import \"{path}\" as things\nthings.value\n"
-    );
+    let src = format!("import \"{path}\" as things\nthings.value\n");
     assert_num(&src, "42");
 }
 
 #[test]
 fn use_relative_path_nested_exports() {
     let path = fixture("things.tive");
-    let src = format!(
-        "use \"{path}\".sth0.{{ sth1, sth2 }}\nsth1() + sth2()\n"
-    );
+    let src = format!("use \"{path}\".sth0.{{ sth1, sth2 }}\nsth1() + sth2()\n");
     assert_num(&src, "303");
 }
 

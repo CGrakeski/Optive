@@ -11,8 +11,8 @@ mod common;
 // 本套件验证协作调度语义（顺序敏感断言在 M:N 真并行下不成立），
 // 统一固定 workers=1；M:N 专项测试见 vm_mn_parallel.rs。
 use common::{
-    assert_bool_w1 as assert_bool, assert_num_w1 as assert_num,
-    assert_text_w1 as assert_text, run_err_w1 as run_err, value_w1 as value,
+    assert_bool_w1 as assert_bool, assert_num_w1 as assert_num, assert_text_w1 as assert_text,
+    run_err_w1 as run_err, value_w1 as value,
 };
 use optive::value::Value;
 
@@ -633,10 +633,7 @@ s.send(1)
     )
     .unwrap_err();
     let msg = err.to_string();
-    assert!(
-        msg.contains("send") || msg.contains("Stream"),
-        "{msg}"
-    );
+    assert!(msg.contains("send") || msg.contains("Stream"), "{msg}");
 }
 
 #[test]

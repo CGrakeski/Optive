@@ -36,10 +36,7 @@ pub fn create_project(parent: &Path, name: &str) -> Result<PathBuf, String> {
     let name = validate_project_name(name)?;
     let root = parent.join(&name);
     if root.exists() {
-        return Err(format!(
-            "directory already exists: {}",
-            root.display()
-        ));
+        return Err(format!("directory already exists: {}", root.display()));
     }
 
     fs::create_dir_all(root.join("src")).map_err(|e| e.to_string())?;
@@ -62,11 +59,8 @@ print("Hello from {name}!")
     );
     fs::write(root.join("src/main.tive"), main_tive).map_err(|e| e.to_string())?;
 
-    fs::write(
-        root.join(".gitignore"),
-        "Optive.cache\n/deps/\n",
-    )
-    .map_err(|e| e.to_string())?;
+    fs::write(root.join(".gitignore"), "Optive.cache\n/deps/\n.optive/\n")
+        .map_err(|e| e.to_string())?;
 
     Ok(root)
 }
@@ -85,10 +79,7 @@ mod tests {
 
     #[test]
     fn template_has_no_version_field() {
-        let parent = std::env::temp_dir().join(format!(
-            "optive_new_tpl_{}",
-            std::process::id()
-        ));
+        let parent = std::env::temp_dir().join(format!("optive_new_tpl_{}", std::process::id()));
         let _ = fs::remove_dir_all(&parent);
         fs::create_dir_all(&parent).unwrap();
         let root = create_project(&parent, "TplDemo").unwrap();

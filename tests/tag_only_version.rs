@@ -97,9 +97,7 @@ fn new_project_omits_package_version() {
     assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
     let toml = fs::read_to_string(parent.join("DemoPkg/Optive.toml")).unwrap();
     assert!(
-        !toml
-            .lines()
-            .any(|l| l.trim_start().starts_with("version")),
+        !toml.lines().any(|l| l.trim_start().starts_with("version")),
         "{toml}"
     );
     assert!(toml.contains("git tags"), "{toml}");
@@ -140,7 +138,10 @@ entry = "src/main.tive"
     fs::write(root.join("src/main.tive"), "print(2)\n").unwrap();
     let (code, _, stderr) = run_optive(&["publish", "0.2.0"], &root);
     assert_ne!(code, 0);
-    assert!(stderr.contains("dirty") || stderr.contains("worktree"), "{stderr}");
+    assert!(
+        stderr.contains("dirty") || stderr.contains("worktree"),
+        "{stderr}"
+    );
 
     git(&root, &["checkout", "--", "."]);
     let (code, _, stderr) = run_optive(&["publish", "0.1.0"], &root);

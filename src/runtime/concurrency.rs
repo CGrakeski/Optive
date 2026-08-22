@@ -1,7 +1,6 @@
 //! Channel / Mutex / `RWMutex` / `WaitGroup` / Semaphore / Once / Barrier / Cond
 //! 构造与方法绑定。
 
-
 use crate::error::RuntimeError;
 use crate::shared::Shared;
 use crate::value::{
@@ -174,7 +173,10 @@ pub fn get_mutex_method(m: &Shared<MutexInner>, field: &str) -> Result<Value> {
     }
 }
 
-pub fn get_mutex_guard_method(g: &Shared<crate::value::MutexGuardInner>, field: &str) -> Result<Value> {
+pub fn get_mutex_guard_method(
+    g: &Shared<crate::value::MutexGuardInner>,
+    field: &str,
+) -> Result<Value> {
     match field {
         "get" => method!(field, g, _vm, |args| {
             if !args.is_empty() {
@@ -337,9 +339,7 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
                 ));
             }
             let Value::MutexGuard(guard) = &args[0] else {
-                return Err(RuntimeError::type_err(
-                    "Cond.wait expects a MutexGuard",
-                ));
+                return Err(RuntimeError::type_err("Cond.wait expects a MutexGuard"));
             };
             vm.cond_wait(&s, guard)
         }),
@@ -360,9 +360,7 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
         }),
         ("Cond", "broadcast") => method!(field, s, vm, |args| {
             if !args.is_empty() {
-                return Err(RuntimeError::type_err(
-                    "Cond.broadcast takes no arguments",
-                ));
+                return Err(RuntimeError::type_err("Cond.broadcast takes no arguments"));
             }
             match &mut *s.borrow_mut() {
                 SyncInner::Cond { signals, waiters } => {
@@ -516,9 +514,7 @@ pub fn get_task_method(task: &Shared<crate::value::TaskInner>, field: &str) -> R
         }),
         "cancelled" => method!(field, task, _vm, |args| {
             if !args.is_empty() {
-                return Err(RuntimeError::type_err(
-                    "Task.cancelled takes no arguments",
-                ));
+                return Err(RuntimeError::type_err("Task.cancelled takes no arguments"));
             }
             Ok(Value::Bool(task.borrow().is_cancelled()))
         }),
@@ -640,9 +636,7 @@ pub fn construct_channel(args: &[Value]) -> Result<Value> {
             ))
         }
     };
-    Ok(Value::Channel(Shared::new(ChannelInner::new(
-        capacity,
-    ))))
+    Ok(Value::Channel(Shared::new(ChannelInner::new(capacity))))
 }
 
 pub fn construct_stream(args: &[Value]) -> Result<Value> {
@@ -665,9 +659,9 @@ pub fn construct_stream(args: &[Value]) -> Result<Value> {
             ))
         }
     };
-    Ok(Value::Stream(Shared::new(StreamInner::Channel(Shared::new(
-        ChannelInner::new(capacity),
-    )))))
+    Ok(Value::Stream(Shared::new(StreamInner::Channel(
+        Shared::new(ChannelInner::new(capacity)),
+    ))))
 }
 
 /// 从已有迭代器状态构造拉取 `Stream（map/filter/take/from_gen`）。
@@ -689,9 +683,7 @@ pub fn construct_mutex(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(RuntimeError::type_err("Mutex() requires 1 argument"));
     }
-    Ok(Value::Mutex(Shared::new(MutexInner::new(
-        args[0].clone(),
-    ))))
+    Ok(Value::Mutex(Shared::new(MutexInner::new(args[0].clone()))))
 }
 
 pub fn construct_rwmutex(args: &[Value]) -> Result<Value> {
@@ -722,9 +714,7 @@ pub fn construct_waitgroup(args: &[Value]) -> Result<Value> {
             "WaitGroup count must be non-negative",
         ));
     }
-    Ok(Value::Sync(Shared::new(SyncInner::WaitGroup {
-        count,
-    })))
+    Ok(Value::Sync(Shared::new(SyncInner::WaitGroup { count })))
 }
 
 pub fn construct_semaphore(args: &[Value]) -> Result<Value> {
@@ -739,9 +729,7 @@ pub fn construct_semaphore(args: &[Value]) -> Result<Value> {
             "Semaphore permits must be non-negative",
         ));
     }
-    Ok(Value::Sync(Shared::new(SyncInner::Semaphore {
-        permits,
-    })))
+    Ok(Value::Sync(Shared::new(SyncInner::Semaphore { permits })))
 }
 
 pub fn construct_once(args: &[Value]) -> Result<Value> {
@@ -841,11 +829,7 @@ pub fn construct_timeout_ctx(args: &[Value]) -> Result<Value> {
     }
     let secs = match &args[0] {
         Value::Num(n) => n.to_f64_checked()?,
-        _ => {
-            return Err(RuntimeError::type_err(
-                "with_timeout() expects num seconds",
-            ))
-        }
+        _ => return Err(RuntimeError::type_err("with_timeout() expects num seconds")),
     };
     if !secs.is_finite() {
         return Err(RuntimeError::type_err(
@@ -880,11 +864,7 @@ fn num_deadline_ms(n: &Num) -> Result<i64> {
 pub fn deadline_from_secs(secs: &Value) -> Result<Value> {
     let secs_f = match secs {
         Value::Num(n) => n.to_f64_checked()?,
-        _ => {
-            return Err(RuntimeError::type_err(
-                "sleep/deadline expects num seconds",
-            ))
-        }
+        _ => return Err(RuntimeError::type_err("sleep/deadline expects num seconds")),
     };
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

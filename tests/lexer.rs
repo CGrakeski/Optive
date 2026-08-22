@@ -34,7 +34,14 @@ fn lex_var_keyword() {
 
 #[test]
 fn lex_const() {
-    assert_kinds!("const let z = 3", KwConst, KwLet, Identifier, Assign, NumLiteral);
+    assert_kinds!(
+        "const let z = 3",
+        KwConst,
+        KwLet,
+        Identifier,
+        Assign,
+        NumLiteral
+    );
 }
 
 #[test]

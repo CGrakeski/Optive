@@ -14,11 +14,11 @@ use crate::ast::{Expr, ExprKind};
 use crate::error::RuntimeError;
 use crate::ffi::{abi_size_align, AbiType};
 use crate::ptr_registry::{self, PtrEntry, PtrKind};
+use crate::shared::Shared;
 use crate::sized::SizedNum;
 use crate::value::{builtin_repr, ModuleObject, Num, StructDef, StructInstance, Value};
 use crate::vm::Vm;
 use crate::Result;
-use crate::shared::Shared;
 
 thread_local! {
     static LAST_ERRNO: Cell<i32> = const { Cell::new(0) };
@@ -26,9 +26,7 @@ thread_local! {
 }
 
 pub fn sample_error_codes() {
-    let code = std::io::Error::last_os_error()
-        .raw_os_error()
-        .unwrap_or(0);
+    let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
     LAST_ERRNO.with(|c| c.set(code));
 }
 
@@ -63,9 +61,14 @@ fn active_vm<'a>() -> Result<&'a mut Vm> {
 
 pub fn builtin_errno(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if !args.is_empty() {
-        return Err(RuntimeError::type_err(format!("{} takes no arguments", builtin_repr("errno"))));
+        return Err(RuntimeError::type_err(format!(
+            "{} takes no arguments",
+            builtin_repr("errno")
+        )));
     }
-    Ok(Value::Num(Num::from_i64(i64::from(LAST_ERRNO.with(std::cell::Cell::get)))))
+    Ok(Value::Num(Num::from_i64(i64::from(
+        LAST_ERRNO.with(std::cell::Cell::get),
+    ))))
 }
 
 pub fn builtin_last_error(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -75,9 +78,10 @@ pub fn builtin_last_error(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 pub fn builtin_alloc(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(RuntimeError::type_err(
-            format!("{}(nbytes|TypeRef) requires 1 argument", builtin_repr("alloc")),
-        ));
+        return Err(RuntimeError::type_err(format!(
+            "{}(nbytes|TypeRef) requires 1 argument",
+            builtin_repr("alloc")
+        )));
     }
     match &args[0] {
         Value::TypeRef(name) => {
@@ -88,11 +92,8 @@ pub fn builtin_alloc(vm: &mut Vm, args: &[Value]) -> Result<Value> {
                         builtin_repr("alloc")
                     ))
                 })?;
-                let addr = ptr_registry::alloc_owned(
-                    layout.size,
-                    layout.align,
-                    Some(name.clone()),
-                )?;
+                let addr =
+                    ptr_registry::alloc_owned(layout.size, layout.align, Some(name.clone()))?;
                 return Ok(Value::Ptr(addr));
             }
             let (sz, align) = abi_size_align(&AbiType::from_type_name(name)?);
@@ -109,9 +110,10 @@ pub fn builtin_alloc(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 pub fn builtin_free(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.is_empty() || args.len() > 2 {
-        return Err(RuntimeError::type_err(
-            format!("{}(ptr[, size]) requires pointer (size optional if registered)", builtin_repr("free")),
-        ));
+        return Err(RuntimeError::type_err(format!(
+            "{}(ptr[, size]) requires pointer (size optional if registered)",
+            builtin_repr("free")
+        )));
     }
     let p = expect_ptr("free", &args[0])?;
     if p == 0 {
@@ -135,16 +137,20 @@ pub fn builtin_free(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         }
     }
     // 兼容路径已移除：未登记指针的 size 释放无法得知对齐，易 UB。
-    Err(RuntimeError::value_err(
-        format!("{}: pointer not registered; only free Owned pointers from {} / Struct.alloc", builtin_repr("free"), builtin_repr("alloc")),
-    ))
+    Err(RuntimeError::value_err(format!(
+        "{}: pointer not registered; only free Owned pointers from {} / Struct.alloc",
+        builtin_repr("free"),
+        builtin_repr("alloc")
+    )))
 }
 
 pub fn builtin_sizeof(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(RuntimeError::type_err(
-            format!("{} requires 1 type (TypeRef or {} layout)", builtin_repr("sizeof"), builtin_repr("Struct")),
-        ));
+        return Err(RuntimeError::type_err(format!(
+            "{} requires 1 type (TypeRef or {} layout)",
+            builtin_repr("sizeof"),
+            builtin_repr("Struct")
+        )));
     }
     let size = match &args[0] {
         Value::TypeRef(n) => {
@@ -164,15 +170,19 @@ pub fn builtin_sizeof(vm: &mut Vm, args: &[Value]) -> Result<Value> {
                 .ok_or_else(|| RuntimeError::type_err("invalid struct size"))?
                 as usize,
             _ => {
-                return Err(RuntimeError::type_err(
-                    format!("{}: expected TypeRef or {} module", builtin_repr("sizeof"), builtin_repr("Struct")),
-                ))
+                return Err(RuntimeError::type_err(format!(
+                    "{}: expected TypeRef or {} module",
+                    builtin_repr("sizeof"),
+                    builtin_repr("Struct")
+                )))
             }
         },
         _ => {
-            return Err(RuntimeError::type_err(
-                format!("{}: expected TypeRef or {} module", builtin_repr("sizeof"), builtin_repr("Struct")),
-            ))
+            return Err(RuntimeError::type_err(format!(
+                "{}: expected TypeRef or {} module",
+                builtin_repr("sizeof"),
+                builtin_repr("Struct")
+            )))
         }
     };
     Ok(Value::Num(Num::from_i64(size as i64)))
@@ -180,22 +190,26 @@ pub fn builtin_sizeof(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 pub fn builtin_alloc_array(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(RuntimeError::type_err(
-            format!("{}(T, n) requires type and count", builtin_repr("alloc_array")),
-        ));
+        return Err(RuntimeError::type_err(format!(
+            "{}(T, n) requires type and count",
+            builtin_repr("alloc_array")
+        )));
     }
     let (elem_name, stride, align) = resolve_elem_type(vm, &args[0])?;
     let n = expect_usize("alloc_array", &args[1])?;
-    let nbytes = stride
-        .checked_mul(n)
-        .ok_or_else(|| RuntimeError::value_err(format!("{}: size overflow", builtin_repr("alloc_array"))))?;
+    let nbytes = stride.checked_mul(n).ok_or_else(|| {
+        RuntimeError::value_err(format!("{}: size overflow", builtin_repr("alloc_array")))
+    })?;
     let addr = ptr_registry::alloc_owned(nbytes, align, Some(elem_name))?;
     Ok(Value::Ptr(addr))
 }
 
 pub fn builtin_ptr_live(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(RuntimeError::type_err(format!("{}(p) requires 1 argument", builtin_repr("ptr_live"))));
+        return Err(RuntimeError::type_err(format!(
+            "{}(p) requires 1 argument",
+            builtin_repr("ptr_live")
+        )));
     }
     let p = expect_ptr("ptr_live", &args[0])?;
     // Owned 且未 free；外来 unsafe_ptr 为 false（见 docs/ffi.md）。
@@ -204,9 +218,10 @@ pub fn builtin_ptr_live(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 pub fn builtin_ptr_check(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(RuntimeError::type_err(
-            format!("{}(p, T) requires pointer and type", builtin_repr("ptr_check")),
-        ));
+        return Err(RuntimeError::type_err(format!(
+            "{}(p, T) requires pointer and type",
+            builtin_repr("ptr_check")
+        )));
     }
     let p = expect_ptr("ptr_check", &args[0])?;
     let (want, _, _) = resolve_elem_type(vm, &args[1])?;
@@ -218,13 +233,17 @@ pub fn builtin_ptr_check(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 pub fn builtin_unsafe_ptr(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(RuntimeError::type_err(
-            format!("{}(p) requires 1 pointer argument", builtin_repr("unsafe_ptr")),
-        ));
+        return Err(RuntimeError::type_err(format!(
+            "{}(p) requires 1 pointer argument",
+            builtin_repr("unsafe_ptr")
+        )));
     }
     let p = expect_ptr("unsafe_ptr", &args[0])?;
     if p == 0 {
-        return Err(RuntimeError::value_err(format!("{}: null pointer", builtin_repr("unsafe_ptr"))));
+        return Err(RuntimeError::value_err(format!(
+            "{}: null pointer",
+            builtin_repr("unsafe_ptr")
+        )));
     }
     // 已登记（含 Owned）则保持原条目，避免把可 free 指针降级为 foreign。
     if ptr_registry::lookup(p).is_none() {
@@ -241,9 +260,10 @@ pub fn builtin_unsafe_ptr(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 pub fn builtin_cast_ptr(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(RuntimeError::type_err(
-            format!("{}(p, T) requires pointer and element type", builtin_repr("cast_ptr")),
-        ));
+        return Err(RuntimeError::type_err(format!(
+            "{}(p, T) requires pointer and element type",
+            builtin_repr("cast_ptr")
+        )));
     }
     let p = expect_ptr("cast_ptr", &args[0])?;
     let (elem, _, _) = resolve_elem_type(vm, &args[1])?;
@@ -264,9 +284,10 @@ fn resolve_elem_type(vm: &Vm, v: &Value) -> Result<(String, usize, usize)> {
             Ok((name.clone(), sz, al.max(1)))
         }
         Value::TypeSpec(spec) if ptr_registry::is_ptr_type_name(&spec.name) => {
-            Err(RuntimeError::type_err(
-                format!("{} element must be pointee type, not ptr[T]", builtin_repr("alloc_array")),
-            ))
+            Err(RuntimeError::type_err(format!(
+                "{} element must be pointee type, not ptr[T]",
+                builtin_repr("alloc_array")
+            )))
         }
         other => Err(RuntimeError::type_err(format!(
             "expected TypeRef, got {}",
@@ -277,9 +298,10 @@ fn resolve_elem_type(vm: &Vm, v: &Value) -> Result<(String, usize, usize)> {
 
 pub fn builtin_write_bytes(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 3 {
-        return Err(RuntimeError::type_err(
-            format!("{}(ptr, offset, bytes) requires 3 arguments", builtin_repr("write_bytes")),
-        ));
+        return Err(RuntimeError::type_err(format!(
+            "{}(ptr, offset, bytes) requires 3 arguments",
+            builtin_repr("write_bytes")
+        )));
     }
     let base = expect_ptr("write_bytes", &args[0])?;
     let off = expect_usize("write_bytes", &args[1])?;
@@ -305,7 +327,10 @@ pub fn builtin_write_bytes(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         }
     };
     if base == 0 {
-        return Err(RuntimeError::value_err(format!("{}: null pointer", builtin_repr("write_bytes"))));
+        return Err(RuntimeError::value_err(format!(
+            "{}: null pointer",
+            builtin_repr("write_bytes")
+        )));
     }
     ptr_registry::check_access(base, off, bytes.len())?;
     unsafe {
@@ -316,15 +341,19 @@ pub fn builtin_write_bytes(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 pub fn builtin_read_bytes(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 3 {
-        return Err(RuntimeError::type_err(
-            format!("{}(ptr, offset, len) requires 3 arguments", builtin_repr("read_bytes")),
-        ));
+        return Err(RuntimeError::type_err(format!(
+            "{}(ptr, offset, len) requires 3 arguments",
+            builtin_repr("read_bytes")
+        )));
     }
     let base = expect_ptr("read_bytes", &args[0])?;
     let off = expect_usize("read_bytes", &args[1])?;
     let len = expect_usize("read_bytes", &args[2])?;
     if base == 0 {
-        return Err(RuntimeError::value_err(format!("{}: null pointer", builtin_repr("read_bytes"))));
+        return Err(RuntimeError::value_err(format!(
+            "{}: null pointer",
+            builtin_repr("read_bytes")
+        )));
     }
     ptr_registry::check_access(base, off, len)?;
     let mut buf = vec![0u8; len];
@@ -339,7 +368,11 @@ pub fn builtin_read_bytes(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 }
 
 pub fn builtin_write_i32(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    write_int::<i32>(args, "write_i32", |v| Ok(expect_i64_label("i32", v)? as i32))
+    write_int::<i32>(
+        args,
+        "write_i32",
+        |v| Ok(expect_i64_label("i32", v)? as i32),
+    )
 }
 pub fn builtin_read_i32(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     read_int::<i32>(args, "read_i32", |v| Value::Sized(SizedNum::I32(v)))
@@ -385,11 +418,7 @@ fn write_int<T: Copy>(
     Ok(Value::None)
 }
 
-fn read_int<T: Copy>(
-    args: &[Value],
-    name: &str,
-    to_val: impl FnOnce(T) -> Value,
-) -> Result<Value> {
+fn read_int<T: Copy>(args: &[Value], name: &str, to_val: impl FnOnce(T) -> Value) -> Result<Value> {
     let ctx = builtin_repr(name);
     if args.len() != 2 {
         return Err(RuntimeError::type_err(format!(
@@ -408,12 +437,17 @@ fn read_int<T: Copy>(
 
 pub fn builtin_cstring(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(RuntimeError::type_err(
-            format!("{}(text) -> [ptr, size]; free with {}(ptr, size)", builtin_repr("cstring"), builtin_repr("free")),
-        ));
+        return Err(RuntimeError::type_err(format!(
+            "{}(text) -> [ptr, size]; free with {}(ptr, size)",
+            builtin_repr("cstring"),
+            builtin_repr("free")
+        )));
     }
     let Value::Text(s) = &args[0] else {
-        return Err(RuntimeError::type_err(format!("{} requires text", builtin_repr("cstring"))));
+        return Err(RuntimeError::type_err(format!(
+            "{} requires text",
+            builtin_repr("cstring")
+        )));
     };
     let mut bytes = s.as_bytes().to_vec();
     bytes.push(0);
@@ -432,36 +466,49 @@ pub fn builtin_cstring(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 pub fn builtin_cstring_to_text(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(RuntimeError::type_err(
-            format!("{}(ptr) requires 1 pointer", builtin_repr("cstring_to_text")),
-        ));
+        return Err(RuntimeError::type_err(format!(
+            "{}(ptr) requires 1 pointer",
+            builtin_repr("cstring_to_text")
+        )));
     }
     let p = expect_ptr("cstring_to_text", &args[0])?;
     if p == 0 {
         return Ok(Value::Text(String::new()));
     }
     if !ptr_registry::is_registered(p) {
-        return Err(RuntimeError::value_err(
-            format!("{}: pointer not registered ({} to allow)", builtin_repr("cstring_to_text"), builtin_repr("unsafe_ptr")),
-        ));
+        return Err(RuntimeError::value_err(format!(
+            "{}: pointer not registered ({} to allow)",
+            builtin_repr("cstring_to_text"),
+            builtin_repr("unsafe_ptr")
+        )));
     }
     // 拷贝到 Optive 托管 `text`；调用方仍须按所有权释放 C 侧缓冲。
     let s = unsafe { std::ffi::CStr::from_ptr(p as *const std::ffi::c_char) };
     let text = s
         .to_str()
-        .map_err(|e| RuntimeError::value_err(format!("{}: invalid UTF-8: {e}", builtin_repr("cstring_to_text"))))?
+        .map_err(|e| {
+            RuntimeError::value_err(format!(
+                "{}: invalid UTF-8: {e}",
+                builtin_repr("cstring_to_text")
+            ))
+        })?
         .to_string();
     Ok(Value::Text(text))
 }
 
 pub fn builtin_wstring(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(RuntimeError::type_err(
-            format!("{}(text) -> [ptr, nbytes]; free with {}", builtin_repr("wstring"), builtin_repr("free")),
-        ));
+        return Err(RuntimeError::type_err(format!(
+            "{}(text) -> [ptr, nbytes]; free with {}",
+            builtin_repr("wstring"),
+            builtin_repr("free")
+        )));
     }
     let Value::Text(s) = &args[0] else {
-        return Err(RuntimeError::type_err(format!("{} requires text", builtin_repr("wstring"))));
+        return Err(RuntimeError::type_err(format!(
+            "{} requires text",
+            builtin_repr("wstring")
+        )));
     };
     let mut units: Vec<u16> = s.encode_utf16().collect();
     units.push(0);
@@ -480,18 +527,21 @@ pub fn builtin_wstring(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 pub fn builtin_wstring_to_text(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(RuntimeError::type_err(
-            format!("{}(ptr) requires 1 pointer", builtin_repr("wstring_to_text")),
-        ));
+        return Err(RuntimeError::type_err(format!(
+            "{}(ptr) requires 1 pointer",
+            builtin_repr("wstring_to_text")
+        )));
     }
     let p = expect_ptr("wstring_to_text", &args[0])?;
     if p == 0 {
         return Ok(Value::Text(String::new()));
     }
     if !ptr_registry::is_registered(p) {
-        return Err(RuntimeError::value_err(
-            format!("{}: pointer not registered ({} to allow)", builtin_repr("wstring_to_text"), builtin_repr("unsafe_ptr")),
-        ));
+        return Err(RuntimeError::value_err(format!(
+            "{}: pointer not registered ({} to allow)",
+            builtin_repr("wstring_to_text"),
+            builtin_repr("unsafe_ptr")
+        )));
     }
     // 拷贝到 Optive 托管 `text`。
     let mut units = Vec::new();
@@ -504,7 +554,10 @@ pub fn builtin_wstring_to_text(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         units.push(u);
         i += 1;
         if i > 10_000_000 {
-            return Err(RuntimeError::value_err(format!("{}: string too long", builtin_repr("wstring_to_text"))));
+            return Err(RuntimeError::value_err(format!(
+                "{}: string too long",
+                builtin_repr("wstring_to_text")
+            )));
         }
     }
     Ok(Value::Text(String::from_utf16_lossy(&units)))
@@ -512,34 +565,41 @@ pub fn builtin_wstring_to_text(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 pub fn builtin_struct(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(RuntimeError::type_err(
-            format!("{}(fields) requires 1 list of [name, type] pairs", builtin_repr("Struct")),
-        ));
+        return Err(RuntimeError::type_err(format!(
+            "{}(fields) requires 1 list of [name, type] pairs",
+            builtin_repr("Struct")
+        )));
     }
     let Value::List(fields_v) = &args[0] else {
-        return Err(RuntimeError::type_err(format!("{}: fields must be a list", builtin_repr("Struct"))));
+        return Err(RuntimeError::type_err(format!(
+            "{}: fields must be a list",
+            builtin_repr("Struct")
+        )));
     };
     let mut fields = Vec::new();
     let mut offset = 0usize;
     let mut max_align = 1usize;
     for item in fields_v.borrow().iter() {
         let Value::List(pair) = item else {
-            return Err(RuntimeError::type_err(
-                format!("{} field must be [name, type]", builtin_repr("Struct")),
-            ));
+            return Err(RuntimeError::type_err(format!(
+                "{} field must be [name, type]",
+                builtin_repr("Struct")
+            )));
         };
         let pair = pair.borrow();
         if pair.len() != 2 {
-            return Err(RuntimeError::type_err(
-                format!("{} field must be [name, type]", builtin_repr("Struct")),
-            ));
+            return Err(RuntimeError::type_err(format!(
+                "{} field must be [name, type]",
+                builtin_repr("Struct")
+            )));
         }
         let name = match &pair[0] {
             Value::Text(s) => s.clone(),
             _ => {
-                return Err(RuntimeError::type_err(
-                    format!("{} field name must be text", builtin_repr("Struct")),
-                ))
+                return Err(RuntimeError::type_err(format!(
+                    "{} field name must be text",
+                    builtin_repr("Struct")
+                )))
             }
         };
         let abi = match &pair[1] {
@@ -832,20 +892,26 @@ fn abi_from_type_value(val: &Value, layout_id: &str) -> Result<AbiType> {
 
 pub fn builtin_load(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(RuntimeError::type_err(
-            format!("{}(Type, ptr) requires type and pointer", builtin_repr("load")),
-        ));
+        return Err(RuntimeError::type_err(format!(
+            "{}(Type, ptr) requires type and pointer",
+            builtin_repr("load")
+        )));
     }
     let Value::TypeRef(name) = &args[0] else {
-        return Err(RuntimeError::type_err(format!("{}: first argument must be TypeRef", builtin_repr("load"))));
+        return Err(RuntimeError::type_err(format!(
+            "{}: first argument must be TypeRef",
+            builtin_repr("load")
+        )));
     };
     let base = expect_ptr("load", &args[1])?;
-    let def = vm
-        .struct_defs
-        .get(name)
-        .ok_or_else(|| RuntimeError::type_err(format!("{}: unknown type '{name}'", builtin_repr("load"))))?;
+    let def = vm.struct_defs.get(name).ok_or_else(|| {
+        RuntimeError::type_err(format!("{}: unknown type '{name}'", builtin_repr("load")))
+    })?;
     let layout = def.native_layout.as_ref().ok_or_else(|| {
-        RuntimeError::type_err(format!("{}: '{name}' has no native layout", builtin_repr("load")))
+        RuntimeError::type_err(format!(
+            "{}: '{name}' has no native layout",
+            builtin_repr("load")
+        ))
     })?;
     ptr_registry::check_access(base, 0, layout.size)?;
     let mut slots = Vec::with_capacity(layout.fields.len());
@@ -859,7 +925,9 @@ pub fn builtin_load(vm: &mut Vm, args: &[Value]) -> Result<Value> {
             .fields
             .iter()
             .position(|f| f.name == *fname)
-            .ok_or_else(|| RuntimeError::attr_err(format!("{}: missing field '{fname}'", builtin_repr("load"))))?;
+            .ok_or_else(|| {
+                RuntimeError::attr_err(format!("{}: missing field '{fname}'", builtin_repr("load")))
+            })?;
         ordered.push(slots[idx].clone());
     }
     Ok(Value::Struct(Arc::new(StructInstance {
@@ -949,15 +1017,17 @@ fn write_scalar_at(addr: usize, type_name: &str, val: &Value) -> Result<()> {
 
 pub fn builtin_store(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(RuntimeError::type_err(
-            format!("{}(ptr, struct_instance) requires 2 arguments", builtin_repr("store")),
-        ));
+        return Err(RuntimeError::type_err(format!(
+            "{}(ptr, struct_instance) requires 2 arguments",
+            builtin_repr("store")
+        )));
     }
     let base = expect_ptr("store", &args[0])?;
     let Value::Struct(inst) = &args[1] else {
-        return Err(RuntimeError::type_err(
-            format!("{}: second argument must be a struct instance", builtin_repr("store")),
-        ));
+        return Err(RuntimeError::type_err(format!(
+            "{}: second argument must be a struct instance",
+            builtin_repr("store")
+        )));
     };
     let layout = inst.def.native_layout.as_ref().ok_or_else(|| {
         RuntimeError::type_err(format!(
@@ -974,7 +1044,9 @@ pub fn builtin_store(vm: &mut Vm, args: &[Value]) -> Result<Value> {
             .fields
             .iter()
             .position(|n| n == &f.name)
-            .ok_or_else(|| RuntimeError::attr_err(format!("{}: no field '{}'", builtin_repr("store"), f.name)))?;
+            .ok_or_else(|| {
+                RuntimeError::attr_err(format!("{}: no field '{}'", builtin_repr("store"), f.name))
+            })?;
         write_field(base, f, &slots[idx])?;
     }
     let _ = vm;
@@ -1112,9 +1184,10 @@ pub(crate) fn unpack_c_struct(vm: &Vm, name: &str, buf: &[u8]) -> Result<Value> 
         .struct_defs
         .get(name)
         .ok_or_else(|| RuntimeError::type_err(format!("unknown type '{name}'")))?;
-    let layout = def.native_layout.as_ref().ok_or_else(|| {
-        RuntimeError::type_err(format!("'{name}' has no native layout"))
-    })?;
+    let layout = def
+        .native_layout
+        .as_ref()
+        .ok_or_else(|| RuntimeError::type_err(format!("'{name}' has no native layout")))?;
     if buf.len() < layout.size {
         return Err(RuntimeError::value_err(format!(
             "C struct '{name}' return buffer too small: {} < {}",
@@ -1162,39 +1235,44 @@ static CALLBACK_IDS: AtomicUsize = AtomicUsize::new(1);
 
 pub fn builtin_callback(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 3 {
-        return Err(RuntimeError::type_err(
-            format!("{}(callable, arg_types, ret_type) requires 3 arguments", builtin_repr("callback")),
-        ));
+        return Err(RuntimeError::type_err(format!(
+            "{}(callable, arg_types, ret_type) requires 3 arguments",
+            builtin_repr("callback")
+        )));
     }
     let callable = args[0].clone();
     if !matches!(
         callable,
         Value::Function(_) | Value::Builtin(_) | Value::GenericFunction(_)
     ) {
-        return Err(RuntimeError::type_err(
-            format!("{}: first argument must be callable", builtin_repr("callback")),
-        ));
+        return Err(RuntimeError::type_err(format!(
+            "{}: first argument must be callable",
+            builtin_repr("callback")
+        )));
     }
     let Value::List(arg_types) = &args[1] else {
-        return Err(RuntimeError::type_err(
-            format!("{}: arg_types must be a list of TypeRefs", builtin_repr("callback")),
-        ));
+        return Err(RuntimeError::type_err(format!(
+            "{}: arg_types must be a list of TypeRefs",
+            builtin_repr("callback")
+        )));
     };
     let mut arg_abis = Vec::new();
     for t in arg_types.borrow().iter() {
         let Value::TypeRef(n) = t else {
-            return Err(RuntimeError::type_err(
-                format!("{}: arg_types elements must be TypeRefs", builtin_repr("callback")),
-            ));
+            return Err(RuntimeError::type_err(format!(
+                "{}: arg_types elements must be TypeRefs",
+                builtin_repr("callback")
+            )));
         };
         arg_abis.push(AbiType::from_type_name(n)?);
     }
     let ret_abi = match &args[2] {
         Value::TypeRef(n) => AbiType::from_type_name(n)?,
         _ => {
-            return Err(RuntimeError::type_err(
-                format!("{}: ret_type must be a TypeRef", builtin_repr("callback")),
-            ))
+            return Err(RuntimeError::type_err(format!(
+                "{}: ret_type must be a TypeRef",
+                builtin_repr("callback")
+            )))
         }
     };
 
@@ -1266,9 +1344,11 @@ pub fn builtin_callback(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 pub fn builtin_callback_free(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(RuntimeError::type_err(
-            format!("{}(id) requires id from {}", builtin_repr("callback_free"), builtin_repr("callback")),
-        ));
+        return Err(RuntimeError::type_err(format!(
+            "{}(id) requires id from {}",
+            builtin_repr("callback_free"),
+            builtin_repr("callback")
+        )));
     }
     let id = expect_usize("callback_free", &args[0])?;
     if let Some(owned) = CALLBACKS.lock().remove(&id) {
@@ -1283,12 +1363,8 @@ pub fn builtin_callback_free(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 unsafe fn decode_cb_arg(p: *mut c_void, abi: AbiType) -> Value {
     // Prefer Value::Num so Optive arithmetic (`+`, etc.) works without casts.
     match abi {
-        AbiType::I32 => Value::Num(Num::from_i64(i64::from(unsafe {
-            *(p as *const i32)
-        }))),
-        AbiType::U32 => Value::Num(Num::from_i64(i64::from(unsafe {
-            *(p as *const u32)
-        }))),
+        AbiType::I32 => Value::Num(Num::from_i64(i64::from(unsafe { *(p as *const i32) }))),
+        AbiType::U32 => Value::Num(Num::from_i64(i64::from(unsafe { *(p as *const u32) }))),
         AbiType::I64 => Value::Num(Num::from_i64(unsafe { *(p as *const i64) })),
         AbiType::U64 => {
             let n = unsafe { *(p as *const u64) };
@@ -1298,18 +1374,10 @@ unsafe fn decode_cb_arg(p: *mut c_void, abi: AbiType) -> Value {
                 Value::Sized(SizedNum::U64(n))
             }
         }
-        AbiType::I16 => Value::Num(Num::from_i64(i64::from(unsafe {
-            *(p as *const i16)
-        }))),
-        AbiType::U16 => Value::Num(Num::from_i64(i64::from(unsafe {
-            *(p as *const u16)
-        }))),
-        AbiType::I8 => Value::Num(Num::from_i64(i64::from(unsafe {
-            *(p as *const i8)
-        }))),
-        AbiType::U8 => Value::Num(Num::from_i64(i64::from(unsafe {
-            *(p as *const u8)
-        }))),
+        AbiType::I16 => Value::Num(Num::from_i64(i64::from(unsafe { *(p as *const i16) }))),
+        AbiType::U16 => Value::Num(Num::from_i64(i64::from(unsafe { *(p as *const u16) }))),
+        AbiType::I8 => Value::Num(Num::from_i64(i64::from(unsafe { *(p as *const i8) }))),
+        AbiType::U8 => Value::Num(Num::from_i64(i64::from(unsafe { *(p as *const u8) }))),
         AbiType::Bool => Value::Bool(unsafe { *(p as *const u8) } != 0),
         // Floats stay sized; convert with num.(f64.(_)) if needed in script.
         AbiType::F32 => Value::Sized(SizedNum::F32(unsafe { *(p as *const f32) })),
@@ -1326,12 +1394,13 @@ unsafe fn decode_cb_arg(p: *mut c_void, abi: AbiType) -> Value {
 fn encode_cb_ret_u64(v: &Value, abi: AbiType) -> u64 {
     match abi {
         AbiType::Void => 0,
-        AbiType::Bool | AbiType::I8 | AbiType::U8 => {
-            u64::from(v.is_truthy())
-        }
-        AbiType::I16 | AbiType::U16 | AbiType::I32 | AbiType::U32 | AbiType::I64 | AbiType::Isize => {
-            expect_i64("cb", v).unwrap_or(0) as u64
-        }
+        AbiType::Bool | AbiType::I8 | AbiType::U8 => u64::from(v.is_truthy()),
+        AbiType::I16
+        | AbiType::U16
+        | AbiType::I32
+        | AbiType::U32
+        | AbiType::I64
+        | AbiType::Isize => expect_i64("cb", v).unwrap_or(0) as u64,
         AbiType::Pointer | AbiType::CharPtr | AbiType::WCharPtr | AbiType::Usize => {
             expect_ptr_or_usize("cb", v).unwrap_or(0) as u64
         }

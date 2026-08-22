@@ -2,7 +2,10 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{Expr, ExprKind, CallArg, FuncParam, Block, LocatedStmt, Stmt, ForItem, CatchClause, MatchCase, LValue, FStringPart, SelectCase, Pattern, PatternElem, DelTarget};
+use crate::ast::{
+    Block, CallArg, CatchClause, DelTarget, Expr, ExprKind, FStringPart, ForItem, FuncParam,
+    LValue, LocatedStmt, MatchCase, Pattern, PatternElem, SelectCase, Stmt,
+};
 use crate::types::{static_type_value_from_expr, type_value_display, type_values_equal};
 use crate::value::Value;
 
@@ -84,10 +87,7 @@ pub fn infer_type_args_from_arg_exprs(
     Ok(out)
 }
 
-fn type_param_in_annotation(
-    expr: &Expr,
-    type_params: &[(String, Option<Expr>)],
-) -> Option<String> {
+fn type_param_in_annotation(expr: &Expr, type_params: &[(String, Option<Expr>)]) -> Option<String> {
     match &expr.kind {
         ExprKind::Var(name) if type_params.iter().any(|(p, _)| p == name) => Some(name.clone()),
         _ => None,
@@ -110,8 +110,9 @@ pub fn infer_type_from_expr(expr: &Expr, param_name: &str) -> Option<Value> {
             crate::ast::UnaryOp::Not | crate::ast::UnaryOp::TruthyNot => {
                 Some(Value::type_ref("bool"))
             }
-            crate::ast::UnaryOp::Neg | crate::ast::UnaryOp::Invert => infer_type_from_expr(operand, param_name)
-                .or_else(|| Some(Value::type_ref("num"))),
+            crate::ast::UnaryOp::Neg | crate::ast::UnaryOp::Invert => {
+                infer_type_from_expr(operand, param_name).or_else(|| Some(Value::type_ref("num")))
+            }
         },
         ExprKind::Binary { op, left, right } => match op {
             crate::ast::BinaryOp::Eq
@@ -234,7 +235,12 @@ fn substitute_stmt_body(stmt: &Stmt, type_names: &HashMap<String, String>) -> St
             then_block: substitute_block(then_block, type_names),
             elifs: elifs
                 .iter()
-                .map(|(c, b)| (substitute_expr(c, type_names), substitute_block(b, type_names)))
+                .map(|(c, b)| {
+                    (
+                        substitute_expr(c, type_names),
+                        substitute_block(b, type_names),
+                    )
+                })
                 .collect(),
             else_block: else_block.as_ref().map(|b| substitute_block(b, type_names)),
         },
@@ -338,9 +344,15 @@ fn substitute_lvalue(lv: &LValue, type_names: &HashMap<String, String>) -> LValu
             step,
         } => LValue::Slice {
             object: Box::new(substitute_expr(object, type_names)),
-            start: start.as_ref().map(|e| Box::new(substitute_expr(e, type_names))),
-            end: end.as_ref().map(|e| Box::new(substitute_expr(e, type_names))),
-            step: step.as_ref().map(|e| Box::new(substitute_expr(e, type_names))),
+            start: start
+                .as_ref()
+                .map(|e| Box::new(substitute_expr(e, type_names))),
+            end: end
+                .as_ref()
+                .map(|e| Box::new(substitute_expr(e, type_names))),
+            step: step
+                .as_ref()
+                .map(|e| Box::new(substitute_expr(e, type_names))),
         },
     }
 }
@@ -349,7 +361,9 @@ fn substitute_lvalue(lv: &LValue, type_names: &HashMap<String, String>) -> LValu
 pub fn substitute_expr(expr: &Expr, type_names: &HashMap<String, String>) -> Expr {
     let kind = match &expr.kind {
         ExprKind::Member { object, field } if field == "__name__" => match &object.kind {
-            ExprKind::Var(n) if type_names.contains_key(n) => ExprKind::String(type_names[n].clone()),
+            ExprKind::Var(n) if type_names.contains_key(n) => {
+                ExprKind::String(type_names[n].clone())
+            }
             // 不满足「类型名.__name__」时，回退到通用 Member 处理（与下方 Member arm 等价）。
             _ => ExprKind::Member {
                 object: Box::new(substitute_expr(object, type_names)),
@@ -391,17 +405,29 @@ pub fn substitute_expr(expr: &Expr, type_names: &HashMap<String, String>) -> Exp
                 .map(|e| substitute_expr(e, type_names))
                 .collect(),
         ),
-        ExprKind::ListComp { elem, items, guards } => ExprKind::ListComp {
+        ExprKind::ListComp {
+            elem,
+            items,
+            guards,
+        } => ExprKind::ListComp {
             elem: Box::new(substitute_expr(elem, type_names)),
             items: substitute_for_items(items, type_names),
             guards: substitute_guards(guards, type_names),
         },
-        ExprKind::SetComp { elem, items, guards } => ExprKind::SetComp {
+        ExprKind::SetComp {
+            elem,
+            items,
+            guards,
+        } => ExprKind::SetComp {
             elem: Box::new(substitute_expr(elem, type_names)),
             items: substitute_for_items(items, type_names),
             guards: substitute_guards(guards, type_names),
         },
-        ExprKind::GeneratorExp { elem, items, guards } => ExprKind::GeneratorExp {
+        ExprKind::GeneratorExp {
+            elem,
+            items,
+            guards,
+        } => ExprKind::GeneratorExp {
             elem: Box::new(substitute_expr(elem, type_names)),
             items: substitute_for_items(items, type_names),
             guards: substitute_guards(guards, type_names),
@@ -409,7 +435,12 @@ pub fn substitute_expr(expr: &Expr, type_names: &HashMap<String, String>) -> Exp
         ExprKind::Dict(entries) => ExprKind::Dict(
             entries
                 .iter()
-                .map(|(k, v)| (substitute_expr(k, type_names), substitute_expr(v, type_names)))
+                .map(|(k, v)| {
+                    (
+                        substitute_expr(k, type_names),
+                        substitute_expr(v, type_names),
+                    )
+                })
                 .collect(),
         ),
         ExprKind::DictComp {
@@ -451,9 +482,15 @@ pub fn substitute_expr(expr: &Expr, type_names: &HashMap<String, String>) -> Exp
             step,
         } => ExprKind::Slice {
             object: Box::new(substitute_expr(object, type_names)),
-            start: start.as_ref().map(|e| Box::new(substitute_expr(e, type_names))),
-            end: end.as_ref().map(|e| Box::new(substitute_expr(e, type_names))),
-            step: step.as_ref().map(|e| Box::new(substitute_expr(e, type_names))),
+            start: start
+                .as_ref()
+                .map(|e| Box::new(substitute_expr(e, type_names))),
+            end: end
+                .as_ref()
+                .map(|e| Box::new(substitute_expr(e, type_names))),
+            step: step
+                .as_ref()
+                .map(|e| Box::new(substitute_expr(e, type_names))),
         },
         ExprKind::Pipeline {
             left,
@@ -537,9 +574,7 @@ pub fn substitute_expr(expr: &Expr, type_names: &HashMap<String, String>) -> Exp
                     body: substitute_block(&c.body, type_names),
                 })
                 .collect(),
-            else_block: else_block
-                .as_ref()
-                .map(|b| substitute_block(b, type_names)),
+            else_block: else_block.as_ref().map(|b| substitute_block(b, type_names)),
         },
         ExprKind::NamedAssign { name, value } => ExprKind::NamedAssign {
             name: name.clone(),

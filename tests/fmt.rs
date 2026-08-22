@@ -15,13 +15,17 @@ use optive::{tokenize, TokenKind};
 #[test]
 fn lex_emits_line_comment_token() {
     let toks = tokenize("let x = 1 // hi\n").expect("lex");
-    assert!(toks.iter().any(|t| t.kind == TokenKind::LineComment && t.value == " hi"));
+    assert!(toks
+        .iter()
+        .any(|t| t.kind == TokenKind::LineComment && t.value == " hi"));
 }
 
 #[test]
 fn lex_emits_block_comment_token() {
     let toks = tokenize("1 /* block */ 2").expect("lex");
-    assert!(toks.iter().any(|t| t.kind == TokenKind::BlockComment && t.value == " block "));
+    assert!(toks
+        .iter()
+        .any(|t| t.kind == TokenKind::BlockComment && t.value == " block "));
 }
 
 #[test]
@@ -77,7 +81,10 @@ foo(
 )
 ";
     let out = format_source(src).expect("fmt");
-    assert!(out.contains("foo(\n"), "expected multiline call, got:\n{out}");
+    assert!(
+        out.contains("foo(\n"),
+        "expected multiline call, got:\n{out}"
+    );
     assert!(out.contains("    a,\n"));
     assert!(out.contains("    b,\n"));
 }

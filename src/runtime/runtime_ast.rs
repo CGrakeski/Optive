@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    Block, BinaryOp, CallArg, CatchClause, CatchPattern, Expr, ExprKind, ForItem, LValue,
+    BinaryOp, Block, CallArg, CatchClause, CatchPattern, Expr, ExprKind, ForItem, LValue,
     LocatedStmt, MacroCallArg, MatchCase, Pattern, PatternElem, Stmt, UnaryOp, Visibility,
 };
 use crate::codegen::Generator;
@@ -399,13 +399,11 @@ pub fn ast_from_stmt(stmt: &Stmt) -> RuntimeAstNode {
         } => {
             let mut elif_stmts: Vec<RuntimeAstNode> = elifs
                 .iter()
-                .map(|(c, b)| {
-                    RuntimeAstNode {
-                        kind: AstNodeKind::IfStmt,
-                        slot_a: Some(Box::new(ast_from_expr(c))),
-                        slot_b: Some(Box::new(ast_from_block(b))),
-                        ..default_node()
-                    }
+                .map(|(c, b)| RuntimeAstNode {
+                    kind: AstNodeKind::IfStmt,
+                    slot_a: Some(Box::new(ast_from_expr(c))),
+                    slot_b: Some(Box::new(ast_from_block(b))),
+                    ..default_node()
                 })
                 .collect();
             let mut node = RuntimeAstNode {
@@ -750,7 +748,9 @@ pub fn binding_var_name_for_quote(expr: &RuntimeAstNode) -> Result<String> {
     if expr.kind == AstNodeKind::VarRef {
         Ok(expr.text.clone())
     } else {
-        Err(RuntimeError::type_err("quote binding must be a simple identifier"))
+        Err(RuntimeError::type_err(
+            "quote binding must be a simple identifier",
+        ))
     }
 }
 
@@ -808,9 +808,10 @@ pub fn quote_binding_to_value(node: &RuntimeAstNode) -> Result<Value> {
         AstNodeKind::Bool => Ok(Value::Bool(node.bool_val)),
         AstNodeKind::NoneLit => Ok(Value::None),
         AstNodeKind::FrozenAst => {
-            let inner = node.slot_a.as_ref().ok_or_else(|| {
-                RuntimeError::msg("FrozenAst binding missing payload")
-            })?;
+            let inner = node
+                .slot_a
+                .as_ref()
+                .ok_or_else(|| RuntimeError::msg("FrozenAst binding missing payload"))?;
             Ok(Value::RuntimeAst(Arc::new((**inner).clone())))
         }
         AstNodeKind::Vector => {
@@ -831,11 +832,7 @@ pub fn ast_to_source(node: &RuntimeAstNode) -> String {
         AstNodeKind::Bool => node.bool_val.to_string(),
         AstNodeKind::NoneLit => "none".into(),
         AstNodeKind::VarRef => node.text.clone(),
-        AstNodeKind::Unary => format!(
-            "{}{}",
-            node.text,
-            slot_str(node.slot_a.as_deref())
-        ),
+        AstNodeKind::Unary => format!("{}{}", node.text, slot_str(node.slot_a.as_deref())),
         AstNodeKind::Binary => format!(
             "({} {} {})",
             slot_str(node.slot_a.as_deref()),
@@ -857,11 +854,7 @@ pub fn ast_to_source(node: &RuntimeAstNode) -> String {
             }
         }
         AstNodeKind::MemberAccess => {
-            format!(
-                "{}.{}",
-                slot_str(node.slot_a.as_deref()),
-                node.text
-            )
+            format!("{}.{}", slot_str(node.slot_a.as_deref()), node.text)
         }
         AstNodeKind::IndexAccess => {
             format!(
@@ -894,7 +887,10 @@ pub fn ast_to_source(node: &RuntimeAstNode) -> String {
 }
 
 /// 深度优先遍历 AST 节点树；对每个节点调用 `visit`。
-pub fn walk_ast_nodes(node: &RuntimeAstNode, visit: &mut dyn FnMut(&RuntimeAstNode) -> Result<()>) -> Result<()> {
+pub fn walk_ast_nodes(
+    node: &RuntimeAstNode,
+    visit: &mut dyn FnMut(&RuntimeAstNode) -> Result<()>,
+) -> Result<()> {
     visit(node)?;
     for child in &node.children {
         walk_ast_nodes(child, visit)?;
@@ -923,7 +919,9 @@ fn slot_str(slot: Option<&RuntimeAstNode>) -> String {
 
 pub fn eval_ast_value(vm: &mut Vm, node: &RuntimeAstNode) -> Result<Value> {
     let body = if node.kind == AstNodeKind::QuoteExpr {
-        node.slot_a.as_deref().ok_or_else(|| RuntimeError::msg("empty quote AST"))?
+        node.slot_a
+            .as_deref()
+            .ok_or_else(|| RuntimeError::msg("empty quote AST"))?
     } else {
         node
     };
@@ -978,10 +976,17 @@ fn ast_to_block(node: &RuntimeAstNode) -> Result<Block> {
             .map(|stmts| {
                 stmts
                     .into_iter()
-                    .map(|stmt| LocatedStmt { line: 0, column: 1, stmt })
+                    .map(|stmt| LocatedStmt {
+                        line: 0,
+                        column: 1,
+                        stmt,
+                    })
                     .collect()
             }),
-        _ => Ok(vec![LocatedStmt { line: 0, column: 1, stmt: ast_to_stmt(node)?,
+        _ => Ok(vec![LocatedStmt {
+            line: 0,
+            column: 1,
+            stmt: ast_to_stmt(node)?,
         }]),
     }
 }
@@ -994,7 +999,11 @@ fn ast_to_stmt(node: &RuntimeAstNode) -> Result<Stmt> {
                 .map(ast_to_stmt)
                 .collect::<Result<Vec<_>>>()?
                 .into_iter()
-                .map(|stmt| LocatedStmt { line: 0, column: 1, stmt })
+                .map(|stmt| LocatedStmt {
+                    line: 0,
+                    column: 1,
+                    stmt,
+                })
                 .collect(),
         )),
         AstNodeKind::VarDecl => Ok(Stmt::VarDecl {
@@ -1004,25 +1013,25 @@ fn ast_to_stmt(node: &RuntimeAstNode) -> Result<Stmt> {
             name: node.text.clone(),
             type_expr: None,
             type_strong: false,
-            init: node
-                .slot_a
-                .as_ref()
-                .map(|s| ast_to_expr(s))
-                .transpose()?,
+            init: node.slot_a.as_ref().map(|s| ast_to_expr(s)).transpose()?,
         }),
         AstNodeKind::Assign => {
             let target = if node.text.is_empty() {
-                ast_to_lvalue(node.slot_b.as_deref().ok_or_else(|| {
-                    RuntimeError::value_err("invalid assign AST")
-                })?)?
+                ast_to_lvalue(
+                    node.slot_b
+                        .as_deref()
+                        .ok_or_else(|| RuntimeError::value_err("invalid assign AST"))?,
+                )?
             } else {
                 LValue::Name(node.text.clone())
             };
             Ok(Stmt::Assign {
                 target,
-                value: ast_to_expr(node.slot_a.as_deref().ok_or_else(|| {
-                    RuntimeError::msg("assign missing value")
-                })?)?,
+                value: ast_to_expr(
+                    node.slot_a
+                        .as_deref()
+                        .ok_or_else(|| RuntimeError::msg("assign missing value"))?,
+                )?,
             })
         }
         AstNodeKind::ReturnStmt => Ok(Stmt::Return(
@@ -1032,81 +1041,99 @@ fn ast_to_stmt(node: &RuntimeAstNode) -> Result<Stmt> {
             let mut elifs = Vec::new();
             for elif in &node.stmts {
                 elifs.push((
-                    ast_to_expr(elif.slot_a.as_deref().ok_or_else(|| {
-                        RuntimeError::msg("elif missing cond")
-                    })?)?,
-                    ast_to_block(elif.slot_b.as_deref().ok_or_else(|| {
-                        RuntimeError::msg("elif missing body")
-                    })?)?,
+                    ast_to_expr(
+                        elif.slot_a
+                            .as_deref()
+                            .ok_or_else(|| RuntimeError::msg("elif missing cond"))?,
+                    )?,
+                    ast_to_block(
+                        elif.slot_b
+                            .as_deref()
+                            .ok_or_else(|| RuntimeError::msg("elif missing body"))?,
+                    )?,
                 ));
             }
             Ok(Stmt::If {
-                cond: ast_to_expr(node.slot_a.as_deref().ok_or_else(|| {
-                    RuntimeError::msg("if missing cond")
-                })?)?,
-                then_block: ast_to_block(node.slot_b.as_deref().ok_or_else(|| {
-                    RuntimeError::msg("if missing body")
-                })?)?,
+                cond: ast_to_expr(
+                    node.slot_a
+                        .as_deref()
+                        .ok_or_else(|| RuntimeError::msg("if missing cond"))?,
+                )?,
+                then_block: ast_to_block(
+                    node.slot_b
+                        .as_deref()
+                        .ok_or_else(|| RuntimeError::msg("if missing body"))?,
+                )?,
                 elifs,
-                else_block: node
-                    .slot_c
-                    .as_ref()
-                    .map(|b| ast_to_block(b))
-                    .transpose()?,
+                else_block: node.slot_c.as_ref().map(|b| ast_to_block(b)).transpose()?,
             })
         }
         AstNodeKind::WhileStmt => Ok(Stmt::While {
-            cond: ast_to_expr(node.slot_a.as_deref().ok_or_else(|| {
-                RuntimeError::msg("while missing cond")
-            })?)?,
-            body: ast_to_block(node.slot_b.as_deref().ok_or_else(|| {
-                RuntimeError::msg("while missing body")
-            })?)?,
+            cond: ast_to_expr(
+                node.slot_a
+                    .as_deref()
+                    .ok_or_else(|| RuntimeError::msg("while missing cond"))?,
+            )?,
+            body: ast_to_block(
+                node.slot_b
+                    .as_deref()
+                    .ok_or_else(|| RuntimeError::msg("while missing body"))?,
+            )?,
         }),
         AstNodeKind::ForStmt => Ok(Stmt::For {
             items: vec![ForItem {
                 name: node.text.clone(),
-                iterable: ast_to_expr(node.slot_a.as_deref().ok_or_else(|| {
-                    RuntimeError::msg("for missing iterable")
-                })?)?,
+                iterable: ast_to_expr(
+                    node.slot_a
+                        .as_deref()
+                        .ok_or_else(|| RuntimeError::msg("for missing iterable"))?,
+                )?,
             }],
-            body: ast_to_block(node.slot_b.as_deref().ok_or_else(|| {
-                RuntimeError::msg("for missing body")
-            })?)?,
+            body: ast_to_block(
+                node.slot_b
+                    .as_deref()
+                    .ok_or_else(|| RuntimeError::msg("for missing body"))?,
+            )?,
         }),
         AstNodeKind::LoopStmt => Ok(Stmt::Loop {
             count: node.slot_a.as_ref().map(|s| ast_to_expr(s)).transpose()?,
-            body: ast_to_block(node.slot_b.as_deref().ok_or_else(|| {
-                RuntimeError::msg("loop missing body")
-            })?)?,
+            body: ast_to_block(
+                node.slot_b
+                    .as_deref()
+                    .ok_or_else(|| RuntimeError::msg("loop missing body"))?,
+            )?,
         }),
         AstNodeKind::BreakStmt => Ok(Stmt::Break),
         AstNodeKind::ContinueStmt => Ok(Stmt::Continue),
         AstNodeKind::ThrowStmt => Ok(Stmt::Throw(ast_to_expr(
-            node.slot_a.as_deref().ok_or_else(|| RuntimeError::msg("throw missing expr"))?,
+            node.slot_a
+                .as_deref()
+                .ok_or_else(|| RuntimeError::msg("throw missing expr"))?,
         )?)),
         AstNodeKind::MatchStmt => {
             let mut cases = Vec::new();
             for case in &node.stmts {
                 cases.push(MatchCase {
-                    pattern: ast_to_pattern(case.slot_a.as_deref().ok_or_else(|| {
-                        RuntimeError::msg("match case missing pattern")
-                    })?)?,
-                    body: ast_to_block(case.slot_b.as_deref().ok_or_else(|| {
-                        RuntimeError::msg("match case missing body")
-                    })?)?,
+                    pattern: ast_to_pattern(
+                        case.slot_a
+                            .as_deref()
+                            .ok_or_else(|| RuntimeError::msg("match case missing pattern"))?,
+                    )?,
+                    body: ast_to_block(
+                        case.slot_b
+                            .as_deref()
+                            .ok_or_else(|| RuntimeError::msg("match case missing body"))?,
+                    )?,
                 });
             }
             Ok(Stmt::Match {
-                subject: ast_to_expr(node.slot_a.as_deref().ok_or_else(|| {
-                    RuntimeError::msg("match missing subject")
-                })?)?,
+                subject: ast_to_expr(
+                    node.slot_a
+                        .as_deref()
+                        .ok_or_else(|| RuntimeError::msg("match missing subject"))?,
+                )?,
                 cases,
-                else_block: node
-                    .slot_c
-                    .as_ref()
-                    .map(|b| ast_to_block(b))
-                    .transpose()?,
+                else_block: node.slot_c.as_ref().map(|b| ast_to_block(b)).transpose()?,
             })
         }
         AstNodeKind::TryStmt => {
@@ -1125,25 +1152,28 @@ fn ast_to_stmt(node: &RuntimeAstNode) -> Result<Stmt> {
                 };
                 catches.push(CatchClause {
                     pattern,
-                    body: ast_to_block(catch.slot_b.as_deref().ok_or_else(|| {
-                        RuntimeError::msg("catch missing body")
-                    })?)?,
+                    body: ast_to_block(
+                        catch
+                            .slot_b
+                            .as_deref()
+                            .ok_or_else(|| RuntimeError::msg("catch missing body"))?,
+                    )?,
                 });
             }
             Ok(Stmt::Try {
-                body: ast_to_block(node.slot_a.as_deref().ok_or_else(|| {
-                    RuntimeError::msg("try missing body")
-                })?)?,
+                body: ast_to_block(
+                    node.slot_a
+                        .as_deref()
+                        .ok_or_else(|| RuntimeError::msg("try missing body"))?,
+                )?,
                 catches,
-                else_block: node
-                    .slot_c
-                    .as_ref()
-                    .map(|b| ast_to_block(b))
-                    .transpose()?,
+                else_block: node.slot_c.as_ref().map(|b| ast_to_block(b)).transpose()?,
             })
         }
         AstNodeKind::ExprStmt => Ok(Stmt::Expr(ast_to_expr(
-            node.slot_a.as_deref().ok_or_else(|| RuntimeError::msg("expr stmt missing expr"))?,
+            node.slot_a
+                .as_deref()
+                .ok_or_else(|| RuntimeError::msg("expr stmt missing expr"))?,
         )?)),
         _ => ast_to_expr(node).map(Stmt::Expr),
     }
@@ -1152,7 +1182,9 @@ fn ast_to_stmt(node: &RuntimeAstNode) -> Result<Stmt> {
 fn ast_to_pattern(node: &RuntimeAstNode) -> Result<Pattern> {
     match node.text.as_str() {
         "Expr" => Ok(Pattern::Value(Box::new(ast_to_expr(
-            node.slot_a.as_deref().ok_or_else(|| RuntimeError::msg("pattern expr"))?,
+            node.slot_a
+                .as_deref()
+                .ok_or_else(|| RuntimeError::msg("pattern expr"))?,
         )?))),
         "Bind" => Ok(Pattern::Bind(
             node.binding_names.first().cloned().unwrap_or_default(),
@@ -1165,7 +1197,9 @@ fn ast_to_pattern(node: &RuntimeAstNode) -> Result<Pattern> {
                         c.binding_names.first().cloned().unwrap_or_default(),
                     )),
                     "Expr" => Ok(PatternElem::Value(Box::new(ast_to_expr(
-                        c.slot_a.as_deref().ok_or_else(|| RuntimeError::msg("pattern"))?,
+                        c.slot_a
+                            .as_deref()
+                            .ok_or_else(|| RuntimeError::msg("pattern"))?,
                     )?))),
                     _ => Ok(PatternElem::Nested(ast_to_pattern(c)?)),
                 })
@@ -1179,7 +1213,9 @@ fn ast_to_pattern(node: &RuntimeAstNode) -> Result<Pattern> {
                         c.binding_names.first().cloned().unwrap_or_default(),
                     )),
                     "Expr" => Ok(PatternElem::Value(Box::new(ast_to_expr(
-                        c.slot_a.as_deref().ok_or_else(|| RuntimeError::msg("pattern"))?,
+                        c.slot_a
+                            .as_deref()
+                            .ok_or_else(|| RuntimeError::msg("pattern"))?,
                     )?))),
                     _ => Ok(PatternElem::Nested(ast_to_pattern(c)?)),
                 })
@@ -1190,17 +1226,23 @@ fn ast_to_pattern(node: &RuntimeAstNode) -> Result<Pattern> {
             fields: node.binding_names.clone(),
         }),
         "Or" => Ok(Pattern::Or(
-            node.children.iter().map(ast_to_pattern).collect::<Result<_>>()?,
+            node.children
+                .iter()
+                .map(ast_to_pattern)
+                .collect::<Result<_>>()?,
         )),
         "Call" => Ok(Pattern::Call {
             type_name: node.hygienic_names.first().cloned().unwrap_or_default(),
-            args: node.children.iter().map(ast_to_pattern).collect::<Result<_>>()?,
+            args: node
+                .children
+                .iter()
+                .map(ast_to_pattern)
+                .collect::<Result<_>>()?,
         }),
         _ => Err(RuntimeError::msg(format!(
             "unknown match pattern tag: {}",
             node.text
-        )),
-        ),
+        ))),
     }
 }
 
@@ -1208,18 +1250,24 @@ fn ast_to_lvalue(node: &RuntimeAstNode) -> Result<LValue> {
     match node.kind {
         AstNodeKind::VarRef => Ok(LValue::Name(node.text.clone())),
         AstNodeKind::MemberAccess => Ok(LValue::Member {
-            object: Box::new(ast_to_expr(node.slot_a.as_deref().ok_or_else(|| {
-                RuntimeError::msg("member lvalue")
-            })?)?),
+            object: Box::new(ast_to_expr(
+                node.slot_a
+                    .as_deref()
+                    .ok_or_else(|| RuntimeError::msg("member lvalue"))?,
+            )?),
             field: node.text.clone(),
         }),
         AstNodeKind::IndexAccess => Ok(LValue::Index {
-            object: Box::new(ast_to_expr(node.slot_a.as_deref().ok_or_else(|| {
-                RuntimeError::msg("index lvalue")
-            })?)?),
-            index: Box::new(ast_to_expr(node.slot_b.as_deref().ok_or_else(|| {
-                RuntimeError::msg("index lvalue")
-            })?)?),
+            object: Box::new(ast_to_expr(
+                node.slot_a
+                    .as_deref()
+                    .ok_or_else(|| RuntimeError::msg("index lvalue"))?,
+            )?),
+            index: Box::new(ast_to_expr(
+                node.slot_b
+                    .as_deref()
+                    .ok_or_else(|| RuntimeError::msg("index lvalue"))?,
+            )?),
         }),
         _ => Err(RuntimeError::value_err("invalid lvalue AST")),
     }
@@ -1233,62 +1281,121 @@ fn ast_to_expr(node: &RuntimeAstNode) -> Result<Expr> {
         AstNodeKind::NoneLit => Ok(Expr::at(0, 1, ExprKind::None)),
         AstNodeKind::VarRef => Ok(Expr::at(0, 1, ExprKind::Var(node.text.clone()))),
         AstNodeKind::Placeholder => Ok(Expr::at(0, 1, ExprKind::Placeholder)),
-        AstNodeKind::Unary => Ok(Expr::at(0, 1, ExprKind::Unary {
-            op: parse_unary_op(&node.text)?,
-            operand: Box::new(ast_to_expr(node.slot_a.as_deref().ok_or_else(|| {
-                RuntimeError::msg("unary missing operand")
-            })?)?),
-        })),
-        AstNodeKind::Binary => Ok(Expr::at(0, 1, ExprKind::Binary {
-            op: parse_binary_op(&node.text)?,
-            left: Box::new(ast_to_expr(node.slot_a.as_deref().ok_or_else(|| {
-                RuntimeError::msg("binary missing left")
-            })?)?),
-            right: Box::new(ast_to_expr(node.slot_b.as_deref().ok_or_else(|| {
-                RuntimeError::msg("binary missing right")
-            })?)?),
-        })),
-        AstNodeKind::FuncCall => Ok(Expr::at(0, 1, ExprKind::Call {
-            callee: Box::new(ast_to_expr(node.slot_a.as_deref().ok_or_else(|| {
-                RuntimeError::msg("call missing callee")
-            })?)?),
-            args: node.call_args.iter().map(ast_to_call_arg).collect::<Result<_>>()?,
-        })),
-        AstNodeKind::MacroCall => Ok(Expr::at(0, 1, ExprKind::MacroCall {
-            callee: Box::new(ast_to_expr(node.slot_a.as_deref().ok_or_else(|| {
-                RuntimeError::msg("macro call missing callee")
-            })?)?),
-            args: node
-                .call_args
-                .iter()
-                .map(ast_to_macro_call_arg)
-                .collect::<Result<_>>()?,
-        })),
-        AstNodeKind::MemberAccess => Ok(Expr::at(0, 1, ExprKind::Member {
-            object: Box::new(ast_to_expr(node.slot_a.as_deref().ok_or_else(|| {
-                RuntimeError::msg("member missing object")
-            })?)?),
-            field: node.text.clone(),
-        })),
-        AstNodeKind::IndexAccess => Ok(Expr::at(0, 1, ExprKind::Index {
-            object: Box::new(ast_to_expr(node.slot_a.as_deref().ok_or_else(|| {
-                RuntimeError::msg("index missing object")
-            })?)?),
-            index: Box::new(ast_to_expr(node.slot_b.as_deref().ok_or_else(|| {
-                RuntimeError::msg("index missing index")
-            })?)?),
-        })),
-        AstNodeKind::TypeConvert => Ok(Expr::at(0, 1, ExprKind::TypeConvert {
-            type_expr: Box::new(ast_to_expr(node.slot_a.as_deref().ok_or_else(|| {
-                RuntimeError::msg("type convert missing type")
-            })?)?),
-            value: Box::new(ast_to_expr(node.slot_b.as_deref().ok_or_else(|| {
-                RuntimeError::msg("type convert missing value")
-            })?)?),
-        })),
-        AstNodeKind::Vector => Ok(Expr::at(0, 1, ExprKind::List(
-            node.children.iter().map(ast_to_expr).collect::<Result<_>>()?,
-        ))),
+        AstNodeKind::Unary => Ok(Expr::at(
+            0,
+            1,
+            ExprKind::Unary {
+                op: parse_unary_op(&node.text)?,
+                operand: Box::new(ast_to_expr(
+                    node.slot_a
+                        .as_deref()
+                        .ok_or_else(|| RuntimeError::msg("unary missing operand"))?,
+                )?),
+            },
+        )),
+        AstNodeKind::Binary => Ok(Expr::at(
+            0,
+            1,
+            ExprKind::Binary {
+                op: parse_binary_op(&node.text)?,
+                left: Box::new(ast_to_expr(
+                    node.slot_a
+                        .as_deref()
+                        .ok_or_else(|| RuntimeError::msg("binary missing left"))?,
+                )?),
+                right: Box::new(ast_to_expr(
+                    node.slot_b
+                        .as_deref()
+                        .ok_or_else(|| RuntimeError::msg("binary missing right"))?,
+                )?),
+            },
+        )),
+        AstNodeKind::FuncCall => Ok(Expr::at(
+            0,
+            1,
+            ExprKind::Call {
+                callee: Box::new(ast_to_expr(
+                    node.slot_a
+                        .as_deref()
+                        .ok_or_else(|| RuntimeError::msg("call missing callee"))?,
+                )?),
+                args: node
+                    .call_args
+                    .iter()
+                    .map(ast_to_call_arg)
+                    .collect::<Result<_>>()?,
+            },
+        )),
+        AstNodeKind::MacroCall => Ok(Expr::at(
+            0,
+            1,
+            ExprKind::MacroCall {
+                callee: Box::new(ast_to_expr(
+                    node.slot_a
+                        .as_deref()
+                        .ok_or_else(|| RuntimeError::msg("macro call missing callee"))?,
+                )?),
+                args: node
+                    .call_args
+                    .iter()
+                    .map(ast_to_macro_call_arg)
+                    .collect::<Result<_>>()?,
+            },
+        )),
+        AstNodeKind::MemberAccess => Ok(Expr::at(
+            0,
+            1,
+            ExprKind::Member {
+                object: Box::new(ast_to_expr(
+                    node.slot_a
+                        .as_deref()
+                        .ok_or_else(|| RuntimeError::msg("member missing object"))?,
+                )?),
+                field: node.text.clone(),
+            },
+        )),
+        AstNodeKind::IndexAccess => Ok(Expr::at(
+            0,
+            1,
+            ExprKind::Index {
+                object: Box::new(ast_to_expr(
+                    node.slot_a
+                        .as_deref()
+                        .ok_or_else(|| RuntimeError::msg("index missing object"))?,
+                )?),
+                index: Box::new(ast_to_expr(
+                    node.slot_b
+                        .as_deref()
+                        .ok_or_else(|| RuntimeError::msg("index missing index"))?,
+                )?),
+            },
+        )),
+        AstNodeKind::TypeConvert => Ok(Expr::at(
+            0,
+            1,
+            ExprKind::TypeConvert {
+                type_expr: Box::new(ast_to_expr(
+                    node.slot_a
+                        .as_deref()
+                        .ok_or_else(|| RuntimeError::msg("type convert missing type"))?,
+                )?),
+                value: Box::new(ast_to_expr(
+                    node.slot_b
+                        .as_deref()
+                        .ok_or_else(|| RuntimeError::msg("type convert missing value"))?,
+                )?),
+            },
+        )),
+        AstNodeKind::Vector => Ok(Expr::at(
+            0,
+            1,
+            ExprKind::List(
+                node.children
+                    .iter()
+                    .map(ast_to_expr)
+                    .collect::<Result<_>>()?,
+            ),
+        )),
         AstNodeKind::BlockStmt => {
             let stmts = ast_to_block(node)?;
             if stmts.len() == 1 {
@@ -1298,18 +1405,24 @@ fn ast_to_expr(node: &RuntimeAstNode) -> Result<Expr> {
             }
             Err(RuntimeError::msg("block used as expression in eval"))
         }
-        AstNodeKind::QuoteExpr => Ok(Expr::at(0, 1, ExprKind::Quote {
-            hygienic_names: node.hygienic_names.clone(),
-            bindings: node
-                .binding_names
-                .iter()
-                .zip(node.bindings.iter())
-                .map(|(name, _)| Ok(Expr::at(0, 1, ExprKind::Var(name.clone()))))
-                .collect::<Result<_>>()?,
-            body: ast_to_block(node.slot_a.as_deref().ok_or_else(|| {
-                RuntimeError::msg("quote missing body")
-            })?)?,
-        })),
+        AstNodeKind::QuoteExpr => Ok(Expr::at(
+            0,
+            1,
+            ExprKind::Quote {
+                hygienic_names: node.hygienic_names.clone(),
+                bindings: node
+                    .binding_names
+                    .iter()
+                    .zip(node.bindings.iter())
+                    .map(|(name, _)| Ok(Expr::at(0, 1, ExprKind::Var(name.clone()))))
+                    .collect::<Result<_>>()?,
+                body: ast_to_block(
+                    node.slot_a
+                        .as_deref()
+                        .ok_or_else(|| RuntimeError::msg("quote missing body"))?,
+                )?,
+            },
+        )),
         _ => Err(RuntimeError::msg(format!(
             "cannot convert AST kind {:?} to expression",
             node.kind
@@ -1379,7 +1492,11 @@ pub fn parse_to_ast(source: &str) -> Result<RuntimeAstNode> {
     let program = Parser::parse(source).map_err(|e| RuntimeError::msg(e.to_string()))?;
     Ok(RuntimeAstNode {
         kind: AstNodeKind::BlockStmt,
-        stmts: program.stmts.iter().map(|ls| ast_from_stmt(&ls.stmt)).collect(),
+        stmts: program
+            .stmts
+            .iter()
+            .map(|ls| ast_from_stmt(&ls.stmt))
+            .collect(),
         ..default_node()
     })
 }
@@ -1395,7 +1512,9 @@ pub fn with_arity1(
     f: impl FnOnce(&Value) -> Result<Value>,
 ) -> Result<Value> {
     if args.len() != 1 {
-        return Err(RuntimeError::type_err(format!("{name} requires 1 argument")));
+        return Err(RuntimeError::type_err(format!(
+            "{name} requires 1 argument"
+        )));
     }
     f(&args[0])
 }
@@ -1474,10 +1593,7 @@ fn expect_ast_list(v: &Value, ctx: &str) -> Result<Vec<RuntimeAstNode>> {
     let Value::List(lst) = v else {
         return Err(RuntimeError::type_err(format!("{ctx} expects a list")));
     };
-    lst.borrow()
-        .iter()
-        .map(value_as_ast)
-        .collect()
+    lst.borrow().iter().map(value_as_ast).collect()
 }
 
 pub fn ast_vec_push(vec_value: &Value, ast_value: &Value) -> Result<Value> {
@@ -1511,9 +1627,7 @@ fn runtime_ast_to_struct(vm: &Vm, node: &RuntimeAstNode) -> Result<Value> {
     };
     let call_args_list = |args: &[AstCallArg]| -> Value {
         Value::List(Shared::new(
-            args.iter()
-                .map(|a| a.value.clone().into_value())
-                .collect(),
+            args.iter().map(|a| a.value.clone().into_value()).collect(),
         ))
     };
 
@@ -1586,7 +1700,10 @@ fn runtime_ast_to_struct(vm: &Vm, node: &RuntimeAstNode) -> Result<Value> {
             vec![
                 ast_field(node.slot_a.as_deref()),
                 Value::List(Shared::new(
-                    node.bindings.iter().map(|b| b.clone().into_value()).collect(),
+                    node.bindings
+                        .iter()
+                        .map(|b| b.clone().into_value())
+                        .collect(),
                 )),
             ],
         ),
@@ -1670,10 +1787,7 @@ pub fn register_ast_struct_types(vm: &mut Vm) {
                 fields: fields.iter().map(|(f, _)| f.to_string()).collect(),
                 mutable_fields: fields.iter().map(|_| false).collect(),
                 typed: false,
-                field_types: fields
-                    .iter()
-                    .map(|_| FieldTypeInfo::default())
-                    .collect(),
+                field_types: fields.iter().map(|_| FieldTypeInfo::default()).collect(),
                 type_params: Vec::new(),
                 native_layout: None,
                 methods: std::collections::HashMap::new(),
@@ -1688,9 +1802,9 @@ pub fn register_ast_struct_types(vm: &mut Vm) {
 }
 
 pub fn check_macro_param_ast_kind(param_type: &Expr, ast: &RuntimeAstNode) -> Result<()> {
-    let Some(name) = crate::types::static_type_value_from_expr(param_type).and_then(|v| {
-        crate::types::type_value_base(&v).map(str::to_string)
-    }) else {
+    let Some(name) = crate::types::static_type_value_from_expr(param_type)
+        .and_then(|v| crate::types::type_value_base(&v).map(str::to_string))
+    else {
         return Ok(());
     };
     let Some(expected) = annotation_to_kind(&name) else {

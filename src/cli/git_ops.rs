@@ -469,10 +469,7 @@ pub fn git_remotes_equivalent(a: &str, b: &str) -> bool {
 }
 
 /// 已有目录不能当作 `url` 的继续同步目标时（origin 不同、或不是 git），应删掉重克隆。
-pub fn should_replace_checkout(
-    path: &std::path::Path,
-    url: &str,
-) -> Result<bool, Box<dyn Error>> {
+pub fn should_replace_checkout(path: &std::path::Path, url: &str) -> Result<bool, Box<dyn Error>> {
     if !path.exists() {
         return Ok(false);
     }
@@ -505,12 +502,8 @@ pub fn remove_checkout(path: &std::path::Path) -> Result<(), Box<dyn Error>> {
         Ok(()) => Ok(()),
         Err(e) => {
             std::thread::sleep(std::time::Duration::from_millis(250));
-            fs::remove_dir_all(path).map_err(|e2| {
-                format!(
-                    "cannot replace {}: {e}; retry: {e2}",
-                    path.display()
-                )
-            })?;
+            fs::remove_dir_all(path)
+                .map_err(|e2| format!("cannot replace {}: {e}; retry: {e2}", path.display()))?;
             Ok(())
         }
     }
@@ -740,12 +733,10 @@ fn remote_has_no_commits(ref_map: &gix::remote::fetch::RefMap) -> bool {
     if ref_map.remote_refs.is_empty() {
         return true;
     }
-    ref_map.remote_refs.iter().all(|r| {
-        matches!(
-            r,
-            gix::protocol::handshake::Ref::Unborn { .. }
-        )
-    })
+    ref_map
+        .remote_refs
+        .iter()
+        .all(|r| matches!(r, gix::protocol::handshake::Ref::Unborn { .. }))
 }
 
 fn remote_tip_id(
@@ -838,7 +829,7 @@ pub fn latest_semver_version(url: &str) -> Result<String, Box<dyn Error>> {
         let repo = gix::open(&tmp_root)?;
         let mut best: Option<super::semver::Version> = None;
         for (ver, _) in list_semver_tags(&repo)? {
-            if best.as_ref().map_or(true, |b| ver > *b) {
+            if best.as_ref().is_none_or(|b| ver > *b) {
                 best = Some(ver);
             }
         }
@@ -869,29 +860,29 @@ pub fn resolve_version_commit(url: &str, version: &str) -> Result<String, Box<dy
     if let Some(parent) = tmp_root.parent() {
         fs::create_dir_all(parent)?;
     }
-        let outcome = (|| -> Result<String, Box<dyn Error>> {
-            clone_into(url, &tmp_root)?;
-            let req = super::semver::parse_req(version)
-                .map_err(|e| format!("invalid version constraint `{version}`: {e}"))?;
-            let repo = gix::open(&tmp_root)?;
-            let tags = list_semver_tags(&repo)?;
-            let mut best: Option<(super::semver::Version, String)> = None;
-            for (ver, tag) in &tags {
-                if !req.matches(ver) {
-                    continue;
-                }
-                if best.as_ref().map_or(true, |(b, _)| ver > b) {
-                    best = Some((*ver, tag.clone()));
-                }
+    let outcome = (|| -> Result<String, Box<dyn Error>> {
+        clone_into(url, &tmp_root)?;
+        let req = super::semver::parse_req(version)
+            .map_err(|e| format!("invalid version constraint `{version}`: {e}"))?;
+        let repo = gix::open(&tmp_root)?;
+        let tags = list_semver_tags(&repo)?;
+        let mut best: Option<(super::semver::Version, String)> = None;
+        for (ver, tag) in &tags {
+            if !req.matches(ver) {
+                continue;
             }
-            let Some((_, tag)) = best else {
-                return Err(missing_version_tag_err(url, version, &tags).into());
-            };
-            checkout_rev(&tmp_root, &tag)?;
-            let repo = gix::open(&tmp_root)?;
-            let id = repo.head_id()?;
-            Ok(id.to_string())
-        })();
+            if best.as_ref().is_none_or(|(b, _)| ver > b) {
+                best = Some((*ver, tag.clone()));
+            }
+        }
+        let Some((_, tag)) = best else {
+            return Err(missing_version_tag_err(url, version, &tags).into());
+        };
+        checkout_rev(&tmp_root, &tag)?;
+        let repo = gix::open(&tmp_root)?;
+        let id = repo.head_id()?;
+        Ok(id.to_string())
+    })();
     let _ = fs::remove_dir_all(&tmp_root);
     outcome
 }
@@ -996,8 +987,8 @@ fn clone_git_repo(
             .into()
     });
 
-    let exists_non_empty = target_dir.exists()
-        && !(target_dir.is_dir() && dir_is_empty(target_dir).unwrap_or(false));
+    let exists_non_empty =
+        target_dir.exists() && !(target_dir.is_dir() && dir_is_empty(target_dir).unwrap_or(false));
     if exists_non_empty {
         if opts.skip_if_exists {
             println!("Dependency already present: {}", target_dir.display());
@@ -1093,12 +1084,12 @@ pub fn checkout_rev(repo_dir: &std::path::Path, rev: &str) -> Result<(), Box<dyn
 
 fn checkout_git_worktree(
     repo: Repository,
-    mut index: &mut File,
+    index: &mut File,
     workdir: PathBuf,
     opts: Options,
 ) -> Result<(), Box<dyn Error>> {
     gix::worktree::state::checkout(
-        &mut index,
+        index,
         workdir,
         repo.objects.clone().into_arc()?,
         &gix::progress::Discard,
@@ -1244,10 +1235,7 @@ mod tests {
 
     #[test]
     fn resolve_version_missing_tag_mentions_hint() {
-        let tmp = std::env::temp_dir().join(format!(
-            "optive_ver_hint_{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("optive_ver_hint_{}", std::process::id()));
         let src = tmp.join("src");
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&src).unwrap();
@@ -1259,14 +1247,25 @@ mod tests {
         assert!(status.success());
         let _ = std::process::Command::new("git")
             .current_dir(&src)
-            .args(["-c", "user.email=t@e.com", "-c", "user.name=t", "commit", "--allow-empty", "-m", "i"])
+            .args([
+                "-c",
+                "user.email=t@e.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "i",
+            ])
             .status();
         let url = if cfg!(windows) {
             format!("file:///{}", src.display().to_string().replace('\\', "/"))
         } else {
             format!("file://{}", src.display())
         };
-        let err = resolve_version_commit(&url, "0.0.1").unwrap_err().to_string();
+        let err = resolve_version_commit(&url, "0.0.1")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no git tag matching"), "{err}");
         assert!(err.contains("no semver git tags"), "{err}");
         assert!(err.contains("Optive publish"), "{err}");

@@ -5,9 +5,8 @@ use std::path::PathBuf;
 use crate::cli::manifest::find_project;
 use optive::custom::{
     self, build_active_from_ids, custom_dir, list_installed_ids, load_pack_dir, load_pack_staging,
-    parse_use_list,
-    read_global_use, read_project_use, set_active_pack, write_global_use, write_project_use, CliMsg,
-    Diag, GLOBAL_CONFIG_FILE, PROJECT_CUSTOM_FILE,
+    parse_use_list, read_global_use, read_project_use, set_active_pack, write_global_use,
+    write_project_use, CliMsg, Diag, GLOBAL_CONFIG_FILE, PROJECT_CUSTOM_FILE,
 };
 
 fn t(msg: CliMsg) -> String {
@@ -56,8 +55,10 @@ fn cmd_show() {
     } else {
         println!("Custom.toml: (not in a project)");
     }
-    let g = custom_dir()
-        .parent().map_or_else(|| PathBuf::from(GLOBAL_CONFIG_FILE), |p| p.join(GLOBAL_CONFIG_FILE));
+    let g = custom_dir().parent().map_or_else(
+        || PathBuf::from(GLOBAL_CONFIG_FILE),
+        |p| p.join(GLOBAL_CONFIG_FILE),
+    );
     println!("Global: {}", g.display());
     if let Ok(ids) = read_global_use() {
         if !ids.is_empty() {

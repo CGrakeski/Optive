@@ -83,12 +83,26 @@ pub(crate) fn specialize_with_entry(code: &mut [Instruction], entry_env: &[Optio
             Instruction::LoadFastSubImm { slot, .. } => {
                 let t = env_get(&env, *slot);
                 // 结果类型：若槽为 Num 则差仍为 Num；否则未知。
-                stack.push(if t == Some(Tag::Num) { Some(Tag::Num) } else { None });
+                stack.push(if t == Some(Tag::Num) {
+                    Some(Tag::Num)
+                } else {
+                    None
+                });
             }
-            Instruction::LoadFastLeImm { slot, .. } => {
+            Instruction::LoadFastLeImm { slot, .. }
+            | Instruction::LoadFastLtImm { slot, .. }
+            | Instruction::LoadFastGtImm { slot, .. }
+            | Instruction::LoadFastEqImm { slot, .. } => {
                 let t = env_get(&env, *slot);
                 let _ = t;
                 stack.push(Some(Tag::Bool));
+            }
+            Instruction::LoadFastSqrGt { .. } | Instruction::LoadFastModEq0 { .. } => {
+                stack.push(Some(Tag::Bool));
+            }
+            Instruction::LoadFastAddImmStore { slot, .. } => {
+                let t = env_get(&env, *slot);
+                env_set(&mut env, *slot, t.or(Some(Tag::Num)));
             }
             Instruction::Load(_)
             | Instruction::LoadGlobal(_)
@@ -416,7 +430,12 @@ pub(crate) fn specialize_with_entry(code: &mut [Instruction], entry_env: &[Optio
             }
             Instruction::DelName(_) | Instruction::DelAttr(_) => {}
             // 已是特化或其余：做保守栈效果
-            Instruction::AddNumNum | Instruction::SubNumNum | Instruction::MulNumNum | Instruction::DivNumNum | Instruction::ModNumNum | Instruction::PowNumNum => {
+            Instruction::AddNumNum
+            | Instruction::SubNumNum
+            | Instruction::MulNumNum
+            | Instruction::DivNumNum
+            | Instruction::ModNumNum
+            | Instruction::PowNumNum => {
                 let _ = stack.pop();
                 let _ = stack.pop();
                 stack.push(Some(Tag::Num));
@@ -456,7 +475,12 @@ enum OpKind {
     Sub,
 }
 
-fn rewrite_cmp(ins: &mut Instruction, stack: &mut Vec<Option<Tag>>, num_op: Instruction, _ord: bool) {
+fn rewrite_cmp(
+    ins: &mut Instruction,
+    stack: &mut Vec<Option<Tag>>,
+    num_op: Instruction,
+    _ord: bool,
+) {
     let (rb, ra) = pop2(stack);
     if ra == Some(Tag::Num) && rb == Some(Tag::Num) {
         *ins = num_op;

@@ -55,10 +55,7 @@ fn debug_line_breakpoint_and_continue() {
     });
     state.borrow_mut().add_line_breakpoint("", 3);
     debug::attach(&mut vm, state.clone());
-    load(
-        &mut vm,
-        "a = 1\nb = 2\nc = a + b\n",
-    );
+    load(&mut vm, "a = 1\nb = 2\nc = a + b\n");
     let done = vm.run_until_debug_break().expect("run");
     assert!(done.is_none());
     assert_eq!(state.borrow().stop_reason, Some(StopReason::Breakpoint));
@@ -102,10 +99,7 @@ fn debug_step_over_advances_line() {
         ..Default::default()
     });
     debug::attach(&mut vm, state.clone());
-    load(
-        &mut vm,
-        "a = 1\nb = 2\nc = 3\n",
-    );
+    load(&mut vm, "a = 1\nb = 2\nc = 3\n");
     assert!(vm.run_until_debug_break().unwrap().is_none());
     let line0 = debug::line_at_pc(&vm);
     let depth = vm.debug_call_depth();
@@ -174,7 +168,8 @@ foo(1)
     assert_eq!(state.borrow().stop_reason, Some(StopReason::Breakpoint));
     let name = vm.debug_current_func_name();
     assert!(
-        name.as_deref().is_some_and(|n| n == "foo" || n.ends_with("foo")),
+        name.as_deref()
+            .is_some_and(|n| n == "foo" || n.ends_with("foo")),
         "expected foo, got {name:?}"
     );
 
@@ -190,7 +185,10 @@ fn debug_finish_returns_from_call() {
         stop_on_entry: false,
         ..Default::default()
     });
-    state.borrow_mut().function_breakpoints.insert("inner".into());
+    state
+        .borrow_mut()
+        .function_breakpoints
+        .insert("inner".into());
     debug::attach(&mut vm, state.clone());
     load(
         &mut vm,
@@ -274,7 +272,10 @@ fn debug_line_breakpoint_refires_each_loop_iteration() {
             Err(e) => panic!("run error: {e}"),
         }
     }
-    assert_eq!(hits, 3, "line BP should fire once per iteration (got {hits})");
+    assert_eq!(
+        hits, 3,
+        "line BP should fire once per iteration (got {hits})"
+    );
 }
 
 #[test]
@@ -412,4 +413,3 @@ await t
         state.borrow().last_uncaught
     );
 }
-

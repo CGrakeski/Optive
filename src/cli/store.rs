@@ -86,9 +86,9 @@ impl Store {
     }
 
     pub fn lookup(&self, id: &str) -> Result<Option<PackRecord>, Box<dyn std::error::Error>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, git_url, effective_rev, path FROM packs WHERE id = ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, git_url, effective_rev, path FROM packs WHERE id = ?1")?;
         let mut rows = stmt.query(params![id])?;
         if let Some(row) = rows.next()? {
             let path_s: String = row.get(3)?;
@@ -145,7 +145,10 @@ impl Store {
         pack_ids: &[String],
     ) -> Result<(), Box<dyn std::error::Error>> {
         let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM refs WHERE project_key = ?1", params![project_key])?;
+        tx.execute(
+            "DELETE FROM refs WHERE project_key = ?1",
+            params![project_key],
+        )?;
         for id in pack_ids {
             tx.execute(
                 "INSERT OR IGNORE INTO refs (project_key, pack_id) VALUES (?1, ?2)",
@@ -185,9 +188,8 @@ impl Store {
     pub fn delete_pack(&mut self, id: &str) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(rec) = self.lookup(id)? {
             if rec.path.exists() {
-                fs::remove_dir_all(&rec.path).map_err(|e| {
-                    format!("cannot remove pack {}: {e}", rec.path.display())
-                })?;
+                fs::remove_dir_all(&rec.path)
+                    .map_err(|e| format!("cannot remove pack {}: {e}", rec.path.display()))?;
             }
         }
         self.conn

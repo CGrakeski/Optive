@@ -165,7 +165,9 @@ impl SizedNum {
                 _ => unreachable!("LITERAL_SUFFIXES entry without parser: {suf}"),
             };
         }
-        Err(RuntimeError::value_err(format!("invalid sized literal: {text}")))
+        Err(RuntimeError::value_err(format!(
+            "invalid sized literal: {text}"
+        )))
     }
 
     pub const ALL_NAMES: &[&str] = &[
@@ -182,9 +184,9 @@ impl fmt::Display for SizedNum {
 macro_rules! parse_int {
     ($name:ident, $ty:ty, $ctor:ident) => {
         fn $name(body: &str) -> Result<SizedNum> {
-            body.parse::<$ty>()
-                .map(SizedNum::$ctor)
-                .map_err(|_| RuntimeError::value_err(format!("invalid {} literal: {body}", stringify!($ty))))
+            body.parse::<$ty>().map(SizedNum::$ctor).map_err(|_| {
+                RuntimeError::value_err(format!("invalid {} literal: {body}", stringify!($ty)))
+            })
         }
     };
 }

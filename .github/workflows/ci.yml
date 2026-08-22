@@ -57,7 +57,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --bin Optive
-      - name: Test (default — 跳过被 ignore 的慢基准)
+      - name: Test (default — 跳过被 ignore 的慢基准；含 vm_concurrency / vm_gc_mn / fuzz_frontend)
         run: cargo test
       - name: Test (ignored 基准，仅作冒烟)
         # 慢的 fib(30) 等；CI 上只验证能跑通，不读性能数据。

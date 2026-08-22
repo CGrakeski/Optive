@@ -11,9 +11,7 @@ use std::thread;
 use parking_lot::Mutex;
 
 use crate::error::RuntimeError;
-use crate::ffi::{
-    invoke_native_call_sampled, ArgStorage, FfiCallable, RetStorage, AbiType,
-};
+use crate::ffi::{invoke_native_call_sampled, AbiType, ArgStorage, FfiCallable, RetStorage};
 use crate::gc::SharedGc;
 use crate::Result;
 
@@ -157,6 +155,7 @@ pub(crate) fn submit_call(
     let Some(tx) = tx_guard.as_ref() else {
         return Err(RuntimeError::msg("internal: FFI pool not started"));
     };
-    tx.send(job).map_err(|_| RuntimeError::msg("FFI pool worker gone"))?;
+    tx.send(job)
+        .map_err(|_| RuntimeError::msg("FFI pool worker gone"))?;
     Ok(pending)
 }

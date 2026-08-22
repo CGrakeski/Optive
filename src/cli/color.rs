@@ -183,40 +183,35 @@ fn enable_windows_vt() {}
 mod tests {
     use super::*;
 
-#[test]
-fn take_color_flags() {
-    let args = vec![
-        "Optive".into(),
-        "--color".into(),
-        "run".into(),
-        ".".into(),
-    ];
-    let (c, rest) = take_color_args(&args);
-    assert_eq!(c, ColorChoice::Always);
-    assert_eq!(rest, vec!["Optive", "run", "."]);
+    #[test]
+    fn take_color_flags() {
+        let args = vec!["Optive".into(), "--color".into(), "run".into(), ".".into()];
+        let (c, rest) = take_color_args(&args);
+        assert_eq!(c, ColorChoice::Always);
+        assert_eq!(rest, vec!["Optive", "run", "."]);
 
-    let args = vec![
-        "Optive".into(),
-        "--no-color".into(),
-        "new".into(),
-        "App".into(),
-    ];
-    let (c, rest) = take_color_args(&args);
-    assert_eq!(c, ColorChoice::Never);
-    assert_eq!(rest, vec!["Optive", "new", "App"]);
+        let args = vec![
+            "Optive".into(),
+            "--no-color".into(),
+            "new".into(),
+            "App".into(),
+        ];
+        let (c, rest) = take_color_args(&args);
+        assert_eq!(c, ColorChoice::Never);
+        assert_eq!(rest, vec!["Optive", "new", "App"]);
 
-    let args = vec!["Optive".into(), "--color=auto".into()];
-    let (c, _) = take_color_args(&args);
-    assert_eq!(c, ColorChoice::Auto);
+        let args = vec!["Optive".into(), "--color=auto".into()];
+        let (c, _) = take_color_args(&args);
+        assert_eq!(c, ColorChoice::Auto);
 
-    let args = vec![
-        "Optive".into(),
-        "--color".into(),
-        "never".into(),
-        "run".into(),
-    ];
-    let (c, rest) = take_color_args(&args);
-    assert_eq!(c, ColorChoice::Never);
-    assert_eq!(rest, vec!["Optive", "run"]);
-}
+        let args = vec![
+            "Optive".into(),
+            "--color".into(),
+            "never".into(),
+            "run".into(),
+        ];
+        let (c, rest) = take_color_args(&args);
+        assert_eq!(c, ColorChoice::Never);
+        assert_eq!(rest, vec!["Optive", "run"]);
+    }
 }

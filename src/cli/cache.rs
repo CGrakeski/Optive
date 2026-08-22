@@ -33,18 +33,12 @@ impl ProjectCache {
             Ok(t) => match toml::from_str(&t) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!(
-                        "warning: ignoring corrupt {}: {e}",
-                        path.display()
-                    );
+                    eprintln!("warning: ignoring corrupt {}: {e}", path.display());
                     Self::default()
                 }
             },
             Err(e) => {
-                eprintln!(
-                    "warning: cannot read {}: {e}",
-                    path.display()
-                );
+                eprintln!("warning: cannot read {}: {e}", path.display());
                 Self::default()
             }
         }
@@ -76,20 +70,12 @@ impl ProjectCache {
             // 宽松：规范化后按 git + branch 匹配（兼容旧缓存里未规范化的键）
             self.entries
                 .values()
-                .find(|e| {
-                    store::normalize_git_url(&e.git) == norm && e.branch.as_deref() == branch
-                })
+                .find(|e| store::normalize_git_url(&e.git) == norm && e.branch.as_deref() == branch)
                 .map(|e| e.commit.as_str())
         })
     }
 
-    pub fn put(
-        &mut self,
-        git: &str,
-        branch: Option<&str>,
-        commit: &str,
-        id: Option<&str>,
-    ) {
+    pub fn put(&mut self, git: &str, branch: Option<&str>, commit: &str, id: Option<&str>) {
         let norm = store::normalize_git_url(git);
         let k = Self::key(git, branch);
         self.entries.insert(

@@ -33,12 +33,9 @@ pub fn load_pack_index() -> Result<BTreeMap<String, String>, Box<dyn std::error:
         )
         .into());
     }
-    let text = fs::read_to_string(&path).map_err(|e| {
-        format!("cannot read {}: {e}", path.display())
-    })?;
-    parse_pack_index(&text).map_err(|e| {
-        format!("invalid {}: {e}", path.display()).into()
-    })
+    let text =
+        fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    parse_pack_index(&text).map_err(|e| format!("invalid {}: {e}", path.display()).into())
 }
 
 pub fn parse_pack_index(text: &str) -> Result<BTreeMap<String, String>, String> {
@@ -48,27 +45,25 @@ pub fn parse_pack_index(text: &str) -> Result<BTreeMap<String, String>, String> 
 /// 按包名查 git URL。
 pub fn lookup_pack_url(name: &str) -> Result<String, Box<dyn std::error::Error>> {
     let map = load_pack_index()?;
-    map.get(name)
-        .cloned()
-        .ok_or_else(|| {
-            let known: Vec<&str> = map.keys().map(String::as_str).collect();
-            let shown = if known.len() > 8 {
-                format!("{}… ({} packs)", known[..8].join(", "), known.len())
-            } else if known.is_empty() {
-                "(empty index)".into()
-            } else {
-                known.join(", ")
-            };
-            format!(
-                "pack `{name}` not found in {}\n  \
+    map.get(name).cloned().ok_or_else(|| {
+        let known: Vec<&str> = map.keys().map(String::as_str).collect();
+        let shown = if known.len() > 8 {
+            format!("{}… ({} packs)", known[..8].join(", "), known.len())
+        } else if known.is_empty() {
+            "(empty index)".into()
+        } else {
+            known.join(", ")
+        };
+        format!(
+            "pack `{name}` not found in {}\n  \
                  this file is the local checkout (not fetched on `up`/`add`).\n  \
                  run `Optive index sync` to refresh from the configured remote\n  \
                  (default: https://gitee.com/CGrakeski/optindex.git).\n  \
                  packs currently listed: {shown}",
-                index_json_path().display()
-            )
-            .into()
-        })
+            index_json_path().display()
+        )
+        .into()
+    })
 }
 
 /// 按包名子串搜索（大小写不敏感）。`query` 为 `None` 或空则返回全部。

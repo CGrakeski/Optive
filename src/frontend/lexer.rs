@@ -105,11 +105,7 @@ impl Lexer {
                 } else {
                     TokenKind::Mismatch
                 };
-                let end = if end > start {
-                    end
-                } else {
-                    self.source.len()
-                };
+                let end = if end > start { end } else { self.source.len() };
                 spans.push((start, end, kind));
                 if end < self.source.len() {
                     spans.push((end, self.source.len(), TokenKind::Mismatch));
@@ -247,10 +243,7 @@ impl Lexer {
             return self.read_number(line, col);
         }
 
-        if ch == '-'
-            && self.peek_next_is_number_start()
-            && !self.minus_follows_complete_expr()
-        {
+        if ch == '-' && self.peek_next_is_number_start() && !self.minus_follows_complete_expr() {
             return self.read_number(line, col);
         }
 
@@ -477,8 +470,9 @@ impl Lexer {
                 let encoded: String = bytes
                     .iter()
                     .map(|&b| {
-                        char::from_u32(u32::from(b))
-                            .expect("byte value 0-255 is always a valid char (theoretically unreachable)")
+                        char::from_u32(u32::from(b)).expect(
+                            "byte value 0-255 is always a valid char (theoretically unreachable)",
+                        )
                     })
                     .collect();
                 return Token::new(TokenKind::BytesLiteral, encoded, line, col);
@@ -792,8 +786,7 @@ impl Lexer {
     }
 
     fn identifier_continues_here(&self) -> bool {
-        self.peek_char()
-            .is_some_and(is_ident_continue)
+        self.peek_char().is_some_and(is_ident_continue)
     }
 }
 
@@ -866,12 +859,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            Lexer::new("-1")
-                .tokenize()
-                .unwrap()
-                .first()
-                .unwrap()
-                .value,
+            Lexer::new("-1").tokenize().unwrap().first().unwrap().value,
             "-1"
         );
     }

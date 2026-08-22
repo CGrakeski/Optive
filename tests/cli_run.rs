@@ -100,11 +100,7 @@ fake_lib = { git = "https://github.com/example/fake_lib.git", rev = "aaaaaaaaaaa
     fs::create_dir_all(root.join("deps/fake_lib")).unwrap();
     fs::write(root.join("deps/fake_lib/main.tive"), "export let x = 1\n").unwrap();
 
-    let (code, stdout, stderr) = run_optive_env(
-        &["run"],
-        &root,
-        &[("OPTIVE_USE_LOCAL_DEPS", "1")],
-    );
+    let (code, stdout, stderr) = run_optive_env(&["run"], &root, &[("OPTIVE_USE_LOCAL_DEPS", "1")]);
     assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
     assert!(stdout.contains("ok"), "stdout={stdout}");
 }
@@ -140,11 +136,7 @@ id = "dead"
     )
     .unwrap();
 
-    let (code, stdout, stderr) = run_optive_env(
-        &["run"],
-        &root,
-        &[("OPTIVE_USE_LOCAL_DEPS", "1")],
-    );
+    let (code, stdout, stderr) = run_optive_env(&["run"], &root, &[("OPTIVE_USE_LOCAL_DEPS", "1")]);
     assert_ne!(code, 0, "stdout={stdout}");
     assert!(
         stderr.contains("out of date")
@@ -249,10 +241,7 @@ fn new_then_run_project() {
 
     let (code, stdout, stderr) = run_optive(&["run"], &root);
     assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
-    assert!(
-        stdout.contains("Hello from HelloApp"),
-        "stdout={stdout}"
-    );
+    assert!(stdout.contains("Hello from HelloApp"), "stdout={stdout}");
 }
 
 #[test]
@@ -296,11 +285,7 @@ greeter = { git = "https://github.com/example/greeter.git", rev = "ccccccccccccc
     )
     .unwrap();
 
-    let (code, stdout, stderr) = run_optive_env(
-        &["run"],
-        &root,
-        &[("OPTIVE_USE_LOCAL_DEPS", "1")],
-    );
+    let (code, stdout, stderr) = run_optive_env(&["run"], &root, &[("OPTIVE_USE_LOCAL_DEPS", "1")]);
     assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
     assert!(stdout.contains("hello"), "stdout={stdout}");
 }
@@ -337,11 +322,7 @@ logging = { git = "https://github.com/example/logging.git", rev = "eeeeeeeeeeeee
     fs::create_dir_all(root.join("deps/logging")).unwrap();
     fs::write(root.join("deps/logging/main.tive"), "export let y = 2\n").unwrap();
 
-    let (code, stdout, stderr) = run_optive_env(
-        &["run"],
-        &root,
-        &[("OPTIVE_USE_LOCAL_DEPS", "1")],
-    );
+    let (code, stdout, stderr) = run_optive_env(&["run"], &root, &[("OPTIVE_USE_LOCAL_DEPS", "1")]);
     // LOCAL_DEPS 同名冲突：greeter 会装 logging 到 deps/logging，根也会…
     // 根 import logging 未声明 → 应失败
     assert_ne!(code, 0, "stdout={stdout}");
@@ -381,7 +362,10 @@ fn run_inline_code_missing_arg() {
     let root = tempfile_project("inline_c_miss");
     let (code, _stdout, stderr) = run_optive(&["-c"], &root);
     assert_eq!(code, 2, "stderr={stderr}");
-    assert!(stderr.contains("usage") || stderr.contains("-c"), "stderr={stderr}");
+    assert!(
+        stderr.contains("usage") || stderr.contains("-c"),
+        "stderr={stderr}"
+    );
 }
 
 #[test]
@@ -469,8 +453,7 @@ entry = "src/main.tive"
     )
     .unwrap();
 
-    let (code, stdout, stderr) =
-        run_optive(&["run", "--sandbox", "--", "sand_arg"], &root);
+    let (code, stdout, stderr) = run_optive(&["run", "--sandbox", "--", "sand_arg"], &root);
     assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
     assert!(stdout.contains("sand_arg"), "got: {stdout}");
 }
@@ -490,8 +473,7 @@ entry = "src/main.tive"
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/main.tive"), "print(1)\n").unwrap();
 
-    let (code, _stdout, stderr) =
-        run_optive(&["run", "a", "b", "--", "x"], &root);
+    let (code, _stdout, stderr) = run_optive(&["run", "a", "b", "--", "x"], &root);
     assert_eq!(code, 2, "stderr={stderr}");
     assert!(
         stderr.contains("too many arguments before '--'") || stderr.contains("Error:"),
@@ -620,6 +602,57 @@ entry = "src/main.tive"
     assert!(
         stderr.contains("too many arguments") || stderr.contains("Error:"),
         "stderr={stderr}"
+    );
+}
+
+#[test]
+fn check_ok_project_and_file() {
+    let root = tempfile_project("check_ok");
+    fs::write(
+        root.join("Optive.toml"),
+        r#"
+[package]
+name = "check_ok"
+entry = "src/main.tive"
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/main.tive"), "let x = 1\nprint(x)\n").unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["check"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(
+        stdout.contains("check ok") || stdout.contains("ok "),
+        "stdout={stdout}"
+    );
+
+    let file = root.join("src/main.tive");
+    let (code, stdout, stderr) = run_optive(&["check", file.to_str().unwrap()], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+}
+
+#[test]
+fn check_reports_parse_error() {
+    let root = tempfile_project("check_bad");
+    fs::write(
+        root.join("Optive.toml"),
+        r#"
+[package]
+name = "check_bad"
+entry = "src/main.tive"
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/main.tive"), "let x =\n").unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["check"], &root);
+    assert_ne!(code, 0, "stdout={stdout}");
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("error") || combined.contains("FAILED") || combined.contains("lex"),
+        "out={combined}"
     );
 }
 

@@ -65,14 +65,53 @@ pub enum Instruction {
     LoadMacro(String),
     Store(String),
     StoreGlobal(usize),
-    NewVar { name: String, is_const: bool },
+    NewVar {
+        name: String,
+        is_const: bool,
+    },
     NewVarOrLoad(String),
     LoadFast(usize),
     StoreFast(usize),
     /// 融合：`LoadFast(slot); PushSmall(imm); Sub` → 压入 `lw_slots[slot] - imm`。
-    LoadFastSubImm { slot: usize, imm: i64 },
+    LoadFastSubImm {
+        slot: usize,
+        imm: i64,
+    },
     /// 融合：`LoadFast(slot); PushSmall(imm); Le` → 压入 `lw_slots[slot] <= imm`。
-    LoadFastLeImm { slot: usize, imm: i64 },
+    LoadFastLeImm {
+        slot: usize,
+        imm: i64,
+    },
+    /// 融合：`LoadFast(slot); PushSmall(imm); Lt`。
+    LoadFastLtImm {
+        slot: usize,
+        imm: i64,
+    },
+    /// 融合：`LoadFast(slot); PushSmall(imm); Gt`。
+    LoadFastGtImm {
+        slot: usize,
+        imm: i64,
+    },
+    /// 融合：`LoadFast(slot); PushSmall(imm); Eq`。
+    LoadFastEqImm {
+        slot: usize,
+        imm: i64,
+    },
+    /// 融合：`LoadFast(slot); PushSmall(imm); Add; StoreFast(slot)` → `slot += imm`。
+    LoadFastAddImmStore {
+        slot: usize,
+        imm: i64,
+    },
+    /// 融合：`LoadFast(s); LoadFast(s); Mul; LoadFast(t); Gt` → `s*s > t`。
+    LoadFastSqrGt {
+        sqr_slot: usize,
+        rhs_slot: usize,
+    },
+    /// 融合：`LoadFast(a); LoadFast(b); Mod; PushSmall(0); Eq` → `(a % b) == 0`。
+    LoadFastModEq0 {
+        lhs_slot: usize,
+        rhs_slot: usize,
+    },
     BindFast {
         slot: usize,
         name: String,
@@ -86,14 +125,23 @@ pub enum Instruction {
     GotoIfNot(usize),
     /// 计数循环：栈顶为计数器。`<= 0` 时弹出并跳到目标；否则计数器减 1。
     LoopCountdown(usize),
-    Call { argc: usize },
+    Call {
+        argc: usize,
+    },
     /// 融合：`LoadGlobal(idx); Call { argc }` → 不经栈装载 callee。
-    CallGlobal { global_idx: usize, argc: usize },
-    CallSelf { argc: usize },
+    CallGlobal {
+        global_idx: usize,
+        argc: usize,
+    },
+    CallSelf {
+        argc: usize,
+    },
     CallList,
     /// 扩展调用：栈为 `args_list, kwargs_dict, callee`。
     CallEx,
-    MacroCall { argc: usize },
+    MacroCall {
+        argc: usize,
+    },
     ListAppend,
     ListExtend,
     /// `dict[key] = val`，栈：dict, key, val → dict（就地写入并留下 dict）。
@@ -116,8 +164,13 @@ pub enum Instruction {
     DelName(String),
     DelAttr(String),
     GetAttr(String),
-    StructNew { name: String, argc: usize },
-    VariantNew { name: String },
+    StructNew {
+        name: String,
+        argc: usize,
+    },
+    VariantNew {
+        name: String,
+    },
     SetField(String),
     IterNew,
     IterNext,
@@ -141,7 +194,10 @@ pub enum Instruction {
     /// 将 list/tuple 按精确长度拆到栈上（先压入的元素在栈底，末元素在栈顶）。
     UnpackExact(usize),
     /// 将 list/tuple 拆为 `before` + rest(list) + `after`；栈顶为最后一个 after 元素。
-    UnpackRest { before: usize, after: usize },
+    UnpackRest {
+        before: usize,
+        after: usize,
+    },
     Rethrow,
     /// 栈：… value, `type_val` → … `value（硬检查；type_val` 须为类型）。
     TypeCheck,
@@ -399,11 +455,7 @@ pub fn compact_bytecode(code: Vec<Instruction>) -> (Vec<Instruction>, Vec<usize>
     for i in 0..n {
         final_map[i] = if keep[i] {
             let mid = new_pc[i];
-            let v = if mid < m {
-                new_pc2[mid]
-            } else {
-                final_len
-            };
+            let v = if mid < m { new_pc2[mid] } else { final_len };
             idx = v;
             v
         } else {
@@ -441,9 +493,15 @@ pub fn compact_parallel(map: &[usize], old_to_new: &[usize]) -> Vec<usize> {
     result
 }
 
-/// 融合窥孔：检测 `LoadFast(s); PushSmall(n); Sub/Le` 三连模式并替换为
-/// `LoadFastSubImm` / `LoadFastLeImm` 单指令。需在 `compact_bytecode` 之后运行
-///（Label 已移除，三连指令必然相邻）。
+/// 融合窥孔：检测热循环常见模式并替换为单指令。需在 `compact_bytecode` 之后运行
+///（Label 已移除，多连指令必然相邻）。
+///
+/// - `LoadGlobal; Call` → `CallGlobal`
+/// - `GotoIfNot(next); Goto(t)` → `GotoIf(t)`
+/// - `LoadFast; PushSmall; Sub/Le/Lt/Gt/Eq` → `LoadFast*Imm`
+/// - `LoadFast; PushSmall; Add; StoreFast`（同槽）→ `LoadFastAddImmStore`
+/// - `d*d > n` → `LoadFastSqrGt`
+/// - `n % d == 0` → `LoadFastModEq0`
 ///
 /// 返回紧化后的代码及 `old_pc → new_pc` 映射（长度 n+1，含哨兵），
 /// 供调用方同步紧化 `line_map` / `column_map`。
@@ -457,7 +515,9 @@ pub fn peephole_fuse(code: Vec<Instruction>) -> (Vec<Instruction>, Vec<usize>) {
     let mut jump_targets: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for ins in &code {
         match ins {
-            Instruction::Goto(t) | Instruction::GotoIf(t) | Instruction::GotoIfNot(t)
+            Instruction::Goto(t)
+            | Instruction::GotoIf(t)
+            | Instruction::GotoIfNot(t)
             | Instruction::LoopCountdown(t) => {
                 jump_targets.insert(*t);
             }
@@ -478,8 +538,11 @@ pub fn peephole_fuse(code: Vec<Instruction>) -> (Vec<Instruction>, Vec<usize>) {
     let mut new_code = Vec::with_capacity(n);
     let mut remap = vec![0usize; n + 1];
     let mut i = 0;
+    let untargeted = |from: usize, extra: usize| -> bool {
+        (1..extra).all(|k| !jump_targets.contains(&(from + k)))
+    };
     while i < n {
-        if i + 1 < n && !jump_targets.contains(&(i + 1)) {
+        if i + 1 < n && untargeted(i, 2) {
             if let (Instruction::LoadGlobal(idx), Instruction::Call { argc }) =
                 (&code[i], &code[i + 1])
             {
@@ -494,19 +557,95 @@ pub fn peephole_fuse(code: Vec<Instruction>) -> (Vec<Instruction>, Vec<usize>) {
                     continue;
                 }
             }
+            // `if cond { break/return-path }`：GotoIfNot(next); Goto(target) → GotoIf(target)
+            if let (Instruction::GotoIfNot(fall), Instruction::Goto(target)) =
+                (&code[i], &code[i + 1])
+            {
+                if *fall == i + 2 {
+                    remap[i] = new_code.len();
+                    remap[i + 1] = new_code.len();
+                    new_code.push(Instruction::GotoIf(*target));
+                    i += 2;
+                    continue;
+                }
+            }
         }
-        if i + 2 < n
-            && !jump_targets.contains(&(i + 1))
-            && !jump_targets.contains(&(i + 2))
-        {
+        if i + 4 < n && untargeted(i, 5) {
+            match (
+                &code[i],
+                &code[i + 1],
+                &code[i + 2],
+                &code[i + 3],
+                &code[i + 4],
+            ) {
+                (
+                    Instruction::LoadFast(s1),
+                    Instruction::LoadFast(s2),
+                    Instruction::Mul | Instruction::MulNumNum,
+                    Instruction::LoadFast(t),
+                    Instruction::Gt | Instruction::GtNumNum,
+                ) if s1 == s2 && *s1 < u32::MAX as usize && *t < u32::MAX as usize => {
+                    let dst = new_code.len();
+                    for k in 0..5 {
+                        remap[i + k] = dst;
+                    }
+                    new_code.push(Instruction::LoadFastSqrGt {
+                        sqr_slot: *s1,
+                        rhs_slot: *t,
+                    });
+                    i += 5;
+                    continue;
+                }
+                (
+                    Instruction::LoadFast(a),
+                    Instruction::LoadFast(b),
+                    Instruction::Mod | Instruction::ModNumNum,
+                    Instruction::PushSmall(0),
+                    Instruction::Eq | Instruction::EqNumNum,
+                ) if *a < u32::MAX as usize && *b < u32::MAX as usize => {
+                    let dst = new_code.len();
+                    for k in 0..5 {
+                        remap[i + k] = dst;
+                    }
+                    new_code.push(Instruction::LoadFastModEq0 {
+                        lhs_slot: *a,
+                        rhs_slot: *b,
+                    });
+                    i += 5;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if i + 3 < n && untargeted(i, 4) {
+            if let (
+                Instruction::LoadFast(slot),
+                Instruction::PushSmall(imm),
+                Instruction::Add | Instruction::AddNumNum,
+                Instruction::StoreFast(dst),
+            ) = (&code[i], &code[i + 1], &code[i + 2], &code[i + 3])
+            {
+                if slot == dst && i32::try_from(*imm).is_ok() && *slot < u32::MAX as usize {
+                    let at = new_code.len();
+                    for k in 0..4 {
+                        remap[i + k] = at;
+                    }
+                    new_code.push(Instruction::LoadFastAddImmStore {
+                        slot: *slot,
+                        imm: *imm,
+                    });
+                    i += 4;
+                    continue;
+                }
+            }
+        }
+        if i + 2 < n && untargeted(i, 3) {
             match (&code[i], &code[i + 1], &code[i + 2]) {
                 (
                     Instruction::LoadFast(slot),
                     Instruction::PushSmall(imm),
                     Instruction::Sub | Instruction::SubNumNum,
-                ) if i32::try_from(*imm).is_ok()
-                    && *slot < u32::MAX as usize =>
-                {
+                ) if i32::try_from(*imm).is_ok() && *slot < u32::MAX as usize => {
                     remap[i] = new_code.len();
                     remap[i + 1] = new_code.len();
                     remap[i + 2] = new_code.len();
@@ -521,13 +660,56 @@ pub fn peephole_fuse(code: Vec<Instruction>) -> (Vec<Instruction>, Vec<usize>) {
                     Instruction::LoadFast(slot),
                     Instruction::PushSmall(imm),
                     Instruction::Le | Instruction::LeNumNum,
-                ) if i32::try_from(*imm).is_ok()
-                    && *slot < u32::MAX as usize =>
-                {
+                ) if i32::try_from(*imm).is_ok() && *slot < u32::MAX as usize => {
                     remap[i] = new_code.len();
                     remap[i + 1] = new_code.len();
                     remap[i + 2] = new_code.len();
                     new_code.push(Instruction::LoadFastLeImm {
+                        slot: *slot,
+                        imm: *imm,
+                    });
+                    i += 3;
+                    continue;
+                }
+                (
+                    Instruction::LoadFast(slot),
+                    Instruction::PushSmall(imm),
+                    Instruction::Lt | Instruction::LtNumNum,
+                ) if i32::try_from(*imm).is_ok() && *slot < u32::MAX as usize => {
+                    remap[i] = new_code.len();
+                    remap[i + 1] = new_code.len();
+                    remap[i + 2] = new_code.len();
+                    new_code.push(Instruction::LoadFastLtImm {
+                        slot: *slot,
+                        imm: *imm,
+                    });
+                    i += 3;
+                    continue;
+                }
+                (
+                    Instruction::LoadFast(slot),
+                    Instruction::PushSmall(imm),
+                    Instruction::Gt | Instruction::GtNumNum,
+                ) if i32::try_from(*imm).is_ok() && *slot < u32::MAX as usize => {
+                    remap[i] = new_code.len();
+                    remap[i + 1] = new_code.len();
+                    remap[i + 2] = new_code.len();
+                    new_code.push(Instruction::LoadFastGtImm {
+                        slot: *slot,
+                        imm: *imm,
+                    });
+                    i += 3;
+                    continue;
+                }
+                (
+                    Instruction::LoadFast(slot),
+                    Instruction::PushSmall(imm),
+                    Instruction::Eq | Instruction::EqNumNum,
+                ) if i32::try_from(*imm).is_ok() && *slot < u32::MAX as usize => {
+                    remap[i] = new_code.len();
+                    remap[i + 1] = new_code.len();
+                    remap[i + 2] = new_code.len();
+                    new_code.push(Instruction::LoadFastEqImm {
                         slot: *slot,
                         imm: *imm,
                     });
@@ -546,7 +728,9 @@ pub fn peephole_fuse(code: Vec<Instruction>) -> (Vec<Instruction>, Vec<usize>) {
     let new_len = new_code.len();
     for ins in &mut new_code {
         match ins {
-            Instruction::Goto(t) | Instruction::GotoIf(t) | Instruction::GotoIfNot(t)
+            Instruction::Goto(t)
+            | Instruction::GotoIf(t)
+            | Instruction::GotoIfNot(t)
             | Instruction::LoopCountdown(t) => {
                 *t = if *t >= n { new_len } else { remap[*t] };
             }
@@ -555,11 +739,23 @@ pub fn peephole_fuse(code: Vec<Instruction>) -> (Vec<Instruction>, Vec<usize>) {
                 else_label,
                 end_label,
             } => {
-                *catch_label = if *catch_label >= n { new_len } else { remap[*catch_label] };
+                *catch_label = if *catch_label >= n {
+                    new_len
+                } else {
+                    remap[*catch_label]
+                };
                 if *else_label != 0 {
-                    *else_label = if *else_label >= n { new_len } else { remap[*else_label] };
+                    *else_label = if *else_label >= n {
+                        new_len
+                    } else {
+                        remap[*else_label]
+                    };
                 }
-                *end_label = if *end_label >= n { new_len } else { remap[*end_label] };
+                *end_label = if *end_label >= n {
+                    new_len
+                } else {
+                    remap[*end_label]
+                };
             }
             _ => {}
         }
@@ -578,7 +774,11 @@ pub struct MacroObject {
 }
 
 impl MacroObject {
-    pub fn new(name: impl Into<String>, params: Vec<crate::ast::MacroParam>, body: Vec<Instruction>) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        params: Vec<crate::ast::MacroParam>,
+        body: Vec<Instruction>,
+    ) -> Self {
         let variadic_param_index = params.iter().position(|p| p.is_variadic);
         Self {
             name: name.into(),
@@ -662,6 +862,7 @@ impl FuncFlags {
     }
 
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn pack(
         lightweight: bool,
         needs_arg_checks: bool,
@@ -783,6 +984,7 @@ impl FunctionObject {
     }
 
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn compute_hot_call_argc(
         lightweight: bool,
         is_generator: bool,
@@ -884,7 +1086,7 @@ pub fn function_uses_name_map(body: &[Instruction]) -> bool {
                 | Instruction::Store(_)
                 | Instruction::NewVar { .. }
                 | Instruction::NewVarOrLoad(_)
-                | Instruction::BindFast { .. }
+                | Instruction::BindFast { is_const: true, .. }
                 | Instruction::DelName(_)
         )
     })

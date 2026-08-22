@@ -115,7 +115,10 @@ pub fn check_primitive_instance(vm: &Vm, val: &Value, type_name: &str) -> Option
 }
 
 fn value_matches_abi(val: &Value, abi: &crate::ffi::AbiType) -> bool {
-    use crate::ffi::AbiType::{Void, Bool, I8, U8, I16, U16, I32, U32, I64, U64, Isize, Usize, F32, F64, Pointer, CharPtr, WCharPtr, CStruct};
+    use crate::ffi::AbiType::{
+        Bool, CStruct, CharPtr, Isize, Pointer, Usize, Void, WCharPtr, F32, F64, I16, I32, I64, I8,
+        U16, U32, U64, U8,
+    };
     match abi {
         Void => matches!(val, Value::None),
         Bool => matches!(val, Value::Bool(_)),
@@ -245,7 +248,9 @@ pub fn value_to_type_value(_vm: &Vm, val: &Value) -> Value {
             if s.generic_args.is_empty() {
                 Value::TypeRef(s.def.name.clone())
             } else {
-                Value::TypeSpec(TypeSpecData::new(s.def.name.clone(), s.generic_args.clone(),
+                Value::TypeSpec(TypeSpecData::new(
+                    s.def.name.clone(),
+                    s.generic_args.clone(),
                 ))
             }
         }
@@ -259,8 +264,9 @@ pub fn value_to_type_value(_vm: &Vm, val: &Value) -> Value {
 pub fn value_to_type_value_operand(val: &Value) -> Value {
     match val {
         Value::TypeRef(s) | Value::Text(s) => Value::TypeRef(s.clone()),
-        Value::TypeSpec(spec) => Value::TypeSpec(TypeSpecData::new(spec.name.clone(), spec.args.clone(),
-        )),
+        Value::TypeSpec(spec) => {
+            Value::TypeSpec(TypeSpecData::new(spec.name.clone(), spec.args.clone()))
+        }
         other => Value::TypeRef(other.type_name().to_string()),
     }
 }
@@ -382,19 +388,22 @@ pub fn primitive_value_to_type_value(val: &Value) -> Option<Value> {
                 .borrow()
                 .iter()
                 .filter_map(|e| {
-                    primitive_value_to_type_value(e).or_else(|| {
-                        Some(Value::TypeRef(e.type_name().to_string()))
-                    })
+                    primitive_value_to_type_value(e)
+                        .or_else(|| Some(Value::TypeRef(e.type_name().to_string())))
                 })
                 .collect();
             if elems.is_empty() {
-                Some(Value::TypeSpec(TypeSpecData::new("list", vec![Value::TypeRef("num".to_string())],
+                Some(Value::TypeSpec(TypeSpecData::new(
+                    "list",
+                    vec![Value::TypeRef("num".to_string())],
                 )))
             } else if elems
                 .windows(2)
                 .all(|w| crate::types::type_values_equal(&w[0], &w[1]))
             {
-                Some(Value::TypeSpec(TypeSpecData::new("list", vec![elems[0].clone()],
+                Some(Value::TypeSpec(TypeSpecData::new(
+                    "list",
+                    vec![elems[0].clone()],
                 )))
             } else {
                 Some(Value::TypeSpec(TypeSpecData::new(
@@ -463,11 +472,7 @@ fn list_accepts(vm: &Vm, val: &Value, params: &[Value]) -> bool {
         .all(|item| crate::types::value_accepts(vm, item, elem))
 }
 
-fn list_infer(
-    field_ty: &Value,
-    val_ty: &Value,
-    inferred: &mut HashMap<String, Value>,
-) -> bool {
+fn list_infer(field_ty: &Value, val_ty: &Value, inferred: &mut HashMap<String, Value>) -> bool {
     let Value::TypeSpec(field) = field_ty else {
         return false;
     };
@@ -491,7 +496,9 @@ fn union_match_distance(vm: &Vm, val: &Value, params: &[Value]) -> Option<usize>
 }
 
 fn union_accepts(vm: &Vm, val: &Value, params: &[Value]) -> bool {
-    params.iter().any(|p| crate::types::value_accepts(vm, val, p))
+    params
+        .iter()
+        .any(|p| crate::types::value_accepts(vm, val, p))
 }
 
 fn maybe_match_distance(vm: &Vm, val: &Value, params: &[Value]) -> Option<usize> {
@@ -551,12 +558,7 @@ const fn is_callable_value(val: &Value) -> bool {
     )
 }
 
-fn variance_implies(
-    vm: &Vm,
-    actual: &Value,
-    bound: &Value,
-    variance: &str,
-) -> bool {
+fn variance_implies(vm: &Vm, actual: &Value, bound: &Value, variance: &str) -> bool {
     let Value::TypeSpec(bound_spec) = bound else {
         return false;
     };
@@ -758,8 +760,7 @@ pub fn type_form_match_distance(
 }
 
 pub fn type_form_accepts(vm: &Vm, val: &Value, name: &str, params: &[Value]) -> bool {
-    lookup_type_form(name)
-        .is_some_and(|f| (f.accepts)(vm, val, params))
+    lookup_type_form(name).is_some_and(|f| (f.accepts)(vm, val, params))
 }
 
 pub fn type_form_infer(
@@ -823,20 +824,20 @@ pub fn type_convert_error(type_name: &str, src: &Value) -> RuntimeError {
 
 #[must_use]
 pub fn type_ctor_arity_error(type_name: &str, expected: &str, got: usize) -> RuntimeError {
-    RuntimeError::type_err(format!(
-        "TypeError: {type_name}() {expected}, got {got}"
-    ))
+    RuntimeError::type_err(format!("TypeError: {type_name}() {expected}, got {got}"))
 }
 
 /// 构造原始类型值：`type(args)` — 非类型转换。
-pub fn call_primitive_ctor(_vm: &mut Vm, type_name: &str, args: Vec<Value>) -> Option<Result<Value>> {
+pub fn call_primitive_ctor(
+    _vm: &mut Vm,
+    type_name: &str,
+    args: Vec<Value>,
+) -> Option<Result<Value>> {
     match type_name {
         "text" if args.len() == 1 => Some(Ok(Value::Text(args[0].print_string()))),
         "num" if args.len() == 1 => Some(coerce_to_num(&args[0], type_ctor_error)),
         "bool" if args.len() == 1 => Some(Ok(Value::Bool(args[0].is_truthy()))),
-        "list" if args.is_empty() => {
-            Some(Ok(Value::List(Shared::new(Vec::new()))))
-        }
+        "list" if args.is_empty() => Some(Ok(Value::List(Shared::new(Vec::new())))),
         "list" if args.len() == 1 => Some(construct_list(&args[0])),
         "dict" if args.len().is_multiple_of(2) => Some(construct_dict_kv(args)),
         "dict" => Some(Err(type_ctor_arity_error(
@@ -844,9 +845,7 @@ pub fn call_primitive_ctor(_vm: &mut Vm, type_name: &str, args: Vec<Value>) -> O
             "requires an even number of alternating key, value arguments",
             args.len(),
         ))),
-        "set" if args.is_empty() => {
-            Some(Ok(Value::Set(Shared::new(crate::value::SetMap::new()))))
-        }
+        "set" if args.is_empty() => Some(Ok(Value::Set(Shared::new(crate::value::SetMap::new())))),
         "set" => Some(construct_set(args)),
         "tuple" => Some(Ok(Value::Tuple(args.into()))),
         "bytes" if args.is_empty() => Some(Ok(Value::Bytes(Arc::new(Vec::new())))),
@@ -878,7 +877,11 @@ pub fn call_primitive_ctor(_vm: &mut Vm, type_name: &str, args: Vec<Value>) -> O
 }
 
 /// 将值转为原始类型：`type.(value)` / `convert(type, value)`。
-pub fn call_primitive_convert(vm: &mut Vm, type_name: &str, value: &Value) -> Option<Result<Value>> {
+pub fn call_primitive_convert(
+    vm: &mut Vm,
+    type_name: &str,
+    value: &Value,
+) -> Option<Result<Value>> {
     match type_name {
         "text" => Some(Ok(Value::Text(value.print_string()))),
         "num" => Some(coerce_to_num(value, type_convert_error)),
@@ -889,9 +892,7 @@ pub fn call_primitive_convert(vm: &mut Vm, type_name: &str, value: &Value) -> Op
         "bytes" => Some(convert_to_bytes(value)),
         "iterator" => Some(convert_to_iterator(value)),
         "ptr" => Some(convert_to_ptr(value)),
-        n if crate::sized::SizedNum::ALL_NAMES.contains(&n) => {
-            Some(convert_to_sized(n, value))
-        }
+        n if crate::sized::SizedNum::ALL_NAMES.contains(&n) => Some(convert_to_sized(n, value)),
         n if crate::c_types::lookup_c_type(n).is_some() => Some(convert_to_c_type(n, value)),
         _ => None,
     }
@@ -919,13 +920,13 @@ fn convert_to_sized(type_name: &str, value: &Value) -> Result<Value> {
     }
     let make_int = |bits: u32, signed: bool| -> Result<Value> {
         let n = match value {
-            Value::Num(n) => n.to_i64().ok_or_else(|| type_convert_error(type_name, value))?,
+            Value::Num(n) => n
+                .to_i64()
+                .ok_or_else(|| type_convert_error(type_name, value))?,
             Value::Sized(s) => s
                 .to_i64()
                 .ok_or_else(|| type_convert_error(type_name, value))?,
-            Value::Bool(b) => {
-                i64::from(*b)
-            }
+            Value::Bool(b) => i64::from(*b),
             Value::Ptr(p) => *p as i64,
             other => return Err(type_convert_error(type_name, other)),
         };
@@ -985,7 +986,9 @@ fn convert_to_sized(type_name: &str, value: &Value) -> Result<Value> {
         "u64" => make_int(64, false),
         "isize" => {
             let n = match value {
-                Value::Num(n) => n.to_i64().ok_or_else(|| type_convert_error(type_name, value))?,
+                Value::Num(n) => n
+                    .to_i64()
+                    .ok_or_else(|| type_convert_error(type_name, value))?,
                 Value::Sized(s) => s
                     .to_i64()
                     .ok_or_else(|| type_convert_error(type_name, value))?,
@@ -996,7 +999,10 @@ fn convert_to_sized(type_name: &str, value: &Value) -> Result<Value> {
         }
         "usize" => {
             let n = match value {
-                Value::Num(n) => n.to_i64().ok_or_else(|| type_convert_error(type_name, value))? as u64,
+                Value::Num(n) => n
+                    .to_i64()
+                    .ok_or_else(|| type_convert_error(type_name, value))?
+                    as u64,
                 Value::Sized(s) => s.to_f64() as u64,
                 Value::Ptr(p) => *p as u64,
                 other => return Err(type_convert_error(type_name, other)),
@@ -1223,10 +1229,7 @@ fn convert_to_iterator(arg: &Value) -> Result<Value> {
     }
 }
 
-fn coerce_to_num(
-    arg: &Value,
-    on_mismatch: fn(&str, &Value) -> RuntimeError,
-) -> Result<Value> {
+fn coerce_to_num(arg: &Value, on_mismatch: fn(&str, &Value) -> RuntimeError) -> Result<Value> {
     match arg {
         Value::Num(n) => Ok(Value::Num(n.clone())),
         Value::Sized(s) => {
@@ -1324,7 +1327,11 @@ fn percent_format(fmt: &str, rhs: &Value) -> Result<String> {
         _ => vec![rhs.clone()],
     };
     let mut pos_idx = 0usize;
-    let dict = if let Value::Dict(d) = rhs { Some(d.clone()) } else { None };
+    let dict = if let Value::Dict(d) = rhs {
+        Some(d.clone())
+    } else {
+        None
+    };
 
     while i < n {
         let c = bytes[i];
@@ -1346,7 +1353,8 @@ fn percent_format(fmt: &str, rhs: &Value) -> Result<String> {
         // 可选 (key)
         let key: Option<String> = if bytes[i] == '(' {
             let start = i + 1;
-            let end = (start..n).find(|&j| bytes[j] == ')')
+            let end = (start..n)
+                .find(|&j| bytes[j] == ')')
                 .ok_or_else(|| RuntimeError::value_err("unterminated %(key) in format"))?;
             let k: String = bytes[start..end].iter().collect();
             i = end + 1;
@@ -1389,9 +1397,9 @@ fn percent_format(fmt: &str, rhs: &Value) -> Result<String> {
             precision = Some(p);
         }
         // type
-        let conv = *bytes.get(i).ok_or_else(|| {
-            RuntimeError::value_err("incomplete format specifier (missing type)")
-        })?;
+        let conv = *bytes
+            .get(i)
+            .ok_or_else(|| RuntimeError::value_err("incomplete format specifier (missing type)"))?;
         i += 1;
 
         // 取值
@@ -1466,22 +1474,26 @@ fn format_one(
             let f = to_f64_for_fmt(val)?;
             Ok(format!("{:.*}", precision.unwrap_or(6), f))
         }
-        'x' => Ok(format_int_radix(val, 16, false, plus_sign, space_sign, alt)?),
+        'x' => Ok(format_int_radix(
+            val, 16, false, plus_sign, space_sign, alt,
+        )?),
         'X' => Ok(format_int_radix(val, 16, true, plus_sign, space_sign, alt)?),
         'o' => Ok(format_int_radix(val, 8, false, plus_sign, space_sign, alt)?),
         'b' => Ok(format_int_radix(val, 2, false, plus_sign, space_sign, alt)?),
         'c' => {
             let ch = match val {
                 Value::Num(n) => {
-                    let cp = n.to_i64().ok_or_else(|| {
-                        RuntimeError::value_err("%c needs an integer codepoint")
-                    })? as u32;
+                    let cp = n
+                        .to_i64()
+                        .ok_or_else(|| RuntimeError::value_err("%c needs an integer codepoint"))?
+                        as u32;
                     char::from_u32(cp)
                         .ok_or_else(|| RuntimeError::value_err("invalid codepoint for %c"))?
                 }
-                Value::Text(s) => s.chars().next().ok_or_else(|| {
-                    RuntimeError::value_err("%c needs a non-empty text")
-                })?,
+                Value::Text(s) => s
+                    .chars()
+                    .next()
+                    .ok_or_else(|| RuntimeError::value_err("%c needs a non-empty text"))?,
                 _ => return Err(RuntimeError::value_err("%c needs num or text")),
             };
             Ok(ch.to_string())
@@ -1518,7 +1530,13 @@ fn format_int_radix(
     };
     let prefix = if alt {
         match radix {
-            16 => if upper { "0X" } else { "0x" },
+            16 => {
+                if upper {
+                    "0X"
+                } else {
+                    "0x"
+                }
+            }
             8 => "0",
             2 => "0b",
             _ => "",
@@ -1536,7 +1554,11 @@ fn format_int_radix(
                 2 => format!("{mag:b}"),
                 _ => return Err(RuntimeError::value_err("unsupported radix")),
             };
-            let body = if upper && radix == 16 { body.to_uppercase() } else { body };
+            let body = if upper && radix == 16 {
+                body.to_uppercase()
+            } else {
+                body
+            };
             if *i < 0 {
                 format!("-{prefix}{body}")
             } else if plus_sign {
@@ -1557,7 +1579,11 @@ fn format_int_radix(
                 2 => mag.to_str_radix(2),
                 _ => return Err(RuntimeError::value_err("unsupported radix")),
             };
-            let body = if upper && radix == 16 { body.to_uppercase() } else { body };
+            let body = if upper && radix == 16 {
+                body.to_uppercase()
+            } else {
+                body
+            };
             if bi.is_negative() {
                 format!("-{prefix}{body}")
             } else if plus_sign {
@@ -1587,7 +1613,10 @@ fn apply_width(s: &str, width: usize, left_align: bool, zero_pad: bool, conv: ch
     }
     let pad = width - len;
     // 数字零填充只对数字转换且未左对齐时生效，且填充在符号之后
-    let is_numeric = matches!(conv, 'd' | 'i' | 'u' | 'f' | 'e' | 'E' | 'g' | 'G' | 'x' | 'X' | 'o' | 'b');
+    let is_numeric = matches!(
+        conv,
+        'd' | 'i' | 'u' | 'f' | 'e' | 'E' | 'g' | 'G' | 'x' | 'X' | 'o' | 'b'
+    );
     if zero_pad && !left_align && is_numeric {
         // 找符号前缀
         let (sign, body) = if let Some(stripped) = s.strip_prefix('-') {
@@ -1622,7 +1651,9 @@ fn install_primitive_methods(vm: &mut Vm) {
     ) -> BuiltinFn {
         Arc::new(move |_vm, args| {
             if args.len() != 2 {
-                return Err(RuntimeError::type_err(format!("{method} requires 2 arguments")));
+                return Err(RuntimeError::type_err(format!(
+                    "{method} requires 2 arguments"
+                )));
             }
             if reversed {
                 op(&args[1], &args[0])
@@ -1653,10 +1684,22 @@ fn install_primitive_methods(vm: &mut Vm) {
     num_methods.insert("__ror__".into(), bin_magic("__ror__", true, value_bitor));
     num_methods.insert("__xor__".into(), bin_magic("__xor__", false, value_bitxor));
     num_methods.insert("__rxor__".into(), bin_magic("__rxor__", true, value_bitxor));
-    num_methods.insert("__lshift__".into(), bin_magic("__lshift__", false, value_lshift));
-    num_methods.insert("__rlshift__".into(), bin_magic("__rlshift__", true, value_lshift));
-    num_methods.insert("__rshift__".into(), bin_magic("__rshift__", false, value_rshift));
-    num_methods.insert("__rrshift__".into(), bin_magic("__rrshift__", true, value_rshift));
+    num_methods.insert(
+        "__lshift__".into(),
+        bin_magic("__lshift__", false, value_lshift),
+    );
+    num_methods.insert(
+        "__rlshift__".into(),
+        bin_magic("__rlshift__", true, value_lshift),
+    );
+    num_methods.insert(
+        "__rshift__".into(),
+        bin_magic("__rshift__", false, value_rshift),
+    );
+    num_methods.insert(
+        "__rrshift__".into(),
+        bin_magic("__rrshift__", true, value_rshift),
+    );
     num_methods.insert(
         "__neg__".into(),
         Arc::new(|_vm, args| {
@@ -1686,9 +1729,7 @@ fn install_primitive_methods(vm: &mut Vm) {
                 return Err(RuntimeError::type_err("__mod__ requires 2 arguments"));
             }
             match (&args[0], &args[1]) {
-                (Value::Text(fmt), rhs) => {
-                    Ok(Value::Text(percent_format(fmt, rhs)?))
-                }
+                (Value::Text(fmt), rhs) => Ok(Value::Text(percent_format(fmt, rhs)?)),
                 _ => Err(RuntimeError::type_err("text % expects (text, value)")),
             }
         }),
@@ -1701,7 +1742,9 @@ fn install_primitive_methods(vm: &mut Vm) {
             }
             match (&args[0], &args[1]) {
                 (Value::Text(s), Value::Num(n)) => {
-                    let count = n.to_i64().ok_or_else(|| RuntimeError::value_err("bad repeat count"))?;
+                    let count = n
+                        .to_i64()
+                        .ok_or_else(|| RuntimeError::value_err("bad repeat count"))?;
                     if count < 0 {
                         return Err(RuntimeError::value_err("negative repeat count"));
                     }
@@ -1719,7 +1762,9 @@ fn install_primitive_methods(vm: &mut Vm) {
             }
             match (&args[1], &args[0]) {
                 (Value::Text(s), Value::Num(n)) => {
-                    let count = n.to_i64().ok_or_else(|| RuntimeError::value_err("bad repeat count"))?;
+                    let count = n
+                        .to_i64()
+                        .ok_or_else(|| RuntimeError::value_err("bad repeat count"))?;
                     if count < 0 {
                         return Err(RuntimeError::value_err("negative repeat count"));
                     }
@@ -1775,7 +1820,9 @@ pub fn get_text_method(text: &str, field: &str) -> Result<Value> {
             let needle = args[0].print_string();
             Ok(Value::Bool(text.contains(&needle)))
         })),
-        _ => Err(RuntimeError::attr_err(format!("text has no method {field}"))),
+        _ => Err(RuntimeError::attr_err(format!(
+            "text has no method {field}"
+        ))),
     }
 }
 
@@ -1856,7 +1903,9 @@ pub fn get_list_method(list: &Shared<Vec<Value>>, field: &str) -> Result<Value> 
                 Ok(items.remove(idx))
             }))
         }
-        _ => Err(RuntimeError::attr_err(format!("list has no method {field}"))),
+        _ => Err(RuntimeError::attr_err(format!(
+            "list has no method {field}"
+        ))),
     }
 }
 
@@ -1934,7 +1983,9 @@ pub fn get_dict_method(dict: &Shared<DictMap>, field: &str) -> Result<Value> {
                 Ok(Value::List(Shared::new(pairs)))
             }))
         }
-        _ => Err(RuntimeError::attr_err(format!("dict has no method {field}"))),
+        _ => Err(RuntimeError::attr_err(format!(
+            "dict has no method {field}"
+        ))),
     }
 }
 
@@ -1998,7 +2049,9 @@ pub fn get_tuple_method(tuple: &Arc<[Value]>, field: &str) -> Result<Value> {
                 Ok(Value::Num(Num::Small(t.len() as i64)))
             }))
         }
-        _ => Err(RuntimeError::attr_err(format!("tuple has no method {field}"))),
+        _ => Err(RuntimeError::attr_err(format!(
+            "tuple has no method {field}"
+        ))),
     }
 }
 
@@ -2034,37 +2087,87 @@ pub fn get_bytes_method(bytes: &Arc<Vec<u8>>, field: &str) -> Result<Value> {
                 Ok(Value::Text(out))
             }))
         }
-        _ => Err(RuntimeError::attr_err(format!("bytes has no method {field}"))),
+        _ => Err(RuntimeError::attr_err(format!(
+            "bytes has no method {field}"
+        ))),
     }
 }
 
 fn install_primitive_type_globals(vm: &mut Vm) {
     for ty in [
-        "text", "num", "bool", "list", "dict", "set", "tuple", "bytes", "iterator", "nonetype",
-        "type", "AST", "Frame", "Traceback", "ptr", "i8", "u8", "i16", "u16", "i32", "u32", "i64",
-        "u64", "isize", "usize", "f32", "f64", "Channel", "Stream", "Mutex",
-        "RWMutex", "RwLock", "WaitGroup", "Semaphore", "Once", "Barrier", "Cond",
+        "text",
+        "num",
+        "bool",
+        "list",
+        "dict",
+        "set",
+        "tuple",
+        "bytes",
+        "iterator",
+        "nonetype",
+        "type",
+        "AST",
+        "Frame",
+        "Traceback",
+        "ptr",
+        "i8",
+        "u8",
+        "i16",
+        "u16",
+        "i32",
+        "u32",
+        "i64",
+        "u64",
+        "isize",
+        "usize",
+        "f32",
+        "f64",
+        "Channel",
+        "Stream",
+        "Mutex",
+        "RWMutex",
+        "RwLock",
+        "WaitGroup",
+        "Semaphore",
+        "Once",
+        "Barrier",
+        "Cond",
         "Atomic",
         // 类型形态 / 特殊类型名：注解求值走 load_name，必须是全局类型句柄
-        "Union", "Maybe", "Never", "Literal", "Callable", "Tuple",
-        "Covariant", "Contravariant", "Invariant", "function",
+        "Union",
+        "Maybe",
+        "Never",
+        "Literal",
+        "Callable",
+        "Tuple",
+        "Covariant",
+        "Contravariant",
+        "Invariant",
+        "function",
     ] {
-        vm.globals
-            .or_insert_with(ty.into(), || Value::type_ref(ty));
+        vm.globals.or_insert_with(ty.into(), || Value::type_ref(ty));
     }
     // 优先使用元类型句柄，覆盖同名的旧式内建函数。
     vm.globals.insert("type".into(), Value::type_ref("type"));
-    vm.globals.insert("Channel".into(), Value::type_ref("Channel"));
-    vm.globals.insert("Stream".into(), Value::type_ref("Stream"));
+    vm.globals
+        .insert("Channel".into(), Value::type_ref("Channel"));
+    vm.globals
+        .insert("Stream".into(), Value::type_ref("Stream"));
     vm.globals.insert("Mutex".into(), Value::type_ref("Mutex"));
-    vm.globals.insert("RWMutex".into(), Value::type_ref("RWMutex"));
-    vm.globals.insert("RwLock".into(), Value::type_ref("RWMutex"));
-    vm.globals.insert("WaitGroup".into(), Value::type_ref("WaitGroup"));
-    vm.globals.insert("Semaphore".into(), Value::type_ref("Semaphore"));
+    vm.globals
+        .insert("RWMutex".into(), Value::type_ref("RWMutex"));
+    vm.globals
+        .insert("RwLock".into(), Value::type_ref("RWMutex"));
+    vm.globals
+        .insert("WaitGroup".into(), Value::type_ref("WaitGroup"));
+    vm.globals
+        .insert("Semaphore".into(), Value::type_ref("Semaphore"));
     vm.globals.insert("Once".into(), Value::type_ref("Once"));
-    vm.globals.insert("Barrier".into(), Value::type_ref("Barrier"));
+    vm.globals
+        .insert("Barrier".into(), Value::type_ref("Barrier"));
     vm.globals.insert("Cond".into(), Value::type_ref("Cond"));
-    vm.globals.insert("Atomic".into(), Value::type_ref("Atomic"));
+    vm.globals
+        .insert("Atomic".into(), Value::type_ref("Atomic"));
 }
 
 fn primitive_convert_handler(type_name: &'static str) -> BuiltinFn {

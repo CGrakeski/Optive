@@ -186,11 +186,7 @@ impl SharedMap {
     }
 
     #[inline]
-    pub fn insert(
-        &self,
-        key: String,
-        value: crate::value::Value,
-    ) -> Option<crate::value::Value> {
+    pub fn insert(&self, key: String, value: crate::value::Value) -> Option<crate::value::Value> {
         crate::gc::write_barrier_new_ref(&value);
         self.inner.write().insert(key, value)
     }
@@ -232,11 +228,7 @@ impl SharedMap {
     }
 
     #[inline]
-    pub fn or_insert_with(
-        &self,
-        key: String,
-        f: impl FnOnce() -> crate::value::Value,
-    ) {
+    pub fn or_insert_with(&self, key: String, f: impl FnOnce() -> crate::value::Value) {
         let mut g = self.inner.write();
         g.entry(key).or_insert_with(|| {
             let v = f();
@@ -410,11 +402,7 @@ impl<T: Clone> SharedTable<T> {
 
     #[inline]
     pub fn entry_or_insert_with(&self, key: String, f: impl FnOnce() -> T) -> T {
-        self.inner
-            .write()
-            .entry(key)
-            .or_insert_with(f)
-            .clone()
+        self.inner.write().entry(key).or_insert_with(f).clone()
     }
 }
 

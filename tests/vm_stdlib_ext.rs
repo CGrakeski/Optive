@@ -19,10 +19,7 @@ fn percent_format_positional() {
 
 #[test]
 fn percent_format_named() {
-    assert_text(
-        r#""%(name)s=%(val)d" % {"name": "x", "val": 42}"#,
-        "x=42",
-    );
+    assert_text(r#""%(name)s=%(val)d" % {"name": "x", "val": 42}"#, "x=42");
 }
 
 #[test]
@@ -203,12 +200,10 @@ fn toml_yaml_xml_stringify_roundtrip() {
     }
     let v = value(r#"std.yaml.parse(std.yaml.stringify({"x": 1}))"#);
     match v {
-        Value::Dict(d) => {
-            match d.borrow().get(&optive::value::ValueKey::Text("x".into())) {
-                Some(Value::Num(n)) => assert_eq!(n.to_i64(), Some(1)),
-                other => panic!("expected x=1, got {other:?}"),
-            }
-        }
+        Value::Dict(d) => match d.borrow().get(&optive::value::ValueKey::Text("x".into())) {
+            Some(Value::Num(n)) => assert_eq!(n.to_i64(), Some(1)),
+            other => panic!("expected x=1, got {other:?}"),
+        },
         other => panic!("{}", other.display_string()),
     }
     let xml = value(
@@ -237,9 +232,8 @@ fn xml_stringify_rejects_invalid_qname() {
             "expected invalid tag error for: {src}"
         );
     }
-    let ok = value(
-        r#"std.xml.stringify({"tag": "xml:root", "attrs": {}, "text": "", "children": []})"#,
-    );
+    let ok =
+        value(r#"std.xml.stringify({"tag": "xml:root", "attrs": {}, "text": "", "children": []})"#);
     match ok {
         Value::Text(s) => assert!(s.contains("<xml:root"), "{s}"),
         other => panic!("{}", other.display_string()),
@@ -263,10 +257,7 @@ fn math_atan2_and_divmod() {
 
 #[test]
 fn typing_isinstanceof_and_optional() {
-    assert_eq!(
-        value("isinstanceof(1, num)").display_string(),
-        "true"
-    );
+    assert_eq!(value("isinstanceof(1, num)").display_string(), "true");
     assert_eq!(
         value("std.typing.isinstanceof(none, std.typing.Optional(num))").display_string(),
         "true"
@@ -301,4 +292,19 @@ fn sync_module_exports() {
 #[test]
 fn numeric_mod_still_works() {
     assert_num("10 % 3", "1");
+}
+
+#[test]
+fn log_level_and_exports() {
+    let v = value(
+        r#"
+std.log.set_level("error")
+std.log.debug("hidden")
+std.log.get_level()
+"#,
+    );
+    match v {
+        Value::Text(s) => assert_eq!(s, "error"),
+        other => panic!("{}", other.display_string()),
+    }
 }

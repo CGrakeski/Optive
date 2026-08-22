@@ -244,10 +244,7 @@ impl MnScheduler {
     }
 
     /// 从 local worker → injector → 其他 stealer 取一个任务。
-    pub fn steal_task(
-        &self,
-        local: &Worker<Shared<TaskInner>>,
-    ) -> Option<Shared<TaskInner>> {
+    pub fn steal_task(&self, local: &Worker<Shared<TaskInner>>) -> Option<Shared<TaskInner>> {
         if let Some(t) = local.pop() {
             return Some(t);
         }

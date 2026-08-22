@@ -120,8 +120,12 @@ pub fn cmd_change_track_latest(
     project: &Project,
     value: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    eprintln!("WARNING: track_latest={value} makes `Optive run` follow remote tips for trackable deps.");
-    eprintln!("WARNING: Do not enable this in CI if you need reproducible builds; prefer Optive.lock.");
+    eprintln!(
+        "WARNING: track_latest={value} makes `Optive run` follow remote tips for trackable deps."
+    );
+    eprintln!(
+        "WARNING: Do not enable this in CI if you need reproducible builds; prefer Optive.lock."
+    );
     manifest::set_track_latest(&project.manifest_path, value)?;
     Ok(format!("track_latest set to {value}"))
 }

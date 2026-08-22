@@ -80,9 +80,7 @@ impl ActivePack {
     #[must_use]
     pub fn format_exception_line(&self, name: &str, msg: &str) -> String {
         let gloss = self.pack.gloss.get(name).cloned().unwrap_or_default();
-        if msg.is_empty()
-            && gloss.is_empty()
-            && self.pack.layout.exception.line == "{name}: {msg}"
+        if msg.is_empty() && gloss.is_empty() && self.pack.layout.exception.line == "{name}: {msg}"
         {
             return name.to_string();
         }

@@ -85,10 +85,7 @@ fn path_to_file_url(path: &Path) -> String {
 
 fn scratch(name: &str) -> PathBuf {
     let mut dir = std::env::temp_dir();
-    dir.push(format!(
-        "optive_file_git_{name}_{}",
-        std::process::id()
-    ));
+    dir.push(format!("optive_file_git_{name}_{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir

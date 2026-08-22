@@ -81,8 +81,7 @@ pub fn format_runtime_with_stack(
     out.push_str(pack.traceback_header());
     out.push('\n');
 
-    let bottom_up =
-        pack.traceback_direction() == crate::custom::TraceDirection::BottomUp;
+    let bottom_up = pack.traceback_direction() == crate::custom::TraceDirection::BottomUp;
     let iter: Box<dyn Iterator<Item = (usize, &ErrorStackFrame)>> = if bottom_up {
         Box::new(stack.iter().enumerate().rev())
     } else {
@@ -94,14 +93,11 @@ pub fn format_runtime_with_stack(
         let line = if frame.line == 0 { 1 } else { frame.line };
         out.push_str(&pack.format_traceback_frame(&frame.file, line, &frame.func));
         out.push('\n');
-        let src = frame
-            .source
-            .as_deref()
-            .unwrap_or(if is_innermost {
-                fallback_source
-            } else {
-                ""
-            });
+        let src =
+            frame
+                .source
+                .as_deref()
+                .unwrap_or(if is_innermost { fallback_source } else { "" });
         if let Some(text) = source_line(src, line) {
             out.push_str(&format!("    {text}\n"));
             if is_innermost {
@@ -194,7 +190,11 @@ fn format_source_error(
 }
 
 const fn char_display_width(ch: char) -> usize {
-    if ch == '\t' { 4 } else { 1 }
+    if ch == '\t' {
+        4
+    } else {
+        1
+    }
 }
 
 /// 为已编译程序中每个函数挂上定义处源码与文件名。
@@ -338,12 +338,20 @@ mod tests {
         let err = ParseError::here(1, 7, "expected expression");
         let msg = format_parse_error(src, "<repl>", &err);
         let lines: Vec<&str> = msg.lines().collect();
-        let src_line = lines.iter().find(|l| l.contains("handle")).copied().unwrap();
+        let src_line = lines
+            .iter()
+            .find(|l| l.contains("handle"))
+            .copied()
+            .unwrap();
         let caret = lines.iter().find(|l| l.contains('^')).copied().unwrap();
         let src_text_at = src_line.find('h').unwrap();
         let caret_at = caret.find('^').unwrap();
         // 列 7 = 词尾之后；相对源码文本起点偏移 6
-        assert_eq!(caret_at, src_text_at + 6, "src={src_line:?} caret={caret:?}");
+        assert_eq!(
+            caret_at,
+            src_text_at + 6,
+            "src={src_line:?} caret={caret:?}"
+        );
     }
 
     #[test]
@@ -379,7 +387,12 @@ mod tests {
         assert!(msg.contains("b()"));
         assert!(msg.contains("undefined name: c"));
         let lines: Vec<&str> = msg.lines().collect();
-        let caret = lines.iter().rev().find(|l| l.contains('^')).copied().unwrap();
+        let caret = lines
+            .iter()
+            .rev()
+            .find(|l| l.contains('^'))
+            .copied()
+            .unwrap();
         let src = lines
             .iter()
             .rev()

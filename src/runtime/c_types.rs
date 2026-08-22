@@ -328,9 +328,7 @@ impl CTypeDef {
 #[must_use]
 pub fn lookup_c_type(name: &str) -> Option<&'static CTypeDef> {
     C_TYPES.iter().find(|e| {
-        e.c_name == name
-            || e.export_aliases.contains(&name)
-            || e.type_name_alts.contains(&name)
+        e.c_name == name || e.export_aliases.contains(&name) || e.type_name_alts.contains(&name)
     })
 }
 

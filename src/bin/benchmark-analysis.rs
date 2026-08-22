@@ -192,10 +192,7 @@ struct Bench {
 enum BenchKind {
     Source(&'static str),
     VmOnlyCompileOnce(&'static str),
-    Workers {
-        src: &'static str,
-        workers: usize,
-    },
+    Workers { src: &'static str, workers: usize },
 }
 
 const BENCHES: &[Bench] = &[
@@ -285,11 +282,17 @@ fn parse_args() -> (Vec<&'static Bench>, usize, usize, Option<usize>) {
         match args[i].as_str() {
             "--iters" => {
                 i += 1;
-                iters = args.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| usage());
+                iters = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| usage());
             }
             "--warmup" => {
                 i += 1;
-                warmup = args.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| usage());
+                warmup = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| usage());
             }
             "--workers" => {
                 i += 1;
@@ -314,7 +317,9 @@ fn parse_args() -> (Vec<&'static Bench>, usize, usize, Option<usize>) {
     } else {
         let mut out = Vec::new();
         for n in &names {
-            if let Some(b) = BENCHES.iter().find(|b| b.name == n) { out.push(b) } else {
+            if let Some(b) = BENCHES.iter().find(|b| b.name == n) {
+                out.push(b)
+            } else {
                 eprintln!("unknown bench: {n}");
                 usage();
             }
@@ -329,10 +334,7 @@ fn parse_args() -> (Vec<&'static Bench>, usize, usize, Option<usize>) {
 enum Prepared {
     Source(&'static str),
     VmReady(Vm),
-    Workers {
-        src: &'static str,
-        workers: usize,
-    },
+    Workers { src: &'static str, workers: usize },
 }
 
 fn prepare(bench: &Bench, workers_override: Option<usize>) -> Prepared {
@@ -403,10 +405,7 @@ fn main() {
         let sum: f64 = samples_ms.iter().sum();
         let avg = sum / samples_ms.len() as f64;
         let min = samples_ms.iter().copied().fold(f64::INFINITY, f64::min);
-        let max = samples_ms
-            .iter()
-            .copied()
-            .fold(f64::NEG_INFINITY, f64::max);
+        let max = samples_ms.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
         let samples_json = samples_ms
             .iter()

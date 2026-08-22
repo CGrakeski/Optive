@@ -52,9 +52,7 @@ pub enum GcMode {
 impl GcMode {
     #[must_use]
     pub fn from_env() -> Self {
-        Self::from_env_str(
-            &std::env::var("OPTIVE_GC_MODE").unwrap_or_default(),
-        )
+        Self::from_env_str(&std::env::var("OPTIVE_GC_MODE").unwrap_or_default())
     }
 
     /// 解析 `OPTIVE_GC_MODE` 字符串（测试 / 嵌入可直接调用）。
@@ -171,7 +169,12 @@ impl SharedGc {
         self.data.lock().weaks.len()
     }
 
-    fn track_new(data: &mut TrackerData, primary: usize, weak: TrackedWeak, alias: Option<usize>) -> bool {
+    fn track_new(
+        data: &mut TrackerData,
+        primary: usize,
+        weak: TrackedWeak,
+        alias: Option<usize>,
+    ) -> bool {
         if data.by_addr.contains_key(&primary) {
             return false;
         }
@@ -187,12 +190,7 @@ impl SharedGc {
     pub fn track_list(&self, rc: &Shared<Vec<Value>>) {
         let addr = rc.as_ptr() as usize;
         let mut data = self.data.lock();
-        Self::track_new(
-            &mut data,
-            addr,
-            TrackedWeak::List(rc.downgrade()),
-            None,
-        );
+        Self::track_new(&mut data, addr, TrackedWeak::List(rc.downgrade()), None);
         drop(data);
         self.shade_new_alloc(Value::List(rc.clone()));
     }
@@ -200,12 +198,7 @@ impl SharedGc {
     pub fn track_dict(&self, rc: &Shared<DictMap>) {
         let addr = rc.as_ptr() as usize;
         let mut data = self.data.lock();
-        Self::track_new(
-            &mut data,
-            addr,
-            TrackedWeak::Dict(rc.downgrade()),
-            None,
-        );
+        Self::track_new(&mut data, addr, TrackedWeak::Dict(rc.downgrade()), None);
         drop(data);
         self.shade_new_alloc(Value::Dict(rc.clone()));
     }
@@ -213,12 +206,7 @@ impl SharedGc {
     pub fn track_set(&self, rc: &Shared<SetMap>) {
         let addr = rc.as_ptr() as usize;
         let mut data = self.data.lock();
-        Self::track_new(
-            &mut data,
-            addr,
-            TrackedWeak::Set(rc.downgrade()),
-            None,
-        );
+        Self::track_new(&mut data, addr, TrackedWeak::Set(rc.downgrade()), None);
         drop(data);
         self.shade_new_alloc(Value::Set(rc.clone()));
     }
@@ -226,12 +214,7 @@ impl SharedGc {
     pub fn track_iter(&self, rc: &Shared<IteratorState>) {
         let addr = rc.as_ptr() as usize;
         let mut data = self.data.lock();
-        Self::track_new(
-            &mut data,
-            addr,
-            TrackedWeak::Iter(rc.downgrade()),
-            None,
-        );
+        Self::track_new(&mut data, addr, TrackedWeak::Iter(rc.downgrade()), None);
         drop(data);
         self.shade_new_alloc(Value::Iterator(rc.clone()));
     }
@@ -239,12 +222,7 @@ impl SharedGc {
     pub fn track_cell(&self, rc: &Shared<Value>) {
         let addr = rc.as_ptr() as usize;
         let mut data = self.data.lock();
-        Self::track_new(
-            &mut data,
-            addr,
-            TrackedWeak::Cell(rc.downgrade()),
-            None,
-        );
+        Self::track_new(&mut data, addr, TrackedWeak::Cell(rc.downgrade()), None);
         drop(data);
         self.shade_new_alloc(Value::Cell(rc.clone()));
     }
@@ -639,10 +617,7 @@ fn reindex_by_addr(data: &mut TrackerData) {
                 let Some(rc) = weak.upgrade() else {
                     continue;
                 };
-                (
-                    Arc::as_ptr(&rc) as usize,
-                    Some(rc.slots.lock_addr()),
-                )
+                (Arc::as_ptr(&rc) as usize, Some(rc.slots.lock_addr()))
             }
         };
         data.by_addr.insert(primary, i);
@@ -924,12 +899,24 @@ pub fn mark_value(val: &Value, marked: &mut FxHashSet<usize>, worklist: &mut Vec
                 }
             }
         }
-        Value::Num(crate::value::Num::Int(_) | crate::value::Num::Rat(_) |
-crate::value::Num::Small(_)) | Value::None | Value::Bool(_) | Value::Sized(_)
-| Value::Ptr(_) | Value::DllHandle(_) | Value::Text(_) | Value::TypeRef(_) |
-Value::Bytes(_) | Value::GenericFunction(_) | Value::Macro(_) |
-Value::Builtin(_) | Value::RuntimeAst(_) | Value::TypeSpec(_) |
-Value::EnumMember(_) | Value::Layout(_) => {}
+        Value::Num(
+            crate::value::Num::Int(_) | crate::value::Num::Rat(_) | crate::value::Num::Small(_),
+        )
+        | Value::None
+        | Value::Bool(_)
+        | Value::Sized(_)
+        | Value::Ptr(_)
+        | Value::DllHandle(_)
+        | Value::Text(_)
+        | Value::TypeRef(_)
+        | Value::Bytes(_)
+        | Value::GenericFunction(_)
+        | Value::Macro(_)
+        | Value::Builtin(_)
+        | Value::RuntimeAst(_)
+        | Value::TypeSpec(_)
+        | Value::EnumMember(_)
+        | Value::Layout(_) => {}
     }
 }
 
@@ -974,9 +961,7 @@ fn mark_iterator_children(state: &IteratorState, worklist: &mut Vec<Value>) {
             worklist.push(Value::Channel(channel.clone()));
         }
         IteratorKind::Generator {
-            locals,
-            yield_from,
-            ..
+            locals, yield_from, ..
         } => {
             for v in locals {
                 worklist.push(v.clone());
@@ -1000,9 +985,7 @@ fn mark_sync_children(inner: &crate::value::SyncInner, worklist: &mut Vec<Value>
         | SyncInner::TimeoutCtx { .. } => {}
         SyncInner::Atomic { value } => worklist.push(value.clone()),
         SyncInner::TaskGroup {
-            first_error,
-            tasks,
-            ..
+            first_error, tasks, ..
         } => {
             if let Some(err) = first_error {
                 worklist.push(err.clone());

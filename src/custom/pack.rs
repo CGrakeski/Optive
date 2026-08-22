@@ -41,8 +41,7 @@ pub struct LayoutSet {
     pub exc_line: bool,
 }
 
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Layout {
     pub repl: ReplLayout,
     pub parse: ParseLayout,
@@ -252,35 +251,59 @@ impl CustomPack {
         }
         let s = &overlay.layout_set;
         if s.repl_prompt {
-            out.layout.repl.prompt.clone_from(&overlay.layout.repl.prompt);
+            out.layout
+                .repl
+                .prompt
+                .clone_from(&overlay.layout.repl.prompt);
             out.layout_set.repl_prompt = true;
         }
         if s.repl_continuation {
-            out.layout.repl.continuation.clone_from(&overlay.layout.repl.continuation);
+            out.layout
+                .repl
+                .continuation
+                .clone_from(&overlay.layout.repl.continuation);
             out.layout_set.repl_continuation = true;
         }
         if s.parse_label {
-            out.layout.parse.label_error.clone_from(&overlay.layout.parse.label_error);
+            out.layout
+                .parse
+                .label_error
+                .clone_from(&overlay.layout.parse.label_error);
             out.layout_set.parse_label = true;
         }
         if s.parse_arrow {
-            out.layout.parse.arrow.clone_from(&overlay.layout.parse.arrow);
+            out.layout
+                .parse
+                .arrow
+                .clone_from(&overlay.layout.parse.arrow);
             out.layout_set.parse_arrow = true;
         }
         if s.tb_header {
-            out.layout.traceback.header.clone_from(&overlay.layout.traceback.header);
+            out.layout
+                .traceback
+                .header
+                .clone_from(&overlay.layout.traceback.header);
             out.layout_set.tb_header = true;
         }
         if s.tb_frame {
-            out.layout.traceback.frame.clone_from(&overlay.layout.traceback.frame);
+            out.layout
+                .traceback
+                .frame
+                .clone_from(&overlay.layout.traceback.frame);
             out.layout_set.tb_frame = true;
         }
         if s.tb_direction {
-            out.layout.traceback.direction.clone_from(&overlay.layout.traceback.direction);
+            out.layout
+                .traceback
+                .direction
+                .clone_from(&overlay.layout.traceback.direction);
             out.layout_set.tb_direction = true;
         }
         if s.exc_line {
-            out.layout.exception.line.clone_from(&overlay.layout.exception.line);
+            out.layout
+                .exception
+                .line
+                .clone_from(&overlay.layout.exception.line);
             out.layout_set.exc_line = true;
         }
         for (k, v) in &overlay.gloss {
@@ -312,11 +335,13 @@ pub fn load_pack_staging(dir: &Path) -> Result<CustomPack, PackLoadError> {
     load_pack_dir_inner(dir, false)
 }
 
-fn load_pack_dir_inner(dir: &Path, require_dir_match_id: bool) -> Result<CustomPack, PackLoadError> {
+fn load_pack_dir_inner(
+    dir: &Path,
+    require_dir_match_id: bool,
+) -> Result<CustomPack, PackLoadError> {
     let path = dir.join(PACK_MANIFEST_FILE);
-    let text = std::fs::read_to_string(&path).map_err(|e| {
-        PackLoadError::Io(format!("cannot read {}: {e}", path.display()))
-    })?;
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| PackLoadError::Io(format!("cannot read {}: {e}", path.display())))?;
     let file: PackFile = toml::from_str(&text)
         .map_err(|e| PackLoadError::Parse(format!("invalid {}: {e}", path.display())))?;
     if file.format_version != 1 {
@@ -329,10 +354,7 @@ fn load_pack_dir_inner(dir: &Path, require_dir_match_id: bool) -> Result<CustomP
         return Err(PackLoadError::Invalid("id must be non-empty".into()));
     }
     if require_dir_match_id {
-        let dir_name = dir
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
+        let dir_name = dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
         if dir_name != file.id {
             return Err(PackLoadError::Invalid(format!(
                 "directory name `{dir_name}` must match id `{}`",

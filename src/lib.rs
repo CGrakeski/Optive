@@ -14,16 +14,18 @@
 pub mod compiler;
 pub mod custom;
 pub mod frontend;
+pub mod lsp;
 pub mod runtime;
 pub mod stdlib;
 
 pub use compiler::{
-    codegen, free_vars, hot_code, monomorph, opcode, protocol, specialize, stack_effect,
+    bc_cache, codegen, free_vars, hot_code, monomorph, opcode, protocol, specialize, stack_effect,
 };
 pub use frontend::{ast, diagnostics, error, fmt, lexer, parser, token};
 pub use runtime::{
-    builtins, caps, concurrency, c_types, debug, enum_variant, exceptions, ffi, ffi_extra, ffi_pool, gc, module,
-    ptr_registry, runtime_ast, scheduler, shared, sized, traceback, type_registry, types, value, vm,
+    builtins, c_types, caps, concurrency, debug, enum_variant, exceptions, ffi, ffi_extra,
+    ffi_pool, gc, module, ptr_registry, runtime_ast, scheduler, shared, sized, traceback,
+    type_registry, types, value, vm,
 };
 pub use stdlib as std_modules;
 
@@ -45,9 +47,8 @@ pub fn parse_program(source: &str) -> std::result::Result<ast::Program, ParseErr
 }
 
 pub fn compile(source: &str) -> Result<opcode::CompiledProgram> {
-    let program = P::parse(source).map_err(|e| {
-        RuntimeError::msg(diagnostics::format_parse_error(source, "<compile>", &e))
-    })?;
+    let program = P::parse(source)
+        .map_err(|e| RuntimeError::msg(diagnostics::format_parse_error(source, "<compile>", &e)))?;
     Generator::new().compile(&program)
 }
 
@@ -66,13 +67,33 @@ pub fn run_source_in_vm(vm: &mut vm::Vm, source: &str, file: &str) -> Result<val
                 vm.import_base = parent.to_path_buf();
             }
         } else if path.extension().is_some() || file.contains('/') || file.contains('\\') {
-            vm.import_base = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            vm.import_base =
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         }
     }
-    let program = P::parse(source).map_err(|e| {
-        RuntimeError::msg(diagnostics::format_parse_error(source, file, &e))
-    })?;
-    let mut compiled = Generator::new().compile(&program)?;
+    let mut compiled = if crate::bc_cache::should_use(file) {
+        let mut dep_ids: Vec<String> = vm.dep_map.values().map(|d| d.id.clone()).collect();
+        dep_ids.sort();
+        let key = crate::bc_cache::key(env!("CARGO_PKG_VERSION"), file, source, &dep_ids.join(","));
+        let path = crate::bc_cache::cache_dir().join(format!("{key}.otbc"));
+        if let Some(cached) = crate::bc_cache::load(&path) {
+            crate::bc_cache::note_hit();
+            cached
+        } else {
+            let program = P::parse(source).map_err(|e| {
+                RuntimeError::msg(diagnostics::format_parse_error(source, file, &e))
+            })?;
+            let compiled = Generator::new().compile(&program)?;
+            if crate::bc_cache::store(&path, &compiled) {
+                crate::bc_cache::note_store();
+            }
+            compiled
+        }
+    } else {
+        let program = P::parse(source)
+            .map_err(|e| RuntimeError::msg(diagnostics::format_parse_error(source, file, &e)))?;
+        Generator::new().compile(&program)?
+    };
     diagnostics::attach_function_sources(&mut compiled, source, file);
     vm.load_program(compiled)?;
     vm.run().map_err(|e| {

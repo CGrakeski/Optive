@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use super::color;
 use super::home;
 use super::lock::{LockEdge, LockFile, ROOT_PARENT};
-use super::manifest::{find_project, RevSpec, Project};
+use super::manifest::{find_project, Project, RevSpec};
 use super::store::Store;
 
 pub fn print_env() {
@@ -20,9 +20,18 @@ pub fn print_env() {
     }
     println!("pack/:                   {}", home::pack_dir().display());
     println!("custom/:                 {}", home::custom_dir().display());
-    println!("Config.toml:             {}", home::global_config_path().display());
-    println!("index.db:                {}", home::index_db_path().display());
-    println!("index dir:               {}", super::registry::index_dir().display());
+    println!(
+        "Config.toml:             {}",
+        home::global_config_path().display()
+    );
+    println!(
+        "index.db:                {}",
+        home::index_db_path().display()
+    );
+    println!(
+        "index dir:               {}",
+        super::registry::index_dir().display()
+    );
     let index_json = super::registry::index_json_path();
     println!(
         "index.json:               {} ({})",
@@ -52,12 +61,18 @@ pub fn print_env() {
     }
     println!(
         "OPTIVE_USE_LOCAL_DEPS:   {}",
-        if home::use_local_deps() {
-            "1"
-        } else {
-            "0"
-        }
+        if home::use_local_deps() { "1" } else { "0" }
     );
+    println!(
+        "bytecode cache:          {}",
+        optive::bc_cache::cache_dir().display()
+    );
+    if let Ok(v) = std::env::var("OPTIVE_BC_DIR") {
+        println!("OPTIVE_BC_DIR (env):     {v}");
+    }
+    if let Ok(v) = std::env::var("OPTIVE_BC_CACHE") {
+        println!("OPTIVE_BC_CACHE (env):   {v}");
+    }
 }
 
 pub fn doctor(verbose: bool) -> Result<i32, Box<dyn std::error::Error>> {
@@ -128,8 +143,8 @@ fn doctor_project(
     errors: &mut i32,
     warnings: &mut i32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let ver_label = super::repo_meta::project_version_label(&project.root)
-        .unwrap_or_else(|| "(no git)".into());
+    let ver_label =
+        super::repo_meta::project_version_label(&project.root).unwrap_or_else(|| "(no git)".into());
     println!(
         "project: {} {} ({})",
         project.manifest.package.name,
@@ -194,6 +209,15 @@ fn doctor_project(
         }
     } else {
         println!("lock: (none)");
+    }
+
+    if !project.manifest.dependencies.is_empty() {
+        *warnings += 1;
+        println!(
+            "sandbox: {} project dependenc{} run with full host caps by default; pass --sandbox for untrusted packs",
+            project.manifest.dependencies.len(),
+            if project.manifest.dependencies.len() == 1 { "y" } else { "ies" }
+        );
     }
     Ok(())
 }
@@ -300,11 +324,7 @@ pub fn list_deps(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     let root_edges: BTreeMap<&str, &LockEdge> = lock
         .as_ref()
-        .map(|l| {
-            l.root_edges()
-                .map(|e| (e.name.as_str(), e))
-                .collect()
-        })
+        .map(|l| l.root_edges().map(|e| (e.name.as_str(), e)).collect())
         .unwrap_or_default();
 
     for (name, dep) in &project.manifest.dependencies {
@@ -318,16 +338,8 @@ pub fn list_deps(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
             (None, _) => color::red("not installed"),
         };
 
-        println!(
-            "  {}  {}",
-            color::purple(name),
-            color::cyan(&effective)
-        );
-        println!(
-            "    {}  {}",
-            color::dim("mode"),
-            color::dim(&mode)
-        );
+        println!("  {}  {}", color::purple(name), color::cyan(&effective));
+        println!("    {}  {}", color::dim("mode"), color::dim(&mode));
         println!("    {}  {}", color::dim("git"), dep.git);
         println!("    {}  {}", color::dim("path"), path_disp);
         if verbose {

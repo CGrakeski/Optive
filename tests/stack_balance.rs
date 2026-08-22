@@ -77,7 +77,10 @@ func f(ch) {
             idle_ok = true;
         }
     }
-    assert!(idle_ok, "expected bare Suspend in select idle, got {body:?}");
+    assert!(
+        idle_ok,
+        "expected bare Suspend in select idle, got {body:?}"
+    );
     verify_stack_balance(&body).expect("select body stack-balanced");
 }
 
@@ -114,6 +117,95 @@ func f() {
 f()
 ",
         "7",
+    );
+}
+
+#[test]
+fn is_prime_fuses_trial_loop_and_is_lightweight() {
+    let prog = compile(
+        r"
+func is_prime(n) {
+  if (n < 2) { return false }
+  if (n == 2) { return true }
+  if (n % 2 == 0) { return false }
+  var d = 3
+  loop {
+    if (d * d > n) { break }
+    if (n % d == 0) { return false }
+    d = d + 2
+  }
+  return true
+}
+",
+    )
+    .expect("compile");
+    let func = prog.functions.get("is_prime").expect("is_prime");
+    assert!(
+        func.lightweight(),
+        "is_prime should be a lightweight hot-callable (BindFast var is not a name-map)"
+    );
+    let body = func.body.as_ref();
+    assert!(
+        body.iter()
+            .any(|ins| matches!(ins, Instruction::LoadFastSqrGt { .. })),
+        "expected d*d > n fusion, got {body:?}"
+    );
+    assert!(
+        body.iter()
+            .any(|ins| matches!(ins, Instruction::LoadFastModEq0 { .. })),
+        "expected n % d == 0 fusion, got {body:?}"
+    );
+    assert!(
+        body.iter()
+            .any(|ins| matches!(ins, Instruction::LoadFastAddImmStore { slot: 1, imm: 2 })),
+        "expected d = d + 2 fusion, got {body:?}"
+    );
+    verify_stack_balance(body).expect("is_prime stack-balanced");
+}
+
+#[test]
+fn fused_prime_helpers_match_trial_division() {
+    common::assert_num(
+        r"
+func is_prime(n) {
+  if (n < 2) { return false }
+  if (n == 2) { return true }
+  if (n % 2 == 0) { return false }
+  var d = 3
+  loop {
+    if (d * d > n) { break }
+    if (n % d == 0) { return false }
+    d = d + 2
+  }
+  return true
+}
+func count_primes() {
+  var total = 0
+  var n = 2
+  loop {
+    if (n > 100) { break }
+    if (is_prime(n)) { total = total + 1 }
+    n = n + 1
+  }
+  return total
+}
+count_primes()
+",
+        "25",
+    );
+}
+
+#[test]
+fn const_local_still_rejects_assign() {
+    common::run_err(
+        r"
+func f() {
+  const let x = 1
+  x = 2
+  return x
+}
+f()
+",
     );
 }
 

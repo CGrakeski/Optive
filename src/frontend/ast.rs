@@ -56,9 +56,15 @@ pub enum Pattern {
     List(Vec<PatternElem>),
     /// `(a, b)` / `("done", x)` 元组模式（匹配 tuple 或 list）。
     Tuple(Vec<PatternElem>),
-    Struct { type_name: String, fields: Vec<String> },
+    Struct {
+        type_name: String,
+        fields: Vec<String>,
+    },
     Or(Vec<Self>),
-    Call { type_name: String, args: Vec<Self> },
+    Call {
+        type_name: String,
+        args: Vec<Self>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -98,7 +104,10 @@ pub struct CatchClause {
 #[derive(Debug, Clone)]
 pub enum CatchPattern {
     Wildcard,
-    Bind { name: String, type_name: Option<String> },
+    Bind {
+        name: String,
+        type_name: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -158,7 +167,10 @@ pub enum Stmt {
         pattern: DestructPattern,
         init: Expr,
     },
-    Assign { target: LValue, value: Expr },
+    Assign {
+        target: LValue,
+        value: Expr,
+    },
     /// `(x, y) = ...` / `[a, [b, c]] = ...`
     DestructAssign {
         pattern: DestructPattern,
@@ -193,9 +205,18 @@ pub enum Stmt {
         elifs: Vec<(Expr, Block)>,
         else_block: Option<Block>,
     },
-    While { cond: Expr, body: Block },
-    Loop { count: Option<Expr>, body: Block },
-    For { items: Vec<ForItem>, body: Block },
+    While {
+        cond: Expr,
+        body: Block,
+    },
+    Loop {
+        count: Option<Expr>,
+        body: Block,
+    },
+    For {
+        items: Vec<ForItem>,
+        body: Block,
+    },
     Break,
     Continue,
     Try {
@@ -326,8 +347,14 @@ pub struct VariantCaseDecl {
 #[derive(Debug, Clone)]
 pub enum LValue {
     Name(String),
-    Member { object: Box<Expr>, field: String },
-    Index { object: Box<Expr>, index: Box<Expr> },
+    Member {
+        object: Box<Expr>,
+        field: String,
+    },
+    Index {
+        object: Box<Expr>,
+        index: Box<Expr>,
+    },
     Slice {
         object: Box<Expr>,
         start: Option<Box<Expr>>,
@@ -387,22 +414,41 @@ pub enum ExprKind {
     None,
     Var(String),
     Placeholder,
-    Unary { op: UnaryOp, operand: Box<Expr> },
-    Binary { op: BinaryOp, left: Box<Expr>, right: Box<Expr> },
-    Call { callee: Box<Expr>, args: Vec<CallArg> },
+    Unary {
+        op: UnaryOp,
+        operand: Box<Expr>,
+    },
+    Binary {
+        op: BinaryOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Call {
+        callee: Box<Expr>,
+        args: Vec<CallArg>,
+    },
     MacroCall {
         callee: Box<Expr>,
         args: Vec<MacroCallArg>,
     },
-    Member { object: Box<Expr>, field: String },
-    Index { object: Box<Expr>, index: Box<Expr> },
+    Member {
+        object: Box<Expr>,
+        field: String,
+    },
+    Index {
+        object: Box<Expr>,
+        index: Box<Expr>,
+    },
     Slice {
         object: Box<Expr>,
         start: Option<Box<Expr>>,
         end: Option<Box<Expr>>,
         step: Option<Box<Expr>>,
     },
-    TypeConvert { type_expr: Box<Expr>, value: Box<Expr> },
+    TypeConvert {
+        type_expr: Box<Expr>,
+        value: Box<Expr>,
+    },
     List(Vec<Expr>),
     ListComp {
         elem: Box<Expr>,
@@ -440,20 +486,30 @@ pub enum ExprKind {
         then_expr: Box<Expr>,
         else_expr: Box<Expr>,
     },
-    Handle { operand: Box<Expr> },
+    Handle {
+        operand: Box<Expr>,
+    },
     /// `go expr` — 启动任务，立即返回 Task。
-    Go { operand: Box<Expr> },
+    Go {
+        operand: Box<Expr>,
+    },
     /// `par for (x in xs) { ... }` — 并行 map，脱糖为 `std.async.par_map` / `gather`。
     ParFor {
         items: Vec<ForItem>,
         body: Block,
     },
     /// `par { e1; e2; ... }` — 并行求值表达式，返回结果元组。
-    ParBlock { exprs: Vec<Expr> },
+    ParBlock {
+        exprs: Vec<Expr>,
+    },
     /// `snap expr` — 若为 `none` 则抛异常，否则返回 `expr`。
-    Snap { operand: Box<Expr> },
+    Snap {
+        operand: Box<Expr>,
+    },
     /// `await expr` — 启动并等待。
-    Await { operand: Box<Expr> },
+    Await {
+        operand: Box<Expr>,
+    },
     /// `suspend` — 协作式让出 CPU（调度器预算用尽时也会隐式挂起）。
     Suspend,
     /// `select { case ev as x { } } else { }`
@@ -461,7 +517,10 @@ pub enum ExprKind {
         cases: Vec<SelectCase>,
         else_block: Option<Block>,
     },
-    NamedAssign { name: String, value: Box<Expr> },
+    NamedAssign {
+        name: String,
+        value: Box<Expr>,
+    },
     DoFunc {
         params: Vec<FuncParam>,
         /// 须 `Box`：直接 `Option<Expr>` 会与 `ExprKind` 形成无限大小。
@@ -558,7 +617,10 @@ pub fn fill_placeholders(expr: &Expr, repl: &Expr) -> Expr {
             expr.loc,
             ExprKind::Quote {
                 hygienic_names: hygienic_names.clone(),
-                bindings: bindings.iter().map(|b| fill_placeholders(b, repl)).collect(),
+                bindings: bindings
+                    .iter()
+                    .map(|b| fill_placeholders(b, repl))
+                    .collect(),
                 body: body.clone(),
             },
         ),
@@ -669,7 +731,11 @@ pub fn fill_placeholders(expr: &Expr, repl: &Expr) -> Expr {
                     .collect(),
             ),
         ),
-        ExprKind::ListComp { elem, items, guards } => Expr::new(
+        ExprKind::ListComp {
+            elem,
+            items,
+            guards,
+        } => Expr::new(
             expr.loc,
             ExprKind::ListComp {
                 elem: Box::new(fill_placeholders(elem, repl)),
@@ -677,7 +743,11 @@ pub fn fill_placeholders(expr: &Expr, repl: &Expr) -> Expr {
                 guards: guards.iter().map(|g| fill_placeholders(g, repl)).collect(),
             },
         ),
-        ExprKind::SetComp { elem, items, guards } => Expr::new(
+        ExprKind::SetComp {
+            elem,
+            items,
+            guards,
+        } => Expr::new(
             expr.loc,
             ExprKind::SetComp {
                 elem: Box::new(fill_placeholders(elem, repl)),
@@ -685,7 +755,11 @@ pub fn fill_placeholders(expr: &Expr, repl: &Expr) -> Expr {
                 guards: guards.iter().map(|g| fill_placeholders(g, repl)).collect(),
             },
         ),
-        ExprKind::GeneratorExp { elem, items, guards } => Expr::new(
+        ExprKind::GeneratorExp {
+            elem,
+            items,
+            guards,
+        } => Expr::new(
             expr.loc,
             ExprKind::GeneratorExp {
                 elem: Box::new(fill_placeholders(elem, repl)),

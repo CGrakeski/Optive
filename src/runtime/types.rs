@@ -157,9 +157,10 @@ pub fn bind_function_annotations(vm: &mut Vm, func: &mut FunctionObject) -> crat
         }
         let return_type_value = match &func.return_type {
             None => None,
-            Some(ann) => Some(eval_type_annotation(vm, ann).map_err(|e| {
-                RuntimeError::type_err(format!("return: {}", e.message()))
-            })?),
+            Some(ann) => Some(
+                eval_type_annotation(vm, ann)
+                    .map_err(|e| RuntimeError::type_err(format!("return: {}", e.message())))?,
+            ),
         };
         func.param_types = param_types;
         func.return_type_value = return_type_value;
@@ -646,9 +647,7 @@ fn type_value_to_expr(loc: crate::ast::SourceLoc, ty: &Value) -> Expr {
 #[must_use]
 pub fn substitute_type_annotation(expr: &Expr, subs: &HashMap<String, Value>) -> Expr {
     match &expr.kind {
-        ExprKind::Var(name) if subs.contains_key(name) => {
-            type_value_to_expr(expr.loc, &subs[name])
-        }
+        ExprKind::Var(name) if subs.contains_key(name) => type_value_to_expr(expr.loc, &subs[name]),
         ExprKind::Member { object, field } => Expr::new(
             expr.loc,
             ExprKind::Member {

@@ -45,12 +45,10 @@ impl LockFile {
         if !path.is_file() {
             return Ok(None);
         }
-        let text = fs::read_to_string(path).map_err(|e| {
-            format!("cannot read {}: {e}", path.display())
-        })?;
-        let lock: Self = toml::from_str(&text).map_err(|e| {
-            format!("invalid {}: {e}", path.display())
-        })?;
+        let text =
+            fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let lock: Self =
+            toml::from_str(&text).map_err(|e| format!("invalid {}: {e}", path.display()))?;
         if lock.version != 1 {
             return Err(format!(
                 "unsupported {}: version {} (expected 1)",
@@ -118,14 +116,10 @@ fn intent_matches_edge(dep: &Dependency, edge: &LockEdge) -> bool {
                     edge.pinned && r == &edge.rev && edge.branch.is_none() && edge.tag.is_none()
                 }
                 RevSpec::Tag(t) => {
-                    edge.tag.as_deref() == Some(t.as_str())
-                        && edge.branch.is_none()
-                        && !edge.pinned
+                    edge.tag.as_deref() == Some(t.as_str()) && edge.branch.is_none() && !edge.pinned
                 }
                 RevSpec::Branch(b) => {
-                    edge.branch.as_deref() == Some(b.as_str())
-                        && edge.tag.is_none()
-                        && !edge.pinned
+                    edge.branch.as_deref() == Some(b.as_str()) && edge.tag.is_none() && !edge.pinned
                 }
                 RevSpec::None => !edge.pinned && edge.branch.is_none() && edge.tag.is_none(),
                 RevSpec::IndexVersion(_) => unreachable!(),

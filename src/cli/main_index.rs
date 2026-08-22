@@ -131,10 +131,8 @@ mod tests {
     #[test]
     fn set_and_read_index_url_roundtrip() {
         let _g = ENV_LOCK.lock().unwrap();
-        let tmp = std::env::temp_dir().join(format!(
-            "optive_index_url_test_{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("optive_index_url_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         std::env::set_var("OPTIVE_HOME", &tmp);
@@ -145,10 +143,7 @@ mod tests {
             configured_index_url().unwrap(),
             "https://example.com/optindex.git"
         );
-        assert_eq!(
-            resolve_index_url().unwrap().1,
-            IndexUrlSource::File
-        );
+        assert_eq!(resolve_index_url().unwrap().1, IndexUrlSource::File);
 
         std::env::set_var("OPTIVE_INDEX_URL", "file:///tmp/other-index");
         assert_eq!(configured_index_url().unwrap(), "file:///tmp/other-index");
@@ -162,10 +157,8 @@ mod tests {
     #[test]
     fn unset_falls_back_to_default() {
         let _g = ENV_LOCK.lock().unwrap();
-        let tmp = std::env::temp_dir().join(format!(
-            "optive_index_url_default_{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("optive_index_url_default_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         std::env::set_var("OPTIVE_HOME", &tmp);

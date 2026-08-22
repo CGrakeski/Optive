@@ -1,6 +1,5 @@
 //! Frame / Traceback 运行时值。
 
-
 use crate::value::{FieldTypeInfo, StructDef, StructInstance, Value};
 use crate::vm::Vm;
 
@@ -13,12 +12,7 @@ fn frame_def() -> Arc<StructDef> {
     Arc::new(StructDef {
         name: FRAME_TYPE.into(),
         base: None,
-        fields: vec![
-            "file".into(),
-            "line".into(),
-            "func".into(),
-            "module".into(),
-        ],
+        fields: vec!["file".into(), "line".into(), "func".into(), "module".into()],
         mutable_fields: vec![false, false, false, false],
         typed: true,
         field_types: vec![
@@ -98,7 +92,8 @@ pub fn capture_traceback(vm: &Vm) -> Value {
             frame.line as i64,
             &frame.name,
             vm.globals
-                .get("__package__").map_or_else(|| "<main>".into(), |v| v.print_string()),
+                .get("__package__")
+                .map_or_else(|| "<main>".into(), |v| v.print_string()),
         ));
     }
 
@@ -107,7 +102,8 @@ pub fn capture_traceback(vm: &Vm) -> Value {
         let line = vm.current_line() as i64;
         let module = vm
             .globals
-            .get("__package__").map_or_else(|| "<main>".into(), |v| v.print_string());
+            .get("__package__")
+            .map_or_else(|| "<main>".into(), |v| v.print_string());
         frames.push(make_frame(&file, line, "<module>", &module));
     }
     make_traceback(frames)

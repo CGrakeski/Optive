@@ -1,4 +1,10 @@
-use crate::ast::{Program, Expr, SourceLoc, LocatedStmt, Stmt, DelTarget, ExprKind, Visibility, DestructPattern, DestructElem, CallArg, ProtocolMember, Block, MacroParam, RET_WRAPPER_VAL, fill_placeholders, FuncParam, ForItem, CatchPattern, CatchClause, MatchCase, Pattern, PatternElem, EnumMethodDecl, EnumMemberDecl, VariantCaseDecl, StructField, StructMethod, ModuleRef, UseItem, FStringPart, BinaryOp, UnaryOp, MacroCallArg, SelectCase, LValue};
+use crate::ast::{
+    fill_placeholders, BinaryOp, Block, CallArg, CatchClause, CatchPattern, DelTarget,
+    DestructElem, DestructPattern, EnumMemberDecl, EnumMethodDecl, Expr, ExprKind, FStringPart,
+    ForItem, FuncParam, LValue, LocatedStmt, MacroCallArg, MacroParam, MatchCase, ModuleRef,
+    Pattern, PatternElem, Program, ProtocolMember, SelectCase, SourceLoc, Stmt, StructField,
+    StructMethod, UnaryOp, UseItem, VariantCaseDecl, Visibility, RET_WRAPPER_VAL,
+};
 use crate::error::ParseError;
 use crate::lexer::Lexer;
 use crate::runtime_ast;
@@ -61,19 +67,17 @@ impl Parser {
     }
 
     fn lex(source: &str) -> Result<Vec<Token>, ParseError> {
-        Lexer::new(source)
-            .tokenize()
-            .map_err(|e| match e {
-                crate::error::LexError::Message {
-                    line,
-                    column,
-                    message,
-                } => ParseError::Message {
-                    line,
-                    column,
-                    message: format!("lex error: {message}"),
-                },
-            })
+        Lexer::new(source).tokenize().map_err(|e| match e {
+            crate::error::LexError::Message {
+                line,
+                column,
+                message,
+            } => ParseError::Message {
+                line,
+                column,
+                message: format!("lex error: {message}"),
+            },
+        })
     }
 
     fn current(&self) -> &Token {
@@ -317,7 +321,9 @@ impl Parser {
                 let loc = self.loc_here();
                 self.advance();
                 let do_expr = self.parse_do_func_expr(loc)?;
-                return Ok(Stmt::Expr(Self::apply_decorators_to_expr(decorators, do_expr)));
+                return Ok(Stmt::Expr(Self::apply_decorators_to_expr(
+                    decorators, do_expr,
+                )));
             }
             return Err(self.error("expected 'func', 'gen', or 'do' after with make"));
         }
@@ -349,7 +355,9 @@ impl Parser {
                 let loc = self.loc_here();
                 self.advance();
                 let do_expr = self.parse_do_func_expr(loc)?;
-                return Ok(Stmt::Expr(Self::apply_decorators_to_expr(decorators, do_expr)));
+                return Ok(Stmt::Expr(Self::apply_decorators_to_expr(
+                    decorators, do_expr,
+                )));
             }
             return Err(self.error("decorators must precede func or do"));
         }
@@ -558,7 +566,10 @@ impl Parser {
             || self.check(TokenKind::Placeholder)
         {
             let pattern = self.parse_destruct_pattern()?;
-            self.expect(TokenKind::Assign, "expected '=' in destructuring declaration")?;
+            self.expect(
+                TokenKind::Assign,
+                "expected '=' in destructuring declaration",
+            )?;
             let init = self.parse_expr()?;
             return Ok(Stmt::DestructDecl {
                 visibility,
@@ -639,7 +650,10 @@ impl Parser {
             break;
         }
         self.skip_newlines();
-        self.expect(end, &format!("expected {end_label} in destructuring pattern"))?;
+        self.expect(
+            end,
+            &format!("expected {end_label} in destructuring pattern"),
+        )?;
         Ok(elems)
     }
 
@@ -653,7 +667,10 @@ impl Parser {
                 return Ok(DestructElem::RestDiscard);
             }
             let name = self
-                .expect(TokenKind::Identifier, "expected name after '*' in destructuring")?
+                .expect(
+                    TokenKind::Identifier,
+                    "expected name after '*' in destructuring",
+                )?
                 .value;
             return Ok(DestructElem::Rest(name));
         }
@@ -758,11 +775,7 @@ impl Parser {
                     let mut j = i + 1;
                     while matches!(
                         self.tokens.get(j).map(|t| t.kind),
-                        Some(
-                            TokenKind::Newline
-                                | TokenKind::LineComment
-                                | TokenKind::BlockComment
-                        )
+                        Some(TokenKind::Newline | TokenKind::LineComment | TokenKind::BlockComment)
                     ) {
                         j += 1;
                     }
@@ -882,15 +895,21 @@ impl Parser {
     fn apply_decorators_to_expr(decorators: Vec<Expr>, inner: Expr) -> Expr {
         let mut expr = inner;
         for deco in decorators.into_iter().rev() {
-            { let __loc = expr.loc; expr = Expr::new(__loc, ExprKind::Call {
-                callee: Box::new(deco),
-                args: vec![CallArg {
-                    name: None,
-                    is_splat: false,
-                    is_kwsplat: false,
-                    value: expr,
-                }],
-            }); }
+            {
+                let __loc = expr.loc;
+                expr = Expr::new(
+                    __loc,
+                    ExprKind::Call {
+                        callee: Box::new(deco),
+                        args: vec![CallArg {
+                            name: None,
+                            is_splat: false,
+                            is_kwsplat: false,
+                            value: expr,
+                        }],
+                    },
+                );
+            }
         }
         expr
     }
@@ -1051,7 +1070,10 @@ impl Parser {
         let mutable = if self.match_kind(TokenKind::KwVar) {
             true
         } else {
-            self.expect(TokenKind::KwLet, "expected 'func', 'var', or 'let' in protocol")?;
+            self.expect(
+                TokenKind::KwLet,
+                "expected 'func', 'var', or 'let' in protocol",
+            )?;
             false
         };
         let field_name = self
@@ -1210,9 +1232,7 @@ impl Parser {
         ))
     }
 
-    fn parse_optional_return(
-        &mut self,
-    ) -> Result<(Option<Expr>, bool, Option<Expr>), ParseError> {
+    fn parse_optional_return(&mut self) -> Result<(Option<Expr>, bool, Option<Expr>), ParseError> {
         // `-> T` 软返回；`=> T` 强返回；可选 `: Wrap(_)` 包装器（`_` 为返回值洞，先包装再按返回类型检查）。
         let (return_type, return_strong) = if self.match_kind(TokenKind::FatArrow) {
             (Some(self.parse_type_annotation_expr()?), true)
@@ -1279,9 +1299,7 @@ impl Parser {
             if p.default_expr.is_some() {
                 seen_default = true;
             } else if seen_default {
-                return Err(self.error(
-                    "non-default parameter follows parameter with default",
-                ));
+                return Err(self.error("non-default parameter follows parameter with default"));
             }
         }
         Ok(())
@@ -1304,8 +1322,7 @@ impl Parser {
             .expect(TokenKind::Identifier, "expected parameter name")?
             .value;
         let (type_expr, type_strong) = self.parse_optional_type()?;
-        let default_expr = if !is_variadic && !is_kwvariadic && self.match_kind(TokenKind::Assign)
-        {
+        let default_expr = if !is_variadic && !is_kwvariadic && self.match_kind(TokenKind::Assign) {
             Some(self.parse_expr()?)
         } else {
             None
@@ -1522,10 +1539,9 @@ impl Parser {
             }
         }
         self.expect(TokenKind::RBrace, "expected '}' after match cases")?;
-        if else_block.is_none()
-            && self.match_kind(TokenKind::KwElse) {
-                else_block = Some(self.parse_block()?);
-            }
+        if else_block.is_none() && self.match_kind(TokenKind::KwElse) {
+            else_block = Some(self.parse_block()?);
+        }
         Ok(Stmt::Match {
             subject,
             cases,
@@ -1746,7 +1762,10 @@ impl Parser {
             self.expect(TokenKind::LParen, "expected '(' after case name")?;
             let fields = self.parse_variant_field_list()?;
             self.expect(TokenKind::RParen, "expected ')' after case fields")?;
-            return Ok(VariantCaseDecl { name: case_name, fields });
+            return Ok(VariantCaseDecl {
+                name: case_name,
+                fields,
+            });
         }
         let case_name = self
             .expect(TokenKind::Identifier, "expected case name")?
@@ -1949,25 +1968,27 @@ impl Parser {
                 if self.check(TokenKind::LBrace) {
                     break;
                 }
-                attrs.push(
-                    self.parse_member_name()?,
-                );
+                attrs.push(self.parse_member_name()?);
             }
             ModuleRef::FilePath {
                 path: tok.value,
                 attrs,
             }
         } else {
-            let mut module_path = vec![self
-                .expect(TokenKind::Identifier, "expected module name in use")?
-                .value];
+            let mut module_path = vec![
+                self.expect(TokenKind::Identifier, "expected module name in use")?
+                    .value,
+            ];
             while self.match_kind(TokenKind::Dot) {
                 if self.check(TokenKind::LBrace) {
                     break;
                 }
                 module_path.push(
-                    self.expect(TokenKind::Identifier, "expected identifier after '.' in use")?
-                        .value,
+                    self.expect(
+                        TokenKind::Identifier,
+                        "expected identifier after '.' in use",
+                    )?
+                    .value,
                 );
             }
             ModuleRef::Qualified(module_path)
@@ -1979,9 +2000,10 @@ impl Parser {
     }
 
     fn parse_qualified_name(&mut self) -> Result<Vec<String>, ParseError> {
-        let mut parts = vec![self
-            .expect(TokenKind::Identifier, "expected module path")?
-            .value];
+        let mut parts = vec![
+            self.expect(TokenKind::Identifier, "expected module path")?
+                .value,
+        ];
         while self.match_kind(TokenKind::Dot) {
             parts.push(
                 self.expect(TokenKind::Identifier, "expected identifier in module path")?
@@ -2137,7 +2159,10 @@ impl Parser {
             let cond = self.parse_or()?;
             if self.match_kind(TokenKind::KwThen) {
                 let then_expr = self.parse_ternary()?;
-                self.expect(TokenKind::KwElse, "expected 'else' in if-then-else expression")?;
+                self.expect(
+                    TokenKind::KwElse,
+                    "expected 'else' in if-then-else expression",
+                )?;
                 let else_expr = self.parse_ternary()?;
                 return Ok(Expr::new(
                     loc,
@@ -2247,11 +2272,17 @@ impl Parser {
         while self.match_kind(TokenKind::KwIs) {
             let neg = self.match_kind(TokenKind::KwNot);
             let right = self.parse_comparison_ex(allow_macro)?;
-            { let __loc = expr.loc; expr = Expr::new(__loc, ExprKind::Binary {
-                op: if neg { BinaryOp::IsNot } else { BinaryOp::Is },
-                left: Box::new(expr),
-                right: Box::new(right),
-            }); }
+            {
+                let __loc = expr.loc;
+                expr = Expr::new(
+                    __loc,
+                    ExprKind::Binary {
+                        op: if neg { BinaryOp::IsNot } else { BinaryOp::Is },
+                        left: Box::new(expr),
+                        right: Box::new(right),
+                    },
+                );
+            }
         }
         Ok(expr)
     }
@@ -2270,11 +2301,17 @@ impl Parser {
                 _ => break,
             };
             self.advance();
-            { let __loc = expr.loc; expr = Expr::new(__loc, ExprKind::Binary {
-                op,
-                left: Box::new(expr),
-                right: Box::new(self.parse_bitor_ex(allow_macro)?),
-            }); }
+            {
+                let __loc = expr.loc;
+                expr = Expr::new(
+                    __loc,
+                    ExprKind::Binary {
+                        op,
+                        left: Box::new(expr),
+                        right: Box::new(self.parse_bitor_ex(allow_macro)?),
+                    },
+                );
+            }
         }
         Ok(expr)
     }
@@ -2348,11 +2385,17 @@ impl Parser {
             };
             self.advance();
             self.skip_newlines();
-            { let __loc = expr.loc; expr = Expr::new(__loc, ExprKind::Binary {
-                op,
-                left: Box::new(expr),
-                right: Box::new(self.parse_additive_ex(allow_macro)?),
-            }); }
+            {
+                let __loc = expr.loc;
+                expr = Expr::new(
+                    __loc,
+                    ExprKind::Binary {
+                        op,
+                        left: Box::new(expr),
+                        right: Box::new(self.parse_additive_ex(allow_macro)?),
+                    },
+                );
+            }
         }
         Ok(expr)
     }
@@ -2368,11 +2411,17 @@ impl Parser {
             };
             self.advance();
             self.skip_newlines();
-            { let __loc = expr.loc; expr = Expr::new(__loc, ExprKind::Binary {
-                op,
-                left: Box::new(expr),
-                right: Box::new(self.parse_multiplicative_ex(allow_macro)?),
-            }); }
+            {
+                let __loc = expr.loc;
+                expr = Expr::new(
+                    __loc,
+                    ExprKind::Binary {
+                        op,
+                        left: Box::new(expr),
+                        right: Box::new(self.parse_multiplicative_ex(allow_macro)?),
+                    },
+                );
+            }
         }
         Ok(expr)
     }
@@ -2389,11 +2438,17 @@ impl Parser {
             };
             self.advance();
             self.skip_newlines();
-            { let __loc = expr.loc; expr = Expr::new(__loc, ExprKind::Binary {
-                op,
-                left: Box::new(expr),
-                right: Box::new(self.parse_unary_ex(allow_macro)?),
-            }); }
+            {
+                let __loc = expr.loc;
+                expr = Expr::new(
+                    __loc,
+                    ExprKind::Binary {
+                        op,
+                        left: Box::new(expr),
+                        right: Box::new(self.parse_unary_ex(allow_macro)?),
+                    },
+                );
+            }
         }
         Ok(expr)
     }
@@ -2407,13 +2462,23 @@ impl Parser {
             // `handle boom() is none` → `(handle boom()) is none`
             // `handle 1/0` → `handle (1/0)`
             let operand = self.parse_comparison_ex(allow_macro)?;
-            return Ok(Expr::new(loc, ExprKind::Handle { operand: Box::new(operand) }));
+            return Ok(Expr::new(
+                loc,
+                ExprKind::Handle {
+                    operand: Box::new(operand),
+                },
+            ));
         }
         if self.check(TokenKind::KwGo) {
             let loc = self.loc_here();
             self.advance();
             let operand = self.parse_comparison_ex(allow_macro)?;
-            return Ok(Expr::new(loc, ExprKind::Go { operand: Box::new(operand) }));
+            return Ok(Expr::new(
+                loc,
+                ExprKind::Go {
+                    operand: Box::new(operand),
+                },
+            ));
         }
         if self.check(TokenKind::KwPar) {
             let loc = self.loc_here();
@@ -2434,19 +2499,28 @@ impl Parser {
             let loc = self.loc_here();
             self.advance();
             let operand = self.parse_comparison_ex(allow_macro)?;
-            return Ok(Expr::new(loc, ExprKind::Snap { operand: Box::new(operand) }));
+            return Ok(Expr::new(
+                loc,
+                ExprKind::Snap {
+                    operand: Box::new(operand),
+                },
+            ));
         }
         if self.check(TokenKind::KwAwait) {
             let loc = self.loc_here();
             self.advance();
             self.skip_newlines();
             if self.check(TokenKind::KwYield) {
-                return Err(self.error(
-                    "'await yield' was removed; use 'suspend' to yield to the scheduler",
-                ));
+                return Err(self
+                    .error("'await yield' was removed; use 'suspend' to yield to the scheduler"));
             }
             let operand = self.parse_comparison_ex(allow_macro)?;
-            return Ok(Expr::new(loc, ExprKind::Await { operand: Box::new(operand) }));
+            return Ok(Expr::new(
+                loc,
+                ExprKind::Await {
+                    operand: Box::new(operand),
+                },
+            ));
         }
         if self.check(TokenKind::KwSuspend) {
             let loc = self.loc_here();
@@ -2554,17 +2628,29 @@ impl Parser {
             if self.match_kind(TokenKind::LParen) {
                 let args = self.parse_call_args(true)?;
                 self.expect(TokenKind::RParen, "expected ')'")?;
-                { let __loc = expr.loc; expr = Expr::new(__loc, ExprKind::Call {
-                    callee: Box::new(expr),
-                    args,
-                }); }
+                {
+                    let __loc = expr.loc;
+                    expr = Expr::new(
+                        __loc,
+                        ExprKind::Call {
+                            callee: Box::new(expr),
+                            args,
+                        },
+                    );
+                }
             } else if allow_macro && self.match_kind(TokenKind::LBrace) {
                 let args = self.parse_macro_call_args()?;
                 self.expect(TokenKind::RBrace, "expected '}'")?;
-                { let __loc = expr.loc; expr = Expr::new(__loc, ExprKind::MacroCall {
-                    callee: Box::new(expr),
-                    args,
-                }); }
+                {
+                    let __loc = expr.loc;
+                    expr = Expr::new(
+                        __loc,
+                        ExprKind::MacroCall {
+                            callee: Box::new(expr),
+                            args,
+                        },
+                    );
+                }
             } else if self.match_kind(TokenKind::Dot) {
                 // `Type.(value)` 类型转换；否则为成员访问。
                 if self.check(TokenKind::LParen) {
@@ -2575,16 +2661,28 @@ impl Parser {
                         self.parse_expr()?
                     };
                     self.expect(TokenKind::RParen, "expected ')'")?;
-                    { let __loc = expr.loc; expr = Expr::new(__loc, ExprKind::TypeConvert {
-                        type_expr: Box::new(expr),
-                        value: Box::new(value),
-                    }); }
+                    {
+                        let __loc = expr.loc;
+                        expr = Expr::new(
+                            __loc,
+                            ExprKind::TypeConvert {
+                                type_expr: Box::new(expr),
+                                value: Box::new(value),
+                            },
+                        );
+                    }
                 } else {
                     let field = self.parse_member_name()?;
-                    { let __loc = expr.loc; expr = Expr::new(__loc, ExprKind::Member {
-                        object: Box::new(expr),
-                        field,
-                    }); }
+                    {
+                        let __loc = expr.loc;
+                        expr = Expr::new(
+                            __loc,
+                            ExprKind::Member {
+                                object: Box::new(expr),
+                                field,
+                            },
+                        );
+                    }
                 }
             } else if self.check(TokenKind::LBracket) {
                 self.match_kind(TokenKind::LBracket);
@@ -2605,16 +2703,23 @@ impl Parser {
                         None
                     };
                     self.expect(TokenKind::RBracket, "expected ']'")?;
-                    { let __loc = expr.loc; expr = Expr::new(__loc, ExprKind::Slice {
-                        object: Box::new(expr),
-                        start: None,
-                        end,
-                        step,
-                    }); }
+                    {
+                        let __loc = expr.loc;
+                        expr = Expr::new(
+                            __loc,
+                            ExprKind::Slice {
+                                object: Box::new(expr),
+                                start: None,
+                                end,
+                                step,
+                            },
+                        );
+                    }
                 } else {
                     let first = self.parse_expr()?;
                     if self.match_kind(TokenKind::Colon) {
-                        let end = if self.check(TokenKind::Colon) || self.check(TokenKind::RBracket) {
+                        let end = if self.check(TokenKind::Colon) || self.check(TokenKind::RBracket)
+                        {
                             None
                         } else {
                             Some(Box::new(self.parse_expr()?))
@@ -2629,12 +2734,18 @@ impl Parser {
                             None
                         };
                         self.expect(TokenKind::RBracket, "expected ']'")?;
-                        { let __loc = expr.loc; expr = Expr::new(__loc, ExprKind::Slice {
-                            object: Box::new(expr),
-                            start: Some(Box::new(first)),
-                            end,
-                            step,
-                        }); }
+                        {
+                            let __loc = expr.loc;
+                            expr = Expr::new(
+                                __loc,
+                                ExprKind::Slice {
+                                    object: Box::new(expr),
+                                    start: Some(Box::new(first)),
+                                    end,
+                                    step,
+                                },
+                            );
+                        }
                     } else {
                         // `a[i]`；多实参 `dict[text, num]` / `Union[num, text]` 收成 List 下标。
                         let index = if self.check(TokenKind::Comma) {
@@ -2651,10 +2762,16 @@ impl Parser {
                             first
                         };
                         self.expect(TokenKind::RBracket, "expected ']'")?;
-                        { let __loc = expr.loc; expr = Expr::new(__loc, ExprKind::Index {
-                            object: Box::new(expr),
-                            index: Box::new(index),
-                        }); }
+                        {
+                            let __loc = expr.loc;
+                            expr = Expr::new(
+                                __loc,
+                                ExprKind::Index {
+                                    object: Box::new(expr),
+                                    index: Box::new(index),
+                                },
+                            );
+                        }
                     }
                 }
             } else {
@@ -2731,9 +2848,15 @@ impl Parser {
                 let loc = self.loc_here();
                 self.advance();
                 let cond = self.parse_or()?;
-                self.expect(TokenKind::KwThen, "expected 'then' in if-then-else expression")?;
+                self.expect(
+                    TokenKind::KwThen,
+                    "expected 'then' in if-then-else expression",
+                )?;
                 let then_expr = self.parse_expr()?;
-                self.expect(TokenKind::KwElse, "expected 'else' in if-then-else expression")?;
+                self.expect(
+                    TokenKind::KwElse,
+                    "expected 'else' in if-then-else expression",
+                )?;
                 let else_expr = self.parse_expr()?;
                 Ok(Expr::new(
                     loc,
@@ -2777,9 +2900,7 @@ impl Parser {
             }
             TokenKind::Placeholder => {
                 if !self.allow_placeholder {
-                    return Err(self.error(
-                        "'_' only valid in pipeline step or return wrapper",
-                    ));
+                    return Err(self.error("'_' only valid in pipeline step or return wrapper"));
                 }
                 let loc = self.loc_here();
                 self.advance();
@@ -2960,9 +3081,11 @@ impl Parser {
                     Ok(Expr::new(loc, ExprKind::Set(elems)))
                 }
             }
-            _ => Err(self.error(&crate::custom::render(
-                &crate::custom::Diag::Parse(crate::custom::ParseMsg::ExpectedExpression),
-            ))),
+            _ => Err(
+                self.error(&crate::custom::render(&crate::custom::Diag::Parse(
+                    crate::custom::ParseMsg::ExpectedExpression,
+                ))),
+            ),
         }
     }
 
@@ -3002,10 +3125,9 @@ impl Parser {
             }
         }
         self.expect(TokenKind::RBrace, "expected '}' after match cases")?;
-        if else_block.is_none()
-            && self.match_kind(TokenKind::KwElse) {
-                else_block = Some(self.parse_block()?);
-            }
+        if else_block.is_none() && self.match_kind(TokenKind::KwElse) {
+            else_block = Some(self.parse_block()?);
+        }
         Ok(Expr::new(
             loc,
             ExprKind::Match {
@@ -3054,13 +3176,7 @@ impl Parser {
         if else_block.is_none() && self.match_kind(TokenKind::KwElse) {
             else_block = Some(self.parse_block()?);
         }
-        Ok(Expr::new(
-            loc,
-            ExprKind::Select {
-                cases,
-                else_block,
-            },
-        ))
+        Ok(Expr::new(loc, ExprKind::Select { cases, else_block }))
     }
 }
 

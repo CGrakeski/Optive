@@ -22,12 +22,12 @@ use rustyline::highlight::{CmdKind, Highlighter};
 use rustyline::history::DefaultHistory;
 use rustyline::{Completer, Editor, Helper, Hinter, Validator};
 
-use cli::color;
-use cli::repl_highlight::{self, LineHighlightCache};
-use cli::resolve::{EnsureResult};
-use cli::main_index;
-use optive::caps::Capabilities;
 use crate::cli::debug_cmd::inject_dep_map;
+use cli::color;
+use cli::main_index;
+use cli::repl_highlight::{self, LineHighlightCache};
+use cli::resolve::EnsureResult;
+use optive::caps::Capabilities;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -129,7 +129,10 @@ fn main() {
                 }
                 let (caps, _rest) = match cli::caps::parse_caps(&args[3..]) {
                     Ok(v) => v,
-                    Err(e) => { color::eprint_error(format!("Error: {e}")); process::exit(2); }
+                    Err(e) => {
+                        color::eprint_error(format!("Error: {e}"));
+                        process::exit(2);
+                    }
                 };
                 // 允许多行：整段作为下一个参数（shell 引号内可含换行）。
                 if let Err(e) = run_inline_source(&args[2], caps) {
@@ -258,6 +261,25 @@ fn main() {
                 }
                 return;
             }
+            "check" => {
+                if args.len() > 3 {
+                    color::eprint_error("usage: Optive check [path]");
+                    process::exit(2);
+                }
+                let path = args.get(2).map(PathBuf::from);
+                if let Err(e) = cli::check::cmd_check(path.as_deref()) {
+                    color::eprint_error(format!("Error: {e}"));
+                    process::exit(1);
+                }
+                return;
+            }
+            "lsp" => {
+                if let Err(e) = optive::lsp::run_stdio() {
+                    color::eprint_error(format!("LSP: {e}"));
+                    process::exit(1);
+                }
+                return;
+            }
             "custom" => {
                 if let Err(e) = cli::custom_cmd::run(&args[2..]) {
                     color::eprint_error(format!("Error: {e}"));
@@ -280,9 +302,7 @@ fn main() {
                         }
                     }
                     _ => {
-                        color::eprint_error(
-                            "usage: Optive index sync | Optive index change <url>",
-                        );
+                        color::eprint_error("usage: Optive index sync | Optive index change <url>");
                         process::exit(2);
                     }
                 }
@@ -304,8 +324,8 @@ fn main() {
     repl();
 }
 
-fn parse_project_path_and_script_args(rest: &Vec<String>) -> (Option<PathBuf>, Vec<String>) {
-    let (path, script_args) = match split_project_and_script_args(&rest) {
+fn parse_project_path_and_script_args(rest: &[String]) -> (Option<PathBuf>, Vec<String>) {
+    let (path, script_args) = match split_project_and_script_args(rest) {
         Ok(v) => v,
         Err(e) => {
             color::eprint_error(format!("Error: {e}"));
@@ -368,9 +388,8 @@ fn cmd_fmt(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         return Err("usage: Optive fmt <filename> [-o|--out]".into());
     };
     let source = fs::read_to_string(path)?;
-    let formatted = optive::fmt::format_source(&source).map_err(|e| {
-        optive::diagnostics::format_parse_error(&source, path, &e)
-    })?;
+    let formatted = optive::fmt::format_source(&source)
+        .map_err(|e| optive::diagnostics::format_parse_error(&source, path, &e))?;
     if out_only {
         print!("{formatted}");
     } else {
@@ -470,9 +489,7 @@ fn split_project_and_script_args(
 }
 
 fn build_script_argv(entry_display: &str, script_args: &[String]) -> Vec<String> {
-    let exe = env::args()
-        .next()
-        .unwrap_or_else(|| "Optive".to_string());
+    let exe = env::args().next().unwrap_or_else(|| "Optive".to_string());
     let mut argv = Vec::with_capacity(2 + script_args.len());
     argv.push(exe);
     argv.push(entry_display.to_string());
@@ -525,19 +542,11 @@ fn cmd_add(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         match args[i].as_str() {
             "--name" => {
                 i += 1;
-                name = Some(
-                    args.get(i)
-                        .ok_or("--name requires a value")?
-                        .clone(),
-                );
+                name = Some(args.get(i).ok_or("--name requires a value")?.clone());
             }
             "--branch" => {
                 i += 1;
-                branch = Some(
-                    args.get(i)
-                        .ok_or("--branch requires a value")?
-                        .clone(),
-                );
+                branch = Some(args.get(i).ok_or("--branch requires a value")?.clone());
             }
             "--tag" => {
                 i += 1;
@@ -556,9 +565,8 @@ fn cmd_add(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         i += 1;
     }
-    let target = target.ok_or(
-        "usage: Optive add <git-url|pack[@version]> [--name N] [--branch B|--tag T]",
-    )?;
+    let target = target
+        .ok_or("usage: Optive add <git-url|pack[@version]> [--name N] [--branch B|--tag T]")?;
     let project = cli::manifest::find_project(None)?;
     let msg = cli::commands::cmd_add(
         &project,
@@ -586,11 +594,7 @@ fn cmd_search(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let show = hits.len().min(SOFT_LIMIT);
-    let name_width = hits[..show]
-        .iter()
-        .map(|(n, _)| n.len())
-        .max()
-        .unwrap_or(0);
+    let name_width = hits[..show].iter().map(|(n, _)| n.len()).max().unwrap_or(0);
     for (name, url) in hits.iter().take(show) {
         println!("{name:<name_width$}  {url}");
     }
@@ -642,7 +646,9 @@ fn cmd_deps(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn cmd_change(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let spec = args.first().ok_or("usage: Optive change track_latest=true|false")?;
+    let spec = args
+        .first()
+        .ok_or("usage: Optive change track_latest=true|false")?;
     if let Some(rest) = spec.strip_prefix("track_latest=") {
         let value = match rest {
             "true" | "1" | "yes" => true,
@@ -704,8 +710,6 @@ fn print_ensure_report(ensured: &EnsureResult) {
     }
 }
 
-
-
 fn run_script_path_with_deps(
     path: &Path,
     project_root: &Path,
@@ -713,8 +717,8 @@ fn run_script_path_with_deps(
     caps: Capabilities,
     argv_override: Option<Vec<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let source = fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let source =
+        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let file = path.to_string_lossy().to_string();
     run_in_vm(&source, &file, caps, argv_override, |vm| {
         inject_dep_map(vm, ensured, project_root);
@@ -729,8 +733,8 @@ fn run_script_file(path: &str, caps: Capabilities) {
 }
 
 fn run_script_path(path: &Path, caps: Capabilities) -> Result<(), Box<dyn std::error::Error>> {
-    let source = fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let source =
+        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let file = path.to_string_lossy().to_string();
     run_in_vm(&source, &file, caps, None, |_| {})
 }
@@ -785,6 +789,8 @@ fn print_help() {
     println!("{}", t_cli(CliMsg::HelpFmt));
     println!("{}", t_cli(CliMsg::HelpDebug));
     println!("{}", t_cli(CliMsg::HelpTest));
+    println!("{}", t_cli(CliMsg::HelpCheck));
+    println!("{}", t_cli(CliMsg::HelpLsp));
     println!("{}", t_cli(CliMsg::HelpIndex));
     println!("{}", t_cli(CliMsg::HelpIndexChange));
     println!("{}", t_cli(CliMsg::HelpCustom));

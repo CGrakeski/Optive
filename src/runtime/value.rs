@@ -87,16 +87,16 @@ impl Num {
     pub fn from_literal(text: &str) -> Result<Self> {
         let t = text.trim();
         if let Some((numer_text, denom_text)) = t.split_once('/') {
-            let numer: BigInt = numer_text
-                .trim()
-                .parse()
-                .map_err(|_| RuntimeError::value_err(format!("invalid rational numerator: {text}")))?;
-            let denom: BigInt = denom_text
-                .trim()
-                .parse()
-                .map_err(|_| RuntimeError::value_err(format!("invalid rational denominator: {text}")))?;
+            let numer: BigInt = numer_text.trim().parse().map_err(|_| {
+                RuntimeError::value_err(format!("invalid rational numerator: {text}"))
+            })?;
+            let denom: BigInt = denom_text.trim().parse().map_err(|_| {
+                RuntimeError::value_err(format!("invalid rational denominator: {text}"))
+            })?;
             if denom.is_zero() {
-                return Err(RuntimeError::value_err(format!("invalid rational literal: {text}")));
+                return Err(RuntimeError::value_err(format!(
+                    "invalid rational literal: {text}"
+                )));
             }
             return Ok(Self::from_rational(BigRational::new(numer, denom)));
         }
@@ -109,8 +109,8 @@ impl Num {
             return Ok(Self::Small(n));
         }
         let n: BigInt = t
-                .parse()
-                .map_err(|_| RuntimeError::value_err(format!("invalid integer literal: {text}")))?;
+            .parse()
+            .map_err(|_| RuntimeError::value_err(format!("invalid integer literal: {text}")))?;
         Ok(Self::from_bigint(n))
     }
 
@@ -193,10 +193,12 @@ impl Num {
             },
             (Self::Small(a), Self::Rat(b)) if b.denom() == &One::one() => b
                 .numer()
-                .to_i64().map_or_else(|| self.to_rational() == **b, |bi| a == &bi),
+                .to_i64()
+                .map_or_else(|| self.to_rational() == **b, |bi| a == &bi),
             (Self::Rat(a), Self::Small(b)) if a.denom() == &One::one() => a
                 .numer()
-                .to_i64().map_or_else(|| **a == other.to_rational(), |ai| ai == *b),
+                .to_i64()
+                .map_or_else(|| **a == other.to_rational(), |ai| ai == *b),
             _ => self.to_rational() == other.to_rational(),
         }
     }
@@ -260,10 +262,7 @@ pub struct BuiltinObject {
 }
 
 impl BuiltinObject {
-    pub fn new(
-        name: impl Into<Arc<str>>,
-        func: BuiltinFn,
-    ) -> Arc<Self> {
+    pub fn new(name: impl Into<Arc<str>>, func: BuiltinFn) -> Arc<Self> {
         Arc::new(Self {
             name: name.into(),
             func,
@@ -315,9 +314,7 @@ impl ModuleObject {
         if let Some(v) = self.exports.get(name) {
             return Some(v.clone());
         }
-        self.children
-            .get(name)
-            .map(|m| Value::Module(m.clone()))
+        self.children.get(name).map(|m| Value::Module(m.clone()))
     }
 }
 
@@ -530,9 +527,7 @@ impl DictMap {
     }
 
     pub fn values(&self) -> impl Iterator<Item = &Value> {
-        self.order
-            .iter()
-            .filter_map(|k| self.map.get(k))
+        self.order.iter().filter_map(|k| self.map.get(k))
     }
 }
 
@@ -739,7 +734,11 @@ pub enum SyncInner {
     /// 一次性执行：三态，避免并行下「done 但 value 未写入」。
     Once { phase: OncePhase, value: Value },
     /// 屏障：凑齐 `n` 个 `wait()` 后全部放行（`generation` 递增）。
-    Barrier { n: i64, waiting: usize, generation: u64 },
+    Barrier {
+        n: i64,
+        waiting: usize,
+        generation: u64,
+    },
     /// 条件变量：`signals` 为待消费的唤醒令牌，`waiters` 为当前等待者数。
     Cond { signals: i64, waiters: i64 },
     /// `std.async.taskgroup()`：作用域等待组；`run` 跟踪子任务，`__exit__` cancel+join。
@@ -750,13 +749,9 @@ pub enum SyncInner {
         tasks: Vec<Shared<TaskInner>>,
     },
     /// `std.async.with_timeout(sec)`：截止时刻；`check()` 超时抛 `Cancelled`。
-    TimeoutCtx {
-        deadline: std::time::Instant,
-    },
+    TimeoutCtx { deadline: std::time::Instant },
     /// `std.sync.Atomic.num/bool`：互斥保护的原子槽。
-    Atomic {
-        value: Value,
-    },
+    Atomic { value: Value },
 }
 
 /// `RWMutex` 的读/写守卫，支持 `with` 自动释放。
@@ -933,7 +928,8 @@ pub struct StructDef {
     pub native_layout: Option<std::sync::Arc<crate::ffi_extra::NativeStructLayout>>,
     /// 类型自身的方法表；`a.b` 在此查 `b`，不走全局点分键。
     pub methods: std::collections::HashMap<String, std::sync::Arc<crate::opcode::FunctionObject>>,
-    pub overloads: std::collections::HashMap<String, Vec<std::sync::Arc<crate::opcode::FunctionObject>>>,
+    pub overloads:
+        std::collections::HashMap<String, Vec<std::sync::Arc<crate::opcode::FunctionObject>>>,
 }
 
 #[derive(Clone)]
@@ -1126,13 +1122,7 @@ impl Value {
                     .fields
                     .iter()
                     .enumerate()
-                    .map(|(i, name)| {
-                        format!(
-                            "{}: {}",
-                            name,
-                            s.slots.borrow()[i].display_string()
-                        )
-                    })
+                    .map(|(i, name)| format!("{}: {}", name, s.slots.borrow()[i].display_string()))
                     .collect();
                 format!("{}({})", s.def.name, parts.join(", "))
             }
@@ -1150,15 +1140,8 @@ impl Value {
                     format!("{}[{}]", spec.name, inner.join(", "))
                 }
             }
-            Self::EnumMember(m) => format!(
-                "{}.{}",
-                m.def.name, m.def.members[m.member_index].name
-            ),
-            Self::Variant(v) => format!(
-                "{}({})",
-                v.inst_name,
-                v.payload.display_string()
-            ),
+            Self::EnumMember(m) => format!("{}.{}", m.def.name, m.def.members[m.member_index].name),
+            Self::Variant(v) => format!("{}({})", v.inst_name, v.payload.display_string()),
             Self::Task(_) => "<Task>".to_string(),
             Self::Channel(_) => "<Channel>".to_string(),
             Self::Stream(_) => "<Stream>".to_string(),
@@ -1355,9 +1338,7 @@ impl Value {
             (Self::MutexGuard(a), Self::MutexGuard(b)) => Ok(Shared::ptr_eq(a, b)),
             (Self::Sync(a), Self::Sync(b)) => Ok(Shared::ptr_eq(a, b)),
             (Self::SyncGuard(a), Self::SyncGuard(b)) => Ok(Shared::ptr_eq(a, b)),
-            (Self::TypeSpec(a), Self::TypeSpec(b)) => {
-                Ok(a.as_ref() == b.as_ref())
-            }
+            (Self::TypeSpec(a), Self::TypeSpec(b)) => Ok(a.as_ref() == b.as_ref()),
             (Self::EnumMember(a), Self::EnumMember(b)) => {
                 Ok(Arc::ptr_eq(&a.def, &b.def) && a.member_index == b.member_index)
             }
@@ -1419,8 +1400,10 @@ pub fn values_identical(a: &Value, b: &Value) -> bool {
 
 fn add_num(a: &Num, b: &Num) -> Num {
     match (a, b) {
-        (Num::Small(x), Num::Small(y)) => x
-            .checked_add(*y).map_or_else(|| Num::from_bigint(BigInt::from(*x) + BigInt::from(*y)), Num::Small),
+        (Num::Small(x), Num::Small(y)) => x.checked_add(*y).map_or_else(
+            || Num::from_bigint(BigInt::from(*x) + BigInt::from(*y)),
+            Num::Small,
+        ),
         (Num::Int(x), Num::Int(y)) => Num::from_bigint(x.as_ref() + y.as_ref()),
         (Num::Small(x), Num::Int(y)) => match y.to_i64() {
             Some(yi) => add_num(&Num::Small(*x), &Num::Small(yi)),
@@ -1439,8 +1422,10 @@ fn add_num(a: &Num, b: &Num) -> Num {
 
 fn sub_num(a: &Num, b: &Num) -> Num {
     match (a, b) {
-        (Num::Small(x), Num::Small(y)) => x
-            .checked_sub(*y).map_or_else(|| Num::from_bigint(BigInt::from(*x) - BigInt::from(*y)), Num::Small),
+        (Num::Small(x), Num::Small(y)) => x.checked_sub(*y).map_or_else(
+            || Num::from_bigint(BigInt::from(*x) - BigInt::from(*y)),
+            Num::Small,
+        ),
         (Num::Int(x), Num::Int(y)) => Num::from_bigint(x.as_ref() - y.as_ref()),
         (Num::Small(x), Num::Int(y)) => match y.to_i64() {
             Some(yi) => sub_num(&Num::Small(*x), &Num::Small(yi)),
@@ -1459,8 +1444,10 @@ fn sub_num(a: &Num, b: &Num) -> Num {
 
 fn mul_num(a: &Num, b: &Num) -> Num {
     match (a, b) {
-        (Num::Small(x), Num::Small(y)) => x
-            .checked_mul(*y).map_or_else(|| Num::from_bigint(BigInt::from(*x) * BigInt::from(*y)), Num::Small),
+        (Num::Small(x), Num::Small(y)) => x.checked_mul(*y).map_or_else(
+            || Num::from_bigint(BigInt::from(*x) * BigInt::from(*y)),
+            Num::Small,
+        ),
         (Num::Int(x), Num::Int(y)) => Num::from_bigint(x.as_ref() * y.as_ref()),
         (Num::Small(x), Num::Int(y)) => match y.to_i64() {
             Some(yi) => mul_num(&Num::Small(*x), &Num::Small(yi)),
@@ -1480,12 +1467,16 @@ fn pow_num(base: &Num, exp: &Num) -> Result<Num> {
     if exp_r.denom() == &One::one() {
         let e = exp_r.numer();
         if e.is_negative() {
-            let pos = Num::from_bigint(-e );
+            let pos = Num::from_bigint(-e);
             let powered = pow_num(base, &pos)?;
             if powered.is_zero() {
-                return Err(RuntimeError::zero_div("0.0 cannot be raised to a negative power"));
+                return Err(RuntimeError::zero_div(
+                    "0.0 cannot be raised to a negative power",
+                ));
             }
-            return Ok(Num::from_rational(BigRational::from_integer(One::one()) / powered.to_rational()));
+            return Ok(Num::from_rational(
+                BigRational::from_integer(One::one()) / powered.to_rational(),
+            ));
         }
         if let Some(e_u32) = e.to_u32() {
             let base_r = base.to_rational();
@@ -1683,7 +1674,7 @@ impl IteratorState {
                     }
                     None => Ok(None),
                 }
-            },
+            }
             IteratorKind::Filter { func, source } => loop {
                 let mut src = source.borrow_mut();
                 match src.next_value(vm)? {
@@ -1717,10 +1708,7 @@ impl IteratorState {
                     let args = unpack_genexpr_args(item, arity)?;
                     let mut keep = true;
                     for g in &guards {
-                        if !vm
-                            .call_user_function(g.clone(), args.clone())?
-                            .is_truthy()
-                        {
+                        if !vm.call_user_function(g.clone(), args.clone())?.is_truthy() {
                             keep = false;
                             break;
                         }
@@ -1811,9 +1799,7 @@ impl IteratorState {
                 let obj = obj.clone();
                 match vm.try_call_magic(&obj, "__next__", vec![]) {
                     Some(Ok(v)) => Ok(Some(v)),
-                    Some(Err(e))
-                        if e.kind() == crate::error::ExceptionKind::StopIteration =>
-                    {
+                    Some(Err(e)) if e.kind() == crate::error::ExceptionKind::StopIteration => {
                         vm.active_exception = None;
                         Ok(None)
                     }
@@ -1911,16 +1897,13 @@ pub fn value_to_iterable(v: &Value) -> crate::Result<IteratorState> {
             let items: Vec<Value> = d
                 .borrow()
                 .iter()
-                .map(|(k, v)| {
-                    Value::List(Shared::new(vec![
-                        value_key_to_value(k),
-                        v.clone(),
-                    ]))
-                })
+                .map(|(k, v)| Value::List(Shared::new(vec![value_key_to_value(k), v.clone()])))
                 .collect();
             Ok(IteratorState::from_list(items))
         }
-        _ => Err(crate::error::RuntimeError::type_err("object is not iterable")),
+        _ => Err(crate::error::RuntimeError::type_err(
+            "object is not iterable",
+        )),
     }
 }
 
@@ -2010,7 +1993,10 @@ impl fmt::Display for Value {
 /// 将值切片转为空格分隔的显示文本，供 `print`/`eprint` 等使用。
 #[must_use]
 pub fn args_join_space(args: &[Value]) -> String {
-    args.iter().map(Value::print_string).collect::<Vec<_>>().join(" ")
+    args.iter()
+        .map(Value::print_string)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// 将 `Value` 解析为 `i64`（`WaitGroup.add`、`range`、`randint` 等共用）。

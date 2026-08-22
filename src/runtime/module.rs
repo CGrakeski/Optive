@@ -16,9 +16,7 @@ use std::sync::Arc;
 use crate::shared::Shared;
 /// 已挂到其它已加载模块的函数（`use` 引入）不得换绑到当前模块。
 fn module_env_already_finalized(func: &FunctionObject) -> bool {
-    func.module_env
-        .as_ref()
-        .is_some_and(|env| env.finalized)
+    func.module_env.as_ref().is_some_and(|env| env.finalized)
 }
 
 /// 把模块快照挂到函数（含体内嵌套 `Push(Function)`），使 LoadGlobal/StoreGlobal 解析模块绑定。
@@ -67,7 +65,8 @@ fn rebind_export_value(val: &Value, env: &Arc<ModuleGlobalEnv>) -> Value {
 pub fn install_std(vm: &mut Vm) {
     let std_mod = std_modules::build_std_module();
     vm.register_builtin_module("std", std_mod.clone());
-    vm.globals.insert("std".into(), Value::Module(std_mod.clone()));
+    vm.globals
+        .insert("std".into(), Value::Module(std_mod.clone()));
     if let Err(e) = install_std_macros(vm, &std_mod) {
         // 宏库加载失败不应让解释器起不来，但测试里应立刻暴露。
         eprintln!("warning: failed to install std.macros: {}", e.message());
@@ -146,9 +145,7 @@ pub fn find_module_segments(vm: &mut Vm, parts: &[String]) -> Result<Value> {
         // 尝试按需加载剩余段对应文件，成功后挂到当前 children。
         let sub = load_user_module_segments(vm, &parts[..=i])?;
         if let Value::Module(subm) = &sub {
-            m.borrow_mut()
-                .children
-                .insert(seg.clone(), subm.clone());
+            m.borrow_mut().children.insert(seg.clone(), subm.clone());
         }
         cur_val = sub;
     }
@@ -203,14 +200,12 @@ fn run_module_source(
     vm.package_root = prev_root;
     run_result?;
     let module_env = Arc::new(vm.snapshot_module_global_env());
-    let new_functions: HashMap<String, Arc<FunctionObject>> = vm
-        .functions
-        .with_ref(|m| {
-            m.iter()
-                .filter(|(k, _)| !snap.functions.contains_key(*k))
-                .map(|(k, v)| (k.clone(), function_with_module_env(v, &module_env)))
-                .collect()
-        });
+    let new_functions: HashMap<String, Arc<FunctionObject>> = vm.functions.with_ref(|m| {
+        m.iter()
+            .filter(|(k, _)| !snap.functions.contains_key(*k))
+            .map(|(k, v)| (k.clone(), function_with_module_env(v, &module_env)))
+            .collect()
+    });
     for (k, v) in &new_functions {
         vm.functions.insert(k.clone(), v.clone());
     }
@@ -266,27 +261,23 @@ fn run_module_source(
         }
         *val = rebind_export_value(val, &module_env);
     }
-    let new_macros: HashMap<_, _> = vm
-        .macros
-        .with_ref(|m| {
-            m.iter()
-                .filter(|(k, _)| !snap.macros.contains_key(*k))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
-        });
-    let new_struct_defs: HashMap<_, _> = vm
-        .struct_defs
-        .with_ref(|m| {
-            m.iter()
-                .filter(|(k, _)| !snap.struct_defs.contains_key(*k))
-                .map(|(k, v)| {
-                    // 模块新增 StructDef：其 methods/overloads 也需挂到模块 env，
-                    // 否则模块内 struct 方法体看不到本模块的 let/use 绑定。
-                    let rebound = rebound_struct_def_methods(v.clone(), &module_env);
-                    (k.clone(), rebound)
-                })
-                .collect()
-        });
+    let new_macros: HashMap<_, _> = vm.macros.with_ref(|m| {
+        m.iter()
+            .filter(|(k, _)| !snap.macros.contains_key(*k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    });
+    let new_struct_defs: HashMap<_, _> = vm.struct_defs.with_ref(|m| {
+        m.iter()
+            .filter(|(k, _)| !snap.struct_defs.contains_key(*k))
+            .map(|(k, v)| {
+                // 模块新增 StructDef：其 methods/overloads 也需挂到模块 env，
+                // 否则模块内 struct 方法体看不到本模块的 let/use 绑定。
+                let rebound = rebound_struct_def_methods(v.clone(), &module_env);
+                (k.clone(), rebound)
+            })
+            .collect()
+    });
     vm.finish_module_init(
         snap,
         new_functions,
@@ -342,7 +333,14 @@ fn load_user_module(vm: &mut Vm, module_name: &str) -> Result<Value> {
     // 2) 当前包内相对包根的模块（依赖包或根项目）
     if let Some(root) = vm.package_root.clone() {
         if let Some(file_path) = locate_under_root(&root, &path_components) {
-            return load_file_as_module(vm, module_name, last, &file_path, vm.current_package_id.clone(), Some(root));
+            return load_file_as_module(
+                vm,
+                module_name,
+                last,
+                &file_path,
+                vm.current_package_id.clone(),
+                Some(root),
+            );
         }
     }
 
@@ -350,7 +348,8 @@ fn load_user_module(vm: &mut Vm, module_name: &str) -> Result<Value> {
     if vm.current_package_id == "__root__" {
         if let Ok(file_path) = locate_module_file(&path_components) {
             let import_base = file_path
-                .parent().map_or_else(|| vm.import_base.clone(), std::path::Path::to_path_buf);
+                .parent()
+                .map_or_else(|| vm.import_base.clone(), std::path::Path::to_path_buf);
             return load_file_as_module(
                 vm,
                 module_name,
@@ -421,7 +420,8 @@ fn load_file_as_module(
     vm.module_cache
         .insert(module_name.to_string(), placeholder.clone());
     let import_base = file_path
-        .parent().map_or_else(|| vm.import_base.clone(), std::path::Path::to_path_buf);
+        .parent()
+        .map_or_else(|| vm.import_base.clone(), std::path::Path::to_path_buf);
     match run_module_source(
         vm,
         &source,
@@ -441,21 +441,17 @@ fn load_file_as_module(
     }
 }
 
-fn resolve_package_entry_file(
-    package_root: &Path,
-    logical_name: &str,
-) -> Result<Option<PathBuf>> {
+fn resolve_package_entry_file(package_root: &Path, logical_name: &str) -> Result<Option<PathBuf>> {
     for name in ["Optive.toml"] {
         let p = package_root.join(name);
         if !p.is_file() {
             continue;
         }
-        let text = fs::read_to_string(&p).map_err(|e| {
-            RuntimeError::msg(format!("cannot read {}: {e}", p.display()))
-        })?;
-        let val: toml::Value = text.parse().map_err(|e| {
-            RuntimeError::msg(format!("invalid {}: {e}", p.display()))
-        })?;
+        let text = fs::read_to_string(&p)
+            .map_err(|e| RuntimeError::msg(format!("cannot read {}: {e}", p.display())))?;
+        let val: toml::Value = text
+            .parse()
+            .map_err(|e| RuntimeError::msg(format!("invalid {}: {e}", p.display())))?;
         if let Some(entry) = val
             .get("package")
             .and_then(|pkg| pkg.get("entry"))
@@ -644,7 +640,8 @@ pub fn load_string_module(vm: &mut Vm, path: &str) -> Result<Value> {
         .unwrap_or("module")
         .to_string();
     let import_base = file_path
-        .parent().map_or_else(|| vm.import_base.clone(), std::path::Path::to_path_buf);
+        .parent()
+        .map_or_else(|| vm.import_base.clone(), std::path::Path::to_path_buf);
     let exports = run_module_source(
         vm,
         &source,

@@ -31,7 +31,10 @@ pub fn install_globals(vm: &mut Vm) {
         ("__ast_macro_call__", builtin_ast_macro_call),
         ("__ast_vec_push__", builtin_ast_vec_push),
         ("__ast_vec_extend__", builtin_ast_vec_extend),
-        ("__register_dispatch_handler__", builtin_register_dispatch_handler),
+        (
+            "__register_dispatch_handler__",
+            builtin_register_dispatch_handler,
+        ),
         ("__ensure_dispatch__", builtin_ensure_dispatch),
         ("convert", builtin_convert),
         ("__make_closure__", builtin_make_closure),
@@ -74,7 +77,9 @@ fn builtin_print(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn builtin_len(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("len requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "len requires 1 argument",
+        ));
     }
     if let Some(r) = vm.try_call_magic(&args[0], "__len__", vec![]) {
         return r;
@@ -103,7 +108,9 @@ fn builtin_len(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn builtin_str(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("str requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "str requires 1 argument",
+        ));
     }
     let v = &args[0];
     if let Some(r) = vm.try_call_magic(v, "__str__", vec![]) {
@@ -125,7 +132,9 @@ fn builtin_str(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn builtin_eval(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("eval requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "eval requires 1 argument",
+        ));
     }
     let ast = runtime_ast::value_as_ast(&args[0])?;
     runtime_ast::eval_ast_value(vm, &ast)
@@ -133,7 +142,9 @@ fn builtin_eval(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn builtin_quote(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 3 {
-        return Err(crate::error::RuntimeError::type_err("quote requires 3 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "quote requires 3 arguments",
+        ));
     }
     let Value::List(hyg) = &args[0] else {
         return Err(crate::error::RuntimeError::type_err(
@@ -163,10 +174,7 @@ fn builtin_quote(vm: &mut Vm, args: &[Value]) -> Result<Value> {
         let bind_expr = runtime_ast::value_as_ast(elem)?;
         let name = runtime_ast::binding_var_name_for_quote(&bind_expr)?;
         let bound = runtime_ast::capture_quote_binding_value(vm, &bind_expr)?;
-        captured.push((
-            name,
-            runtime_ast::value_to_quote_binding_ast(&bound)?,
-        ));
+        captured.push((name, runtime_ast::value_to_quote_binding_ast(&bound)?));
     }
 
     Ok(runtime_ast::quote_ast(hygienic, captured, body).into_value())
@@ -235,7 +243,9 @@ fn builtin_ensure_dispatch(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn builtin_convert(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("convert requires 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "convert requires 2 arguments",
+        ));
     }
     vm.convert_type(args[0].clone(), args[1].clone())
 }
@@ -279,11 +289,7 @@ fn builtin_with_exit(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let (exc_type, exc_val, exc_tb) = if args.len() == 2 && !matches!(args[1], Value::None) {
         let exc = &args[1];
         let tb = traceback::get_exception_traceback(exc).unwrap_or(Value::None);
-        (
-            Value::Text(exc.type_name_string()),
-            exc.clone(),
-            tb,
-        )
+        (Value::Text(exc.type_name_string()), exc.clone(), tb)
     } else {
         (Value::None, Value::None, Value::None)
     };
@@ -299,7 +305,9 @@ fn builtin_with_exit(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn builtin_is_a(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("is_a requires 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "is_a requires 2 arguments",
+        ));
     }
     let ok = match &args[1] {
         Value::TypeRef(s) | Value::Text(s) => types::instance_is_a(vm, &args[0], s),
@@ -318,7 +326,9 @@ fn builtin_is_a(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn builtin_hash(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("hash requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "hash requires 1 argument",
+        ));
     }
     let h = crate::value::hash_value(&args[0])?;
     Ok(Value::Num(Num::Small(h)))
@@ -326,7 +336,9 @@ fn builtin_hash(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn builtin_copy(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("copy requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "copy requires 1 argument",
+        ));
     }
     Ok(match &args[0] {
         Value::List(l) => Value::List(Shared::new(l.borrow().clone())),
@@ -338,7 +350,9 @@ fn builtin_copy(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn builtin_deepcopy(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("deepcopy requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "deepcopy requires 1 argument",
+        ));
     }
     let mut memo = HashMap::new();
     deep_copy_value(&args[0], &mut memo)
@@ -446,7 +460,9 @@ fn cycle_key(v: &Value) -> Option<usize> {
 
 fn builtin_id(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("id requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "id requires 1 argument",
+        ));
     }
     let ptr = match &args[0] {
         Value::List(r) => r.as_ptr() as usize,
@@ -463,17 +479,23 @@ fn builtin_id(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn builtin_iter(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("iter requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "iter requires 1 argument",
+        ));
     }
     Ok(Value::Iterator(vm.to_iterator_shared(&args[0])?))
 }
 
 fn builtin_next(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("next requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "next requires 1 argument",
+        ));
     }
     let state = vm.to_iterator_shared(&args[0])?;
-    if let Some(v) = vm.advance_iterator(&state)? { Ok(v) } else {
+    if let Some(v) = vm.advance_iterator(&state)? {
+        Ok(v)
+    } else {
         let exc = crate::exceptions::make_exception(vm, "StopIteration", "iterator exhausted")?;
         vm.throw_value(exc)?;
         Ok(Value::None)
@@ -505,7 +527,9 @@ pub(crate) fn read_line_with_prompt(prompt: &str) -> Result<Value> {
 
 fn builtin_int(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("int requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "int requires 1 argument",
+        ));
     }
     match &args[0] {
         Value::Num(n) => {
@@ -555,29 +579,43 @@ fn builtin_dict_ctor(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn builtin_rational(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("rational requires 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "rational requires 2 arguments",
+        ));
     }
     let numer = match &args[0] {
         Value::Num(Num::Small(n)) => BigInt::from(*n),
         Value::Num(Num::Int(n)) => n.as_ref().clone(),
-        _ => return Err(crate::error::RuntimeError::type_err("rational numerator must be int")),
+        _ => {
+            return Err(crate::error::RuntimeError::type_err(
+                "rational numerator must be int",
+            ))
+        }
     };
     let denom = match &args[1] {
         Value::Num(Num::Small(n)) => BigInt::from(*n),
         Value::Num(Num::Int(n)) => n.as_ref().clone(),
-        _ => return Err(crate::error::RuntimeError::type_err("rational denominator must be int")),
+        _ => {
+            return Err(crate::error::RuntimeError::type_err(
+                "rational denominator must be int",
+            ))
+        }
     };
     if denom.is_zero() {
-        return Err(crate::error::RuntimeError::msg("rational denominator is zero"));
+        return Err(crate::error::RuntimeError::msg(
+            "rational denominator is zero",
+        ));
     }
-    Ok(Value::Num(Num::from_rational(num_rational::BigRational::new(
-        numer, denom,
-    ))))
+    Ok(Value::Num(Num::from_rational(
+        num_rational::BigRational::new(numer, denom),
+    )))
 }
 
 fn builtin_floatstring(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("floatstring requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "floatstring requires 1 argument",
+        ));
     }
     match &args[0] {
         Value::Num(n) => {
@@ -615,11 +653,9 @@ pub(crate) fn call_exit(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         0
     } else {
         match &args[0] {
-            Value::Num(Num::Small(n)) => {
-                i32::try_from(*n).map_err(|_| {
-                    crate::error::RuntimeError::value_err("exit code out of range for i32")
-                })?
-            }
+            Value::Num(Num::Small(n)) => i32::try_from(*n).map_err(|_| {
+                crate::error::RuntimeError::value_err("exit code out of range for i32")
+            })?,
             Value::Num(Num::Int(n)) => n.as_ref().try_into().map_err(|_| {
                 crate::error::RuntimeError::value_err("exit code out of range for i32")
             })?,
@@ -660,7 +696,9 @@ fn builtin_help(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn builtin_repr(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("repr requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "repr requires 1 argument",
+        ));
     }
     Ok(Value::Text(args[0].display_string()))
 }
@@ -711,16 +749,14 @@ fn builtin_make_genexpr(vm: &mut Vm, args: &[Value]) -> Result<Value> {
             ))
         }
     };
-    Ok(Value::Iterator(Shared::new(
-        crate::value::IteratorState {
-            kind: crate::value::IteratorKind::GenExpr {
-                source,
-                arity,
-                elem,
-                guards,
-            },
+    Ok(Value::Iterator(Shared::new(crate::value::IteratorState {
+        kind: crate::value::IteratorKind::GenExpr {
+            source,
+            arity,
+            elem,
+            guards,
         },
-    )))
+    })))
 }
 
 fn builtin_attach_defaults(_vm: &mut Vm, args: &[Value]) -> Result<Value> {

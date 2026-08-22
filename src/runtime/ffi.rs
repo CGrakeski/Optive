@@ -49,7 +49,10 @@ fn env_truthy(name: &str) -> bool {
     match std::env::var(name) {
         Ok(s) => {
             let s = s.trim();
-            !(s.is_empty() || s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("no"))
+            !(s.is_empty()
+                || s == "0"
+                || s.eq_ignore_ascii_case("false")
+                || s.eq_ignore_ascii_case("no"))
         }
         Err(_) => false,
     }
@@ -200,9 +203,8 @@ impl AbiType {
     }
 
     pub fn from_type_name(name: &str) -> Result<Self> {
-        crate::c_types::abi_from_type_name(name).ok_or_else(|| {
-            RuntimeError::type_err(format!("unsupported C ABI type: {name}"))
-        })
+        crate::c_types::abi_from_type_name(name)
+            .ok_or_else(|| RuntimeError::type_err(format!("unsupported C ABI type: {name}")))
     }
 
     fn from_c_layout(name: &str, layout: &crate::ffi_extra::CStructLayout) -> Self {
@@ -275,9 +277,8 @@ fn type_annotation_name(vm: &Vm, ty: &Expr) -> Result<String> {
 
 pub fn load_library(vm: &mut Vm, path: &str) -> Result<Value> {
     vm.caps.check_ffi("frompath")?;
-    let lib = unsafe { Library::new(path) }.map_err(|e| {
-        RuntimeError::msg(format!("failed to load dynamic library '{path}': {e}"))
-    })?;
+    let lib = unsafe { Library::new(path) }
+        .map_err(|e| RuntimeError::msg(format!("failed to load dynamic library '{path}': {e}")))?;
     Ok(Value::DllHandle(Arc::new(DllHandle {
         path: path.to_string(),
         lib: Arc::new(lib),
@@ -316,7 +317,8 @@ pub fn builtin_extern(vm: &mut Vm, args: &[Value]) -> Result<Value> {
         match &args[1] {
             Value::Text(s) => {
                 // 二义：可能是 symbol 或 abi。若只有 2 参且像 abi 名，当作 abi。
-                if args.len() == 2 && matches!(s.as_str(), "c" | "cdecl" | "stdcall" | "winapi" | "default")
+                if args.len() == 2
+                    && matches!(s.as_str(), "c" | "cdecl" | "stdcall" | "winapi" | "default")
                 {
                     conv = parse_call_conv(s)?;
                 } else {
@@ -372,7 +374,9 @@ fn bind_extern_function(
     name_buf.push(0);
     let code_ptr = {
         let sym = unsafe {
-            handle.lib.get::<unsafe extern "C" fn()>(name_buf.as_slice())
+            handle
+                .lib
+                .get::<unsafe extern "C" fn()>(name_buf.as_slice())
         }
         .map_err(|e| {
             RuntimeError::msg(format!(
@@ -551,8 +555,7 @@ fn bind_extern_function(
     });
 
     Ok(Value::Builtin(crate::value::BuiltinObject::new(
-        "extern",
-        wrapper,
+        "extern", wrapper,
     )))
 }
 
@@ -642,8 +645,14 @@ pub(crate) enum ArgStorage {
     F64(f64),
     Ptr(usize),
     /// 缓冲 + 稳定指针槽（`as_arg` 取 `ptr`）。
-    OwnedCString { buf: Vec<u8>, ptr: usize },
-    OwnedWString { buf: Vec<u16>, ptr: usize },
+    OwnedCString {
+        buf: Vec<u8>,
+        ptr: usize,
+    },
+    OwnedWString {
+        buf: Vec<u16>,
+        ptr: usize,
+    },
     CStruct(Vec<u8>),
 }
 
@@ -683,16 +692,30 @@ fn value_to_storage(v: &Value, abi: &AbiType) -> Result<ArgStorage> {
     match abi {
         AbiType::Void => Err(RuntimeError::type_err("void cannot be a parameter")),
         AbiType::Bool => Ok(ArgStorage::I8(i8::from(v.is_truthy()))),
-        AbiType::I8 => Ok(ArgStorage::I8(narrow_i64(v, i64::from(i8::MIN), i64::from(i8::MAX), "i8")? as i8)),
-        AbiType::U8 => Ok(ArgStorage::U8(narrow_i64(v, 0, i64::from(u8::MAX), "u8")? as u8)),
+        AbiType::I8 => {
+            Ok(ArgStorage::I8(
+                narrow_i64(v, i64::from(i8::MIN), i64::from(i8::MAX), "i8")? as i8,
+            ))
+        }
+        AbiType::U8 => Ok(ArgStorage::U8(
+            narrow_i64(v, 0, i64::from(u8::MAX), "u8")? as u8
+        )),
         AbiType::I16 => {
-            Ok(ArgStorage::I16(narrow_i64(v, i64::from(i16::MIN), i64::from(i16::MAX), "i16")? as i16))
+            Ok(ArgStorage::I16(
+                narrow_i64(v, i64::from(i16::MIN), i64::from(i16::MAX), "i16")? as i16,
+            ))
         }
-        AbiType::U16 => Ok(ArgStorage::U16(narrow_i64(v, 0, i64::from(u16::MAX), "u16")? as u16)),
+        AbiType::U16 => Ok(ArgStorage::U16(
+            narrow_i64(v, 0, i64::from(u16::MAX), "u16")? as u16,
+        )),
         AbiType::I32 => {
-            Ok(ArgStorage::I32(narrow_i64(v, i64::from(i32::MIN), i64::from(i32::MAX), "i32")? as i32))
+            Ok(ArgStorage::I32(
+                narrow_i64(v, i64::from(i32::MIN), i64::from(i32::MAX), "i32")? as i32,
+            ))
         }
-        AbiType::U32 => Ok(ArgStorage::U32(narrow_i64(v, 0, i64::from(u32::MAX), "u32")? as u32)),
+        AbiType::U32 => Ok(ArgStorage::U32(
+            narrow_i64(v, 0, i64::from(u32::MAX), "u32")? as u32,
+        )),
         AbiType::I64 => Ok(ArgStorage::I64(as_i64(v)?)),
         AbiType::U64 => Ok(ArgStorage::U64(as_u64(v)?)),
         AbiType::Isize => {
@@ -784,12 +807,7 @@ pub(crate) enum RetStorage {
     CStruct(Vec<u8>),
 }
 
-unsafe fn call_cif(
-    cif: &Cif,
-    code: CodePtr,
-    args: &[Arg],
-    ret: &AbiType,
-) -> Result<RetStorage> {
+unsafe fn call_cif(cif: &Cif, code: CodePtr, args: &[Arg], ret: &AbiType) -> Result<RetStorage> {
     Ok(match ret {
         AbiType::Void => {
             cif.call::<()>(code, args);
@@ -845,10 +863,9 @@ fn abi_to_value(vm: &Vm, ret: RetStorage, abi: &AbiType) -> Result<Value> {
         (RetStorage::I64(v), AbiType::Isize) => Value::Sized(SizedNum::Isize(v as isize)),
         (RetStorage::I64(v), _) => Value::Sized(SizedNum::I64(v)),
         (RetStorage::U64(v), AbiType::Usize) => Value::Sized(SizedNum::Usize(v as usize)),
-        (
-            RetStorage::U64(v),
-            AbiType::Pointer | AbiType::CharPtr | AbiType::WCharPtr,
-        ) => Value::Ptr(v as usize),
+        (RetStorage::U64(v), AbiType::Pointer | AbiType::CharPtr | AbiType::WCharPtr) => {
+            Value::Ptr(v as usize)
+        }
         (RetStorage::U64(v), _) => Value::Sized(SizedNum::U64(v)),
         (RetStorage::F32(v), _) => Value::Sized(SizedNum::F32(v)),
         (RetStorage::F64(v), _) => Value::Sized(SizedNum::F64(v)),
@@ -867,11 +884,14 @@ fn abi_to_value(vm: &Vm, ret: RetStorage, abi: &AbiType) -> Result<Value> {
 fn as_i64(v: &Value) -> Result<i64> {
     match v {
         Value::Sized(s) => s.to_i64().ok_or_else(|| {
-            RuntimeError::type_err(format!("cannot pass {} as integer ABI value", s.type_name()))
+            RuntimeError::type_err(format!(
+                "cannot pass {} as integer ABI value",
+                s.type_name()
+            ))
         }),
-        Value::Num(n) => n
-            .to_i64()
-            .ok_or_else(|| RuntimeError::type_err("cannot pass non-integer num as integer ABI value")),
+        Value::Num(n) => n.to_i64().ok_or_else(|| {
+            RuntimeError::type_err("cannot pass non-integer num as integer ABI value")
+        }),
         Value::Bool(b) => Ok(i64::from(*b)),
         Value::Ptr(p) => Ok(*p as i64),
         other => Err(RuntimeError::type_err(format!(
@@ -930,12 +950,9 @@ fn eval_wrapper_expr(vm: &mut Vm, expr: &crate::ast::Expr, raw: Value) -> Result
         ExprKind::Member { object, field } => {
             let base = eval_wrapper_expr(vm, object, raw)?;
             match base {
-                Value::Module(m) => m
-                    .borrow()
-                    .get_attr(field)
-                    .ok_or_else(|| {
-                        RuntimeError::attr_err(format!("module has no export '{field}'"))
-                    }),
+                Value::Module(m) => m.borrow().get_attr(field).ok_or_else(|| {
+                    RuntimeError::attr_err(format!("module has no export '{field}'"))
+                }),
                 other => vm.get_attr_value(&other, field),
             }
         }

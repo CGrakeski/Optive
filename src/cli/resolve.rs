@@ -9,9 +9,7 @@ use super::cache::ProjectCache;
 use super::git_ops;
 use super::home;
 use super::lock::{self, LockEdge, LockFile, ROOT_PARENT};
-use super::manifest::{
-    read_deps_if_exists, Dependency, Project, RevSpec,
-};
+use super::manifest::{read_deps_if_exists, Dependency, Project, RevSpec};
 use super::registry;
 use super::store::{self, Store};
 
@@ -162,12 +160,7 @@ pub fn ensure_graph(
 
     while let Some((parent, name, dep)) = queue.pop_front() {
         let dep = bind_index_source(&name, dep)?;
-        let effective_rev = resolve_effective_rev(
-            &dep,
-            force_fetch_tips,
-            &cache,
-            opts.mode,
-        )?;
+        let effective_rev = resolve_effective_rev(&dep, force_fetch_tips, &cache, opts.mode)?;
 
         let id = store::content_id(&dep.git, &effective_rev);
         let key = (parent.clone(), name.clone());
@@ -195,12 +188,8 @@ pub fn ensure_graph(
                 }
             }
             local_name_ids.insert(name.clone(), id.clone());
-            let (got_id, path, fresh) = store::ensure_local_pack(
-                &project.deps_dir(),
-                &name,
-                &dep.git,
-                &effective_rev,
-            )?;
+            let (got_id, path, fresh) =
+                store::ensure_local_pack(&project.deps_dir(), &name, &dep.git, &effective_rev)?;
             debug_assert_eq!(got_id, id);
             if fresh {
                 report.installed.push(name.clone());
@@ -225,12 +214,7 @@ pub fn ensure_graph(
         if !dry {
             // 仅 tip/branch 写入 tip 缓存；tag/commit pin 不得污染 tip 槽。
             if matches!(dep.rev, RevSpec::Branch(_) | RevSpec::None) {
-                cache.put(
-                    &dep.git,
-                    dep.rev.branch_name(),
-                    &effective_rev,
-                    Some(&id),
-                );
+                cache.put(&dep.git, dep.rev.branch_name(), &effective_rev, Some(&id));
             }
         }
 
@@ -368,12 +352,7 @@ fn ensure_from_lock(
         };
         // 仅 tip/branch 写入 tip 缓存；tag/commit pin 不得污染 tip 槽。
         if !edge.pinned && edge.tag.is_none() {
-            cache.put(
-                &edge.git,
-                edge.branch.as_deref(),
-                &edge.rev,
-                Some(&edge.id),
-            );
+            cache.put(&edge.git, edge.branch.as_deref(), &edge.rev, Some(&edge.id));
         }
         dep_map.insert(
             (edge.parent.clone(), edge.name.clone()),
@@ -484,12 +463,7 @@ fn materialize_lock_subtree(
         };
 
         if !dry && !edge.pinned && edge.tag.is_none() {
-            cache.put(
-                &edge.git,
-                edge.branch.as_deref(),
-                &edge.rev,
-                Some(&edge.id),
-            );
+            cache.put(&edge.git, edge.branch.as_deref(), &edge.rev, Some(&edge.id));
         }
         dep_map.insert(
             (edge.parent.clone(), edge.name.clone()),
@@ -586,15 +560,14 @@ pub fn dry_run_summary(
         if e.parent != ROOT_PARENT && !verbose {
             continue;
         }
-        let prev = old_root.get(&e.name).map_or("(none)", std::string::String::as_str);
+        let prev = old_root
+            .get(&e.name)
+            .map_or("(none)", std::string::String::as_str);
         if e.parent == ROOT_PARENT {
             if prev == e.effective_rev.as_str() {
                 lines.push(format!("{}: {} (unchanged)", e.name, e.effective_rev));
             } else {
-                lines.push(format!(
-                    "{}: {prev} -> {}",
-                    e.name, e.effective_rev
-                ));
+                lines.push(format!("{}: {prev} -> {}", e.name, e.effective_rev));
             }
         } else if verbose {
             lines.push(format!(

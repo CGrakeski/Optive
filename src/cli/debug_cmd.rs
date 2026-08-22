@@ -6,7 +6,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use optive::codegen::Generator;
-use optive::shared::Shared;
 use optive::debug::{
     self, debug_set, eval_in_paused_vm, format_location, format_source_window, list_fibers,
     list_locals, parse_break_spec, reason_label, stack_frames, DebugState, StepFocus, StepMode,
@@ -15,6 +14,7 @@ use optive::debug::{
 use optive::diagnostics;
 use optive::opcode::Instruction;
 use optive::parser::Parser;
+use optive::shared::Shared;
 use optive::value::Value;
 use optive::vm::{DepPackage, Vm};
 
@@ -34,14 +34,17 @@ pub fn cmd_debug(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn debug_project(path: Option<&Path>, caps: optive::caps::Capabilities) -> Result<(), Box<dyn std::error::Error>> {
+fn debug_project(
+    path: Option<&Path>,
+    caps: optive::caps::Capabilities,
+) -> Result<(), Box<dyn std::error::Error>> {
     let project = super::manifest::find_project(path)?;
     color::status_line(&format!("Debug project {}", project.root.display()));
     let ensured = super::deps::ensure_for_run(&project)?;
     std::env::set_current_dir(&project.root)?;
     let entry = project.entry_path()?;
-    let source = fs::read_to_string(&entry)
-        .map_err(|e| format!("cannot read {}: {e}", entry.display()))?;
+    let source =
+        fs::read_to_string(&entry).map_err(|e| format!("cannot read {}: {e}", entry.display()))?;
     let file = entry.to_string_lossy().to_string();
     let mut vm = Vm::new();
     vm.caps = caps;
@@ -49,9 +52,12 @@ fn debug_project(path: Option<&Path>, caps: optive::caps::Capabilities) -> Resul
     run_debug_session(&mut vm, &source, &file)
 }
 
-fn debug_script_file(path: &Path, caps: optive::caps::Capabilities) -> Result<(), Box<dyn std::error::Error>> {
-    let source = fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+fn debug_script_file(
+    path: &Path,
+    caps: optive::caps::Capabilities,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source =
+        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let file = path.to_string_lossy().to_string();
     let mut vm = Vm::new();
     vm.caps = caps;
@@ -88,9 +94,8 @@ fn run_debug_session(
             vm.import_base = parent.to_path_buf();
         }
     }
-    let program = Parser::parse(source).map_err(|e| {
-        diagnostics::format_parse_error(source, file, &e)
-    })?;
+    let program =
+        Parser::parse(source).map_err(|e| diagnostics::format_parse_error(source, file, &e))?;
     let mut compiled = Generator::new().compile(&program)?;
     diagnostics::attach_function_sources(&mut compiled, source, file);
     vm.load_program(compiled)?;
@@ -152,7 +157,6 @@ fn run_debug_session(
         }};
     }
 
-
     loop {
         if finished {
             if let Some(v) = &last_value {
@@ -203,16 +207,32 @@ fn run_debug_session(
 
             "n" | "next" => {
                 let depth = vm.debug_call_depth();
-                resume_step!(vm, state, StepMode::Over { max_depth: depth }, finished, last_value, {
-                    print_stop(vm, &state.borrow());
-                });
+                resume_step!(
+                    vm,
+                    state,
+                    StepMode::Over { max_depth: depth },
+                    finished,
+                    last_value,
+                    {
+                        print_stop(vm, &state.borrow());
+                    }
+                );
             }
 
             "finish" | "out" => {
                 let depth = vm.debug_call_depth();
-                resume_step!(vm, state, StepMode::Out { target_depth: depth }, finished, last_value, {
-                    print_stop(vm, &state.borrow());
-                });
+                resume_step!(
+                    vm,
+                    state,
+                    StepMode::Out {
+                        target_depth: depth
+                    },
+                    finished,
+                    last_value,
+                    {
+                        print_stop(vm, &state.borrow());
+                    }
+                );
             }
 
             "b" | "break" => {
@@ -242,9 +262,12 @@ fn run_debug_session(
                 } else {
                     let spec = rest.join(" ");
                     if let Some((file, line, cond, log)) = parse_break_spec(&spec) {
-                        state
-                            .borrow_mut()
-                            .add_line_breakpoint_ex(&file, line, cond.clone(), log.clone());
+                        state.borrow_mut().add_line_breakpoint_ex(
+                            &file,
+                            line,
+                            cond.clone(),
+                            log.clone(),
+                        );
                         let mut msg = if file.is_empty() {
                             format!("Breakpoint at line {line}")
                         } else {

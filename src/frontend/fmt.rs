@@ -8,7 +8,11 @@
 //! - 顶层声明之间固定 1 空行；块内不加空行
 //! - 注释以 `Stmt::Comment` 保留
 
-use crate::ast::{Program, LocatedStmt, Stmt, ProtocolMember, CatchPattern, DelTarget, Visibility, Expr, FuncParam, RET_WRAPPER_VAL, ModuleRef, DestructPattern, DestructElem, LValue, Pattern, PatternElem, ExprKind, FStringPart, ForItem, CallArg, UnaryOp, BinaryOp};
+use crate::ast::{
+    BinaryOp, CallArg, CatchPattern, DelTarget, DestructElem, DestructPattern, Expr, ExprKind,
+    FStringPart, ForItem, FuncParam, LValue, LocatedStmt, ModuleRef, Pattern, PatternElem, Program,
+    ProtocolMember, Stmt, UnaryOp, Visibility, RET_WRAPPER_VAL,
+};
 use crate::error::ParseError;
 use crate::parser::Parser;
 use crate::runtime_ast;
@@ -81,11 +85,17 @@ impl Formatter {
 
     fn emit_comment(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::Comment { is_block: false, text } => {
+            Stmt::Comment {
+                is_block: false,
+                text,
+            } => {
                 self.buf.push_str("//");
                 self.buf.push_str(text);
             }
-            Stmt::Comment { is_block: true, text } => {
+            Stmt::Comment {
+                is_block: true,
+                text,
+            } => {
                 self.buf.push_str("/*");
                 self.buf.push_str(text);
                 self.buf.push_str("*/");
@@ -173,7 +183,12 @@ impl Formatter {
                 self.buf.push_str(name);
                 self.emit_type_params(type_params);
                 self.emit_param_list(params, depth);
-                self.emit_return_sig(return_type.as_ref(), *return_strong, return_wrapper.as_ref(), depth);
+                self.emit_return_sig(
+                    return_type.as_ref(),
+                    *return_strong,
+                    return_wrapper.as_ref(),
+                    depth,
+                );
                 self.buf.push(' ');
                 self.emit_block(body, depth);
             }
@@ -504,7 +519,12 @@ impl Formatter {
                 if let Some(ps) = params {
                     self.emit_param_list(ps, depth);
                 }
-                self.emit_return_sig(return_type.as_ref(), *return_strong, return_wrapper.as_ref(), depth);
+                self.emit_return_sig(
+                    return_type.as_ref(),
+                    *return_strong,
+                    return_wrapper.as_ref(),
+                    depth,
+                );
                 if let Some(b) = body {
                     self.buf.push(' ');
                     self.emit_block(b, depth);
@@ -566,8 +586,7 @@ impl Formatter {
                             self.buf.push_str(if f.mutable { "var " } else { "let " });
                             self.buf.push_str(&f.name);
                             if let Some(t) = &f.type_expr {
-                                self.buf
-                                    .push_str(if f.type_strong { " :: " } else { ": " });
+                                self.buf.push_str(if f.type_strong { " :: " } else { ": " });
                                 self.emit_type(t);
                             }
                         }
@@ -673,8 +692,7 @@ impl Formatter {
         depth: usize,
     ) {
         if let Some(t) = return_type {
-            self.buf
-                .push_str(if return_strong { " :: " } else { ": " });
+            self.buf.push_str(if return_strong { " :: " } else { ": " });
             self.emit_type(t);
         }
         if let Some(w) = return_wrapper {
@@ -1021,7 +1039,11 @@ impl Formatter {
                 }
                 self.buf.push('"');
             }
-            ExprKind::ListComp { elem, items, guards } => {
+            ExprKind::ListComp {
+                elem,
+                items,
+                guards,
+            } => {
                 self.buf.push('[');
                 self.emit_expr_replacing(elem, depth, replace_var, with);
                 self.emit_comp_clauses(items, guards, depth, replace_var, with);
@@ -1040,13 +1062,21 @@ impl Formatter {
                 self.emit_comp_clauses(items, guards, depth, replace_var, with);
                 self.buf.push('}');
             }
-            ExprKind::SetComp { elem, items, guards } => {
+            ExprKind::SetComp {
+                elem,
+                items,
+                guards,
+            } => {
                 self.buf.push('{');
                 self.emit_expr_replacing(elem, depth, replace_var, with);
                 self.emit_comp_clauses(items, guards, depth, replace_var, with);
                 self.buf.push('}');
             }
-            ExprKind::GeneratorExp { elem, items, guards } => {
+            ExprKind::GeneratorExp {
+                elem,
+                items,
+                guards,
+            } => {
                 self.buf.push('(');
                 self.emit_expr_replacing(elem, depth, replace_var, with);
                 self.emit_comp_clauses(items, guards, depth, replace_var, with);

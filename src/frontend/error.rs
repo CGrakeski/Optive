@@ -106,23 +106,28 @@ impl ExceptionKind {
 
     #[must_use]
     pub fn from_type_name(name: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|k| k.type_name() == name)
+        Self::ALL.iter().copied().find(|k| k.type_name() == name)
     }
 }
 
 #[derive(Debug, Error, Clone)]
 pub enum LexError {
     #[error("lex error at {line}:{column}: {message}")]
-    Message { line: usize, column: usize, message: String },
+    Message {
+        line: usize,
+        column: usize,
+        message: String,
+    },
 }
 
 #[derive(Debug, Error, Clone)]
 pub enum ParseError {
     #[error("parse error at {line}:{column}: {message}")]
-    Message { line: usize, column: usize, message: String },
+    Message {
+        line: usize,
+        column: usize,
+        message: String,
+    },
 }
 
 #[derive(Debug, Error, Clone)]

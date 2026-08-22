@@ -191,12 +191,7 @@ text(a(1))
 fn generic_func_repl_return_type_param() {
     use optive::{run_source_in_vm, vm::Vm};
     let mut vm = Vm::new();
-    run_source_in_vm(
-        &mut vm,
-        "func a[T](b: T) { return T }",
-        "<repl>",
-    )
-    .expect("define");
+    run_source_in_vm(&mut vm, "func a[T](b: T) { return T }", "<repl>").expect("define");
     let v = run_source_in_vm(&mut vm, "a(1)", "<repl>").expect("infer");
     assert_eq!(v.display_string(), "num");
     let v = run_source_in_vm(&mut vm, "a[num](1)", "<repl>").expect("explicit");

@@ -237,11 +237,7 @@ define_text_char_preds! {
     (text_is_space, "is_space", char::is_whitespace),
 }
 
-fn text_char_predicate(
-    name: &str,
-    args: &[Value],
-    pred: impl Fn(char) -> bool,
-) -> Result<Value> {
+fn text_char_predicate(name: &str, args: &[Value], pred: impl Fn(char) -> bool) -> Result<Value> {
     let s = expect_text(name, args, 0)?;
     Ok(Value::Bool(!s.is_empty() && s.chars().all(pred)))
 }
@@ -268,9 +264,10 @@ fn text_lines(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn text_ord(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let s = expect_text("ord", args, 0)?;
-    let ch = s.chars().next().ok_or_else(|| {
-        crate::error::RuntimeError::type_err("ord requires a non-empty text")
-    })?;
+    let ch = s
+        .chars()
+        .next()
+        .ok_or_else(|| crate::error::RuntimeError::type_err("ord requires a non-empty text"))?;
     Ok(Value::Num(Num::Small(i64::from(ch as u32))))
 }
 
@@ -291,9 +288,7 @@ fn text_chr(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn text_lstrip(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     Ok(Value::Text(
-        expect_text("lstrip", args, 0)?
-            .trim_start()
-            .to_string(),
+        expect_text("lstrip", args, 0)?.trim_start().to_string(),
     ))
 }
 
@@ -768,9 +763,9 @@ fn text_builder_new(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
                 "Builder.len requires 0 arguments",
             ));
         }
-        Ok(Value::Num(Num::Small(
-            buf_l.borrow().chars().count() as i64,
-        )))
+        Ok(Value::Num(
+            Num::Small(buf_l.borrow().chars().count() as i64),
+        ))
     });
 
     let buf_t = buf.clone();

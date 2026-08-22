@@ -31,7 +31,17 @@ enum Style {
 }
 
 const fn style_for(kind: TokenKind) -> Style {
-    use TokenKind::{KwLet, KwVar, KwConst, KwFunc, KwGen, KwFriend, KwDo, KwReturn, KwIf, KwElif, KwElse, KwAnd, KwOr, KwNot, KwLoop, KwWhile, KwBreak, KwContinue, KwImport, KwUse, KwAs, KwIntern, KwExport, KwWith, KwMake, KwFor, KwIn, KwIs, KwThen, KwHandle, KwGo, KwPar, KwSnap, KwAwait, KwSelect, KwYield, KwSuspend, KwMatch, KwCase, KwTry, KwCatch, KwThrow, KwDel, KwOutside, KwOverload, KwMacro, KwQuote, KwTyped, KwVariant, KwEnum, KwStruct, KwProtocol, ColonColon, NumLiteral, StringLiteral, FStringLiteral, BytesLiteral, LineComment, BlockComment, Plus, Minus, Star, StarStar, Slash, Percent, Ampersand, Caret, Tilde, Bang, EqEq, Ne, Lt, Gt, Le, Ge, LtLt, GtGt, Assign, Colon, ColonEq, Arrow, FatArrow, Pipe, Bar, Dot, Comma, Ellipsis, Placeholder};
+    use TokenKind::{
+        Ampersand, Arrow, Assign, Bang, Bar, BlockComment, BytesLiteral, Caret, Colon, ColonColon,
+        ColonEq, Comma, Dot, Ellipsis, EqEq, FStringLiteral, FatArrow, Ge, Gt, GtGt, KwAnd, KwAs,
+        KwAwait, KwBreak, KwCase, KwCatch, KwConst, KwContinue, KwDel, KwDo, KwElif, KwElse,
+        KwEnum, KwExport, KwFor, KwFriend, KwFunc, KwGen, KwGo, KwHandle, KwIf, KwImport, KwIn,
+        KwIntern, KwIs, KwLet, KwLoop, KwMacro, KwMake, KwMatch, KwNot, KwOr, KwOutside,
+        KwOverload, KwPar, KwProtocol, KwQuote, KwReturn, KwSelect, KwSnap, KwStruct, KwSuspend,
+        KwThen, KwThrow, KwTry, KwTyped, KwUse, KwVar, KwVariant, KwWhile, KwWith, KwYield, Le,
+        LineComment, Lt, LtLt, Minus, Ne, NumLiteral, Percent, Pipe, Placeholder, Plus, Slash,
+        Star, StarStar, StringLiteral, Tilde,
+    };
     match kind {
         KwLet | KwVar | KwConst | KwFunc | KwGen | KwFriend | KwDo | KwReturn | KwIf | KwElif
         | KwElse | KwAnd | KwOr | KwNot | KwLoop | KwWhile | KwBreak | KwContinue | KwImport
@@ -96,7 +106,9 @@ pub fn highlight_tive_line(line: &str) -> String {
         }
         let style = style_for(kind);
         let slice = &line[start..end];
-        if matches!(style, Style::None) { out.push_str(slice) } else {
+        if matches!(style, Style::None) {
+            out.push_str(slice)
+        } else {
             out.push_str(ansi_prefix(style));
             out.push_str(slice);
             out.push_str(RESET);

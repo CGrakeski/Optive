@@ -258,9 +258,7 @@ impl Project {
                 ));
             }
             // 纵深防御：能 canonicalize 时再确认未逃出包根（返回值仍用 join 路径，便于相对显示）。
-            if let (Ok(canon_root), Ok(canon)) =
-                (self.root.canonicalize(), p.canonicalize())
-            {
+            if let (Ok(canon_root), Ok(canon)) = (self.root.canonicalize(), p.canonicalize()) {
                 if !canon.starts_with(&canon_root) {
                     return Err(format!(
                         "entry escapes package root: {entry} (from {})",
@@ -300,18 +298,14 @@ impl Project {
 }
 
 /// 读取包内依赖表。清单不存在 → 空表；存在但无法解析 → 硬错误。
-pub fn read_deps_if_exists(
-    package_root: &Path,
-) -> Result<BTreeMap<String, Dependency>, String> {
+pub fn read_deps_if_exists(package_root: &Path) -> Result<BTreeMap<String, Dependency>, String> {
     for name in MANIFEST_NAMES {
         let p = package_root.join(name);
         if p.is_file() {
-            let text = fs::read_to_string(&p).map_err(|e| {
-                format!("cannot read {}: {e}", p.display())
-            })?;
-            let m: Manifest = toml::from_str(&text).map_err(|e| {
-                format!("invalid {}: {e}", p.display())
-            })?;
+            let text =
+                fs::read_to_string(&p).map_err(|e| format!("cannot read {}: {e}", p.display()))?;
+            let m: Manifest =
+                toml::from_str(&text).map_err(|e| format!("invalid {}: {e}", p.display()))?;
             return Ok(m.dependencies);
         }
     }
@@ -319,17 +313,12 @@ pub fn read_deps_if_exists(
 }
 
 /// 用 `toml_edit` 增量写入单个依赖（尽量保留其它注释/格式）。
-pub fn upsert_dependency(
-    manifest_path: &Path,
-    name: &str,
-    dep: &Dependency,
-) -> Result<(), String> {
-    let text = fs::read_to_string(manifest_path).map_err(|e| {
-        format!("cannot read {}: {e}", manifest_path.display())
-    })?;
-    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| {
-        format!("invalid {}: {e}", manifest_path.display())
-    })?;
+pub fn upsert_dependency(manifest_path: &Path, name: &str, dep: &Dependency) -> Result<(), String> {
+    let text = fs::read_to_string(manifest_path)
+        .map_err(|e| format!("cannot read {}: {e}", manifest_path.display()))?;
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .map_err(|e: toml_edit::TomlError| format!("invalid {}: {e}", manifest_path.display()))?;
     if doc.get("dependencies").is_none() {
         doc["dependencies"] = toml_edit::Item::Table(toml_edit::Table::new());
     }
@@ -337,40 +326,35 @@ pub fn upsert_dependency(
         .as_table_mut()
         .ok_or_else(|| format!("{}: [dependencies] is not a table", manifest_path.display()))?;
     deps.insert(name, dependency_to_item(dep));
-    fs::write(manifest_path, doc.to_string()).map_err(|e| {
-        format!("cannot write {}: {e}", manifest_path.display())
-    })?;
+    fs::write(manifest_path, doc.to_string())
+        .map_err(|e| format!("cannot write {}: {e}", manifest_path.display()))?;
     Ok(())
 }
 
 pub fn remove_dependency(manifest_path: &Path, name: &str) -> Result<bool, String> {
-    let text = fs::read_to_string(manifest_path).map_err(|e| {
-        format!("cannot read {}: {e}", manifest_path.display())
-    })?;
-    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| {
-        format!("invalid {}: {e}", manifest_path.display())
-    })?;
+    let text = fs::read_to_string(manifest_path)
+        .map_err(|e| format!("cannot read {}: {e}", manifest_path.display()))?;
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .map_err(|e: toml_edit::TomlError| format!("invalid {}: {e}", manifest_path.display()))?;
     let Some(deps) = doc.get_mut("dependencies").and_then(|i| i.as_table_mut()) else {
         return Ok(false);
     };
     let removed = deps.remove(name).is_some();
-    fs::write(manifest_path, doc.to_string()).map_err(|e| {
-        format!("cannot write {}: {e}", manifest_path.display())
-    })?;
+    fs::write(manifest_path, doc.to_string())
+        .map_err(|e| format!("cannot write {}: {e}", manifest_path.display()))?;
     Ok(removed)
 }
 
 pub fn set_track_latest(manifest_path: &Path, value: bool) -> Result<(), String> {
-    let text = fs::read_to_string(manifest_path).map_err(|e| {
-        format!("cannot read {}: {e}", manifest_path.display())
-    })?;
-    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| {
-        format!("invalid {}: {e}", manifest_path.display())
-    })?;
+    let text = fs::read_to_string(manifest_path)
+        .map_err(|e| format!("cannot read {}: {e}", manifest_path.display()))?;
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .map_err(|e: toml_edit::TomlError| format!("invalid {}: {e}", manifest_path.display()))?;
     doc["track_latest"] = toml_edit::value(value);
-    fs::write(manifest_path, doc.to_string()).map_err(|e| {
-        format!("cannot write {}: {e}", manifest_path.display())
-    })?;
+    fs::write(manifest_path, doc.to_string())
+        .map_err(|e| format!("cannot write {}: {e}", manifest_path.display()))?;
     Ok(())
 }
 
@@ -413,10 +397,7 @@ pub fn find_project(start: Option<&Path>) -> Result<Project, String> {
     let start = match start {
         Some(p) => {
             if p.is_file() {
-                let name = p
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("");
+                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
                 if name == "Optive.toml" {
                     return load_project(p);
                 }
@@ -446,13 +427,11 @@ pub fn find_project(start: Option<&Path>) -> Result<Project, String> {
 }
 
 pub fn load_project(manifest_path: &Path) -> Result<Project, String> {
-    let text = fs::read_to_string(manifest_path).map_err(|e| {
-        format!("cannot read {}: {e}", manifest_path.display())
-    })?;
+    let text = fs::read_to_string(manifest_path)
+        .map_err(|e| format!("cannot read {}: {e}", manifest_path.display()))?;
     reject_forbidden_package_version(&text, manifest_path)?;
-    let manifest: Manifest = toml::from_str(&text).map_err(|e| {
-        format!("invalid {}: {e}", manifest_path.display())
-    })?;
+    let manifest: Manifest =
+        toml::from_str(&text).map_err(|e| format!("invalid {}: {e}", manifest_path.display()))?;
     if manifest.package.name.trim().is_empty() {
         return Err(format!(
             "{}: [package].name must not be empty",
@@ -460,7 +439,8 @@ pub fn load_project(manifest_path: &Path) -> Result<Project, String> {
         ));
     }
     let root = manifest_path
-        .parent().map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf);
+        .parent()
+        .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf);
     let root = root.canonicalize().unwrap_or(root);
     let root = strip_windows_verbatim(root);
     Ok(Project {
@@ -472,9 +452,9 @@ pub fn load_project(manifest_path: &Path) -> Result<Project, String> {
 
 /// `[package].version` 已废除：存在即失败（tag-only，无兼容期）。
 fn reject_forbidden_package_version(text: &str, manifest_path: &Path) -> Result<(), String> {
-    let val: toml::Value = text.parse().map_err(|e| {
-        format!("invalid {}: {e}", manifest_path.display())
-    })?;
+    let val: toml::Value = text
+        .parse()
+        .map_err(|e| format!("invalid {}: {e}", manifest_path.display()))?;
     if val
         .get("package")
         .and_then(|p| p.as_table())
@@ -568,10 +548,7 @@ git_version = { git = "https://github.com/example/gv.git", version = "^0.1.0" }
 
     #[test]
     fn package_version_field_is_rejected() {
-        let dir = std::env::temp_dir().join(format!(
-            "optive_forbid_ver_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("optive_forbid_ver_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("Optive.toml");

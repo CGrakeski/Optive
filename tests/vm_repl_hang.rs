@@ -40,11 +40,7 @@ fn repl_error_shows_call_stack_and_context() {
     );
     let lines: Vec<&str> = msg.lines().collect();
     let caret = lines.iter().rev().find(|l| l.contains('^')).unwrap();
-    let src = lines
-        .iter()
-        .rev()
-        .find(|l| l.contains("func b()"))
-        .unwrap();
+    let src = lines.iter().rev().find(|l| l.contains("func b()")).unwrap();
     // `c` in `func b() { c }` is column 12 (1-based); traceback indents with 4 spaces.
     const C_COLUMN: usize = 12;
     assert_eq!(

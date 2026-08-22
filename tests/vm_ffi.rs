@@ -546,10 +546,7 @@ C.errno()
 "
     );
     let v = value(&src);
-    assert!(
-        matches!(v, Value::Num(_)),
-        "expected num errno, got {v:?}"
-    );
+    assert!(matches!(v, Value::Num(_)), "expected num errno, got {v:?}");
 }
 
 #[test]

@@ -1,6 +1,5 @@
 //! 内建异常类型。
 
-
 use crate::error::ExceptionKind;
 use crate::value::{FieldTypeInfo, StructDef, Value};
 use crate::vm::Vm;
@@ -53,9 +52,7 @@ pub fn struct_is_a(vm: &Vm, val: &Value, type_name: &str) -> bool {
 
 /// 返回直接基类类型名（若有）。
 pub fn direct_base(vm: &Vm, type_name: &str) -> Option<String> {
-    vm.struct_defs
-        .get(type_name)
-        .and_then(|d| d.base.clone())
+    vm.struct_defs.get(type_name).and_then(|d| d.base.clone())
 }
 
 /// 从 `type_name` 到根的继承链（含自身）。
@@ -85,22 +82,26 @@ pub fn kind_of_value(val: &Value) -> Option<ExceptionKind> {
 }
 
 /// 构造异常实例（message 字段；traceback 在 throw 时填入）。
-pub fn make_exception(vm: &Vm, type_name: &str, message: impl Into<String>) -> crate::Result<Value> {
-    let def = vm
-        .struct_defs
-        .get(type_name)
-        .ok_or_else(|| crate::error::RuntimeError::msg(format!("unknown exception: {type_name}")))?;
+pub fn make_exception(
+    vm: &Vm,
+    type_name: &str,
+    message: impl Into<String>,
+) -> crate::Result<Value> {
+    let def = vm.struct_defs.get(type_name).ok_or_else(|| {
+        crate::error::RuntimeError::msg(format!("unknown exception: {type_name}"))
+    })?;
     Ok(Value::Struct(Arc::new(crate::value::StructInstance {
         def,
-        slots: crate::shared::SyncCell::new(vec![
-            Value::Text(message.into()),
-            Value::None,
-        ]),
+        slots: crate::shared::SyncCell::new(vec![Value::Text(message.into()), Value::None]),
         generic_args: Vec::new(),
     })))
 }
 
-pub fn make_exception_kind(vm: &Vm, kind: ExceptionKind, message: impl Into<String>) -> crate::Result<Value> {
+pub fn make_exception_kind(
+    vm: &Vm,
+    kind: ExceptionKind,
+    message: impl Into<String>,
+) -> crate::Result<Value> {
     make_exception(vm, kind.type_name(), message)
 }
 

@@ -44,7 +44,7 @@ impl Instruction {
     #[inline]
     #[must_use]
     pub const fn stack_effect(&self) -> StackEffect {
-        use StackEffect::{Adjust, PopTry, Exit, Jump, CondJump, LoopCountdown, EnterTry, EndTry};
+        use StackEffect::{Adjust, CondJump, EndTry, EnterTry, Exit, Jump, LoopCountdown, PopTry};
         match self {
             Self::Push(_) | Self::PushSmall(_) => Adjust {
                 pop: 0,
@@ -127,6 +127,11 @@ impl Instruction {
             | Self::LoadFast(_)
             | Self::LoadFastSubImm { .. }
             | Self::LoadFastLeImm { .. }
+            | Self::LoadFastLtImm { .. }
+            | Self::LoadFastGtImm { .. }
+            | Self::LoadFastEqImm { .. }
+            | Self::LoadFastSqrGt { .. }
+            | Self::LoadFastModEq0 { .. }
             | Self::FindMod(_)
             | Self::FindModFile(_)
             | Self::PushExc
@@ -150,6 +155,7 @@ impl Instruction {
             Self::EnterScope
             | Self::LeaveScope
             | Self::Label(_)
+            | Self::LoadFastAddImmStore { .. }
             | Self::TypeCheck
             | Self::ResolveFuncTypes
             | Self::RegisterExport(_)
@@ -165,9 +171,7 @@ impl Instruction {
                 alt_push: None,
             },
             Self::PopTry => PopTry,
-            Self::Call { argc }
-            | Self::CallSelf { argc }
-            | Self::MacroCall { argc } => Adjust {
+            Self::Call { argc } | Self::CallSelf { argc } | Self::MacroCall { argc } => Adjust {
                 pop: (*argc as u16).saturating_add(1),
                 push: 1,
                 alt_push: None,
@@ -291,10 +295,7 @@ impl Instruction {
             Self::Throw => Exit { pop: 1 },
             Self::Rethrow => Exit { pop: 0 },
             Self::Goto(t) => Jump { target: *t },
-            Self::GotoIf(t) | Self::GotoIfNot(t) => CondJump {
-                pop: 1,
-                target: *t,
-            },
+            Self::GotoIf(t) | Self::GotoIfNot(t) => CondJump { pop: 1, target: *t },
             Self::LoopCountdown(t) => LoopCountdown { target: *t },
             Self::EnterTry {
                 catch_label,
@@ -370,18 +371,14 @@ pub fn verify_stack_balance(code: &[Instruction]) -> Result<(), String> {
                 match next_ins {
                     Instruction::GotoIfNot(target) => {
                         if d_lo < 1 || d_hi < 1 {
-                            return Err(format!(
-                                "stack underflow before GotoIfNot after pc={pc}"
-                            ));
+                            return Err(format!("stack underflow before GotoIfNot after pc={pc}"));
                         }
                         work.push((pc + 2, d_hi - 1, try_stack.clone()));
                         work.push((*target, d_lo - 1, try_stack));
                     }
                     Instruction::GotoIf(target) => {
                         if d_lo < 1 || d_hi < 1 {
-                            return Err(format!(
-                                "stack underflow before GotoIf after pc={pc}"
-                            ));
+                            return Err(format!("stack underflow before GotoIf after pc={pc}"));
                         }
                         work.push((pc + 2, d_lo - 1, try_stack.clone()));
                         work.push((*target, d_hi - 1, try_stack));
@@ -404,11 +401,7 @@ pub fn verify_stack_balance(code: &[Instruction]) -> Result<(), String> {
                         code[pc]
                     ));
                 }
-                work.push((
-                    pc + 1,
-                    depth - u32::from(pop) + u32::from(push),
-                    try_stack,
-                ));
+                work.push((pc + 1, depth - u32::from(pop) + u32::from(push), try_stack));
             }
             StackEffect::Jump { target } => {
                 work.push((target, depth, try_stack));

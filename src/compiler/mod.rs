@@ -1,5 +1,6 @@
 //! 字节码生成与编译期变换。
 
+pub mod bc_cache;
 pub mod codegen;
 pub mod free_vars;
 pub mod hot_code;

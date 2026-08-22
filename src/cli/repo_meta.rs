@@ -108,7 +108,7 @@ pub fn tag_names_exist(root: &Path, names: &[&str]) -> Result<Vec<String>, Box<d
             continue;
         };
         let tag = tag.strip_suffix("^{}").unwrap_or(tag);
-        if names.iter().any(|n| *n == tag) {
+        if names.contains(&tag) {
             found.push(tag.to_string());
         }
     }
@@ -223,7 +223,5 @@ pub fn package_toml_has_legacy_version(root: &Path) -> bool {
     let Ok(val) = text.parse::<toml::Value>() else {
         return false;
     };
-    val.get("package")
-        .and_then(|p| p.get("version"))
-        .is_some()
+    val.get("package").and_then(|p| p.get("version")).is_some()
 }

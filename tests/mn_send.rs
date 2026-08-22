@@ -6,9 +6,9 @@
     clippy::unimplemented,
     clippy::dbg_macro
 )]
-use optive::value::Value;
 use optive::shared::Shared;
 use optive::value::TaskInner;
+use optive::value::Value;
 
 const fn assert_send<T: Send>() {}
 const fn assert_sync<T: Sync>() {}

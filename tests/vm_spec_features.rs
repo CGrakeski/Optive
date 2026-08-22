@@ -18,10 +18,7 @@ fn list_comp_simple() {
 
 #[test]
 fn list_comp_with_guard() {
-    assert_list(
-        "[x * x for (x in [1, 2, 3]) if (x > 1)]",
-        "[4, 9]",
-    );
+    assert_list("[x * x for (x in [1, 2, 3]) if (x > 1)]", "[4, 9]");
 }
 
 #[test]

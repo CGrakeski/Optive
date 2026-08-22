@@ -193,7 +193,11 @@ fn collect_stmt_scoped(stmt: &Stmt, locals: &mut HashMap<String, ()>, free: &mut
             }
         }
         Stmt::Del(target) => collect_del(target, locals, free),
-        Stmt::With { alias, context, body } => {
+        Stmt::With {
+            alias,
+            context,
+            body,
+        } => {
             collect_expr(context, locals, free);
             let mut scoped = locals.clone();
             if let Some(a) = alias {
@@ -287,7 +291,11 @@ fn collect_lvalue(lv: &LValue, locals: &HashMap<String, ()>, free: &mut HashSet<
 fn collect_expr(expr: &Expr, locals: &HashMap<String, ()>, free: &mut HashSet<String>) {
     match &expr.kind {
         ExprKind::Var(n) => note_var(n, locals, free),
-        ExprKind::Number(_) | ExprKind::String(_) | ExprKind::Bool(_) | ExprKind::None | ExprKind::Placeholder => {}
+        ExprKind::Number(_)
+        | ExprKind::String(_)
+        | ExprKind::Bool(_)
+        | ExprKind::None
+        | ExprKind::Placeholder => {}
         ExprKind::FString(parts) => {
             for part in parts {
                 if let crate::ast::FStringPart::Expr(e) = part {
@@ -316,9 +324,21 @@ fn collect_expr(expr: &Expr, locals: &HashMap<String, ()>, free: &mut HashSet<St
                 collect_expr(e, locals, free);
             }
         }
-        ExprKind::ListComp { elem, items, guards }
-        | ExprKind::SetComp { elem, items, guards }
-        | ExprKind::GeneratorExp { elem, items, guards } => {
+        ExprKind::ListComp {
+            elem,
+            items,
+            guards,
+        }
+        | ExprKind::SetComp {
+            elem,
+            items,
+            guards,
+        }
+        | ExprKind::GeneratorExp {
+            elem,
+            items,
+            guards,
+        } => {
             for item in items {
                 collect_expr(&item.iterable, locals, free);
             }
@@ -393,7 +413,12 @@ fn collect_expr(expr: &Expr, locals: &HashMap<String, ()>, free: &mut HashSet<St
             scoped.insert(pipe_name.clone(), ());
             collect_expr(right, &scoped, free);
         }
-        ExprKind::Slice { object, start, end, step } => {
+        ExprKind::Slice {
+            object,
+            start,
+            end,
+            step,
+        } => {
             collect_expr(object, locals, free);
             if let Some(e) = start {
                 collect_expr(e, locals, free);
@@ -417,11 +442,7 @@ fn collect_expr(expr: &Expr, locals: &HashMap<String, ()>, free: &mut HashSet<St
                 }
             }
         }
-        ExprKind::Quote {
-            bindings,
-            body,
-            ..
-        } => {
+        ExprKind::Quote { bindings, body, .. } => {
             for b in bindings {
                 collect_expr(b, locals, free);
             }

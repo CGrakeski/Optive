@@ -5,12 +5,18 @@ use num_bigint::BigInt;
 use num_traits::Zero;
 
 use crate::runtime_ast;
-use crate::value::{builtin_repr, IteratorKind, IteratorState, ModuleObject, Num, Value, ValueKey, DictMap};
+use crate::value::{
+    builtin_repr, DictMap, IteratorKind, IteratorState, ModuleObject, Num, Value, ValueKey,
+};
 use crate::vm::Vm;
 use crate::Result;
 
 use crate::shared::{Shared, SyncCell};
 
+mod http_server;
+mod log;
+mod net;
+mod sqlite;
 mod text;
 
 /// `format_num` / `format` 字段的默认小数精度。
@@ -195,6 +201,9 @@ pub fn build_std_module() -> Shared<ModuleObject> {
     std_children.insert("exceptions".into(), build_exceptions_module());
     std_children.insert("language".into(), crate::ffi::build_language_module());
     std_children.insert("http".into(), build_http_module());
+    std_children.insert("log".into(), log::build_log_module());
+    std_children.insert("net".into(), net::build_net_module());
+    std_children.insert("sqlite".into(), sqlite::build_sqlite_module());
     std_children.insert("encoding".into(), build_encoding_module());
     std_children.insert("csv".into(), build_csv_module());
     std_children.insert("toml".into(), build_toml_module());
@@ -394,7 +403,9 @@ fn math_sqrt(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     expect_arity("sqrt", args, 1)?;
     let x = expect_num_f64("sqrt", args, 0)?;
     if x < 0.0 {
-        return Err(crate::error::RuntimeError::value_err("sqrt of negative number"));
+        return Err(crate::error::RuntimeError::value_err(
+            "sqrt of negative number",
+        ));
     }
     Ok(Value::Num(float_from_f64(x.sqrt())?))
 }
@@ -426,7 +437,9 @@ fn math_pow(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 fn math_log(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let x = expect_num_f64("log", args, 0)?;
     if x <= 0.0 {
-        return Err(crate::error::RuntimeError::value_err("log requires positive number"));
+        return Err(crate::error::RuntimeError::value_err(
+            "log requires positive number",
+        ));
     }
     if args.len() >= 2 {
         let base = expect_num_f64("log", args, 1)?;
@@ -440,14 +453,18 @@ fn math_log10(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     expect_arity("log10", args, 1)?;
     let x = expect_num_f64("log10", args, 0)?;
     if x <= 0.0 {
-        return Err(crate::error::RuntimeError::value_err("log10 requires positive number"));
+        return Err(crate::error::RuntimeError::value_err(
+            "log10 requires positive number",
+        ));
     }
     Ok(Value::Num(float_from_f64(x.log10())?))
 }
 
 fn math_min(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.is_empty() {
-        return Err(crate::error::RuntimeError::type_err("min requires at least 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "min requires at least 1 argument",
+        ));
     }
     let mut best = match &args[0] {
         Value::Num(n) => n.clone(),
@@ -465,7 +482,9 @@ fn math_min(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn math_max(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.is_empty() {
-        return Err(crate::error::RuntimeError::type_err("max requires at least 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "max requires at least 1 argument",
+        ));
     }
     let mut best = match &args[0] {
         Value::Num(n) => n.clone(),
@@ -525,7 +544,9 @@ fn bigint_gcd(mut a: BigInt, mut b: BigInt) -> BigInt {
 
 fn math_gcd(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("gcd requires 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "gcd requires 2 arguments",
+        ));
     }
     let (Value::Num(a), Value::Num(b)) = (&args[0], &args[1]) else {
         return Err(crate::error::RuntimeError::type_err("gcd requires nums"));
@@ -539,7 +560,9 @@ fn math_gcd(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 fn math_lcm(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     use num_traits::{Signed, Zero};
     if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("lcm requires 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "lcm requires 2 arguments",
+        ));
     }
     let (Value::Num(a), Value::Num(b)) = (&args[0], &args[1]) else {
         return Err(crate::error::RuntimeError::type_err("lcm requires nums"));
@@ -574,7 +597,9 @@ fn math_sign(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn math_mod(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("mod requires 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "mod requires 2 arguments",
+        ));
     }
     match (&args[0], &args[1]) {
         (Value::Num(a), Value::Num(b)) => {
@@ -589,7 +614,6 @@ fn math_mod(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
 }
 
-
 fn math_is_integer(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     match args.first() {
         Some(Value::Num(n)) => {
@@ -599,14 +623,18 @@ fn math_is_integer(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
             };
             Ok(Value::Bool(ok))
         }
-        _ => Err(crate::error::RuntimeError::type_err("is_integer requires 1 num")),
+        _ => Err(crate::error::RuntimeError::type_err(
+            "is_integer requires 1 num",
+        )),
     }
 }
 
 fn math_is_rational(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     match args.first() {
         Some(Value::Num(n)) => Ok(Value::Bool(matches!(n, Num::Rat(_)))),
-        _ => Err(crate::error::RuntimeError::type_err("is_rational requires 1 num")),
+        _ => Err(crate::error::RuntimeError::type_err(
+            "is_rational requires 1 num",
+        )),
     }
 }
 
@@ -626,7 +654,9 @@ fn math_range(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
             let stop = expect_int("range", args, 1)?;
             let stride = expect_int("range", args, 2)?;
             if stride == 0 {
-                return Err(crate::error::RuntimeError::value_err("range step must not be zero"));
+                return Err(crate::error::RuntimeError::value_err(
+                    "range step must not be zero",
+                ));
             }
             (start, stop, stride)
         }
@@ -647,9 +677,8 @@ fn io_read_file(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
     let path = expect_text("read_file", args, 0)?;
     vm.caps.check_fs("read_file", &path)?;
-    let content = std::fs::read_to_string(&path).map_err(|e| {
-        crate::error::RuntimeError::io_err(format!("read_file failed: {e}"))
-    })?;
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| crate::error::RuntimeError::io_err(format!("read_file failed: {e}")))?;
     vm.request_cooperative_yield();
     Ok(Value::Text(content))
 }
@@ -663,9 +692,8 @@ fn io_write_file(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let path = expect_text("write_file", args, 0)?;
     vm.caps.check_fs("write_file", &path)?;
     let content = args[1].print_string();
-    std::fs::write(&path, content).map_err(|e| {
-        crate::error::RuntimeError::io_err(format!("write_file failed: {e}"))
-    })?;
+    std::fs::write(&path, content)
+        .map_err(|e| crate::error::RuntimeError::io_err(format!("write_file failed: {e}")))?;
     vm.request_cooperative_yield();
     Ok(Value::None)
 }
@@ -763,9 +791,7 @@ fn format_format(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
                 .iter()
                 .position(|&c| c == '}')
                 .map(|p| i + 1 + p)
-                .ok_or_else(|| {
-                    crate::error::RuntimeError::value_err("format: unmatched '{'")
-                })?;
+                .ok_or_else(|| crate::error::RuntimeError::value_err("format: unmatched '{'"))?;
             let inner: String = chars[i + 1..close].iter().collect();
             let idx = if inner.is_empty() {
                 let n = auto_idx;
@@ -779,9 +805,7 @@ fn format_format(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
                 })?
             };
             let v = values.get(idx).ok_or_else(|| {
-                crate::error::RuntimeError::value_err(format!(
-                    "format: missing argument {{{idx}}}"
-                ))
+                crate::error::RuntimeError::value_err(format!("format: missing argument {{{idx}}}"))
             })?;
             result.push_str(&v.print_string());
             i = close + 1;
@@ -804,11 +828,16 @@ fn format_format(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn format_join(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("join requires 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "join requires 2 arguments",
+        ));
     }
     let sep = expect_text("join", args, 0)?;
     let items = value_to_list(&args[1])?;
-    let parts: Vec<String> = items.iter().map(super::runtime::value::Value::print_string).collect();
+    let parts: Vec<String> = items
+        .iter()
+        .map(super::runtime::value::Value::print_string)
+        .collect();
     Ok(Value::Text(parts.join(&sep)))
 }
 
@@ -862,10 +891,7 @@ fn format_indent(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let text = expect_text("indent", args, 0)?;
     let n = expect_int("indent", args, 1)?.max(0) as usize;
     let pad = " ".repeat(n);
-    let out: Vec<String> = text
-        .lines()
-        .map(|line| format!("{pad}{line}"))
-        .collect();
+    let out: Vec<String> = text.lines().map(|line| format!("{pad}{line}")).collect();
     Ok(Value::Text(out.join("\n")))
 }
 
@@ -876,14 +902,18 @@ fn iter_iter(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn iter_to_list(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("to_list requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "to_list requires 1 argument",
+        ));
     }
     Ok(Value::List(Shared::new(materialize_iter(vm, &args[0])?)))
 }
 
 fn iter_to_set(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("to_set requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "to_set requires 1 argument",
+        ));
     }
     let mut set = crate::value::SetMap::new();
     for item in materialize_iter(vm, &args[0])? {
@@ -894,7 +924,9 @@ fn iter_to_set(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn iter_enumerate(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("enumerate requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "enumerate requires 1 argument",
+        ));
     }
     let source = value_to_iterator_rc(vm, &args[0])?;
     // 跟踪源游标；enumerate 包装自身也需可被 GC 看见。
@@ -930,7 +962,9 @@ fn iter_chain(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn iter_take(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("take requires 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "take requires 2 arguments",
+        ));
     }
     let n = expect_int("take", args, 1)?.max(0) as usize;
     let source = value_to_iterator_rc(vm, &args[0])?;
@@ -947,7 +981,9 @@ fn iter_take(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn iter_skip(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("skip requires 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "skip requires 2 arguments",
+        ));
     }
     let n = expect_int("skip", args, 1)?.max(0) as usize;
     let source = value_to_iterator_rc(vm, &args[0])?;
@@ -964,7 +1000,9 @@ fn iter_skip(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn iter_next(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.is_empty() {
-        return Err(crate::error::RuntimeError::type_err("next requires an iterator"));
+        return Err(crate::error::RuntimeError::type_err(
+            "next requires an iterator",
+        ));
     }
     let state = value_to_iterator_rc(vm, &args[0])?;
     match vm.advance_iterator(&state)? {
@@ -973,7 +1011,8 @@ fn iter_next(vm: &mut Vm, args: &[Value]) -> Result<Value> {
             if args.len() >= 2 {
                 Ok(args[1].clone())
             } else {
-                let exc = crate::exceptions::make_exception(vm, "StopIteration", "iterator exhausted")?;
+                let exc =
+                    crate::exceptions::make_exception(vm, "StopIteration", "iterator exhausted")?;
                 vm.throw_value(exc)?;
                 Ok(Value::None)
             }
@@ -1015,7 +1054,9 @@ fn iter_repeat(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn iter_cycle(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("cycle requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "cycle requires 1 argument",
+        ));
     }
     // cycle 需要可回放的有限序列，因此物化源一次。
     let items = materialize_iter(vm, &args[0])?;
@@ -1026,7 +1067,9 @@ fn iter_cycle(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn iter_count(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("count requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "count requires 1 argument",
+        ));
     }
     let state = value_to_iterator_rc(vm, &args[0])?;
     let mut n = 0i64;
@@ -1064,10 +1107,7 @@ fn iter_any(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let pred = expect_function("any", args, 1)?;
     let state = value_to_iterator_rc(vm, &args[0])?;
     while let Some(item) = vm.advance_iterator(&state)? {
-        if vm
-            .call_user_function(pred.clone(), vec![item])?
-            .is_truthy()
-        {
+        if vm.call_user_function(pred.clone(), vec![item])?.is_truthy() {
             return Ok(Value::Bool(true));
         }
     }
@@ -1083,10 +1123,7 @@ fn iter_all(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let pred = expect_function("all", args, 1)?;
     let state = value_to_iterator_rc(vm, &args[0])?;
     while let Some(item) = vm.advance_iterator(&state)? {
-        if !vm
-            .call_user_function(pred.clone(), vec![item])?
-            .is_truthy()
-        {
+        if !vm.call_user_function(pred.clone(), vec![item])?.is_truthy() {
             return Ok(Value::Bool(false));
         }
     }
@@ -1095,7 +1132,9 @@ fn iter_all(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn dict_keys(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("keys requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "keys requires 1 argument",
+        ));
     }
     let Value::Dict(d) = &args[0] else {
         return Err(crate::error::RuntimeError::type_err("keys requires dict"));
@@ -1106,7 +1145,9 @@ fn dict_keys(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn dict_values(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("values requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "values requires 1 argument",
+        ));
     }
     let Value::Dict(d) = &args[0] else {
         return Err(crate::error::RuntimeError::type_err("values requires dict"));
@@ -1118,7 +1159,9 @@ fn dict_values(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn dict_items(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("items requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "items requires 1 argument",
+        ));
     }
     let Value::Dict(d) = &args[0] else {
         return Err(crate::error::RuntimeError::type_err("items requires dict"));
@@ -1126,12 +1169,7 @@ fn dict_items(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let pairs: Vec<Value> = d
         .borrow()
         .iter()
-        .map(|(k, v)| {
-            Value::List(Shared::new(vec![
-                value_key_to_value(k),
-                v.clone(),
-            ]))
-        })
+        .map(|(k, v)| Value::List(Shared::new(vec![value_key_to_value(k), v.clone()])))
         .collect();
     Ok(Value::List(Shared::new(pairs)))
 }
@@ -1181,7 +1219,9 @@ fn dict_from_items(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn dict_update(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("update requires 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "update requires 2 arguments",
+        ));
     }
     let Value::Dict(dst) = &args[0] else {
         return Err(crate::error::RuntimeError::type_err("update requires dict"));
@@ -1213,7 +1253,9 @@ fn dict_merge(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn dict_invert(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("invert requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "invert requires 1 argument",
+        ));
     }
     let Value::Dict(d) = &args[0] else {
         return Err(crate::error::RuntimeError::type_err("invert requires dict"));
@@ -1233,7 +1275,9 @@ fn dict_setdefault(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         ));
     }
     let Value::Dict(d) = &args[0] else {
-        return Err(crate::error::RuntimeError::type_err("setdefault requires dict"));
+        return Err(crate::error::RuntimeError::type_err(
+            "setdefault requires dict",
+        ));
     };
     let key = ValueKey::from_value(&args[1])?;
     let mut map = d.borrow_mut();
@@ -1248,7 +1292,9 @@ pub(crate) fn value_to_list(v: &Value) -> Result<Vec<Value>> {
     match v {
         Value::List(list) => Ok(list.borrow().clone()),
         Value::Text(s) => Ok(s.chars().map(|c| Value::Text(c.to_string())).collect()),
-        _ => Err(crate::error::RuntimeError::type_err("object is not iterable")),
+        _ => Err(crate::error::RuntimeError::type_err(
+            "object is not iterable",
+        )),
     }
 }
 
@@ -1259,7 +1305,6 @@ fn value_key_to_value(k: &ValueKey) -> Value {
         ValueKey::Text(s) => Value::Text(s.clone()),
     }
 }
-
 
 fn ast_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let source = expect_text("parse", args, 0)?;
@@ -1290,7 +1335,9 @@ ast_export_natural2! {
 
 fn ast_unparse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("unparse requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "unparse requires 1 argument",
+        ));
     }
     let node = runtime_ast::value_as_ast(&args[0])?;
     Ok(Value::Text(runtime_ast::ast_to_source(&node)))
@@ -1298,7 +1345,9 @@ fn ast_unparse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn ast_walk(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("walk requires 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "walk requires 2 arguments",
+        ));
     }
     let node = runtime_ast::value_as_ast(&args[0])?;
     let visitor = expect_function("walk", args, 1)?;
@@ -1309,7 +1358,11 @@ fn ast_walk(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     Ok(Value::None)
 }
 
-fn expect_function(name: &str, args: &[Value], idx: usize) -> Result<Arc<crate::opcode::FunctionObject>> {
+fn expect_function(
+    name: &str,
+    args: &[Value],
+    idx: usize,
+) -> Result<Arc<crate::opcode::FunctionObject>> {
     match args.get(idx) {
         Some(Value::Function(f)) => Ok(f.clone()),
         _ => Err(crate::error::RuntimeError::type_err(format!(
@@ -1320,7 +1373,9 @@ fn expect_function(name: &str, args: &[Value], idx: usize) -> Result<Arc<crate::
 
 fn decos_log(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("log requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "log requires 1 argument",
+        ));
     }
     let inner = expect_function("log", args, 0)?;
     Ok(Value::builtin("log", move |vm, call_args| {
@@ -1331,7 +1386,9 @@ fn decos_log(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn decos_once(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("once requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "once requires 1 argument",
+        ));
     }
     let inner = expect_function("once", args, 0)?;
     let cached = SyncCell::new(None::<Value>);
@@ -1413,7 +1470,8 @@ fn build_typing_module() -> Shared<ModuleObject> {
     }
     submodule(
         "typing",
-        &[("Union", type_ctor("Union")),
+        &[
+            ("Union", type_ctor("Union")),
             ("Maybe", type_ctor("Maybe")),
             ("Optional", type_ctor("Maybe")),
             ("Tuple", type_ctor("Tuple")),
@@ -1425,7 +1483,8 @@ fn build_typing_module() -> Shared<ModuleObject> {
             ("Literal", type_ctor_literal()),
             ("fields_of", builtin(typing_fields_of)),
             ("protocol_of", builtin(typing_protocol_of)),
-            ("isinstanceof", builtin(typing_isinstanceof)),],
+            ("isinstanceof", builtin(typing_isinstanceof)),
+        ],
     )
 }
 
@@ -1520,7 +1579,8 @@ fn typing_isinstanceof(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 fn build_functional_module() -> Shared<ModuleObject> {
     submodule(
         "functional",
-        &[("map", builtin(func_map)),
+        &[
+            ("map", builtin(func_map)),
             ("filter", builtin(func_filter)),
             ("zip", builtin(func_zip)),
             ("reduce", builtin(func_reduce)),
@@ -1528,14 +1588,16 @@ fn build_functional_module() -> Shared<ModuleObject> {
             ("partial", builtin(func_partial)),
             ("identity", builtin(func_identity)),
             ("const", builtin(func_const)),
-            ("flip", builtin(func_flip)),],
+            ("flip", builtin(func_flip)),
+        ],
     )
 }
 
 fn build_collections_module() -> Shared<ModuleObject> {
     submodule(
         "collections",
-        &[("sorted", builtin(coll_sorted)),
+        &[
+            ("sorted", builtin(coll_sorted)),
             ("reversed", builtin(coll_reversed)),
             ("min", builtin(coll_min)),
             ("max", builtin(coll_max)),
@@ -1549,7 +1611,8 @@ fn build_collections_module() -> Shared<ModuleObject> {
             ("flatten", builtin(coll_flatten)),
             ("chunk", builtin(coll_chunk)),
             ("count", builtin(coll_count)),
-            ("group_by", builtin(coll_group_by)),],
+            ("group_by", builtin(coll_group_by)),
+        ],
     )
 }
 
@@ -1828,10 +1891,7 @@ fn async_stream_filter(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let source = vm.to_iterator_shared(&args[0])?;
     Ok(crate::concurrency::stream_from_iterator(Shared::new(
         IteratorState {
-            kind: IteratorKind::Filter {
-                func: pred,
-                source,
-            },
+            kind: IteratorKind::Filter { func: pred, source },
         },
     )))
 }
@@ -1870,7 +1930,9 @@ fn sync_atomic_bool(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 /// `std.sync.yield()`：主动让出当前 fiber，给其它就绪 fiber 一个运行机会。
 fn sync_yield(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if !args.is_empty() {
-        return Err(crate::error::RuntimeError::type_err("yield requires 0 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "yield requires 0 arguments",
+        ));
     }
     vm.request_cooperative_yield();
     Ok(Value::None)
@@ -1879,7 +1941,8 @@ fn sync_yield(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 fn build_path_module() -> Shared<ModuleObject> {
     submodule(
         "path",
-        &[("join", builtin(path_join)),
+        &[
+            ("join", builtin(path_join)),
             ("basename", builtin(path_basename)),
             ("dirname", builtin(path_dirname)),
             ("extension", builtin(path_extension)),
@@ -1887,14 +1950,16 @@ fn build_path_module() -> Shared<ModuleObject> {
             ("is_absolute", builtin(path_is_absolute)),
             ("abspath", builtin(path_abspath)),
             ("normalize", builtin(path_normalize)),
-            ("splitext", builtin(path_splitext)),],
+            ("splitext", builtin(path_splitext)),
+        ],
     )
 }
 
 fn build_fs_module() -> Shared<ModuleObject> {
     submodule(
         "fs",
-        &[("exists", builtin(fs_exists)),
+        &[
+            ("exists", builtin(fs_exists)),
             ("is_file", builtin(fs_is_file)),
             ("is_dir", builtin(fs_is_dir)),
             ("list_dir", builtin(fs_list_dir)),
@@ -1907,7 +1972,8 @@ fn build_fs_module() -> Shared<ModuleObject> {
             ("read_text", builtin(io_read_file)),
             ("write_text", builtin(io_write_file)),
             ("read_bytes", builtin(io_read_bytes)),
-            ("write_bytes", builtin(io_write_bytes)),],
+            ("write_bytes", builtin(io_write_bytes)),
+        ],
     )
 }
 
@@ -1931,19 +1997,23 @@ fn build_os_module() -> Shared<ModuleObject> {
 fn build_json_module() -> Shared<ModuleObject> {
     submodule(
         "json",
-        &[("parse", builtin(json_parse)),
+        &[
+            ("parse", builtin(json_parse)),
             ("stringify", builtin(json_stringify)),
             ("parse_file", builtin(json_parse_file)),
-            ("dump", builtin(json_dump)),],
+            ("dump", builtin(json_dump)),
+        ],
     )
 }
 
 fn build_test_module() -> Shared<ModuleObject> {
     submodule(
         "test",
-        &[("assert_eq", builtin(test_assert_eq)),
+        &[
+            ("assert_eq", builtin(test_assert_eq)),
             ("assert_true", builtin(test_assert_true)),
-            ("assert_raises", builtin(test_assert_raises)),],
+            ("assert_raises", builtin(test_assert_raises)),
+        ],
     )
 }
 
@@ -1964,13 +2034,15 @@ fn build_debug_module() -> Shared<ModuleObject> {
 fn build_random_module() -> Shared<ModuleObject> {
     submodule(
         "random",
-        &[("randint", builtin(random_randint)),
+        &[
+            ("randint", builtin(random_randint)),
             ("random", builtin(random_random)),
             ("randstring", builtin(random_randstring)),
             ("choice", builtin(random_choice)),
             ("shuffle", builtin(random_shuffle)),
             ("sample", builtin(random_sample)),
-            ("seed", builtin(random_seed)),],
+            ("seed", builtin(random_seed)),
+        ],
     )
 }
 
@@ -2138,7 +2210,9 @@ fn value_to_iterator_rc(vm: &mut Vm, v: &Value) -> Result<Shared<IteratorState>>
 
 fn func_map(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("map requires 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "map requires 2 arguments",
+        ));
     }
     let func = expect_function("map", args, 0)?;
     let source = value_to_iterator_rc(vm, &args[1])?;
@@ -2149,7 +2223,9 @@ fn func_map(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn func_filter(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("filter requires 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "filter requires 2 arguments",
+        ));
     }
     let pred = expect_function("filter", args, 0)?;
     let source = value_to_iterator_rc(vm, &args[1])?;
@@ -2160,14 +2236,18 @@ fn func_filter(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn func_zip(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
-        return Err(crate::error::RuntimeError::type_err("zip requires at least 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "zip requires at least 2 arguments",
+        ));
     }
     vm.zip_iterables(args.to_vec())
 }
 
 fn func_reduce(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
-        return Err(crate::error::RuntimeError::type_err("reduce requires at least 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "reduce requires at least 2 arguments",
+        ));
     }
     let func = expect_function("reduce", args, 0)?;
     let items = materialize_iter(vm, &args[1])?;
@@ -2180,7 +2260,9 @@ fn func_reduce(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn func_compose(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("compose requires 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "compose requires 2 arguments",
+        ));
     }
     let f = expect_function("compose", args, 0)?;
     let g = expect_function("compose", args, 1)?;
@@ -2192,7 +2274,9 @@ fn func_compose(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn func_partial(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
-        return Err(crate::error::RuntimeError::type_err("partial requires at least 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "partial requires at least 2 arguments",
+        ));
     }
     let func = expect_function("partial", args, 0)?;
     let bound: Vec<Value> = args[1..].to_vec();
@@ -2205,14 +2289,18 @@ fn func_partial(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn func_identity(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("identity requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "identity requires 1 argument",
+        ));
     }
     Ok(args[0].clone())
 }
 
 fn func_const(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("const requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "const requires 1 argument",
+        ));
     }
     let x = args[0].clone();
     Ok(Value::builtin("const", move |_vm, _args| Ok(x.clone())))
@@ -2234,7 +2322,9 @@ fn func_flip(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn coll_sorted(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("sorted requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "sorted requires 1 argument",
+        ));
     }
     let mut items = materialize_iter(vm, &args[0])?;
     items.sort_by_key(super::runtime::value::Value::print_string);
@@ -2243,7 +2333,9 @@ fn coll_sorted(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn coll_reversed(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("reversed requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "reversed requires 1 argument",
+        ));
     }
     let mut items = materialize_iter(vm, &args[0])?;
     items.reverse();
@@ -2254,7 +2346,13 @@ fn coll_min(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let items = materialize_iter(vm, &args[0])?;
     items
         .into_iter()
-        .reduce(|a, b| if a.print_string() <= b.print_string() { a } else { b })
+        .reduce(|a, b| {
+            if a.print_string() <= b.print_string() {
+                a
+            } else {
+                b
+            }
+        })
         .ok_or_else(|| crate::error::RuntimeError::msg("min of empty"))
 }
 
@@ -2262,7 +2360,13 @@ fn coll_max(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let items = materialize_iter(vm, &args[0])?;
     items
         .into_iter()
-        .reduce(|a, b| if a.print_string() >= b.print_string() { a } else { b })
+        .reduce(|a, b| {
+            if a.print_string() >= b.print_string() {
+                a
+            } else {
+                b
+            }
+        })
         .ok_or_else(|| crate::error::RuntimeError::msg("max of empty"))
 }
 
@@ -2276,7 +2380,9 @@ fn coll_sum(vm: &mut Vm, args: &[Value]) -> Result<Value> {
                 Num::Int(x) => total += x.as_ref(),
                 Num::Rat(r) if *r.denom() == BigInt::from(1) => total += r.numer(),
                 Num::Rat(_) => {
-                    return Err(crate::error::RuntimeError::type_err("sum requires integer values"));
+                    return Err(crate::error::RuntimeError::type_err(
+                        "sum requires integer values",
+                    ));
                 }
             }
         }
@@ -2286,12 +2392,16 @@ fn coll_sum(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn coll_all(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let items = materialize_iter(vm, &args[0])?;
-    Ok(Value::Bool(items.iter().all(super::runtime::value::Value::is_truthy)))
+    Ok(Value::Bool(
+        items.iter().all(super::runtime::value::Value::is_truthy),
+    ))
 }
 
 fn coll_any(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let items = materialize_iter(vm, &args[0])?;
-    Ok(Value::Bool(items.iter().any(super::runtime::value::Value::is_truthy)))
+    Ok(Value::Bool(
+        items.iter().any(super::runtime::value::Value::is_truthy),
+    ))
 }
 
 fn coll_unique(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -2325,14 +2435,17 @@ fn coll_last(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn coll_nth(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("nth requires 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "nth requires 2 arguments",
+        ));
     }
     let n = expect_int("nth", args, 1)? as usize;
     let items = materialize_iter(vm, &args[0])?;
     if let Some(v) = items.into_iter().nth(n) {
         return Ok(v);
     }
-    let exc = crate::exceptions::make_exception(vm, "IndexError", format!("nth out of range: {n}"))?;
+    let exc =
+        crate::exceptions::make_exception(vm, "IndexError", format!("nth out of range: {n}"))?;
     match vm.throw_value(exc) {
         Ok(()) => Ok(Value::None),
         Err(e) => Err(e),
@@ -2341,7 +2454,9 @@ fn coll_nth(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn coll_flatten(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("flatten requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "flatten requires 1 argument",
+        ));
     }
     let mut out = Vec::new();
     for item in materialize_iter(vm, &args[0])? {
@@ -2357,11 +2472,15 @@ fn coll_flatten(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn coll_chunk(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("chunk requires 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "chunk requires 2 arguments",
+        ));
     }
     let size = expect_int("chunk", args, 1)?;
     if size <= 0 {
-        return Err(crate::error::RuntimeError::type_err("chunk size must be positive"));
+        return Err(crate::error::RuntimeError::type_err(
+            "chunk size must be positive",
+        ));
     }
     let size = size as usize;
     let items = materialize_iter(vm, &args[0])?;
@@ -2439,8 +2558,8 @@ fn time_now_ms(_vm: &mut Vm, _args: &[Value]) -> Result<Value> {
 }
 
 fn time_monotonic(_vm: &mut Vm, _args: &[Value]) -> Result<Value> {
-    use std::time::Instant;
     use std::sync::OnceLock;
+    use std::time::Instant;
     static START: OnceLock<Instant> = OnceLock::new();
     let start = START.get_or_init(Instant::now);
     let secs = start.elapsed().as_secs_f64();
@@ -2509,12 +2628,30 @@ fn time_utc_parts(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let secs = expect_int("utc_parts", args, 0)?;
     let (y, m, d, hh, mm, ss) = utc_parts_from_secs(secs);
     let mut map = DictMap::new();
-    map.insert(ValueKey::Text("year".into()), Value::Num(Num::Small(i64::from(y))));
-    map.insert(ValueKey::Text("month".into()), Value::Num(Num::Small(i64::from(m))));
-    map.insert(ValueKey::Text("day".into()), Value::Num(Num::Small(i64::from(d))));
-    map.insert(ValueKey::Text("hour".into()), Value::Num(Num::Small(i64::from(hh))));
-    map.insert(ValueKey::Text("minute".into()), Value::Num(Num::Small(i64::from(mm))));
-    map.insert(ValueKey::Text("second".into()), Value::Num(Num::Small(i64::from(ss))));
+    map.insert(
+        ValueKey::Text("year".into()),
+        Value::Num(Num::Small(i64::from(y))),
+    );
+    map.insert(
+        ValueKey::Text("month".into()),
+        Value::Num(Num::Small(i64::from(m))),
+    );
+    map.insert(
+        ValueKey::Text("day".into()),
+        Value::Num(Num::Small(i64::from(d))),
+    );
+    map.insert(
+        ValueKey::Text("hour".into()),
+        Value::Num(Num::Small(i64::from(hh))),
+    );
+    map.insert(
+        ValueKey::Text("minute".into()),
+        Value::Num(Num::Small(i64::from(mm))),
+    );
+    map.insert(
+        ValueKey::Text("second".into()),
+        Value::Num(Num::Small(i64::from(ss))),
+    );
     Ok(Value::Dict(Shared::new(map)))
 }
 
@@ -2634,7 +2771,10 @@ fn time_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 }
 
 fn path_join(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    let parts: Vec<String> = args.iter().map(super::runtime::value::Value::print_string).collect();
+    let parts: Vec<String> = args
+        .iter()
+        .map(super::runtime::value::Value::print_string)
+        .collect();
     if parts.is_empty() {
         return Ok(Value::Text(String::new()));
     }
@@ -2681,10 +2821,7 @@ fn path_os_str_component(
     pick: impl FnOnce(&std::path::Path) -> Option<&std::ffi::OsStr>,
 ) -> Result<Value> {
     path_map_text(name, args, |p| {
-        pick(p)
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string()
+        pick(p).and_then(|s| s.to_str()).unwrap_or("").to_string()
     })
 }
 
@@ -2715,7 +2852,12 @@ fn path_dirname(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn path_is_absolute(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     // 纯词法判断，不触盘，不受沙箱限制。
-    path_bool_query(&crate::caps::Capabilities::full(), "is_absolute", args, std::path::Path::is_absolute)
+    path_bool_query(
+        &crate::caps::Capabilities::full(),
+        "is_absolute",
+        args,
+        std::path::Path::is_absolute,
+    )
 }
 
 fn path_bool_query(
@@ -2743,10 +2885,11 @@ fn strip_windows_extended_prefix(s: &str) -> String {
 
 fn path_abspath(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let p = expect_text("abspath", args, 0)?;
-    let abs = if let Ok(path) = std::fs::canonicalize(&p) { path } else {
-        let cwd = std::env::current_dir().map_err(|e| {
-            crate::error::RuntimeError::io_err(format!("abspath failed: {e}"))
-        })?;
+    let abs = if let Ok(path) = std::fs::canonicalize(&p) {
+        path
+    } else {
+        let cwd = std::env::current_dir()
+            .map_err(|e| crate::error::RuntimeError::io_err(format!("abspath failed: {e}")))?;
         normalize_pathbuf(cwd.join(&p))
     };
     #[cfg(windows)]
@@ -2817,11 +2960,9 @@ fn fs_list_dir(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     for entry in std::fs::read_dir(&p)
         .map_err(|e| crate::error::RuntimeError::io_err(format!("list_dir failed: {e}")))?
     {
-        let entry =
-            entry.map_err(|e| crate::error::RuntimeError::io_err(format!("list_dir failed: {e}")))?;
-        names.push(Value::Text(
-            entry.file_name().to_string_lossy().to_string(),
-        ));
+        let entry = entry
+            .map_err(|e| crate::error::RuntimeError::io_err(format!("list_dir failed: {e}")))?;
+        names.push(Value::Text(entry.file_name().to_string_lossy().to_string()));
     }
     names.sort_by_key(super::runtime::value::Value::print_string);
     vm.request_cooperative_yield();
@@ -2852,7 +2993,9 @@ define_fs_path_op! {
 
 fn fs_rename(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("rename requires 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "rename requires 2 arguments",
+        ));
     }
     let from = expect_text("rename", args, 0)?;
     let to = expect_text("rename", args, 1)?;
@@ -2865,7 +3008,9 @@ fn fs_rename(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn fs_copy(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("copy requires 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "copy requires 2 arguments",
+        ));
     }
     let from = expect_text("copy", args, 0)?;
     let to = expect_text("copy", args, 1)?;
@@ -2878,13 +3023,14 @@ fn fs_copy(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn os_getenv(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let key = expect_text("getenv", args, 0)?;
-    Ok(std::env::var(&key)
-        .map_or(Value::None, Value::Text))
+    Ok(std::env::var(&key).map_or(Value::None, Value::Text))
 }
 
 fn os_setenv(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("setenv requires 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "setenv requires 2 arguments",
+        ));
     }
     vm.caps.check_env("setenv")?;
     let key = expect_text("setenv", args, 0)?;
@@ -2941,7 +3087,10 @@ fn os_parse_cmdline(args: &[Value]) -> Result<(String, Vec<String>)> {
                     .iter()
                     .map(super::runtime::value::Value::print_string)
                     .collect(),
-                Some(Value::Tuple(t)) => t.iter().map(super::runtime::value::Value::print_string).collect(),
+                Some(Value::Tuple(t)) => t
+                    .iter()
+                    .map(super::runtime::value::Value::print_string)
+                    .collect(),
                 Some(other) => {
                     return Err(crate::error::RuntimeError::type_err(format!(
                         "run/capture args must be a list, got {}",
@@ -2959,7 +3108,10 @@ fn os_parse_cmdline(args: &[Value]) -> Result<(String, Vec<String>)> {
                 ));
             }
             let prog = items[0].print_string();
-            let rest = items[1..].iter().map(super::runtime::value::Value::print_string).collect();
+            let rest = items[1..]
+                .iter()
+                .map(super::runtime::value::Value::print_string)
+                .collect();
             Ok((prog, rest))
         }
         other => Err(crate::error::RuntimeError::type_err(format!(
@@ -2969,12 +3121,7 @@ fn os_parse_cmdline(args: &[Value]) -> Result<(String, Vec<String>)> {
     }
 }
 
-fn os_spawn_result(
-    vm: &mut Vm,
-    prog: &str,
-    args: &[String],
-    capture: bool,
-) -> Result<Value> {
+fn os_spawn_result(vm: &mut Vm, prog: &str, args: &[String], capture: bool) -> Result<Value> {
     vm.caps.check_process("os.run")?;
     vm.request_cooperative_yield();
     let mut cmd = std::process::Command::new(prog);
@@ -2994,7 +3141,10 @@ fn os_spawn_result(
     }
     .map_err(|e| crate::error::RuntimeError::io_err(format!("os.run failed: {e}")))?;
     vm.request_cooperative_yield();
-    let code = output.status.code().unwrap_or(i32::from(!output.status.success()));
+    let code = output
+        .status
+        .code()
+        .unwrap_or(i32::from(!output.status.success()));
     let mut map = DictMap::new();
     map.insert(
         ValueKey::Text("ok".into()),
@@ -3043,14 +3193,18 @@ fn json_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn json_stringify(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("stringify requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "stringify requires 1 argument",
+        ));
     }
     Ok(Value::Text(json_stringify_value(&args[0])?))
 }
 
 fn json_parse_file(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("parse_file requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "parse_file requires 1 argument",
+        ));
     }
     let path = expect_text("parse_file", args, 0)?;
     let text = std::fs::read_to_string(&path)
@@ -3090,9 +3244,9 @@ impl JsonParser {
     fn read_u_escape(&mut self) -> Result<u32> {
         let mut hex = String::new();
         for _ in 0..4 {
-            let c = self.bump().ok_or_else(|| {
-                crate::error::RuntimeError::msg("json parse: bad \\u escape")
-            })?;
+            let c = self
+                .bump()
+                .ok_or_else(|| crate::error::RuntimeError::msg("json parse: bad \\u escape"))?;
             hex.push(c);
         }
         u32::from_str_radix(&hex, 16)
@@ -3118,7 +3272,9 @@ impl JsonParser {
             Some(c) => Err(crate::error::RuntimeError::msg(format!(
                 "json parse: unexpected '{c}'"
             ))),
-            None => Err(crate::error::RuntimeError::msg("json parse: unexpected end")),
+            None => Err(crate::error::RuntimeError::msg(
+                "json parse: unexpected end",
+            )),
         }
     }
 
@@ -3169,9 +3325,7 @@ impl JsonParser {
                             }
                             let cp = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
                             out.push(char::from_u32(cp).ok_or_else(|| {
-                                crate::error::RuntimeError::value_err(
-                                    "json parse: invalid unicode",
-                                )
+                                crate::error::RuntimeError::value_err("json parse: invalid unicode")
                             })?);
                         } else if (0xDC00..=0xDFFF).contains(&code) {
                             return Err(crate::error::RuntimeError::value_err(
@@ -3179,17 +3333,11 @@ impl JsonParser {
                             ));
                         } else {
                             out.push(char::from_u32(code).ok_or_else(|| {
-                                crate::error::RuntimeError::value_err(
-                                    "json parse: invalid unicode",
-                                )
+                                crate::error::RuntimeError::value_err("json parse: invalid unicode")
                             })?);
                         }
                     }
-                    _ => {
-                        return Err(crate::error::RuntimeError::msg(
-                            "json parse: bad escape",
-                        ))
-                    }
+                    _ => return Err(crate::error::RuntimeError::msg("json parse: bad escape")),
                 },
                 Some(c) => out.push(c),
                 None => {
@@ -3237,9 +3385,8 @@ impl JsonParser {
             Ok(Value::Num(Num::Small(n)))
         } else {
             Ok(Value::Num(Num::from_bigint(
-                BigInt::parse_bytes(s.as_bytes(), 10).ok_or_else(|| {
-                    crate::error::RuntimeError::msg("json parse: bad number")
-                })?,
+                BigInt::parse_bytes(s.as_bytes(), 10)
+                    .ok_or_else(|| crate::error::RuntimeError::msg("json parse: bad number"))?,
             )))
         }
     }
@@ -3284,9 +3431,7 @@ impl JsonParser {
             let key = self.parse_string()?;
             self.skip_ws();
             if self.bump() != Some(':') {
-                return Err(crate::error::RuntimeError::msg(
-                    "json parse: expected ':'",
-                ));
+                return Err(crate::error::RuntimeError::msg("json parse: expected ':'"));
             }
             let val = self.parse_value()?;
             map.insert(ValueKey::from_value(&Value::Text(key))?, val);
@@ -3361,7 +3506,9 @@ fn json_escape_string(s: &str) -> String {
 
 fn test_assert_eq(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("assert_eq requires 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "assert_eq requires 2 arguments",
+        ));
     }
     if args[0].print_string() != args[1].print_string() {
         let exc = crate::exceptions::make_exception(
@@ -3376,7 +3523,9 @@ fn test_assert_eq(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn test_assert_true(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("assert_true requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "assert_true requires 1 argument",
+        ));
     }
     if !args[0].is_truthy() {
         let exc = crate::exceptions::make_exception(vm, "AssertionError", "assertion failed")?;
@@ -3414,11 +3563,7 @@ fn test_assert_raises(vm: &mut Vm, args: &[Value]) -> Result<Value> {
                 let exc = crate::exceptions::make_exception(
                     vm,
                     "AssertionError",
-                    format!(
-                        "expected {}, got {}",
-                        exc_type,
-                        thrown.type_name()
-                    ),
+                    format!("expected {}, got {}", exc_type, thrown.type_name()),
                 )?;
                 vm.throw_value(exc)?;
             }
@@ -3433,14 +3578,18 @@ fn debug_traceback(vm: &mut Vm, _args: &[Value]) -> Result<Value> {
 
 fn debug_format_tb(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("format_tb requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "format_tb requires 1 argument",
+        ));
     }
     Ok(Value::Text(args[0].display_string()))
 }
 
 fn debug_print_tb(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("print_tb requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "print_tb requires 1 argument",
+        ));
     }
     println!("{}", args[0].display_string());
     Ok(Value::None)
@@ -3471,7 +3620,9 @@ fn debug_format_exception(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn debug_type_name(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("type_name requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "type_name requires 1 argument",
+        ));
     }
     Ok(Value::Text(args[0].type_name_string()))
 }
@@ -3533,7 +3684,9 @@ fn random_seed(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn random_randint(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("randint requires 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "randint requires 2 arguments",
+        ));
     }
     let lo = expect_int("randint", args, 0)?;
     let hi = expect_int("randint", args, 1)?;
@@ -3571,7 +3724,9 @@ fn random_randstring(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn random_choice(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("choice requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "choice requires 1 argument",
+        ));
     }
     let items = materialize_iter(vm, &args[0])?;
     if items.is_empty() {
@@ -3583,10 +3738,14 @@ fn random_choice(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn random_shuffle(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(crate::error::RuntimeError::type_err("shuffle requires 1 argument"));
+        return Err(crate::error::RuntimeError::type_err(
+            "shuffle requires 1 argument",
+        ));
     }
     let Value::List(list) = &args[0] else {
-        return Err(crate::error::RuntimeError::type_err("shuffle requires list"));
+        return Err(crate::error::RuntimeError::type_err(
+            "shuffle requires list",
+        ));
     };
     let mut items = list.borrow_mut();
     let n = items.len();
@@ -3625,29 +3784,36 @@ fn random_sample(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 fn build_re_module() -> Shared<ModuleObject> {
     submodule(
         "re",
-        &[("compile", builtin(re_compile)),
+        &[
+            ("compile", builtin(re_compile)),
             ("match", builtin(re_match)),
             ("findall", builtin(re_findall)),
             ("sub", builtin(re_sub)),
-            ("split", builtin(re_split)),],
+            ("split", builtin(re_split)),
+        ],
     )
 }
 
 fn build_hash_module() -> Shared<ModuleObject> {
     submodule(
         "hash",
-        &[("md5", builtin(hash_md5)),
+        &[
+            ("md5", builtin(hash_md5)),
             ("sha256", builtin(hash_sha256)),
-            ("hmac", builtin(hash_hmac)),],
+            ("sha512", builtin(hash_sha512)),
+            ("hmac", builtin(hash_hmac)),
+        ],
     )
 }
 
 fn build_exceptions_module() -> Shared<ModuleObject> {
     submodule(
         "exceptions",
-        &[("bases", builtin(exc_bases)),
+        &[
+            ("bases", builtin(exc_bases)),
             ("chain", builtin(exc_chain)),
-            ("tree", builtin(exc_tree)),],
+            ("tree", builtin(exc_tree)),
+        ],
     )
 }
 
@@ -3713,7 +3879,9 @@ fn re_compile(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn re_match(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("match requires 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "match requires 2 arguments",
+        ));
     }
     let pat = expect_text("match", args, 0)?;
     let text = expect_text("match", args, 1)?;
@@ -3748,7 +3916,9 @@ fn re_match_impl(_vm: &mut Vm, re: &regex::Regex, args: &[Value]) -> Result<Valu
 
 fn re_findall(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("findall requires 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "findall requires 2 arguments",
+        ));
     }
     let pat = expect_text("findall", args, 0)?;
     let text = expect_text("findall", args, 1)?;
@@ -3763,19 +3933,25 @@ fn re_findall(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn re_sub(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 3 {
-        return Err(crate::error::RuntimeError::type_err("sub requires 3 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "sub requires 3 arguments",
+        ));
     }
     let pat = expect_text("sub", args, 0)?;
     let repl = expect_text("sub", args, 1)?;
     let text = expect_text("sub", args, 2)?;
     let re = regex::Regex::new(&pat)
         .map_err(|e| crate::error::RuntimeError::value_err(format!("invalid regex: {e}")))?;
-    Ok(Value::Text(re.replace_all(&text, repl.as_str()).into_owned()))
+    Ok(Value::Text(
+        re.replace_all(&text, repl.as_str()).into_owned(),
+    ))
 }
 
 fn re_split(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(crate::error::RuntimeError::type_err("split requires 2 arguments"));
+        return Err(crate::error::RuntimeError::type_err(
+            "split requires 2 arguments",
+        ));
     }
     let pat = expect_text("split", args, 0)?;
     let text = expect_text("split", args, 1)?;
@@ -3789,8 +3965,8 @@ fn re_split(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 }
 
 fn hash_md5(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    use md5::Md5;
     use digest::Digest;
+    use md5::Md5;
     let text = expect_text("md5", args, 0)?;
     let digest = Md5::digest(text.as_bytes());
     Ok(Value::Text(hex::encode(digest)))
@@ -3800,6 +3976,13 @@ fn hash_sha256(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     use sha2::{Digest, Sha256};
     let text = expect_text("sha256", args, 0)?;
     let digest = Sha256::digest(text.as_bytes());
+    Ok(Value::Text(hex::encode(digest)))
+}
+
+fn hash_sha512(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    use sha2::{Digest, Sha512};
+    let text = expect_text("sha512", args, 0)?;
+    let digest = Sha512::digest(text.as_bytes());
     Ok(Value::Text(hex::encode(digest)))
 }
 
@@ -3838,7 +4021,11 @@ fn hash_hmac(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 fn exc_bases(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let name = match args.first() {
         Some(Value::Text(s)) => s.as_str(),
-        _ => return Err(crate::error::RuntimeError::type_err("bases requires exception type name")),
+        _ => {
+            return Err(crate::error::RuntimeError::type_err(
+                "bases requires exception type name",
+            ))
+        }
     };
     Ok(match crate::exceptions::direct_base(vm, name) {
         Some(base) => Value::Text(base),
@@ -3849,7 +4036,11 @@ fn exc_bases(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 fn exc_chain(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let name = match args.first() {
         Some(Value::Text(s)) => s.as_str(),
-        _ => return Err(crate::error::RuntimeError::type_err("chain requires exception type name")),
+        _ => {
+            return Err(crate::error::RuntimeError::type_err(
+                "chain requires exception type name",
+            ))
+        }
     };
     let chain: Vec<Value> = crate::exceptions::inheritance_chain(vm, name)
         .into_iter()
@@ -3882,6 +4073,11 @@ fn build_http_module() -> Shared<ModuleObject> {
             ("patch", named_builtin("patch", http_patch)),
             ("head", named_builtin("head", http_head)),
             ("request", named_builtin("request", http_request)),
+            ("serve", named_builtin("serve", http_server::http_serve)),
+            (
+                "serve_tls",
+                named_builtin("serve_tls", http_server::http_serve_tls),
+            ),
         ],
     )
 }
@@ -3905,10 +4101,14 @@ fn extract_headers(name: &str, opts: &Value) -> Result<reqwest::header::HeaderMa
                 Value::Bool(b) => &b.to_string(),
                 _ => continue,
             };
-            let hn = reqwest::header::HeaderName::try_from(key_str)
-                .map_err(|e| crate::error::RuntimeError::value_err(format!("{name}: invalid header name '{key_str}': {e}")))?;
-            let hv = reqwest::header::HeaderValue::try_from(val_str)
-                .map_err(|e| crate::error::RuntimeError::value_err(format!("{name}: invalid header value: {e}")))?;
+            let hn = reqwest::header::HeaderName::try_from(key_str).map_err(|e| {
+                crate::error::RuntimeError::value_err(format!(
+                    "{name}: invalid header name '{key_str}': {e}"
+                ))
+            })?;
+            let hv = reqwest::header::HeaderValue::try_from(val_str).map_err(|e| {
+                crate::error::RuntimeError::value_err(format!("{name}: invalid header value: {e}"))
+            })?;
             headers.insert(hn, hv);
         }
     }
@@ -3964,13 +4164,19 @@ fn response_to_dict(resp: reqwest::blocking::Response) -> Result<Value> {
             Value::Text(val.to_string()),
         );
     }
-    let body = resp
-        .text()
-        .map_err(|e| crate::error::RuntimeError::io_err(format!("http: failed to read body: {e}")))?;
+    let body = resp.text().map_err(|e| {
+        crate::error::RuntimeError::io_err(format!("http: failed to read body: {e}"))
+    })?;
     let mut out = DictMap::new();
-    out.insert(ValueKey::Text("status".into()), Value::Num(Num::Small(i64::from(status))));
+    out.insert(
+        ValueKey::Text("status".into()),
+        Value::Num(Num::Small(i64::from(status))),
+    );
     out.insert(ValueKey::Text("body".into()), Value::Text(body));
-    out.insert(ValueKey::Text("headers".into()), Value::Dict(Shared::new(header_map)));
+    out.insert(
+        ValueKey::Text("headers".into()),
+        Value::Dict(Shared::new(header_map)),
+    );
     out.insert(
         ValueKey::Text("ok".into()),
         Value::Bool((200..300).contains(&status)),
@@ -4005,9 +4211,9 @@ fn build_client(opts: &Value) -> Result<reqwest::blocking::Client> {
     } else if let Some(n) = opt_num(opts, "follow_redirects") {
         builder = builder.redirect(reqwest::redirect::Policy::limited(n.max(0) as usize));
     }
-    builder
-        .build()
-        .map_err(|e| crate::error::RuntimeError::io_err(format!("http: failed to build client: {e}")))
+    builder.build().map_err(|e| {
+        crate::error::RuntimeError::io_err(format!("http: failed to build client: {e}"))
+    })
 }
 
 /// 从 opts.auth（"user:pass" 或 {user,pass}）解析基本认证，按请求应用。
@@ -4294,10 +4500,9 @@ fn enc_url_decode(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
             i += 1;
         }
     }
-    Ok(Value::Text(
-        String::from_utf8(out)
-            .map_err(|e| crate::error::RuntimeError::value_err(format!("url_decode: {e}")))?,
-    ))
+    Ok(Value::Text(String::from_utf8(out).map_err(|e| {
+        crate::error::RuntimeError::value_err(format!("url_decode: {e}"))
+    })?))
 }
 
 fn hex_val(b: u8) -> Result<u8> {
@@ -4529,9 +4734,7 @@ fn csv_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         .from_reader(text.as_bytes());
     let rows: Vec<Vec<String>> = rdr
         .records()
-        .map(|r| {
-            r.map_err(|e| crate::error::RuntimeError::value_err(format!("csv parse: {e}")))
-        })
+        .map(|r| r.map_err(|e| crate::error::RuntimeError::value_err(format!("csv parse: {e}"))))
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .map(|r| r.iter().map(std::string::ToString::to_string).collect())
@@ -4561,9 +4764,7 @@ fn csv_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
             .iter()
             .map(|row| {
                 Value::List(Shared::new(
-                    row.iter()
-                        .map(|s| Value::Text(s.clone()))
-                        .collect(),
+                    row.iter().map(|s| Value::Text(s.clone())).collect(),
                 ))
             })
             .collect();
@@ -4584,8 +4785,15 @@ fn csv_stringify(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let mut wtr = csv::Writer::from_writer(vec![]);
     for row in rows {
         let cells: Vec<String> = match row {
-            Value::List(list) => list.borrow().iter().map(super::runtime::value::Value::print_string).collect(),
-            Value::Tuple(t) => t.iter().map(super::runtime::value::Value::print_string).collect(),
+            Value::List(list) => list
+                .borrow()
+                .iter()
+                .map(super::runtime::value::Value::print_string)
+                .collect(),
+            Value::Tuple(t) => t
+                .iter()
+                .map(super::runtime::value::Value::print_string)
+                .collect(),
             other => {
                 return Err(crate::error::RuntimeError::type_err(format!(
                     "csv.stringify row must be list/tuple, got {}",
@@ -4593,13 +4801,12 @@ fn csv_stringify(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
                 )))
             }
         };
-        wtr.write_record(&cells).map_err(|e| {
-            crate::error::RuntimeError::value_err(format!("csv.stringify: {e}"))
-        })?;
+        wtr.write_record(&cells)
+            .map_err(|e| crate::error::RuntimeError::value_err(format!("csv.stringify: {e}")))?;
     }
-    let data = wtr.into_inner().map_err(|e| {
-        crate::error::RuntimeError::value_err(format!("csv.stringify: {e}"))
-    })?;
+    let data = wtr
+        .into_inner()
+        .map_err(|e| crate::error::RuntimeError::value_err(format!("csv.stringify: {e}")))?;
     Ok(Value::Text(String::from_utf8(data).map_err(|e| {
         crate::error::RuntimeError::value_err(format!("csv.stringify: {e}"))
     })?))
@@ -4787,7 +4994,9 @@ fn xml_escape_text(s: &str) -> String {
 }
 
 fn xml_escape_attr(s: &str) -> String {
-    xml_escape_text(s).replace('"', "&quot;").replace('\'', "&apos;")
+    xml_escape_text(s)
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 fn build_xml_module() -> Shared<ModuleObject> {

@@ -51,8 +51,14 @@ pub enum VersionReq {
     Exact(Version),
     Caret(Version),
     /// `components`：用户写了几段（`~1` → 1，`~1.2` → 2，`~1.2.3` → 3）。
-    Tilde { version: Version, components: u8 },
-    Cmp { op: CmpOp, version: Version },
+    Tilde {
+        version: Version,
+        components: u8,
+    },
+    Cmp {
+        op: CmpOp,
+        version: Version,
+    },
 }
 
 impl VersionReq {
@@ -73,7 +79,6 @@ impl VersionReq {
             },
         }
     }
-
 }
 
 fn caret_matches(base: Version, v: Version) -> bool {

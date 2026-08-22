@@ -105,10 +105,7 @@ total
 
 #[test]
 fn p1_list_comp_zip() {
-    assert_list(
-        "[x + y for (x in [1, 2], y in [10, 20])]",
-        "[11, 22]",
-    );
+    assert_list("[x + y for (x in [1, 2], y in [10, 20])]", "[11, 22]");
 }
 
 #[test]

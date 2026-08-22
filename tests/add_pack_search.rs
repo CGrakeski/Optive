@@ -88,10 +88,7 @@ fn path_to_file_url(path: &Path) -> String {
 
 fn scratch(name: &str) -> PathBuf {
     let mut dir = std::env::temp_dir();
-    dir.push(format!(
-        "optive_add_search_{name}_{}",
-        std::process::id()
-    ));
+    dir.push(format!("optive_add_search_{name}_{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir
@@ -145,8 +142,14 @@ fn search_filters_by_substring() {
     assert!(!stdout.contains("otherpack"), "stdout={stdout}");
 
     let (code, stdout, stderr) = run_optive(&["search"], &root, &home, &index_dir);
-    assert_eq!(code, 0, "search all failed: stderr={stderr}\nstdout={stdout}");
-    assert!(stdout.contains("greeter") && stdout.contains("otherpack"), "stdout={stdout}");
+    assert_eq!(
+        code, 0,
+        "search all failed: stderr={stderr}\nstdout={stdout}"
+    );
+    assert!(
+        stdout.contains("greeter") && stdout.contains("otherpack"),
+        "stdout={stdout}"
+    );
 }
 
 #[test]
@@ -158,8 +161,7 @@ fn add_pack_at_version_writes_index_dep() {
     let (code, stdout, stderr) = run_optive(&["new", "hello_app"], &root, &home, &index_dir);
     assert_eq!(code, 0, "new failed: stderr={stderr}\nstdout={stdout}");
 
-    let (code, stdout, stderr) =
-        run_optive(&["add", "greeter@0.1.2"], &app, &home, &index_dir);
+    let (code, stdout, stderr) = run_optive(&["add", "greeter@0.1.2"], &app, &home, &index_dir);
     assert_eq!(code, 0, "add failed: stderr={stderr}\nstdout={stdout}");
     assert!(
         stdout.contains("added greeter") || stderr.contains("added greeter"),

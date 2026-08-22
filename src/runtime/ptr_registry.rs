@@ -6,8 +6,8 @@ use std::sync::LazyLock;
 use parking_lot::Mutex;
 
 use crate::error::RuntimeError;
-use crate::value::builtin_repr;
 use crate::ffi::{abi_size_align, AbiType};
+use crate::value::builtin_repr;
 use crate::value::Value;
 use crate::Result;
 
@@ -69,9 +69,11 @@ pub fn is_live(addr: usize) -> bool {
 /// 读/写下标或 peek 前：必须登记；Owned 校验 `[offset, offset+len)` 不越界。
 pub fn check_access(addr: usize, offset: usize, len: usize) -> Result<PtrEntry> {
     let Some(e) = lookup(addr) else {
-        return Err(RuntimeError::value_err(
-            format!("pointer not registered (use {} / {} before peek)", builtin_repr("alloc"), builtin_repr("unsafe_ptr")),
-        ));
+        return Err(RuntimeError::value_err(format!(
+            "pointer not registered (use {} / {} before peek)",
+            builtin_repr("alloc"),
+            builtin_repr("unsafe_ptr")
+        )));
     };
     if e.kind == PtrKind::Owned {
         let end = offset
@@ -89,14 +91,18 @@ pub fn check_access(addr: usize, offset: usize, len: usize) -> Result<PtrEntry> 
 
 pub fn require_elem(addr: usize) -> Result<(PtrEntry, String)> {
     let e = lookup(addr).ok_or_else(|| {
-        RuntimeError::value_err(
-            format!("pointer not registered (use {} / {} for typed indexing)", builtin_repr("alloc_array"), builtin_repr("cast_ptr")),
-        )
+        RuntimeError::value_err(format!(
+            "pointer not registered (use {} / {} for typed indexing)",
+            builtin_repr("alloc_array"),
+            builtin_repr("cast_ptr")
+        ))
     })?;
     let elem = e.elem.clone().ok_or_else(|| {
-        RuntimeError::type_err(
-            format!("untyped ptr cannot be indexed (use {}(T,n) or {}(p, T))", builtin_repr("alloc_array"), builtin_repr("cast_ptr")),
-        )
+        RuntimeError::type_err(format!(
+            "untyped ptr cannot be indexed (use {}(T,n) or {}(p, T))",
+            builtin_repr("alloc_array"),
+            builtin_repr("cast_ptr")
+        ))
     })?;
     Ok((e, elem))
 }
@@ -104,7 +110,10 @@ pub fn require_elem(addr: usize) -> Result<(PtrEntry, String)> {
 pub fn set_elem(addr: usize, elem: Option<String>) -> Result<()> {
     let mut g = REGISTRY.lock();
     let e = g.get_mut(&addr).ok_or_else(|| {
-        RuntimeError::value_err(format!("{}: pointer not registered", builtin_repr("cast_ptr")))
+        RuntimeError::value_err(format!(
+            "{}: pointer not registered",
+            builtin_repr("cast_ptr")
+        ))
     })?;
     e.elem = elem;
     Ok(())
@@ -166,22 +175,25 @@ pub fn free_owned(addr: usize) -> Result<()> {
         return Ok(());
     }
     let Some(e) = unregister(addr) else {
-        return Err(RuntimeError::value_err(
-            format!("{}: pointer not registered as owned (already freed or foreign)", builtin_repr("free")),
-        ));
+        return Err(RuntimeError::value_err(format!(
+            "{}: pointer not registered as owned (already freed or foreign)",
+            builtin_repr("free")
+        )));
     };
     if e.kind != PtrKind::Owned {
         // 放回并报错
         register(e);
-        return Err(RuntimeError::value_err(
-            format!("{}: cannot free foreign/unsafe pointer", builtin_repr("free")),
-        ));
+        return Err(RuntimeError::value_err(format!(
+            "{}: cannot free foreign/unsafe pointer",
+            builtin_repr("free")
+        )));
     }
     if e.nbytes == 0 {
         return Ok(());
     }
-    let layout = std::alloc::Layout::from_size_align(e.nbytes, e.align.max(1))
-        .map_err(|e| RuntimeError::value_err(format!("{}: invalid layout: {e}", builtin_repr("free"))))?;
+    let layout = std::alloc::Layout::from_size_align(e.nbytes, e.align.max(1)).map_err(|e| {
+        RuntimeError::value_err(format!("{}: invalid layout: {e}", builtin_repr("free")))
+    })?;
     unsafe { std::alloc::dealloc(addr as *mut u8, layout) };
     Ok(())
 }

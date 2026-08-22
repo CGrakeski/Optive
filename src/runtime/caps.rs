@@ -73,7 +73,7 @@ impl Capabilities {
         }
     }
 
-    /// 网络网关：`std.http` 模块调用前先过此关。
+    /// 网络网关：`std.http` / `std.net` 调用前先过此关。
     pub fn check_network(&self, op: &str) -> Result<(), RuntimeError> {
         if self.network {
             Ok(())

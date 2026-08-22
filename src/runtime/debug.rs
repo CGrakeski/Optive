@@ -125,13 +125,8 @@ impl DebugState {
         } else {
             (normalize_path(file), line)
         };
-        self.line_breakpoints.insert(
-            key,
-            LineBreakpoint {
-                condition,
-                log,
-            },
-        );
+        self.line_breakpoints
+            .insert(key, LineBreakpoint { condition, log });
     }
 
     pub fn remove_line_breakpoint(&mut self, file: &str, line: usize) -> bool {
@@ -196,11 +191,7 @@ fn paths_match(bp_file: &str, actual: &str) -> bool {
     a == b || a.ends_with(&b) || b.ends_with(&a)
 }
 
-fn find_line_bp<'a>(
-    state: &'a DebugState,
-    file: &str,
-    line: usize,
-) -> Option<&'a LineBreakpoint> {
+fn find_line_bp<'a>(state: &'a DebugState, file: &str, line: usize) -> Option<&'a LineBreakpoint> {
     if line == 0 {
         return None;
     }
@@ -284,7 +275,9 @@ pub fn should_pause(vm: &mut Vm, state: &mut DebugState) -> bool {
 
     // 离开武装函数后解除
     if let Some(armed) = &state.armed_func_bp {
-        let still = func_name.as_ref().is_some_and(|n| func_bp_matches(armed, n));
+        let still = func_name
+            .as_ref()
+            .is_some_and(|n| func_bp_matches(armed, n));
         if !still {
             state.armed_func_bp = None;
         }
@@ -331,12 +324,7 @@ pub fn should_pause(vm: &mut Vm, state: &mut DebugState) -> bool {
                 if let Some(log_expr) = log {
                     match eval_in_paused_vm(vm, &log_expr) {
                         Ok(v) => println!("[blog {}:{}] {}", file, line, v.display_string()),
-                        Err(e) => println!(
-                            "[blog {}:{}] error: {}",
-                            file,
-                            line,
-                            e.message()
-                        ),
+                        Err(e) => println!("[blog {}:{}] error: {}", file, line, e.message()),
                     }
                     // 纯日志断点：打印后继续（若同时有条件则仍可停）
                     if cond.is_none() {
@@ -349,12 +337,7 @@ pub fn should_pause(vm: &mut Vm, state: &mut DebugState) -> bool {
                     match eval_in_paused_vm(vm, &c) {
                         Ok(v) => v.is_truthy(),
                         Err(e) => {
-                            println!(
-                                "[break {}:{}] condition error: {}",
-                                file,
-                                line,
-                                e.message()
-                            );
+                            println!("[break {}:{}] condition error: {}", file, line, e.message());
                             false
                         }
                     }

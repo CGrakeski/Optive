@@ -45,11 +45,17 @@ impl BenchStats {
     }
 
     pub fn min_ms(&self) -> f64 {
-        self.samples_ms.iter().copied().fold(f64::INFINITY, f64::min)
+        self.samples_ms
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min)
     }
 
     pub fn max_ms(&self) -> f64 {
-        self.samples_ms.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+        self.samples_ms
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max)
     }
 
     #[must_use]
@@ -192,6 +198,34 @@ loop {
 total
 ";
 
+const PRIMES_SEQ_SRC: &str = r"
+func is_prime(n) {
+  if (n < 2) { return false }
+  if (n == 2) { return true }
+  if (n % 2 == 0) { return false }
+  var d = 3
+  loop {
+    if (d * d > n) { break }
+    if (n % d == 0) { return false }
+    d = d + 2
+  }
+  return true
+}
+
+func count_primes() {
+  var total = 0
+  var n = 2
+  loop {
+    if (n > 50001) { break }
+    if (is_prime(n)) { total = total + 1 }
+    n = n + 1
+  }
+  return total
+}
+
+count_primes()
+";
+
 fn run_parallel_primes(workers: usize) -> optive::value::Value {
     let mut vm = Vm::with_workers(workers);
     run_source_in_vm(&mut vm, PARALLEL_PRIMES_SRC, "<bench-primes>").expect("parallel primes")
@@ -313,6 +347,26 @@ fn bench_nested_loop_1b_vm_only() {
     );
 }
 
+#[test]
+#[ignore = "slow benchmark; run with --ignored"]
+fn bench_primes_seq() {
+    run_assert_bench("primes_seq(2..50001)", 4, PRIMES_SEQ_SRC, "5133");
+}
+
+#[test]
+#[ignore = "slow benchmark; run with --ignored"]
+fn bench_primes_seq_vm_only() {
+    let program = optive::compile(PRIMES_SEQ_SRC).expect("compile");
+    let mut vm = optive::vm::Vm::new();
+    vm.load_program(program).expect("load_program");
+    let stats = BenchStats::run("primes_seq(2..50001) vm-only", 4, || {
+        vm.reset_execution();
+        let v = vm.run().expect("primes");
+        assert_eq!(v.display_string(), "5133");
+    });
+    stats.report();
+}
+
 /// 并行筛素数：同 8 个 go 任务，扫 `OPTIVE_WORKERS` / `Vm::with_workers` = 1,2,4,8。
 #[test]
 #[ignore = "slow benchmark; run with --ignored"]
@@ -330,7 +384,10 @@ fn bench_parallel_primes() {
     if let Some((_, base)) = avgs.first() {
         if *base > 0.0 {
             for (w, avg) in &avgs {
-                println!("parallel_primes speedup vs 1 worker @ {w}: {:.2}x", base / avg);
+                println!(
+                    "parallel_primes speedup vs 1 worker @ {w}: {:.2}x",
+                    base / avg
+                );
             }
         }
     }

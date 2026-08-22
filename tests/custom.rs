@@ -13,9 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use optive::custom::{
-    self, build_active_from_ids, load_pack_dir, load_pack_staging, set_active_pack, write_global_use,
-    write_project_use, ActivePack, CliMsg, CustomPack, Diag, ErrorKindMsg, ParseMsg,
-    PROJECT_CUSTOM_FILE,
+    self, build_active_from_ids, load_pack_dir, load_pack_staging, set_active_pack,
+    write_global_use, write_project_use, ActivePack, CliMsg, CustomPack, Diag, ErrorKindMsg,
+    ParseMsg, PROJECT_CUSTOM_FILE,
 };
 use optive::error::{ExceptionKind, RuntimeError};
 use optive::{diagnostics, run_source};
@@ -27,7 +27,9 @@ fn catgirl_src() -> PathBuf {
 }
 
 fn with_temp_home<T>(f: impl FnOnce(&PathBuf) -> T) -> T {
-    let _guard = HOME_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = HOME_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile_dir();
     std::env::set_var("OPTIVE_HOME", &dir);
     std::env::remove_var("OPTIVE_CUSTOM");
@@ -55,11 +57,7 @@ fn tempfile_dir() -> PathBuf {
 fn install_catgirl(home: &Path) {
     let dest = home.join("custom/catgirl");
     fs::create_dir_all(&dest).unwrap();
-    fs::copy(
-        catgirl_src().join("Custom.toml"),
-        dest.join("Custom.toml"),
-    )
-    .unwrap();
+    fs::copy(catgirl_src().join("Custom.toml"), dest.join("Custom.toml")).unwrap();
 }
 
 #[test]
@@ -79,10 +77,7 @@ fn merge_field_level_layout_and_messages() {
     overlay.layout_set.repl_prompt = true;
     // 不设 continuation → 应保留 base
     let merged = base.merged_with(&overlay);
-    assert_eq!(
-        merged.render_message("runtime.zero_division", "x"),
-        "boom!"
-    );
+    assert_eq!(merged.render_message("runtime.zero_division", "x"), "boom!");
     assert_eq!(merged.layout.repl.prompt, "?> ");
     assert_eq!(merged.layout.repl.continuation, "... ");
 }
@@ -123,10 +118,7 @@ fn identity_type_name_stable_under_custom() {
     with_temp_home(|home| {
         install_catgirl(home);
         set_active_pack(build_active_from_ids(&["catgirl".into()]).unwrap());
-        assert_eq!(
-            ExceptionKind::ZeroDivision.type_name(),
-            "ZeroDivisionError"
-        );
+        assert_eq!(ExceptionKind::ZeroDivision.type_name(), "ZeroDivisionError");
         assert_eq!(
             RuntimeError::zero_div_diag().kind(),
             ExceptionKind::ZeroDivision
@@ -155,11 +147,7 @@ fn write_project_and_global_use() {
         install_catgirl(home);
         let proj = home.join("proj");
         fs::create_dir_all(&proj).unwrap();
-        fs::write(
-            proj.join("Optive.toml"),
-            "[package]\nname = \"t\"\n",
-        )
-        .unwrap();
+        fs::write(proj.join("Optive.toml"), "[package]\nname = \"t\"\n").unwrap();
         let custom_toml = proj.join(PROJECT_CUSTOM_FILE);
         write_project_use(&custom_toml, &["catgirl".into()]).unwrap();
         let text = fs::read_to_string(&custom_toml).unwrap();

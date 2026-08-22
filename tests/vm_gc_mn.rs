@@ -9,8 +9,8 @@
 //! M:N / concurrent GC 环收集回归。
 
 use optive::run_source;
-use optive::vm::Vm;
 use optive::value::Value;
+use optive::vm::Vm;
 use std::sync::atomic::Ordering;
 
 fn assert_cleared_at_least(src: &str, workers: usize, min: i64) {
@@ -19,7 +19,10 @@ fn assert_cleared_at_least(src: &str, workers: usize, min: i64) {
     match v {
         Value::Num(n) => {
             let c = n.to_i64().unwrap_or(0);
-            assert!(c >= min, "workers={workers}: expected cleared >= {min}, got {c}");
+            assert!(
+                c >= min,
+                "workers={workers}: expected cleared >= {min}, got {c}"
+            );
         }
         other => panic!("expected num, got {}", other.display_string()),
     }
@@ -124,8 +127,7 @@ gc()
 
 #[test]
 fn gc_concurrent_parallel_markers_break_cycles() {
-    let mut vm =
-        Vm::with_workers_gc_markers(2, optive::gc::GcMode::Concurrent, 4);
+    let mut vm = Vm::with_workers_gc_markers(2, optive::gc::GcMode::Concurrent, 4);
     let src = r"
 func make_n(n) {
     for (i in std.math.range(n)) {

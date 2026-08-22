@@ -1,8 +1,8 @@
 //! Shared helpers for integration tests.
 #![allow(dead_code)]
 
-use optive::{eval_bool, eval_num, eval_text, parse_program, run_source, tokenize, TokenKind};
 use optive::value::Value;
+use optive::{eval_bool, eval_num, eval_text, parse_program, run_source, tokenize, TokenKind};
 
 pub fn tokens(source: &str) -> Vec<optive::Token> {
     tokenize(source).expect("lex error")
@@ -45,11 +45,17 @@ pub fn parse_ok(source: &str) {
 }
 
 pub fn parse_err(source: &str) {
-    assert!(parse_program(source).is_err(), "expected parse error for: {source}");
+    assert!(
+        parse_program(source).is_err(),
+        "expected parse error for: {source}"
+    );
 }
 
 pub fn run_err(source: &str) {
-    assert!(run_source(source).is_err(), "expected runtime error for: {source}");
+    assert!(
+        run_source(source).is_err(),
+        "expected runtime error for: {source}"
+    );
 }
 
 /// 用给定能力集跑源码（沙箱测试用）。
@@ -65,7 +71,10 @@ pub fn run_with_caps(
 /// 断言给定源码在指定能力集下抛错，且消息包含 `needle`。
 pub fn assert_caps_err(source: &str, caps: optive::caps::Capabilities, needle: &str) {
     match run_with_caps(source, caps) {
-        Ok(v) => panic!("expected error containing '{needle}', got ok value: {}", v.display_string()),
+        Ok(v) => panic!(
+            "expected error containing '{needle}', got ok value: {}",
+            v.display_string()
+        ),
         Err(e) => {
             let msg = e.message();
             assert!(
@@ -137,9 +146,5 @@ pub fn assert_text(source: &str, expected: &str) {
 }
 
 pub fn assert_list(source: &str, expected: &str) {
-    assert_eq!(
-        value(source).display_string(),
-        expected,
-        "source: {source}"
-    );
+    assert_eq!(value(source).display_string(), expected, "source: {source}");
 }

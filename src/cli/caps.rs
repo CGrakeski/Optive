@@ -17,7 +17,9 @@ use optive::caps::{Capabilities, FsPolicy};
 /// - `--allow-path DIR`：把 DIR 加入文件系统允许根（可重复；不改变网络/环境）
 /// - `--allow-ffi`：在沙箱下显式允许 `C.frompath` / `extern`
 /// - `--no-ffi`：禁止原生 FFI（即使非 sandbox）
-pub fn parse_caps(args: &[String]) -> Result<(Capabilities, Vec<String>), Box<dyn std::error::Error>> {
+pub fn parse_caps(
+    args: &[String],
+) -> Result<(Capabilities, Vec<String>), Box<dyn std::error::Error>> {
     let mut no_network = false;
     let mut env_off = false;
     let mut ffi_off = false;
@@ -50,9 +52,7 @@ pub fn parse_caps(args: &[String]) -> Result<(Capabilities, Vec<String>), Box<dy
                 });
             }
             "--allow-path" => {
-                let dir = args
-                    .get(i + 1)
-                    .ok_or("--allow-path requires a value")?;
+                let dir = args.get(i + 1).ok_or("--allow-path requires a value")?;
                 roots.push(PathBuf::from(dir));
                 i += 1;
             }

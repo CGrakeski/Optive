@@ -52,7 +52,9 @@ pub fn eval_const_num(expr: &Expr) -> Result<Num> {
                 Num::Rat(r) => Ok(Num::from_rational(-r.as_ref())),
             }
         }
-        _ => Err(RuntimeError::type_err("enum member value must be integer literal")),
+        _ => Err(RuntimeError::type_err(
+            "enum member value must be integer literal",
+        )),
     }
 }
 

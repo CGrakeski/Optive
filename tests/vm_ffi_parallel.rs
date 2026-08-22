@@ -149,7 +149,9 @@ await sleeper
 n
 "#
     );
-    let mut vm = Vm::with_workers(2).with_ffi_threads(2).with_ffi_serial(false);
+    let mut vm = Vm::with_workers(2)
+        .with_ffi_threads(2)
+        .with_ffi_serial(false);
     let t0 = Instant::now();
     let v = run_source_in_vm(&mut vm, &src, "<ffi_offload>").expect("run");
     let elapsed = t0.elapsed();
@@ -209,9 +211,6 @@ fn bench_serial_vs_parallel_sleep() {
         let mut vm = Vm::with_workers(4).with_ffi_serial(serial);
         let t0 = Instant::now();
         run_source_in_vm(&mut vm, &src, "<bench>").expect("run");
-        eprintln!(
-            "serial={serial} elapsed_ms={}",
-            t0.elapsed().as_millis()
-        );
+        eprintln!("serial={serial} elapsed_ms={}", t0.elapsed().as_millis());
     }
 }

@@ -7,12 +7,15 @@ use crate::builtins;
 use crate::error::RuntimeError;
 use crate::exceptions;
 use crate::module;
+use crate::opcode::{CompiledProgram, FunctionObject, Instruction, MacroObject, ModuleGlobalEnv};
 use crate::runtime_ast::{self, RuntimeAstNode};
 use crate::traceback;
 use crate::type_registry;
 use crate::types::{self, type_value_display};
-use crate::opcode::{CompiledProgram, FunctionObject, Instruction, MacroObject, ModuleGlobalEnv};
-use crate::value::{BuiltinFn, ChannelInner, DictMap, DispatchTable, IteratorKind, IteratorState, ModuleObject, MutexInner, Num, TaskInner, TaskState, Value, ValueKey, values_identical};
+use crate::value::{
+    values_identical, BuiltinFn, ChannelInner, DictMap, DispatchTable, IteratorKind, IteratorState,
+    ModuleObject, MutexInner, Num, TaskInner, TaskState, Value, ValueKey,
+};
 use crate::Result;
 
 use crate::scheduler::{self, MnScheduler};
@@ -119,12 +122,21 @@ pub(crate) struct TaskFiber {
 /// 同步原语在 `block_suspend` + Call 重试之间保留的登记状态。
 #[derive(Clone)]
 enum SyncWaitResume {
-    Barrier { id: usize, generation: u64 },
-    Cond { id: usize },
+    Barrier {
+        id: usize,
+        generation: u64,
+    },
+    Cond {
+        id: usize,
+    },
     /// Cond 已收到信号，正在重新获取 mutex；挂起后勿再次登记 waiter / unlock。
-    CondRelock { id: usize },
+    CondRelock {
+        id: usize,
+    },
     /// `std.time.sleep` 协作切片：截止时刻，随纤程迁移。
-    Sleep { until: std::time::Instant },
+    Sleep {
+        until: std::time::Instant,
+    },
 }
 
 /// 辅助宏：从环境变量读取正的 usize，带缓存或不带缓存。
@@ -248,7 +260,11 @@ fn validate_function_hot(func: &crate::opcode::FunctionObject) -> Result<()> {
 }
 
 fn validate_hot_bytecode(hot: &crate::hot_code::HotCode) -> Result<()> {
-    use crate::hot_code::{H_GOTO, H_GOTO_IF, H_GOTO_IF_NOT, H_LOOP_COUNTDOWN, H_LOAD_FAST, H_STORE_FAST, H_RET_FAST, H_CALL_SELF, H_LOAD_FAST_SUB_IMM, H_LOAD_FAST_LE_IMM, H_LOAD_GLOBAL, H_STORE_GLOBAL, H_CALL, H_CALL_GLOBAL};
+    use crate::hot_code::{
+        H_CALL, H_CALL_GLOBAL, H_CALL_SELF, H_GOTO, H_GOTO_IF, H_GOTO_IF_NOT, H_LOAD_FAST,
+        H_LOAD_FAST_LE_IMM, H_LOAD_FAST_SUB_IMM, H_LOAD_GLOBAL, H_LOOP_COUNTDOWN, H_RET_FAST,
+        H_STORE_FAST, H_STORE_GLOBAL,
+    };
     let n = hot.ops.len();
     if hot.args.len() != n {
         return Err(RuntimeError::msg(format!(
@@ -261,10 +277,7 @@ fn validate_hot_bytecode(hot: &crate::hot_code::HotCode) -> Result<()> {
         let op = hot.ops[pc];
         let arg = hot.args[pc];
         // 跳转类指令的目标必须落在 [0, n)。
-        let is_jump = matches!(
-            op,
-            H_GOTO | H_GOTO_IF | H_GOTO_IF_NOT | H_LOOP_COUNTDOWN
-        );
+        let is_jump = matches!(op, H_GOTO | H_GOTO_IF | H_GOTO_IF_NOT | H_LOOP_COUNTDOWN);
         if is_jump {
             let target = arg;
             if target < 0 || (target as usize) >= n {
@@ -564,12 +577,45 @@ enum StepAction {
     LoadMacro(String),
     Store(String),
     StoreGlobal(usize),
-    NewVar { name: String, is_const: bool },
+    NewVar {
+        name: String,
+        is_const: bool,
+    },
     NewVarOrLoad(String),
     LoadFast(usize),
     StoreFast(usize),
-    LoadFastSubImm { slot: usize, imm: i64 },
-    LoadFastLeImm { slot: usize, imm: i64 },
+    LoadFastSubImm {
+        slot: usize,
+        imm: i64,
+    },
+    LoadFastLeImm {
+        slot: usize,
+        imm: i64,
+    },
+    LoadFastLtImm {
+        slot: usize,
+        imm: i64,
+    },
+    LoadFastGtImm {
+        slot: usize,
+        imm: i64,
+    },
+    LoadFastEqImm {
+        slot: usize,
+        imm: i64,
+    },
+    LoadFastAddImmStore {
+        slot: usize,
+        imm: i64,
+    },
+    LoadFastSqrGt {
+        sqr_slot: usize,
+        rhs_slot: usize,
+    },
+    LoadFastModEq0 {
+        lhs_slot: usize,
+        rhs_slot: usize,
+    },
     BindFast {
         slot: usize,
         name: String,
@@ -582,12 +628,21 @@ enum StepAction {
     GotoIf(usize),
     GotoIfNot(usize),
     LoopCountdown(usize),
-    Call { argc: usize },
-    CallGlobal { global_idx: usize, argc: usize },
-    CallSelf { argc: usize },
+    Call {
+        argc: usize,
+    },
+    CallGlobal {
+        global_idx: usize,
+        argc: usize,
+    },
+    CallSelf {
+        argc: usize,
+    },
     CallList,
     CallEx,
-    MacroCall { argc: usize },
+    MacroCall {
+        argc: usize,
+    },
     ListAppend,
     ListExtend,
     DictSet,
@@ -607,8 +662,13 @@ enum StepAction {
     DelName(String),
     DelAttr(String),
     GetAttr(String),
-    StructNew { name: String, argc: usize },
-    VariantNew { name: String },
+    StructNew {
+        name: String,
+        argc: usize,
+    },
+    VariantNew {
+        name: String,
+    },
     SetField(String),
     IterNew,
     IterNext,
@@ -629,7 +689,10 @@ enum StepAction {
     IsInstance(String),
     MatchEq,
     UnpackExact(usize),
-    UnpackRest { before: usize, after: usize },
+    UnpackRest {
+        before: usize,
+        after: usize,
+    },
     Rethrow,
     TypeCheck,
     /// 栈顶 Function：定义处求值并缓存类型注解。
@@ -637,7 +700,9 @@ enum StepAction {
     FindMod(Vec<String>),
     FindModFile(String),
     RegisterExport(String),
-    GoCall { argc: usize },
+    GoCall {
+        argc: usize,
+    },
     GoValue,
     Await,
     Suspend,
@@ -795,8 +860,7 @@ impl Vm {
             mn_idle_rounds: 0,
             select_fair_order: Vec::new(),
             select_fair_pos: 0,
-            select_rng: 0x00C0_FFEE_u64
-                ^ std::time::Instant::now().elapsed().as_nanos() as u64,
+            select_rng: 0x00C0_FFEE_u64 ^ std::time::Instant::now().elapsed().as_nanos() as u64,
             debug_break_requested: false,
             debug_paused_tasks: Vec::new(),
             gc_auto_cooldown_until: None,
@@ -954,11 +1018,7 @@ impl Vm {
             return 0;
         };
         let need_stw = self.mn_parallel;
-        let stw_ok = if need_stw {
-            self.mn.begin_stw()
-        } else {
-            true
-        };
+        let stw_ok = if need_stw { self.mn.begin_stw() } else { true };
 
         let cleared = if stw_ok {
             let cleared = match gc.mode() {
@@ -976,14 +1036,11 @@ impl Vm {
             let n = self.mn.note_stw_failure();
             gc.stw_fallback_count.fetch_add(1, Ordering::Relaxed);
             if n == 1 || n.is_multiple_of(64) {
-                eprintln!(
-                    "optive: GC stop-the-world 超时（累计 {n} 次），本轮回退冷却后重试"
-                );
+                eprintln!("optive: GC stop-the-world 超时（累计 {n} 次），本轮回退冷却后重试");
             }
             let hold = gc.tracked_count();
             self.gc_auto_cooldown_hold_count = hold;
-            self.gc_auto_cooldown_until =
-                Some(std::time::Instant::now() + Self::gc_stw_cooldown());
+            self.gc_auto_cooldown_until = Some(std::time::Instant::now() + Self::gc_stw_cooldown());
             0
         };
 
@@ -1041,14 +1098,11 @@ impl Vm {
             let n = self.mn.note_stw_failure();
             self.gc.stw_fallback_count.fetch_add(1, Ordering::Relaxed);
             if n == 1 || n.is_multiple_of(64) {
-                eprintln!(
-                    "optive: GC terminate STW 超时（累计 {n} 次），本轮回退冷却后重试"
-                );
+                eprintln!("optive: GC terminate STW 超时（累计 {n} 次），本轮回退冷却后重试");
             }
             let hold = self.gc.tracked_count();
             self.gc_auto_cooldown_hold_count = hold;
-            self.gc_auto_cooldown_until =
-                Some(std::time::Instant::now() + Self::gc_stw_cooldown());
+            self.gc_auto_cooldown_until = Some(std::time::Instant::now() + Self::gc_stw_cooldown());
             let stw3 = self.mn.begin_stw();
             let cleared = if stw3 {
                 self.gc.collect_stw_inner(self)
@@ -1078,7 +1132,10 @@ impl Vm {
             .ok()
             .and_then(|s| s.parse().ok())
             .filter(|&n: &u64| n > 0)
-            .map_or(std::time::Duration::from_millis(50), std::time::Duration::from_millis)
+            .map_or(
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_millis,
+            )
     }
 
     /// 将本 Vm 局部根推入工作表（不含共享 fiber / parked / scheduled）。
@@ -1236,7 +1293,11 @@ impl Vm {
         if !self.mn_parallel {
             return;
         }
-        if !self.mn.stw_requested.load(std::sync::atomic::Ordering::Acquire) {
+        if !self
+            .mn
+            .stw_requested
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             return;
         }
         let mut roots = Vec::new();
@@ -1288,10 +1349,8 @@ impl Vm {
 
         builtins::install_globals(self);
         type_registry::install_core_types(self);
-        self.globals.insert(
-            "__package__".into(),
-            Value::Text(package_name.to_string()),
-        );
+        self.globals
+            .insert("__package__".into(), Value::Text(package_name.to_string()));
 
         let exports = Shared::new(HashMap::new());
         self.module_init_exports = Some(exports.clone());
@@ -1299,7 +1358,8 @@ impl Vm {
         self.functions.replace_with(snap.functions.clone());
         self.macros.replace_with(snap.macros.clone());
         self.struct_defs.replace_with(snap.struct_defs.clone());
-        self.overload_tables.replace_with(snap.overload_tables.clone());
+        self.overload_tables
+            .replace_with(snap.overload_tables.clone());
         exports
     }
 
@@ -1394,10 +1454,8 @@ impl Vm {
         self.macros.extend(program.macros);
         self.overload_tables.extend(program.overload_tables);
         self.protocols.extend(program.protocols);
-        self.globals.insert(
-            "__package__".into(),
-            Value::Text("__main__".into()),
-        );
+        self.globals
+            .insert("__package__".into(), Value::Text("__main__".into()));
         self.pc = 0;
         // REPL 多次 load：热 Store 可能只写平行槽；重建表前刷入 SharedMap，
         // 否则下一行读到 NewVar 的 none（如 `acc = acc + 5`）。
@@ -1550,7 +1608,10 @@ impl Vm {
         // 顶层：非 none 平行槽是热 Store 的权威来源；none 槽回退 SharedMap
         //（friend/`__register_dispatch__` 可能只写 map；`del` 后无键 → NameError）。
         if let Some(v) = self.script_globals.get(idx) {
-            let name = self.script_global_names.get(idx).map_or("", std::string::String::as_str);
+            let name = self
+                .script_global_names
+                .get(idx)
+                .map_or("", std::string::String::as_str);
             if name.is_empty() {
                 return Err(RuntimeError::msg(format!(
                     "internal: LoadGlobal({idx}) resolves to empty global name"
@@ -1785,9 +1846,7 @@ impl Vm {
         self.stack_sp = sp;
         // SAFETY: sp < stack_sp（旧值）<= stack.len()，故 sp 在界内。
         // 调用方保证 stack_sp > 0（debug_assert 校验；release 下由上层 pop_hot / 冷路径守卫）。
-        unsafe {
-            std::mem::replace(self.stack.get_unchecked_mut(sp), StackVal::Empty)
-        }
+        unsafe { std::mem::replace(self.stack.get_unchecked_mut(sp), StackVal::Empty) }
     }
 
     /// 二元 Int 运算就地完成：读 TOS/TOS1，写回 TOS1，sp-=1。成功返回 true。
@@ -1937,7 +1996,9 @@ impl Vm {
     #[inline(always)]
     fn call_self_lightweight(&mut self, argc: usize, entry_pc: usize, frame_slots: usize) {
         if self.lw_depth >= self.cached_max_depth {
-            self.set_hot_error(RuntimeError::msg("RecursionError: maximum recursion depth exceeded"));
+            self.set_hot_error(RuntimeError::msg(
+                "RecursionError: maximum recursion depth exceeded",
+            ));
             return;
         }
         self.push_fast_ret(self.pc);
@@ -2010,6 +2071,46 @@ impl Vm {
             }
         }
         self.local_set(slot, val.into_value());
+    }
+
+    #[inline(always)]
+    fn lw_slot_int(&self, slot: usize) -> Option<i64> {
+        if self.lw_depth == 0 {
+            return None;
+        }
+        let idx = self.lw_base + slot;
+        if idx >= self.lw_sp {
+            return None;
+        }
+        match unsafe { self.lw_slots.get_unchecked(idx) } {
+            StackVal::Int(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    fn push_fast_cmp_imm(
+        &mut self,
+        slot: usize,
+        imm: i64,
+        pred: impl Fn(std::cmp::Ordering) -> bool,
+    ) -> Result<()> {
+        let sv = self.load_fast_sv(slot);
+        if let StackVal::Int(n) = sv {
+            self.op_push_bool(pred(n.cmp(&imm)));
+            return Ok(());
+        }
+        let a = sv.into_value();
+        let ord = match &a {
+            Value::Num(n) => n.cmp_num(&Num::Small(imm)),
+            _ => {
+                return Err(RuntimeError::type_err(format!(
+                    "cannot compare {} with number",
+                    a.type_name()
+                )));
+            }
+        };
+        self.op_push_bool(pred(ord));
+        Ok(())
     }
 
     #[inline(always)]
@@ -2097,7 +2198,13 @@ impl Vm {
             (Value::Num(_), Value::Num(_)) => av.add(&bv)?,
             (Value::Text(_), Value::Text(_)) => av.add(&bv)?,
             (Value::List(_), Value::List(_)) => av.add(&bv)?,
-            _ => self.dispatch_binary_arith(&av, &bv, "__add__", "__radd__", super::value::Value::add)?,
+            _ => self.dispatch_binary_arith(
+                &av,
+                &bv,
+                "__add__",
+                "__radd__",
+                super::value::Value::add,
+            )?,
         };
         self.push_value(result);
         Ok(())
@@ -2109,7 +2216,13 @@ impl Vm {
         let bv = b.into_value();
         let result = match (&av, &bv) {
             (Value::Num(_), Value::Num(_)) => av.sub(&bv)?,
-            _ => self.dispatch_binary_arith(&av, &bv, "__sub__", "__rsub__", super::value::Value::sub)?,
+            _ => self.dispatch_binary_arith(
+                &av,
+                &bv,
+                "__sub__",
+                "__rsub__",
+                super::value::Value::sub,
+            )?,
         };
         self.push_value(result);
         Ok(())
@@ -2167,9 +2280,8 @@ impl Vm {
                 let bv = rhs.into_value();
                 let result = match (&av, &bv) {
                     (Value::Num(_), Value::Num(_)) => av.mul(&bv)?,
-                    _ => self.dispatch_binary_arith(&av, &bv, "__mul__", "__rmul__", |x, y| {
-                        x.mul(y)
-                    })?,
+                    _ => self
+                        .dispatch_binary_arith(&av, &bv, "__mul__", "__rmul__", |x, y| x.mul(y))?,
                 };
                 self.push_value(result);
             }
@@ -2183,9 +2295,9 @@ impl Vm {
         let a = self.pop()?;
         let result = match (&a, &b) {
             (Value::Num(_), Value::Num(_)) => a.div(&b)?,
-            _ => self.dispatch_binary_arith(&a, &b, "__truediv__", "__rtruediv__", |x, y| {
-                x.div(y)
-            })?,
+            _ => {
+                self.dispatch_binary_arith(&a, &b, "__truediv__", "__rtruediv__", |x, y| x.div(y))?
+            }
         };
         self.push_value(result);
         Ok(())
@@ -2220,9 +2332,8 @@ impl Vm {
                 let bv = rhs.into_value();
                 let result = match (&av, &bv) {
                     (Value::Num(_), Value::Num(_)) => av.rem(&bv)?,
-                    _ => self.dispatch_binary_arith(&av, &bv, "__mod__", "__rmod__", |x, y| {
-                        x.rem(y)
-                    })?,
+                    _ => self
+                        .dispatch_binary_arith(&av, &bv, "__mod__", "__rmod__", |x, y| x.rem(y))?,
                 };
                 self.push_value(result);
                 Ok(())
@@ -2234,7 +2345,9 @@ impl Vm {
     fn exec_cmp_num(&mut self, pred: impl Fn(std::cmp::Ordering) -> bool) -> Result<()> {
         let b = self.pop_hot();
         let a = self.pop_hot();
-        let result = if let (StackVal::Int(x), StackVal::Int(y)) = (&a, &b) { pred(x.cmp(y)) } else {
+        let result = if let (StackVal::Int(x), StackVal::Int(y)) = (&a, &b) {
+            pred(x.cmp(y))
+        } else {
             let av = a.to_value();
             let bv = b.to_value();
             match (&av, &bv) {
@@ -2264,7 +2377,14 @@ impl Vm {
     /// 必须 `inline(always)`：每指令一次调用的开销在空循环上远大于 I-cache 压力。
     #[inline(always)]
     fn dispatch_hot_u8(&mut self, ops: &[u8], hot_args: &[i64], pc: usize) -> HotFlow {
-        use crate::hot_code::{H_PUSH_SMALL, H_LOAD_FAST, H_STORE_FAST, H_LOAD_FAST_SUB_IMM, H_LOAD_FAST_LE_IMM, H_ADD_NUM, H_SUB_NUM, H_MUL_NUM, H_DIV_NUM, H_MOD_NUM, H_LE, H_LT, H_GT, H_GE, H_EQ, H_NE, H_GOTO, H_LOOP_COUNTDOWN, H_GOTO_IF_NOT, H_GOTO_IF, H_LABEL, H_CALL_SELF, H_RET, H_RET_LEAVE, H_RET_FAST, H_ADD_TEXT, H_ADD_LIST, H_LOAD_GLOBAL, H_STORE_GLOBAL, H_CALL, H_CALL_GLOBAL};
+        use crate::hot_code::{
+            H_ADD_LIST, H_ADD_NUM, H_ADD_TEXT, H_CALL, H_CALL_GLOBAL, H_CALL_SELF, H_DIV_NUM, H_EQ,
+            H_GE, H_GOTO, H_GOTO_IF, H_GOTO_IF_NOT, H_GT, H_LABEL, H_LE, H_LOAD_FAST,
+            H_LOAD_FAST_ADD_IMM_STORE, H_LOAD_FAST_EQ_IMM, H_LOAD_FAST_GT_IMM, H_LOAD_FAST_LE_IMM,
+            H_LOAD_FAST_LT_IMM, H_LOAD_FAST_MOD_EQ0, H_LOAD_FAST_SQR_GT, H_LOAD_FAST_SUB_IMM,
+            H_LOAD_GLOBAL, H_LOOP_COUNTDOWN, H_LT, H_MOD_NUM, H_MUL_NUM, H_NE, H_PUSH_BOOL,
+            H_PUSH_SMALL, H_RET, H_RET_FAST, H_RET_LEAVE, H_STORE_FAST, H_STORE_GLOBAL, H_SUB_NUM,
+        };
         // SAFETY（已由外层 `'hot` 循环 `if pc >= code_len { break }` 保证）：
         // 进入本函数时 `pc < ops.len()`，且 `HotCode::encode` 保证 `ops.len() == hot_args.len()`。
         let op = unsafe { *ops.get_unchecked(pc) };
@@ -2273,6 +2393,11 @@ impl Vm {
             H_PUSH_SMALL => {
                 self.pc = pc + 1;
                 self.op_push_int(arg);
+                HotFlow::Cont
+            }
+            H_PUSH_BOOL => {
+                self.pc = pc + 1;
+                self.op_push_bool(arg != 0);
                 HotFlow::Cont
             }
             H_LOAD_FAST => {
@@ -2293,7 +2418,7 @@ impl Vm {
                                     HotFlow::Cont
                                 }
                             }
-                        }
+                        };
                     }
                     self.op_push(StackVal::Empty);
                 } else {
@@ -2351,20 +2476,84 @@ impl Vm {
             }
             H_LOAD_FAST_LE_IMM => {
                 let (slot, imm) = crate::hot_code::decode_slot_imm(arg);
-                if self.lw_depth != 0 {
-                    let idx = self.lw_base + slot;
-                    if idx < self.lw_sp {
-                        // SAFETY: idx < lw_sp <= lw_slots.len()。
-                        if let StackVal::Int(n) = unsafe { self.lw_slots.get_unchecked(idx) } {
-                            self.pc = pc + 1;
-                            self.op_push_bool(*n <= imm);
-                            HotFlow::Cont
-                        } else {
-                            HotFlow::Cold
+                if let Some(n) = self.lw_slot_int(slot) {
+                    self.pc = pc + 1;
+                    self.op_push_bool(n <= imm);
+                    HotFlow::Cont
+                } else {
+                    HotFlow::Cold
+                }
+            }
+            H_LOAD_FAST_LT_IMM => {
+                let (slot, imm) = crate::hot_code::decode_slot_imm(arg);
+                if let Some(n) = self.lw_slot_int(slot) {
+                    self.pc = pc + 1;
+                    self.op_push_bool(n < imm);
+                    HotFlow::Cont
+                } else {
+                    HotFlow::Cold
+                }
+            }
+            H_LOAD_FAST_GT_IMM => {
+                let (slot, imm) = crate::hot_code::decode_slot_imm(arg);
+                if let Some(n) = self.lw_slot_int(slot) {
+                    self.pc = pc + 1;
+                    self.op_push_bool(n > imm);
+                    HotFlow::Cont
+                } else {
+                    HotFlow::Cold
+                }
+            }
+            H_LOAD_FAST_EQ_IMM => {
+                let (slot, imm) = crate::hot_code::decode_slot_imm(arg);
+                if let Some(n) = self.lw_slot_int(slot) {
+                    self.pc = pc + 1;
+                    self.op_push_bool(n == imm);
+                    HotFlow::Cont
+                } else {
+                    HotFlow::Cold
+                }
+            }
+            H_LOAD_FAST_ADD_IMM_STORE => {
+                let (slot, imm) = crate::hot_code::decode_slot_imm(arg);
+                if let Some(n) = self.lw_slot_int(slot) {
+                    let (r, ov) = n.overflowing_add(imm);
+                    if !ov {
+                        if let Err(e) = self.reject_const_fast_store(slot) {
+                            self.set_hot_error(e);
+                            return HotFlow::Fail;
                         }
-                    } else {
-                        HotFlow::Cold
+                        self.pc = pc + 1;
+                        self.store_fast_sv(slot, StackVal::Int(r));
+                        return HotFlow::Cont;
                     }
+                }
+                HotFlow::Cold
+            }
+            H_LOAD_FAST_SQR_GT => {
+                let (dslot, nslot) = crate::hot_code::decode_two_slots(arg);
+                if let (Some(d), Some(n)) = (self.lw_slot_int(dslot), self.lw_slot_int(nslot)) {
+                    self.pc = pc + 1;
+                    let gt = match d.checked_mul(d) {
+                        Some(sq) => sq > n,
+                        None => (d as i128).saturating_mul(d as i128) > i128::from(n),
+                    };
+                    self.op_push_bool(gt);
+                    HotFlow::Cont
+                } else {
+                    HotFlow::Cold
+                }
+            }
+            H_LOAD_FAST_MOD_EQ0 => {
+                let (lhs, rhs) = crate::hot_code::decode_two_slots(arg);
+                if let (Some(a), Some(b)) = (self.lw_slot_int(lhs), self.lw_slot_int(rhs)) {
+                    if b == 0 {
+                        self.set_hot_error(RuntimeError::zero_div_diag());
+                        return HotFlow::Fail;
+                    }
+                    self.pc = pc + 1;
+                    self.op_push_bool(a % b == 0);
+                    HotFlow::Cont
                 } else {
                     HotFlow::Cold
                 }
@@ -2542,7 +2731,9 @@ impl Vm {
                 // 这里直接 pop 后走 dispatch_eq（保留 __eq__ 魔术语义）。
                 let b = self.pop_hot();
                 let a = self.pop_hot();
-                let result = if let (StackVal::Int(x), StackVal::Int(y)) = (&a, &b) { Ok(x == y) } else {
+                let result = if let (StackVal::Int(x), StackVal::Int(y)) = (&a, &b) {
+                    Ok(x == y)
+                } else {
                     let av = a.to_value();
                     let bv = b.to_value();
                     self.dispatch_eq(&av, &bv)
@@ -2565,7 +2756,9 @@ impl Vm {
                 }
                 let b = self.pop_hot();
                 let a = self.pop_hot();
-                let result = if let (StackVal::Int(x), StackVal::Int(y)) = (&a, &b) { Ok(x != y) } else {
+                let result = if let (StackVal::Int(x), StackVal::Int(y)) = (&a, &b) {
+                    Ok(x != y)
+                } else {
                     let av = a.to_value();
                     let bv = b.to_value();
                     self.dispatch_eq(&av, &bv).map(|eq| !eq)
@@ -2779,8 +2972,7 @@ impl Vm {
                     if let StackVal::Int(n) = v {
                         // SAFETY: idx < script_globals.len(); name non-empty checked above.
                         unsafe {
-                            *self.script_globals.get_unchecked_mut(idx) =
-                                Value::Num(Num::Small(n));
+                            *self.script_globals.get_unchecked_mut(idx) = Value::Num(Num::Small(n));
                         }
                         if self.mn_parallel {
                             return self.dispatch_hot_store_global_mn(idx, n);
@@ -2837,16 +3029,12 @@ impl Vm {
                 if let Value::Function(f) = *b {
                     f
                 } else {
-                    self.set_hot_error(RuntimeError::msg(
-                        "internal: H_CALL lightweight mismatch",
-                    ));
+                    self.set_hot_error(RuntimeError::msg("internal: H_CALL lightweight mismatch"));
                     return HotFlow::Fail;
                 }
             }
             _ => {
-                self.set_hot_error(RuntimeError::msg(
-                    "internal: H_CALL lightweight mismatch",
-                ));
+                self.set_hot_error(RuntimeError::msg("internal: H_CALL lightweight mismatch"));
                 return HotFlow::Fail;
             }
         };
@@ -2888,7 +3076,6 @@ impl Vm {
         }
         HotFlow::Switched
     }
-
 
     #[inline(never)]
     fn dispatch_hot_load_global_slow(&mut self, idx: usize) -> HotFlow {
@@ -2985,10 +3172,7 @@ impl Vm {
 
     /// 热路径解析全局函数：顶层走平行槽，避免 `SharedMap`。
     #[inline(always)]
-    fn resolve_global_function_hot(
-        &self,
-        idx: usize,
-    ) -> Result<Option<Arc<FunctionObject>>> {
+    fn resolve_global_function_hot(&self, idx: usize) -> Result<Option<Arc<FunctionObject>>> {
         if self.user_call_frames.is_empty() && idx < self.script_globals.len() {
             // SAFETY: idx 已界检。
             return Ok(match unsafe { self.script_globals.get_unchecked(idx) } {
@@ -3009,7 +3193,9 @@ impl Vm {
     #[inline(always)]
     fn call_self_lw1(&mut self, entry_pc: usize) {
         if self.lw_depth >= self.cached_max_depth {
-            self.set_hot_error(RuntimeError::msg("RecursionError: maximum recursion depth exceeded"));
+            self.set_hot_error(RuntimeError::msg(
+                "RecursionError: maximum recursion depth exceeded",
+            ));
             return;
         }
         self.push_fast_ret(self.pc);
@@ -3142,7 +3328,9 @@ impl Vm {
                             .hot_error
                             .take()
                             .unwrap_or_else(|| RuntimeError::msg("hot path error"));
-                        if self.handle_or_promote_error(&e)? { continue 'outer }
+                        if self.handle_or_promote_error(&e)? {
+                            continue 'outer;
+                        }
                         self.record_error_stack();
                         self.unwind_user_calls_on_error()?;
                         return self.finish_uncaught(e);
@@ -3151,10 +3339,9 @@ impl Vm {
                         if self.lw_depth > 0 && self.fast_ret_sp == 0 {
                             self.pop_lightweight_frame();
                         }
-                        let (leave, result_sv) = self
-                            .pending_ret
-                            .take()
-                            .expect("pending_ret set under HotFlow::PendingRet (theoretically unreachable)");
+                        let (leave, result_sv) = self.pending_ret.take().expect(
+                            "pending_ret set under HotFlow::PendingRet (theoretically unreachable)",
+                        );
                         let result = result_sv.into_value();
                         if let Some(ret) = self.complete_user_return_instruction(leave, result)? {
                             return Ok(InterpResult::Value(Some(ret)));
@@ -3172,7 +3359,9 @@ impl Vm {
                         if self.pending_main_yield {
                             self.pending_main_yield = false;
                             if let Err(e) = self.scheduler_yield() {
-                                if self.handle_or_promote_error(&e)? { continue 'outer }
+                                if self.handle_or_promote_error(&e)? {
+                                    continue 'outer;
+                                }
                                 self.record_error_stack();
                                 self.unwind_user_calls_on_error()?;
                                 return self.finish_uncaught(e);
@@ -3184,7 +3373,9 @@ impl Vm {
                         let ops_ptr = Arc::as_ptr(&self.hot_ops).cast::<u8>();
                         let args_ptr = Arc::as_ptr(&self.hot_args).cast::<i64>();
                         if let Err(e) = self.step() {
-                            if self.handle_or_promote_error(&e)? { continue 'outer }
+                            if self.handle_or_promote_error(&e)? {
+                                continue 'outer;
+                            }
                             self.record_error_stack();
                             self.unwind_user_calls_on_error()?;
                             return self.finish_uncaught(e);
@@ -3196,7 +3387,9 @@ impl Vm {
                         if self.pending_main_yield {
                             self.pending_main_yield = false;
                             if let Err(e) = self.scheduler_yield() {
-                                if self.handle_or_promote_error(&e)? { continue 'outer }
+                                if self.handle_or_promote_error(&e)? {
+                                    continue 'outer;
+                                }
                                 self.record_error_stack();
                                 self.unwind_user_calls_on_error()?;
                                 return self.finish_uncaught(e);
@@ -3254,7 +3447,8 @@ impl Vm {
     /// 未捕获脚本异常时，用异常种类与文案覆盖原始宿主错误。
     fn finalize_runtime_error(&self, fallback: RuntimeError) -> RuntimeError {
         if let Some(exc) = self.active_exception.as_ref() {
-            let kind = exceptions::kind_of_value(exc).unwrap_or(crate::error::ExceptionKind::Runtime);
+            let kind =
+                exceptions::kind_of_value(exc).unwrap_or(crate::error::ExceptionKind::Runtime);
             RuntimeError::typed(kind, exceptions::format_uncaught(exc))
         } else {
             fallback
@@ -3366,8 +3560,38 @@ impl Vm {
             I::NewVarOrLoad(name) => StepAction::NewVarOrLoad(name.clone()),
             I::LoadFast(slot) => StepAction::LoadFast(*slot),
             I::StoreFast(slot) => StepAction::StoreFast(*slot),
-            I::LoadFastSubImm { slot, imm } => StepAction::LoadFastSubImm { slot: *slot, imm: *imm },
-            I::LoadFastLeImm { slot, imm } => StepAction::LoadFastLeImm { slot: *slot, imm: *imm },
+            I::LoadFastSubImm { slot, imm } => StepAction::LoadFastSubImm {
+                slot: *slot,
+                imm: *imm,
+            },
+            I::LoadFastLeImm { slot, imm } => StepAction::LoadFastLeImm {
+                slot: *slot,
+                imm: *imm,
+            },
+            I::LoadFastLtImm { slot, imm } => StepAction::LoadFastLtImm {
+                slot: *slot,
+                imm: *imm,
+            },
+            I::LoadFastGtImm { slot, imm } => StepAction::LoadFastGtImm {
+                slot: *slot,
+                imm: *imm,
+            },
+            I::LoadFastEqImm { slot, imm } => StepAction::LoadFastEqImm {
+                slot: *slot,
+                imm: *imm,
+            },
+            I::LoadFastAddImmStore { slot, imm } => StepAction::LoadFastAddImmStore {
+                slot: *slot,
+                imm: *imm,
+            },
+            I::LoadFastSqrGt { sqr_slot, rhs_slot } => StepAction::LoadFastSqrGt {
+                sqr_slot: *sqr_slot,
+                rhs_slot: *rhs_slot,
+            },
+            I::LoadFastModEq0 { lhs_slot, rhs_slot } => StepAction::LoadFastModEq0 {
+                lhs_slot: *lhs_slot,
+                rhs_slot: *rhs_slot,
+            },
             I::BindFast {
                 slot,
                 name,
@@ -3486,24 +3710,28 @@ impl Vm {
             StepAction::Push(v) => self.push_value(v),
             StepAction::PushSmall(n) => self.push_int(n),
             StepAction::Pop => {
-                if self.stack_sp > 0 { self.op_pop(); }
+                if self.stack_sp > 0 {
+                    self.op_pop();
+                }
             }
             StepAction::Add => {
                 let b = self.pop()?;
                 let a = self.pop()?;
                 let result = match (&a, &b) {
-                    (Value::Num(Num::Small(x)), Value::Num(Num::Small(y))) => Value::Num(
-                        x.checked_add(*y).map_or_else(|| {
+                    (Value::Num(Num::Small(x)), Value::Num(Num::Small(y))) => {
+                        Value::Num(x.checked_add(*y).map_or_else(
+                            || {
                                 Num::from_bigint(
-                                    num_bigint::BigInt::from(*x)
-                                        + num_bigint::BigInt::from(*y),
+                                    num_bigint::BigInt::from(*x) + num_bigint::BigInt::from(*y),
                                 )
-                            }, Num::Small),
-                    ),
+                            },
+                            Num::Small,
+                        ))
+                    }
                     (Value::Num(_), Value::Num(_)) => a.add(&b)?,
-                    _ => self.dispatch_binary_arith(&a, &b, "__add__", "__radd__", |x, y| {
-                        x.add(y)
-                    })?,
+                    _ => {
+                        self.dispatch_binary_arith(&a, &b, "__add__", "__radd__", |x, y| x.add(y))?
+                    }
                 };
                 self.push_value(result);
             }
@@ -3511,18 +3739,20 @@ impl Vm {
                 let b = self.pop()?;
                 let a = self.pop()?;
                 let result = match (&a, &b) {
-                    (Value::Num(Num::Small(x)), Value::Num(Num::Small(y))) => Value::Num(
-                        x.checked_sub(*y).map_or_else(|| {
+                    (Value::Num(Num::Small(x)), Value::Num(Num::Small(y))) => {
+                        Value::Num(x.checked_sub(*y).map_or_else(
+                            || {
                                 Num::from_bigint(
-                                    num_bigint::BigInt::from(*x)
-                                        - num_bigint::BigInt::from(*y),
+                                    num_bigint::BigInt::from(*x) - num_bigint::BigInt::from(*y),
                                 )
-                            }, Num::Small),
-                    ),
+                            },
+                            Num::Small,
+                        ))
+                    }
                     (Value::Num(_), Value::Num(_)) => a.sub(&b)?,
-                    _ => self.dispatch_binary_arith(&a, &b, "__sub__", "__rsub__", |x, y| {
-                        x.sub(y)
-                    })?,
+                    _ => {
+                        self.dispatch_binary_arith(&a, &b, "__sub__", "__rsub__", |x, y| x.sub(y))?
+                    }
                 };
                 self.push_value(result);
             }
@@ -3532,9 +3762,7 @@ impl Vm {
                 let result = if matches!((&a, &b), (Value::Num(_), Value::Num(_))) {
                     a.mul(&b)?
                 } else {
-                    self.dispatch_binary_arith(&a, &b, "__mul__", "__rmul__", |x, y| {
-                        x.mul(y)
-                    })?
+                    self.dispatch_binary_arith(&a, &b, "__mul__", "__rmul__", |x, y| x.mul(y))?
                 };
                 self.push_value(result);
             }
@@ -3544,9 +3772,7 @@ impl Vm {
                 let result = if matches!((&a, &b), (Value::Num(_), Value::Num(_))) {
                     a.div(&b)?
                 } else {
-                    self.dispatch_binary_arith(&a, &b, "__div__", "__rdiv__", |x, y| {
-                        x.div(y)
-                    })?
+                    self.dispatch_binary_arith(&a, &b, "__div__", "__rdiv__", |x, y| x.div(y))?
                 };
                 self.push_value(result);
             }
@@ -3556,9 +3782,7 @@ impl Vm {
                 let result = if matches!((&a, &b), (Value::Num(_), Value::Num(_))) {
                     a.pow(&b)?
                 } else {
-                    self.dispatch_binary_arith(&a, &b, "__pow__", "__rpow__", |x, y| {
-                        x.pow(y)
-                    })?
+                    self.dispatch_binary_arith(&a, &b, "__pow__", "__rpow__", |x, y| x.pow(y))?
                 };
                 self.push_value(result);
             }
@@ -3568,9 +3792,7 @@ impl Vm {
                 let result = if matches!((&a, &b), (Value::Num(_), Value::Num(_))) {
                     a.rem(&b)?
                 } else {
-                    self.dispatch_binary_arith(&a, &b, "__mod__", "__rmod__", |x, y| {
-                        x.rem(y)
-                    })?
+                    self.dispatch_binary_arith(&a, &b, "__mod__", "__rmod__", |x, y| x.rem(y))?
                 };
                 self.push_value(result);
             }
@@ -3580,9 +3802,7 @@ impl Vm {
                 let result = if matches!((&a, &b), (Value::Num(_), Value::Num(_))) {
                     a.bitand(&b)?
                 } else {
-                    self.dispatch_binary_arith(&a, &b, "__and__", "__rand__", |x, y| {
-                        x.bitand(y)
-                    })?
+                    self.dispatch_binary_arith(&a, &b, "__and__", "__rand__", |x, y| x.bitand(y))?
                 };
                 self.push_value(result);
             }
@@ -3592,9 +3812,7 @@ impl Vm {
                 let result = if matches!((&a, &b), (Value::Num(_), Value::Num(_))) {
                     a.bitor(&b)?
                 } else {
-                    self.dispatch_binary_arith(&a, &b, "__or__", "__ror__", |x, y| {
-                        x.bitor(y)
-                    })?
+                    self.dispatch_binary_arith(&a, &b, "__or__", "__ror__", |x, y| x.bitor(y))?
                 };
                 self.push_value(result);
             }
@@ -3604,9 +3822,7 @@ impl Vm {
                 let result = if matches!((&a, &b), (Value::Num(_), Value::Num(_))) {
                     a.bitxor(&b)?
                 } else {
-                    self.dispatch_binary_arith(&a, &b, "__xor__", "__rxor__", |x, y| {
-                        x.bitxor(y)
-                    })?
+                    self.dispatch_binary_arith(&a, &b, "__xor__", "__rxor__", |x, y| x.bitxor(y))?
                 };
                 self.push_value(result);
             }
@@ -3846,9 +4062,9 @@ impl Vm {
                 name,
                 is_const,
             } => {
-                let val = self.pop().map_err(|_| {
-                    RuntimeError::msg("internal: BindFast with empty stack")
-                })?;
+                let val = self
+                    .pop()
+                    .map_err(|_| RuntimeError::msg("internal: BindFast with empty stack"))?;
                 if self.locals_stack.is_empty() {
                     return Err(RuntimeError::type_err(
                         "internal: BindFast requires an active local frame",
@@ -3889,21 +4105,57 @@ impl Vm {
                 self.exec_sub_slow(a, b)?;
             }
             StepAction::LoadFastLeImm { slot, imm } => {
+                self.push_fast_cmp_imm(slot, imm, |c| {
+                    c == std::cmp::Ordering::Less || c == std::cmp::Ordering::Equal
+                })?;
+            }
+            StepAction::LoadFastLtImm { slot, imm } => {
+                self.push_fast_cmp_imm(slot, imm, |c| c == std::cmp::Ordering::Less)?;
+            }
+            StepAction::LoadFastGtImm { slot, imm } => {
+                self.push_fast_cmp_imm(slot, imm, |c| c == std::cmp::Ordering::Greater)?;
+            }
+            StepAction::LoadFastEqImm { slot, imm } => {
+                self.push_fast_cmp_imm(slot, imm, |c| c == std::cmp::Ordering::Equal)?;
+            }
+            StepAction::LoadFastAddImmStore { slot, imm } => {
+                self.reject_const_fast_store(slot)?;
                 let sv = self.load_fast_sv(slot);
-                let a = match sv {
-                    StackVal::Int(n) => Value::Num(Num::Small(n)),
-                    other => other.into_value(),
-                };
-                let ord = match &a {
-                    Value::Num(n) => n.cmp_num(&Num::Small(imm)),
+                self.op_push(sv);
+                self.op_push_int(imm);
+                let b = self.op_pop();
+                let a = self.op_pop();
+                self.exec_add_slow(a, b)?;
+                let v = self.pop_hot();
+                self.store_fast_sv(slot, v);
+            }
+            StepAction::LoadFastSqrGt { sqr_slot, rhs_slot } => {
+                let d = self.load_fast_sv(sqr_slot);
+                self.op_push(d.copy_imm());
+                self.op_push(d);
+                self.exec_mul_num()?;
+                let n = self.load_fast_sv(rhs_slot);
+                self.op_push(n);
+                self.exec_cmp_num(|c| c == std::cmp::Ordering::Greater)?;
+            }
+            StepAction::LoadFastModEq0 { lhs_slot, rhs_slot } => {
+                let a = self.load_fast_sv(lhs_slot);
+                let b = self.load_fast_sv(rhs_slot);
+                self.op_push(a);
+                self.op_push(b);
+                self.exec_mod_num()?;
+                self.op_push_int(0);
+                let z = self.pop_hot();
+                let r = self.pop_hot();
+                let eq = match (&r, &z) {
+                    (StackVal::Int(x), StackVal::Int(y)) => x == y,
                     _ => {
-                        return Err(RuntimeError::type_err(format!(
-                            "cannot compare {} with number",
-                            a.type_name()
-                        )));
+                        let av = r.to_value();
+                        let bv = z.to_value();
+                        self.dispatch_eq(&av, &bv)?
                     }
                 };
-                self.op_push_bool(ord == std::cmp::Ordering::Less || ord == std::cmp::Ordering::Equal);
+                self.op_push_bool(eq);
             }
             StepAction::Label => {}
             StepAction::Goto(target) => {
@@ -4207,9 +4459,7 @@ impl Vm {
                 let obj = self.pop()?;
                 let rc = self.to_iterator_shared(&obj)?;
                 self.gc.track_iter(&rc);
-                self.iterators.push(ActiveIter {
-                    state: rc,
-                });
+                self.iterators.push(ActiveIter { state: rc });
             }
             StepAction::IterNext => {
                 let state = self
@@ -4322,19 +4572,13 @@ impl Vm {
                 let n = match &v {
                     Value::List(lst) => lst.borrow().len(),
                     Value::Tuple(t) => t.len(),
-                    _ => {
-                        return Err(RuntimeError::type_err(
-                            "ListLen requires list or tuple",
-                        ))
-                    }
+                    _ => return Err(RuntimeError::type_err("ListLen requires list or tuple")),
                 };
                 self.push_int(n as i64);
             }
             StepAction::IsInstance(type_name) => {
                 let v = self.pop()?;
-                self.push_bool(types::instance_is_a(
-                    self, &v, &type_name,
-                ));
+                self.push_bool(types::instance_is_a(self, &v, &type_name));
             }
             StepAction::MatchEq => {
                 let b = self.pop()?;
@@ -4829,6 +5073,15 @@ impl Vm {
                 }
             }
         }
+        // BindFast 在热路径里编成 H_STORE_FAST，不会写入 name_to_slot。
+        // `del` 仍按函数体里的槽位清掉局部（含轻量帧）。
+        if let Some(slot) = self.fast_local_slot(name) {
+            self.local_set(slot, Value::None);
+            if let Some(map) = self.name_to_slot.last_mut().and_then(|m| m.as_mut()) {
+                map.remove(name);
+            }
+            return Ok(());
+        }
         if self.globals.remove(name).is_some() {
             if let Some(idx) = self.script_global_names.iter().position(|n| n == name) {
                 if idx < self.script_globals.len() {
@@ -4838,6 +5091,23 @@ impl Vm {
             return Ok(());
         }
         Err(RuntimeError::name_err(format!("name not found: {name}")))
+    }
+
+    fn fast_local_slot(&self, name: &str) -> Option<usize> {
+        let func = self.func_stack.last()?;
+        for (i, p) in func.params.iter().enumerate() {
+            if p.name == name {
+                return Some(i);
+            }
+        }
+        for ins in func.body.iter() {
+            if let crate::opcode::Instruction::BindFast { slot, name: n, .. } = ins {
+                if n == name {
+                    return Some(*slot);
+                }
+            }
+        }
+        None
     }
 
     pub(crate) fn struct_has_method(&self, obj: &Value, method: &str) -> bool {
@@ -4922,12 +5192,7 @@ impl Vm {
         fallback(a, b)
     }
 
-    fn call_struct_method(
-        &mut self,
-        obj: &Value,
-        method: &str,
-        args: Vec<Value>,
-    ) -> Result<Value> {
+    fn call_struct_method(&mut self, obj: &Value, method: &str, args: Vec<Value>) -> Result<Value> {
         let Value::Struct(s) = obj else {
             return Err(RuntimeError::msg("expected struct instance"));
         };
@@ -4962,12 +5227,7 @@ impl Vm {
         kwargs: DictMap,
     ) -> Result<Value> {
         self.user_call_deferred = false;
-        if !kwargs.is_empty()
-            && !matches!(
-                callee,
-                Value::Function(_) | Value::GenericFunction(_)
-            )
-        {
+        if !kwargs.is_empty() && !matches!(callee, Value::Function(_) | Value::GenericFunction(_)) {
             return Err(RuntimeError::type_err(
                 "keyword arguments only supported for user functions",
             ));
@@ -5032,7 +5292,9 @@ impl Vm {
                     self,
                     type_name,
                     None,
-                    args.into_iter().next().expect("variant arg count checked above (theoretically unreachable)"),
+                    args.into_iter()
+                        .next()
+                        .expect("variant arg count checked above (theoretically unreachable)"),
                 )
             }
             Value::TypeRef(ref type_name) => {
@@ -5128,10 +5390,7 @@ impl Vm {
             self.track_value(&dict);
             bound[ki] = Some(dict);
         } else if !kwargs.is_empty() {
-            let names: Vec<String> = kwargs
-                .keys()
-                .map(value_key_to_display)
-                .collect();
+            let names: Vec<String> = kwargs.keys().map(value_key_to_display).collect();
             return Err(RuntimeError::msg(format!(
                 "{}() got unexpected keyword argument(s): {}",
                 func.name,
@@ -5172,9 +5431,7 @@ impl Vm {
 
         bound
             .into_iter()
-            .map(|v| {
-                v.ok_or_else(|| RuntimeError::msg("internal: unbound argument slot"))
-            })
+            .map(|v| v.ok_or_else(|| RuntimeError::msg("internal: unbound argument slot")))
             .collect()
     }
     fn resolve_macro_args(mac: &MacroObject, args: &[Value]) -> Result<Vec<Value>> {
@@ -5229,8 +5486,8 @@ impl Vm {
             }
             if let (Some(ty), true) = (&param.type_expr, param.type_strong) {
                 if let Some(Value::RuntimeAst(ast)) = resolved.get(i) {
-                runtime_ast::check_macro_param_ast_kind(ty, ast)?;
-            }
+                    runtime_ast::check_macro_param_ast_kind(ty, ast)?;
+                }
             }
         }
 
@@ -5258,8 +5515,7 @@ impl Vm {
             }
             if !self.name_to_slot.is_empty() {
                 let frame = self.locals_stack.len() - 1;
-                self.scope_name_map_mut(frame)
-                    .insert(param.name.clone(), i);
+                self.scope_name_map_mut(frame).insert(param.name.clone(), i);
             }
         }
 
@@ -5394,6 +5650,7 @@ impl Vm {
 
     /// 将任意可迭代对象转为共享 iterator 状态。
     /// 内置序列走内建游标；用户 `struct` 走 `__iter__` / `__next__` 协议。
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) fn to_iterator_shared(&mut self, v: &Value) -> Result<Shared<IteratorState>> {
         match v {
             Value::Iterator(it) => Ok(it.clone()),
@@ -5752,10 +6009,7 @@ impl Vm {
                     args[i] = converted;
                 }
                 Err(e) => {
-                    let msg = format!(
-                        "parameter '{}': implicit convert failed: {e}",
-                        param.name
-                    );
+                    let msg = format!("parameter '{}': implicit convert failed: {e}", param.name);
                     let exc = exceptions::make_exception(self, "TypeError", msg)?;
                     self.throw_value(exc)?;
                 }
@@ -5802,12 +6056,7 @@ impl Vm {
         self.check_element_against(&ty, elem, "{*}")
     }
 
-    fn check_element_against(
-        &mut self,
-        ty: &Value,
-        elem: &Value,
-        path: &str,
-    ) -> Result<()> {
+    fn check_element_against(&mut self, ty: &Value, elem: &Value, path: &str) -> Result<()> {
         if types::type_accepts(self, elem, ty) {
             return Ok(());
         }
@@ -5819,7 +6068,11 @@ impl Vm {
         self.raise_type_error(msg)
     }
 
-    pub(crate) fn call_user_function(&mut self, func: Arc<FunctionObject>, args: Vec<Value>) -> Result<Value> {
+    pub(crate) fn call_user_function(
+        &mut self,
+        func: Arc<FunctionObject>,
+        args: Vec<Value>,
+    ) -> Result<Value> {
         match self.call_user_function_poll(func, args)? {
             InterpResult::Value(v) => Ok(v.unwrap_or(Value::None)),
             InterpResult::Suspended => Err(RuntimeError::msg(
@@ -5866,7 +6119,9 @@ impl Vm {
         reenter: bool,
     ) -> Result<()> {
         if self.user_call_frames.len() >= self.cached_max_depth {
-            return Err(RuntimeError::msg("RecursionError: maximum recursion depth exceeded"));
+            return Err(RuntimeError::msg(
+                "RecursionError: maximum recursion depth exceeded",
+            ));
         }
         let func = self.ensure_func_types_resolved(func)?;
         let args = self.apply_implicit_param_converts(&func, args)?;
@@ -5897,10 +6152,11 @@ impl Vm {
             self.name_to_slot.push(None);
         }
 
-        let captured_len = func.captured.as_ref().map_or(0, std::collections::HashMap::len);
-        let frame_size = func
-            .frame_slots
-            .max(func.params.len() + captured_len);
+        let captured_len = func
+            .captured
+            .as_ref()
+            .map_or(0, std::collections::HashMap::len);
+        let frame_size = func.frame_slots.max(func.params.len() + captured_len);
         let mut locals = self.alloc_local_frame(frame_size);
 
         let mut slot = func.params.len();
@@ -6153,10 +6409,7 @@ impl Vm {
         if pc == 0 {
             return line_map.first().copied().unwrap_or(0);
         }
-        line_map
-            .get(pc.saturating_sub(1))
-            .copied()
-            .unwrap_or(0)
+        line_map.get(pc.saturating_sub(1)).copied().unwrap_or(0)
     }
 
     pub(crate) fn current_column(&self) -> usize {
@@ -6314,7 +6567,8 @@ impl Vm {
     }
 
     /// 当前函数可见的局部名（快局部 + name-mapped 作用域），供 eval 绑定注入用。
-    pub(crate) fn debug_visible_local_names(&self) -> Vec<String> {        let mut names: Vec<String> = Vec::new();
+    pub(crate) fn debug_visible_local_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
         let mut seen: FxHashSet<String> = FxHashSet::default();
         if let Some(func) = self.func_stack.last() {
             for p in &func.params {
@@ -6354,7 +6608,10 @@ impl Vm {
             }
             if slot.is_none() {
                 for ins in func.body.iter() {
-                    if let crate::opcode::Instruction::BindFast { slot: s, name: n, .. } = ins {
+                    if let crate::opcode::Instruction::BindFast {
+                        slot: s, name: n, ..
+                    } = ins
+                    {
                         if n == name {
                             slot = Some(*s);
                             break;
@@ -6692,7 +6949,10 @@ impl Vm {
                     let source = source.clone();
                     match self.advance_iterator(&source)? {
                         Some(item) => {
-                            if self.call_user_function(func, vec![item.clone()])?.is_truthy() {
+                            if self
+                                .call_user_function(func, vec![item.clone()])?
+                                .is_truthy()
+                            {
                                 return Ok(Some(item));
                             }
                         }
@@ -6808,9 +7068,7 @@ impl Vm {
                     let obj = obj.clone();
                     match self.try_call_magic(&obj, "__next__", vec![]) {
                         Some(Ok(v)) => return Ok(Some(v)),
-                        Some(Err(e))
-                            if e.kind() == crate::error::ExceptionKind::StopIteration =>
-                        {
+                        Some(Err(e)) if e.kind() == crate::error::ExceptionKind::StopIteration => {
                             self.active_exception = None;
                             return Ok(None);
                         }
@@ -6844,7 +7102,10 @@ impl Vm {
             return Ok(Value::None);
         }
 
-        let captured_len = func.captured.as_ref().map_or(0, std::collections::HashMap::len);
+        let captured_len = func
+            .captured
+            .as_ref()
+            .map_or(0, std::collections::HashMap::len);
         let frame_size = func.frame_slots.max(func.params.len() + captured_len);
         let mut locals = vec![Value::None; frame_size];
         let mut name_map = if func.uses_name_map() {
@@ -6897,10 +7158,7 @@ impl Vm {
         .into_value())
     }
 
-    fn resume_generator(
-        &mut self,
-        state: &Shared<IteratorState>,
-    ) -> Result<Option<Value>> {
+    fn resume_generator(&mut self, state: &Shared<IteratorState>) -> Result<Option<Value>> {
         // 消费者取消时，生成器在下一 yield/恢复点协作退出。
         self.fail_if_current_task_cancelled()?;
         loop {
@@ -6915,7 +7173,9 @@ impl Vm {
                     yield_from,
                 } = &st.kind
                 else {
-                    return Err(RuntimeError::msg("internal: resume_generator on non-generator"));
+                    return Err(RuntimeError::msg(
+                        "internal: resume_generator on non-generator",
+                    ));
                 };
                 (
                     func.clone(),
@@ -6930,10 +7190,10 @@ impl Vm {
                 return Ok(None);
             }
             if let Some(yf) = yield_from {
-                if let Some(v) = self.advance_iterator(&yf)? { return Ok(Some(v)) }
-                if let IteratorKind::Generator { yield_from, .. } =
-                    &mut state.borrow_mut().kind
-                {
+                if let Some(v) = self.advance_iterator(&yf)? {
+                    return Ok(Some(v));
+                }
+                if let IteratorKind::Generator { yield_from, .. } = &mut state.borrow_mut().kind {
                     *yield_from = None;
                 }
                 continue;
@@ -6983,8 +7243,7 @@ impl Vm {
                     return Ok(Some(v));
                 }
                 InterpResult::Value(_) => {
-                    if let IteratorKind::Generator { exhausted, .. } =
-                        &mut state.borrow_mut().kind
+                    if let IteratorKind::Generator { exhausted, .. } = &mut state.borrow_mut().kind
                     {
                         *exhausted = true;
                     }
@@ -7030,9 +7289,7 @@ impl Vm {
             self.active_generator = saved_active.clone();
             self.generator_resuming = saved_resuming;
             if let Some(state) = &saved_active {
-                if let IteratorKind::Generator { yield_from, .. } =
-                    &mut state.borrow_mut().kind
-                {
+                if let IteratorKind::Generator { yield_from, .. } = &mut state.borrow_mut().kind {
                     *yield_from = Some(iter);
                 }
             }
@@ -7057,11 +7314,7 @@ impl Vm {
             .last()
             .cloned()
             .ok_or_else(|| RuntimeError::msg("internal: generator missing locals"))?;
-        let name_map = self
-            .name_to_slot
-            .last()
-            .cloned()
-            .flatten();
+        let name_map = self.name_to_slot.last().cloned().flatten();
         let pc = self.pc;
         if let IteratorKind::Generator {
             locals: l,
@@ -7075,9 +7328,10 @@ impl Vm {
             *p = pc;
         }
 
-        let frame = self.user_call_frames.pop().ok_or_else(|| {
-            RuntimeError::msg("internal: generator missing call frame")
-        })?;
+        let frame = self
+            .user_call_frames
+            .pop()
+            .ok_or_else(|| RuntimeError::msg("internal: generator missing call frame"))?;
         self.locals_stack.pop();
         self.name_to_slot.pop();
         if frame.pushed_func_stack {
@@ -7217,8 +7471,7 @@ impl Vm {
             mn_idle_rounds: 0,
             select_fair_order: Vec::new(),
             select_fair_pos: 0,
-            select_rng: 0x00C0_FFEE_u64
-                ^ std::time::Instant::now().elapsed().as_nanos() as u64,
+            select_rng: 0x00C0_FFEE_u64 ^ std::time::Instant::now().elapsed().as_nanos() as u64,
             debug_break_requested: false,
             debug_paused_tasks: Vec::new(),
             gc_auto_cooldown_until: None,
@@ -7308,8 +7561,7 @@ impl Vm {
             // sleep / FFI / 定时等待的任务会持续在就绪队列自旋或处于执行中，
             // 故不会造成全局静默；连续静默若干轮（覆盖取任务瞬间的竞态窗口）
             // 后才报死锁。
-            let quiescent =
-                !self.mn.is_shutdown() && self.mn.busy() == 0 && self.mn.queues_empty();
+            let quiescent = !self.mn.is_shutdown() && self.mn.busy() == 0 && self.mn.queues_empty();
             if quiescent {
                 self.mn_idle_rounds += 1;
                 if self.mn_idle_rounds >= MN_DEADLOCK_IDLE_ROUNDS {
@@ -7436,12 +7688,7 @@ impl Vm {
             if v.len() >= stop {
                 v.split_off(stop)
             } else {
-                debug_assert!(
-                    false,
-                    "capture_fiber: len {} < stop {}",
-                    v.len(),
-                    stop
-                );
+                debug_assert!(false, "capture_fiber: len {} < stop {}", v.len(), stop);
                 // release 下不变量被破坏会导致静默空帧；至少留可观测痕迹。
                 eprintln!(
                     "optive internal: capture_fiber invariant broken (len {} < stop {})",
@@ -7731,10 +7978,7 @@ impl Vm {
                         ));
                     };
                     self.install_fiber(task.clone(), fiber);
-                    let stop = self
-                        .task_ctx
-                        .as_ref()
-                        .map_or(0, |c| c.stop_ucf);
+                    let stop = self.task_ctx.as_ref().map_or(0, |c| c.stop_ucf);
                     match self.run_interpreter(Some(stop))? {
                         InterpResult::Value(v) => {
                             if let Some(ctx) = self.task_ctx.take() {
@@ -7853,12 +8097,16 @@ impl Vm {
         }
         let until = match self.sync_wait_resume {
             Some(SyncWaitResume::Sleep { until }) => until,
-            _ => if let Some(t) = std::time::Instant::now().checked_add(total) { t } else {
-                // 溢出：睡完本切片后视为到期，避免 Instant 加法 panic。
-                std::thread::sleep(total.min(COOP_SLEEP_SLICE));
-                self.sync_wait_resume = None;
-                return Ok(Value::None);
-            },
+            _ => {
+                if let Some(t) = std::time::Instant::now().checked_add(total) {
+                    t
+                } else {
+                    // 溢出：睡完本切片后视为到期，避免 Instant 加法 panic。
+                    std::thread::sleep(total.min(COOP_SLEEP_SLICE));
+                    self.sync_wait_resume = None;
+                    return Ok(Value::None);
+                }
+            }
         };
         let now = std::time::Instant::now();
         if now >= until {
@@ -7902,17 +8150,13 @@ impl Vm {
                         return Ok(Value::None);
                     }
                     self.ensure_task_runnable(&task);
-                    self.wait_or_deadlock(
-                        "no runnable tasks while awaiting",
-                    )?;
+                    self.wait_or_deadlock("no runnable tasks while awaiting")?;
                     if self.block_suspend || self.debug_break_requested {
                         return Ok(Value::None);
                     }
                 }
                 TaskState::Running => {
-                    self.wait_or_deadlock(
-                        "no runnable tasks while awaiting",
-                    )?;
+                    self.wait_or_deadlock("no runnable tasks while awaiting")?;
                     if self.block_suspend || self.debug_break_requested {
                         return Ok(Value::None);
                     }
@@ -7927,10 +8171,7 @@ impl Vm {
             return;
         }
         let state = task.borrow().state.clone();
-        if matches!(
-            state,
-            TaskState::Pending { .. } | TaskState::Suspended
-        ) {
+        if matches!(state, TaskState::Pending { .. } | TaskState::Suspended) {
             if self.mn_parallel {
                 self.enqueue_task(task.clone());
             } else if !self.ready_tasks.iter().any(|t| Shared::ptr_eq(t, task)) {
@@ -7962,11 +8203,7 @@ impl Vm {
         }
     }
 
-    pub(crate) fn channel_send(
-        &mut self,
-        ch: &Shared<ChannelInner>,
-        value: Value,
-    ) -> Result<()> {
+    pub(crate) fn channel_send(&mut self, ch: &Shared<ChannelInner>, value: Value) -> Result<()> {
         loop {
             let outcome = {
                 let mut inner = ch.borrow_mut();
@@ -8006,10 +8243,7 @@ impl Vm {
         }
     }
 
-    pub(crate) fn channel_recv(
-        &mut self,
-        ch: &Shared<ChannelInner>,
-    ) -> Result<Value> {
+    pub(crate) fn channel_recv(&mut self, ch: &Shared<ChannelInner>) -> Result<Value> {
         loop {
             let outcome = {
                 let mut inner = ch.borrow_mut();
@@ -8049,10 +8283,7 @@ impl Vm {
         }
     }
 
-    pub(crate) fn rwmutex_read(
-        &mut self,
-        s: &Shared<crate::value::SyncInner>,
-    ) -> Result<Value> {
+    pub(crate) fn rwmutex_read(&mut self, s: &Shared<crate::value::SyncInner>) -> Result<Value> {
         use crate::value::{SyncGuardInner, SyncInner};
         loop {
             {
@@ -8063,9 +8294,9 @@ impl Vm {
                 {
                     if !*writer {
                         *readers += 1;
-                        return Ok(Value::SyncGuard(Shared::new(
-                            SyncGuardInner::Read { mu: s.clone() },
-                        )));
+                        return Ok(Value::SyncGuard(Shared::new(SyncGuardInner::Read {
+                            mu: s.clone(),
+                        })));
                     }
                 } else {
                     return Err(RuntimeError::type_err("expected RWMutex"));
@@ -8078,10 +8309,7 @@ impl Vm {
         }
     }
 
-    pub(crate) fn rwmutex_write(
-        &mut self,
-        s: &Shared<crate::value::SyncInner>,
-    ) -> Result<Value> {
+    pub(crate) fn rwmutex_write(&mut self, s: &Shared<crate::value::SyncInner>) -> Result<Value> {
         use crate::value::{SyncGuardInner, SyncInner};
         loop {
             {
@@ -8092,9 +8320,9 @@ impl Vm {
                 {
                     if !*writer && *readers == 0 {
                         *writer = true;
-                        return Ok(Value::SyncGuard(Shared::new(
-                            SyncGuardInner::Write { mu: s.clone() },
-                        )));
+                        return Ok(Value::SyncGuard(Shared::new(SyncGuardInner::Write {
+                            mu: s.clone(),
+                        })));
                     }
                 } else {
                     return Err(RuntimeError::type_err("expected RWMutex"));
@@ -8107,10 +8335,7 @@ impl Vm {
         }
     }
 
-    pub(crate) fn waitgroup_wait(
-        &mut self,
-        s: &Shared<crate::value::SyncInner>,
-    ) -> Result<Value> {
+    pub(crate) fn waitgroup_wait(&mut self, s: &Shared<crate::value::SyncInner>) -> Result<Value> {
         use crate::value::SyncInner;
         loop {
             {
@@ -8181,15 +8406,15 @@ impl Vm {
         }
     }
 
-    pub(crate) fn taskgroup_wait(
-        &mut self,
-        s: &Shared<crate::value::SyncInner>,
-    ) -> Result<Value> {
+    pub(crate) fn taskgroup_wait(&mut self, s: &Shared<crate::value::SyncInner>) -> Result<Value> {
         use crate::value::SyncInner;
         loop {
             let first_error = {
                 let mut inner = s.borrow_mut();
-                let SyncInner::TaskGroup { count, first_error, .. } = &mut *inner else {
+                let SyncInner::TaskGroup {
+                    count, first_error, ..
+                } = &mut *inner
+                else {
                     return Err(RuntimeError::type_err("expected TaskGroup"));
                 };
                 if *count == 0 {
@@ -8445,10 +8670,7 @@ impl Vm {
         self.scheduler_yield()
     }
 
-    pub(crate) fn barrier_wait(
-        &mut self,
-        s: &Shared<crate::value::SyncInner>,
-    ) -> Result<Value> {
+    pub(crate) fn barrier_wait(&mut self, s: &Shared<crate::value::SyncInner>) -> Result<Value> {
         use crate::value::SyncInner;
         let id = s.as_ptr() as usize;
         let my_gen = if let Some(SyncWaitResume::Barrier {
@@ -8730,9 +8952,9 @@ fn index_value(vm: &mut Vm, obj: &Value, idx: &Value) -> Result<Value> {
         }
         (Value::List(v), Value::Num(n)) => {
             let i = num_to_isize(n)?;
-            let borrowed = v.try_borrow().ok_or_else(|| {
-                RuntimeError::msg("RuntimeError: list is already borrowed")
-            })?;
+            let borrowed = v
+                .try_borrow()
+                .ok_or_else(|| RuntimeError::msg("RuntimeError: list is already borrowed"))?;
             let len = borrowed.len() as isize;
             let idx = if i < 0 { len + i } else { i };
             if idx < 0 || idx >= len {
@@ -8818,21 +9040,12 @@ fn index_set(vm: &mut Vm, obj: &Value, idx: &Value, val: Value) -> Result<()> {
     }
 }
 
-fn slice_get(
-    vm: &mut Vm,
-    obj: &Value,
-    start: &Value,
-    end: &Value,
-    step: &Value,
-) -> Result<Value> {
+fn slice_get(vm: &mut Vm, obj: &Value, start: &Value, end: &Value, step: &Value) -> Result<Value> {
     match obj {
         Value::List(v) => {
             let len = v.borrow().len() as isize;
             let indices = compute_slice_indices(len, start, end, step)?;
-            let out: Vec<Value> = indices
-                .into_iter()
-                .map(|i| v.borrow()[i].clone())
-                .collect();
+            let out: Vec<Value> = indices.into_iter().map(|i| v.borrow()[i].clone()).collect();
             Ok(Value::List(Shared::new(out)))
         }
         Value::Tuple(t) => {
@@ -8888,7 +9101,9 @@ fn slice_set(
             }
             Ok(())
         }
-        Value::Text(_) => Err(RuntimeError::value_err("text does not support slice assignment")),
+        Value::Text(_) => Err(RuntimeError::value_err(
+            "text does not support slice assignment",
+        )),
         Value::Struct(_) => {
             vm.call_struct_method(
                 obj,
@@ -9007,14 +9222,21 @@ fn compute_slice_indices(
     }
 }
 
-fn try_variant_case_convert(vm: &Vm, case_struct_name: &str, value: &Value) -> Option<Result<Value>> {
+fn try_variant_case_convert(
+    vm: &Vm,
+    case_struct_name: &str,
+    value: &Value,
+) -> Option<Result<Value>> {
     let parent_variant = vm
         .variant_defs
         .values()
         .into_iter()
         .find(|vdef| vdef.cases.iter().any(|c| c.struct_name == case_struct_name))?;
     let Value::Variant(v) = value else {
-        return Some(Err(type_registry::type_convert_error(case_struct_name, value)));
+        return Some(Err(type_registry::type_convert_error(
+            case_struct_name,
+            value,
+        )));
     };
     if v.def.name != parent_variant.name && v.inst_name != parent_variant.name {
         return Some(Err(RuntimeError::type_err(format!(
@@ -9115,15 +9337,12 @@ fn enum_type_attr(vm: &mut Vm, enum_name: &str, field: &str) -> Result<Value> {
     if let Some(idx) = def.members.iter().position(|m| m.name == field) {
         return Ok(crate::enum_variant::enum_member_value(&def, idx));
     }
-    Err(RuntimeError::attr_err(format!("enum {enum_name} has no member or method {field}")))
+    Err(RuntimeError::attr_err(format!(
+        "enum {enum_name} has no member or method {field}"
+    )))
 }
 
-fn type_spec_attr(
-    vm: &mut Vm,
-    name: &str,
-    type_args: &[Value],
-    field: &str,
-) -> Result<Value> {
+fn type_spec_attr(vm: &mut Vm, name: &str, type_args: &[Value], field: &str) -> Result<Value> {
     if let Some(vdef) = vm.variant_defs.get(name) {
         if vdef.cases.iter().any(|c| c.name == field) {
             let struct_name = crate::enum_variant::case_struct_name(name, field);
@@ -9134,7 +9353,9 @@ fn type_spec_attr(
         }
     }
     if vm.struct_defs.contains_key(name) {
-        return Err(RuntimeError::attr_err(format!("type spec has no attribute {field}")));
+        return Err(RuntimeError::attr_err(format!(
+            "type spec has no attribute {field}"
+        )));
     }
     Err(RuntimeError::msg(format!("unknown type spec {name}")))
 }
@@ -9150,7 +9371,9 @@ fn resolve_type_ref_attr(vm: &mut Vm, type_name: &str, field: &str) -> Result<Va
         let table = vm.get_or_create_convert(type_name);
         return Ok(Value::Dispatch(table));
     }
-    Err(RuntimeError::attr_err(format!("type {type_name} has no attribute {field}")))
+    Err(RuntimeError::attr_err(format!(
+        "type {type_name} has no attribute {field}"
+    )))
 }
 
 fn get_attr(vm: &mut Vm, obj: &Value, field: &str) -> Result<Value> {
@@ -9168,7 +9391,9 @@ fn get_attr(vm: &mut Vm, obj: &Value, field: &str) -> Result<Value> {
         Value::EnumMember(m) if field == "__value__" => Ok(Value::Num(
             crate::enum_variant::enum_member_numeric_value(m),
         )),
-        Value::EnumMember(_) => Err(RuntimeError::attr_err(format!("enum member has no field {field}"))),
+        Value::EnumMember(_) => Err(RuntimeError::attr_err(format!(
+            "enum member has no field {field}"
+        ))),
         Value::Variant(v) if field == "value" || field == "__payload__" => Ok(v.payload.clone()),
         Value::List(list) => type_registry::get_list_method(list, field),
         Value::Dict(dict) => type_registry::get_dict_method(dict, field),
@@ -9215,7 +9440,6 @@ fn get_attr(vm: &mut Vm, obj: &Value, field: &str) -> Result<Value> {
     }
 }
 
-
 fn set_field(vm: &mut Vm, obj: &Value, field: &str, val: Value) -> Result<()> {
     if let Value::Struct(s) = obj {
         let idx = s
@@ -9225,7 +9449,9 @@ fn set_field(vm: &mut Vm, obj: &Value, field: &str, val: Value) -> Result<()> {
             .position(|f| f == field)
             .ok_or_else(|| RuntimeError::attr_err(format!("no field {field}")))?;
         if !s.def.mutable_fields[idx] {
-            return Err(RuntimeError::attr_err(format!("field {field} is not mutable")));
+            return Err(RuntimeError::attr_err(format!(
+                "field {field} is not mutable"
+            )));
         }
         if let Some(info) = s.def.field_types.get(idx) {
             if info.strict {
@@ -9316,7 +9542,11 @@ fn make_struct(
     if !def.type_params.is_empty()
         && !types::check_type_param_bounds(vm, &def.type_params, &generic_args)
     {
-        let exc = exceptions::make_exception(vm, "TypeError", format!("type argument out of bounds for {name}"))?;
+        let exc = exceptions::make_exception(
+            vm,
+            "TypeError",
+            format!("type argument out of bounds for {name}"),
+        )?;
         vm.throw_value(exc)?;
         return Ok(Value::None);
     }
@@ -9378,9 +9608,7 @@ fn seq_items_for_unpack(v: &Value) -> Result<Vec<Value>> {
     match v {
         Value::List(lst) => Ok(lst.borrow().clone()),
         Value::Tuple(t) => Ok(t.to_vec()),
-        _ => Err(RuntimeError::type_err(
-            "can only unpack list or tuple",
-        )),
+        _ => Err(RuntimeError::type_err("can only unpack list or tuple")),
     }
 }
 
@@ -9393,7 +9621,10 @@ fn num_to_isize(n: &Num) -> Result<isize> {
             .map_err(|_| RuntimeError::index_err("index too large")),
         Num::Rat(r) => {
             if r.denom() == &num_traits::One::one() {
-                let i: i64 = r.numer().try_into().map_err(|_| RuntimeError::type_err("bad index"))?;
+                let i: i64 = r
+                    .numer()
+                    .try_into()
+                    .map_err(|_| RuntimeError::type_err("bad index"))?;
                 Ok(i as isize)
             } else {
                 Err(RuntimeError::type_err("index must be integer"))
@@ -9403,9 +9634,7 @@ fn num_to_isize(n: &Num) -> Result<isize> {
 }
 
 /// select 非阻塞试收：沿拉取包装找到底层 Channel；纯列表流视为立即就绪。
-fn select_try_recv_from_iter(
-    it: &Shared<IteratorState>,
-) -> Result<Option<Option<Value>>> {
+fn select_try_recv_from_iter(it: &Shared<IteratorState>) -> Result<Option<Option<Value>>> {
     use crate::value::IteratorKind;
     match &mut it.borrow_mut().kind {
         IteratorKind::Channel { channel } => Ok(channel.borrow_mut().try_recv()),
@@ -9447,11 +9676,9 @@ fn select_try_recv_from_iter(
         | IteratorKind::GenExpr { .. }
         | IteratorKind::Enumerate { .. }
         | IteratorKind::Chain { .. }
-        | IteratorKind::User { .. } => {
-            Err(RuntimeError::type_err(
-                "select recv on mapped/filtered Stream is unsupported; use Channel or bare stream",
-            ))
-        }
+        | IteratorKind::User { .. } => Err(RuntimeError::type_err(
+            "select recv on mapped/filtered Stream is unsupported; use Channel or bare stream",
+        )),
         _ => Err(RuntimeError::type_err(
             "select recv expects Channel-backed Stream",
         )),
@@ -9503,10 +9730,7 @@ fn specialize_generic_runtime(
     let mut cache: HashMap<String, Arc<FunctionObject>> =
         vm.functions.snapshot_map().into_iter().collect();
     let func = crate::codegen::Generator::specialize_generic_template(
-        template,
-        &type_args,
-        &ctx,
-        &mut cache,
+        template, &type_args, &ctx, &mut cache,
     )?;
     vm.functions.with_mut(|m| {
         for (k, v) in cache {

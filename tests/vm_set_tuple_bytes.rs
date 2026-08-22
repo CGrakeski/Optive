@@ -49,7 +49,6 @@ fn empty_set_displays_as_comma_literal() {
     assert_eq!(value("{,}").display_string(), "{,}");
 }
 
-
 #[test]
 fn set_add_remove() {
     assert_num(
