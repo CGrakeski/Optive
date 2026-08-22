@@ -1,0 +1,154 @@
+# Gitee Go 流水线（规范见 https://help.gitee.com/gitee-go/pipeline/basic-config）
+# 对齐 .github/workflows/ci.yml + release.yml 的门禁，在 Gitee 云端复刻。
+#
+# 与 GitHub Actions 的差异（平台限制，不是漏做）：
+# - 云端执行环境只有 Linux，没有 windows-latest / macos-latest 矩阵
+# - 无 paths-ignore；文档/LICENSE 变更也会触发
+# - concurrent GC 阶段为手动（Gitee 无 event_name）；定时触发仍跑 lint/test/audit
+# - tag `v*` 只打 x86_64-linux 包，不交叉编 MSVC / Darwin
+#
+# 开通：仓库「流水线」→ 导入本文件。任务用 build@gcc（Ubuntu + gcc），再 rustup 装稳定版。
+
+version: "1.0"
+name: optive-ci
+displayName: Optive CI
+
+# 全局：阻塞上次未完成的构建（类似 GitHub cancel-in-progress 的弱化版）
+# 单任务超时覆盖 lint(20) / test(40) / release(30) / audit(15)
+strategy:
+  blocking: true
+  stepTimeout: 40
+
+triggers:
+  push:
+    branches:
+      precise:
+        - main
+        - master
+    tags:
+      prefix:
+        - v
+  pr:
+    branches:
+      include:
+        - ".*"
+  # Quartz：每天 06:00（与 ci.yml schedule cron 一致；星期位用 ?）
+  schedule:
+    - cron: "0 6 * * ?"
+
+variables:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+stages:
+  # ── 与 ci.yml `lint` + `audit` 并行 ──
+  - name: quality
+    displayName: 代码检查
+    strategy: naturally
+    trigger: auto
+    steps:
+      - step: build@gcc
+        name: lint
+        displayName: rustfmt 与 clippy
+        gccVersion: "10.3"
+        commands: |
+          set -eu
+          . ./.gitee/rust_env.sh
+          rustup component add rustfmt clippy
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+
+      - step: build@gcc
+        name: audit
+        displayName: cargo audit
+        gccVersion: "10.3"
+        commands: |
+          set -eu
+          . ./.gitee/rust_env.sh
+          cargo install cargo-audit --locked || cargo install cargo-audit
+          cargo generate-lockfile
+          cargo audit
+
+  # ── 与 ci.yml `build-test`（Ubuntu）──
+  - name: test
+    displayName: 构建与测试
+    strategy: naturally
+    trigger: auto
+    steps:
+      - step: build@gcc
+        name: cargo-test
+        displayName: cargo build / test
+        gccVersion: "10.3"
+        commands: |
+          set -eu
+          . ./.gitee/rust_env.sh
+          cargo build --bin Optive
+          cargo test
+          cargo test -- --ignored
+
+  # ── 与 ci.yml `build-release` ──
+  - name: release-smoke
+    displayName: Release 冒烟
+    strategy: naturally
+    trigger: auto
+    steps:
+      - step: build@gcc
+        name: release-build
+        displayName: cargo build --release
+        gccVersion: "10.3"
+        commands: |
+          set -eu
+          . ./.gitee/rust_env.sh
+          cargo build --release --bin Optive
+          ./target/release/Optive -V
+
+  # ── 与 ci.yml `gc-concurrent`（schedule / workflow_dispatch）──
+  # Gitee 无法按触发源过滤阶段，改为手动，对应 GitHub 的 workflow_dispatch。
+  - name: gc-concurrent
+    displayName: Concurrent GC
+    strategy: naturally
+    trigger: manual
+    steps:
+      - step: build@gcc
+        name: gc-tests
+        displayName: vm_gc_mn / vm_gc_mode_compare
+        gccVersion: "10.3"
+        commands: |
+          set -eu
+          export OPTIVE_GC_MODE=concurrent
+          . ./.gitee/rust_env.sh
+          cargo test --test vm_gc_mn
+          cargo test --test vm_gc_mode_compare
+
+  # ── 与 release.yml：仅 v* tag 打包 Linux 制品 ──
+  - name: package
+    displayName: 发布打包
+    strategy: naturally
+    trigger: auto
+    steps:
+      - step: build@gcc
+        name: linux-tarball
+        displayName: optive-*-x86_64-linux.tar.gz
+        gccVersion: "10.3"
+        commands: |
+          set -eu
+          TAG=$(git describe --tags --exact-match 2>/dev/null || true)
+          case "${TAG}" in
+            v*) ;;
+            *)
+              echo "skip package: HEAD 不是 v* tag（当前: ${TAG:-not-a-tag}）"
+              exit 0
+              ;;
+          esac
+          . ./.gitee/rust_env.sh
+          export CARGO_PROFILE_RELEASE_STRIP=symbols
+          cargo build --release --target x86_64-unknown-linux-gnu --bin Optive
+          ARCHIVE="optive-${TAG}-x86_64-linux.tar.gz"
+          tar -C target/x86_64-unknown-linux-gnu/release -czf "${ARCHIVE}" Optive
+          sha256sum "${ARCHIVE}" > SHA256SUMS
+          ls -lh "${ARCHIVE}" SHA256SUMS
+        artifacts:
+          - name: OPTIVE_LINUX
+            path:
+              - ./optive-*-x86_64-linux.tar.gz
+              - ./SHA256SUMS
