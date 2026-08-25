@@ -2,11 +2,15 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
+#[cfg(not(target_os = "android"))]
 use std::ffi::c_void;
+#[cfg(not(target_os = "android"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+#[cfg(not(target_os = "android"))]
 use libffi::low::{self as ffi_low, CallbackMut};
+#[cfg(not(target_os = "android"))]
 use libffi::middle::{Cif, Closure, Type as FfiType};
 use parking_lot::Mutex;
 
@@ -1214,25 +1218,46 @@ pub(crate) fn unpack_c_struct(vm: &Vm, name: &str, buf: &[u8]) -> Result<Value> 
 
 // ----- sync callbacks -------------------------------------------------------
 
+#[cfg(target_os = "android")]
+pub fn builtin_callback(_vm: &mut Vm, _args: &[Value]) -> Result<Value> {
+    Err(RuntimeError::msg(
+        "callback: libffi is not linked on Android (Windows hosts cannot build libffi-sys for this target)",
+    ))
+}
+
+#[cfg(target_os = "android")]
+pub fn builtin_callback_free(_vm: &mut Vm, _args: &[Value]) -> Result<Value> {
+    Err(RuntimeError::msg(
+        "callback_free: libffi is not linked on Android",
+    ))
+}
+
+#[cfg(not(target_os = "android"))]
 struct CallbackOwned {
     /// Closure must outlive the code pointer; 'static via leak of self-ref bundle.
     _keep: (*mut Closure<'static>, *mut CallbackData),
 }
 
 // SAFETY: 仅通过 CALLBACKS 互斥访问；裸指针指向堆上唯一所有者。
+#[cfg(not(target_os = "android"))]
 unsafe impl Send for CallbackOwned {}
+#[cfg(not(target_os = "android"))]
 unsafe impl Sync for CallbackOwned {}
 
+#[cfg(not(target_os = "android"))]
 struct CallbackData {
     callable: Value,
     arg_abis: Vec<AbiType>,
     ret_abi: AbiType,
 }
 
+#[cfg(not(target_os = "android"))]
 static CALLBACKS: std::sync::LazyLock<Mutex<HashMap<usize, CallbackOwned>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(not(target_os = "android"))]
 static CALLBACK_IDS: AtomicUsize = AtomicUsize::new(1);
 
+#[cfg(not(target_os = "android"))]
 pub fn builtin_callback(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 3 {
         return Err(RuntimeError::type_err(format!(
@@ -1342,6 +1367,7 @@ pub fn builtin_callback(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     ])))
 }
 
+#[cfg(not(target_os = "android"))]
 pub fn builtin_callback_free(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(RuntimeError::type_err(format!(
@@ -1360,6 +1386,7 @@ pub fn builtin_callback_free(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     Ok(Value::None)
 }
 
+#[cfg(not(target_os = "android"))]
 unsafe fn decode_cb_arg(p: *mut c_void, abi: AbiType) -> Value {
     // Prefer Value::Num so Optive arithmetic (`+`, etc.) works without casts.
     match abi {
@@ -1391,6 +1418,7 @@ unsafe fn decode_cb_arg(p: *mut c_void, abi: AbiType) -> Value {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn encode_cb_ret_u64(v: &Value, abi: AbiType) -> u64 {
     match abi {
         AbiType::Void => 0,

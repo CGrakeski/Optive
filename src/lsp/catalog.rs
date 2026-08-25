@@ -1,12 +1,7 @@
-//! 静态补全目录：关键字、全局内建、`std.*`。不启动 VM。
-
-pub const KEYWORDS: &[&str] = &[
-    "let", "var", "const", "func", "gen", "friend", "do", "return", "if", "elif", "else", "and",
-    "or", "not", "loop", "while", "break", "continue", "import", "use", "as", "intern", "export",
-    "with", "make", "for", "in", "is", "then", "handle", "go", "par", "snap", "await", "select",
-    "yield", "suspend", "variant", "enum", "struct", "protocol", "macro", "quote", "typed",
-    "match", "case", "try", "catch", "throw", "del", "outside", "overload",
-];
+//! 公开 runtime API 元数据 registry。
+//!
+//! LSP 补全、签名和静态 arity 检查只从这里读取；运行时双向同步测试保证
+//! 所有公开全局内建与 `std` 导出都在 registry 中且没有幽灵条目。
 
 pub const BUILTINS: &[(&str, &str)] = &[
     ("true", "bool true"),
@@ -17,6 +12,8 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("str", "str(x)"),
     ("repr", "repr(x)"),
     ("eval", "eval(ast)"),
+    ("quote", "quote(hygienic_names, bindings, body)"),
+    ("ast_struct", "ast_struct(ast)"),
     ("type", "type(x)"),
     ("convert", "convert(x, T)"),
     ("is_a", "is_a(x, T)"),
@@ -30,7 +27,7 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("input", "input([prompt])"),
     ("int", "int(x)"),
     ("dict", "dict(...)"),
-    ("rational", "rational(n[, d])"),
+    ("rational", "rational(n, d)"),
     ("floatstring", "floatstring(n)"),
     ("now", "now()"),
     ("gc", "gc()"),
@@ -79,6 +76,7 @@ pub const STD_MODULES: &[&str] = &[
 
 /// `(module, export)`。`module == ""` 表示 `std` 根上的名字。
 pub const STD_EXPORTS: &[(&str, &str)] = &[
+    ("", "concat"),
     ("math", "sin"),
     ("math", "cos"),
     ("math", "tan"),
@@ -119,6 +117,7 @@ pub const STD_EXPORTS: &[(&str, &str)] = &[
     ("math", "e"),
     ("math", "tau"),
     ("math", "inf"),
+    ("math", "-inf"),
     ("math", "nan"),
     ("io", "read_file"),
     ("io", "write_file"),
@@ -189,6 +188,9 @@ pub const STD_EXPORTS: &[(&str, &str)] = &[
     ("typing", "Optional"),
     ("typing", "Tuple"),
     ("typing", "Callable"),
+    ("typing", "Covariant"),
+    ("typing", "Contravariant"),
+    ("typing", "Invariant"),
     ("typing", "Never"),
     ("typing", "Literal"),
     ("typing", "fields_of"),
@@ -200,24 +202,62 @@ pub const STD_EXPORTS: &[(&str, &str)] = &[
     ("functional", "reduce"),
     ("functional", "compose"),
     ("functional", "partial"),
+    ("functional", "identity"),
+    ("functional", "const"),
+    ("functional", "flip"),
     ("collections", "sorted"),
     ("collections", "reversed"),
     ("collections", "min"),
     ("collections", "max"),
     ("collections", "sum"),
+    ("collections", "all"),
+    ("collections", "any"),
     ("collections", "unique"),
+    ("collections", "first"),
+    ("collections", "last"),
+    ("collections", "nth"),
+    ("collections", "flatten"),
+    ("collections", "chunk"),
+    ("collections", "count"),
+    ("collections", "group_by"),
     ("time", "now"),
     ("time", "now_ms"),
+    ("time", "monotonic"),
     ("time", "sleep"),
     ("time", "sleep_ms"),
+    ("time", "format"),
+    ("time", "parse"),
+    ("time", "utc_parts"),
+    ("time", "parts"),
+    ("time", "local_offset"),
     ("sync", "Channel"),
     ("sync", "Mutex"),
+    ("sync", "RWMutex"),
+    ("sync", "RwLock"),
     ("sync", "WaitGroup"),
     ("sync", "Semaphore"),
+    ("sync", "Once"),
+    ("sync", "Barrier"),
+    ("sync", "Cond"),
+    ("sync", "Atomic"),
+    ("sync", "yield"),
     ("async", "gather"),
     ("async", "race"),
     ("async", "par_map"),
+    ("async", "par_each"),
     ("async", "taskgroup"),
+    ("async", "with_timeout"),
+    ("async", "workers"),
+    ("async", "Stream"),
+    ("async", "stream"),
+    ("async", "stream_of"),
+    ("async", "stream_from_gen"),
+    ("async", "stream_map"),
+    ("async", "stream_filter"),
+    ("async", "stream_take"),
+    ("text", "Text"),
+    ("text", "Bytes"),
+    ("text", "Builder"),
     ("text", "upper"),
     ("text", "lower"),
     ("text", "strip"),
@@ -226,22 +266,85 @@ pub const STD_EXPORTS: &[(&str, &str)] = &[
     ("text", "replace"),
     ("text", "join"),
     ("text", "from_bytes"),
+    ("text", "len"),
+    ("text", "byte_len"),
+    ("text", "is_empty"),
+    ("text", "trim"),
+    ("text", "trim_start"),
+    ("text", "trim_end"),
+    ("text", "lstrip"),
+    ("text", "rstrip"),
+    ("text", "split_ws"),
+    ("text", "split_once"),
+    ("text", "rsplit_once"),
+    ("text", "rsplit"),
+    ("text", "lines"),
+    ("text", "chars"),
+    ("text", "codepoints"),
+    ("text", "from_chars"),
+    ("text", "from_codepoints"),
+    ("text", "to_bytes"),
+    ("text", "ord"),
+    ("text", "chr"),
+    ("text", "startswith"),
+    ("text", "endswith"),
+    ("text", "find"),
+    ("text", "rfind"),
+    ("text", "count"),
+    ("text", "replace_n"),
+    ("text", "removeprefix"),
+    ("text", "removesuffix"),
+    ("text", "substring"),
+    ("text", "slice"),
+    ("text", "repeat"),
+    ("text", "reverse"),
+    ("text", "capitalize"),
+    ("text", "title"),
+    ("text", "swapcase"),
+    ("text", "center"),
+    ("text", "ljust"),
+    ("text", "rjust"),
+    ("text", "zfill"),
+    ("text", "partition"),
+    ("text", "rpartition"),
+    ("text", "cmp"),
+    ("text", "is_alpha"),
+    ("text", "is_alnum"),
+    ("text", "is_digit"),
+    ("text", "is_space"),
+    ("text", "is_lower"),
+    ("text", "is_upper"),
+    ("text", "is_ascii"),
     ("path", "join"),
     ("path", "basename"),
     ("path", "dirname"),
+    ("path", "extension"),
+    ("path", "stem"),
+    ("path", "is_absolute"),
     ("path", "abspath"),
+    ("path", "normalize"),
+    ("path", "splitext"),
     ("fs", "exists"),
     ("fs", "is_file"),
     ("fs", "is_dir"),
     ("fs", "list_dir"),
     ("fs", "read_text"),
     ("fs", "write_text"),
+    ("fs", "read_bytes"),
+    ("fs", "write_bytes"),
     ("fs", "mkdir"),
+    ("fs", "mkdir_all"),
     ("fs", "remove"),
+    ("fs", "remove_dir"),
+    ("fs", "rename"),
+    ("fs", "copy"),
     ("os", "getenv"),
     ("os", "setenv"),
     ("os", "args"),
     ("os", "cwd"),
+    ("os", "chdir"),
+    ("os", "name"),
+    ("os", "exit"),
     ("os", "run"),
     ("os", "capture"),
     ("json", "parse"),
@@ -251,12 +354,21 @@ pub const STD_EXPORTS: &[(&str, &str)] = &[
     ("test", "assert_eq"),
     ("test", "assert_true"),
     ("test", "assert_raises"),
+    ("test", "each"),
+    ("test", "tmp_dir"),
     ("debug", "traceback"),
+    ("debug", "format_tb"),
+    ("debug", "print_tb"),
+    ("debug", "format_exception"),
+    ("debug", "type_name"),
     ("debug", "breakpoint"),
     ("random", "randint"),
     ("random", "random"),
+    ("random", "randstring"),
     ("random", "choice"),
     ("random", "shuffle"),
+    ("random", "sample"),
+    ("random", "seed"),
     ("re", "compile"),
     ("re", "match"),
     ("re", "findall"),
@@ -268,6 +380,7 @@ pub const STD_EXPORTS: &[(&str, &str)] = &[
     ("hash", "hmac"),
     ("exceptions", "bases"),
     ("exceptions", "chain"),
+    ("exceptions", "tree"),
     ("language", "C"),
     ("http", "get"),
     ("http", "post"),
@@ -313,6 +426,7 @@ pub const STD_EXPORTS: &[(&str, &str)] = &[
 
 /// 常见 `std.*` 调用签名，供参数提示使用。名字必须与运行时导出一致。
 pub const STD_SIGS: &[(&str, &str, &str)] = &[
+    ("", "concat", "std.concat(...)"),
     ("math", "sin", "std.math.sin(x)"),
     ("math", "cos", "std.math.cos(x)"),
     ("math", "tan", "std.math.tan(x)"),
@@ -336,8 +450,8 @@ pub const STD_SIGS: &[(&str, &str, &str)] = &[
     ("math", "log10", "std.math.log10(x)"),
     ("math", "exp", "std.math.exp(x)"),
     ("math", "hypot", "std.math.hypot(a, b)"),
-    ("math", "min", "std.math.min(a, b)"),
-    ("math", "max", "std.math.max(a, b)"),
+    ("math", "min", "std.math.min(value, *values)"),
+    ("math", "max", "std.math.max(value, *values)"),
     ("math", "clamp", "std.math.clamp(x, lo, hi)"),
     ("math", "gcd", "std.math.gcd(a, b)"),
     ("math", "lcm", "std.math.lcm(a, b)"),
@@ -390,12 +504,102 @@ pub const STD_SIGS: &[(&str, &str, &str)] = &[
     ("sqlite", "open", "std.sqlite.open(path)"),
     ("fs", "read_text", "std.fs.read_text(path)"),
     ("fs", "write_text", "std.fs.write_text(path, text)"),
+    ("fs", "read_bytes", "std.fs.read_bytes(path)"),
+    ("fs", "write_bytes", "std.fs.write_bytes(path, data)"),
     ("fs", "exists", "std.fs.exists(path)"),
+    ("fs", "is_file", "std.fs.is_file(path)"),
+    ("fs", "is_dir", "std.fs.is_dir(path)"),
     ("fs", "list_dir", "std.fs.list_dir(path)"),
+    ("fs", "mkdir", "std.fs.mkdir(path)"),
+    ("fs", "mkdir_all", "std.fs.mkdir_all(path)"),
+    ("fs", "remove", "std.fs.remove(path)"),
+    ("fs", "remove_dir", "std.fs.remove_dir(path)"),
+    ("fs", "rename", "std.fs.rename(from, to)"),
+    ("fs", "copy", "std.fs.copy(from, to)"),
     ("path", "join", "std.path.join(*parts)"),
     ("os", "getenv", "std.os.getenv(name)"),
     ("os", "setenv", "std.os.setenv(name, value)"),
+    ("os", "args", "std.os.args()"),
+    ("os", "exit", "std.os.exit(code?)"),
+    ("os", "cwd", "std.os.cwd()"),
+    ("os", "chdir", "std.os.chdir(path)"),
+    ("os", "name", "std.os.name()"),
+    ("os", "run", "std.os.run(command, args?)"),
+    ("os", "capture", "std.os.capture(command, args?)"),
     ("time", "sleep", "std.time.sleep(seconds)"),
+    ("time", "sleep_ms", "std.time.sleep_ms(ms)"),
+    ("time", "format", "std.time.format(secs, fmt, tz?)"),
+    ("time", "parse", "std.time.parse(text, fmt, tz?)"),
+    ("time", "utc_parts", "std.time.utc_parts(secs)"),
+    ("time", "parts", "std.time.parts(secs, tz?)"),
+    ("time", "local_offset", "std.time.local_offset()"),
+    ("time", "now", "std.time.now()"),
+    ("time", "now_ms", "std.time.now_ms()"),
+    ("time", "monotonic", "std.time.monotonic()"),
+    ("sync", "Channel", "std.sync.Channel(capacity?)"),
+    ("sync", "Mutex", "std.sync.Mutex(value)"),
+    ("sync", "RWMutex", "std.sync.RWMutex(value)"),
+    ("sync", "RwLock", "std.sync.RwLock(value)"),
+    ("sync", "WaitGroup", "std.sync.WaitGroup(count?)"),
+    ("sync", "Semaphore", "std.sync.Semaphore(permits)"),
+    ("sync", "Once", "std.sync.Once()"),
+    ("sync", "Barrier", "std.sync.Barrier(parties)"),
+    ("sync", "Cond", "std.sync.Cond()"),
+    ("sync", "Atomic", "std.sync.Atomic(value)"),
+    ("sync", "yield", "std.sync.yield()"),
+    ("async", "taskgroup", "std.async.taskgroup()"),
+    ("async", "with_timeout", "std.async.with_timeout(seconds)"),
+    ("async", "gather", "std.async.gather(tasks)"),
+    ("async", "race", "std.async.race(tasks)"),
+    ("async", "par_map", "std.async.par_map(iterable, callable)"),
+    (
+        "async",
+        "par_each",
+        "std.async.par_each(iterable, callable)",
+    ),
+    ("async", "workers", "std.async.workers()"),
+    ("async", "Stream", "std.async.Stream(capacity?)"),
+    ("async", "stream", "std.async.stream(capacity?)"),
+    ("async", "stream_of", "std.async.stream_of(iterable)"),
+    (
+        "async",
+        "stream_from_gen",
+        "std.async.stream_from_gen(generator)",
+    ),
+    (
+        "async",
+        "stream_map",
+        "std.async.stream_map(stream, callable)",
+    ),
+    (
+        "async",
+        "stream_filter",
+        "std.async.stream_filter(stream, predicate)",
+    ),
+    (
+        "async",
+        "stream_take",
+        "std.async.stream_take(stream, count)",
+    ),
+    ("test", "each", "std.test.each(name, rows, fn)"),
+    ("test", "tmp_dir", "std.test.tmp_dir()"),
+    ("debug", "traceback", "std.debug.traceback()"),
+    ("debug", "format_tb", "std.debug.format_tb(traceback)"),
+    ("debug", "print_tb", "std.debug.print_tb(traceback)"),
+    (
+        "debug",
+        "format_exception",
+        "std.debug.format_exception(exception)",
+    ),
+    ("debug", "type_name", "std.debug.type_name(value)"),
+    ("debug", "breakpoint", "std.debug.breakpoint()"),
+    ("random", "randint", "std.random.randint(lo, hi)"),
+    ("random", "random", "std.random.random()"),
+    ("random", "randstring", "std.random.randstring(length?)"),
+    ("random", "choice", "std.random.choice(iterable)"),
+    ("random", "shuffle", "std.random.shuffle(list)"),
+    ("random", "sample", "std.random.sample(iterable, count)"),
+    ("random", "seed", "std.random.seed(value?)"),
     ("text", "split", "std.text.split(s, sep)"),
     ("text", "replace", "std.text.replace(s, old, new)"),
     ("re", "match", "std.re.match(pattern, text)"),
@@ -472,7 +676,11 @@ pub fn std_export_sig(module: &str, name: &str) -> Option<String> {
         return Some((*s).to_string());
     }
     if STD_EXPORTS.iter().any(|(m, n)| *m == module && *n == name) {
-        return Some(format!("std.{module}.{name}(...)"));
+        return Some(if module.is_empty() {
+            format!("std.{name}(...)")
+        } else {
+            format!("std.{module}.{name}(...)")
+        });
     }
     None
 }
@@ -517,6 +725,91 @@ pub fn handle_method_result(ty: &str, method: &str) -> Option<&'static str> {
 
 pub fn std_module_doc(module: &str) -> String {
     format!("std.{module} — standard library submodule")
+}
+
+/// 全局内建的静态参数范围。非可调用值或未知动态入口返回 `None`。
+pub fn builtin_arity(name: &str) -> Option<(usize, Option<usize>)> {
+    let sig = BUILTINS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, sig)| *sig)?;
+    parse_sig_arity(sig)
+}
+
+/// `std` 导出的静态参数范围。特殊范围和签名都属于本 registry。
+pub fn std_arity(module: &str, export: &str) -> Option<(usize, Option<usize>)> {
+    if let Some((_, _, min, max)) = STD_ARITY
+        .iter()
+        .find(|(m, e, _, _)| *m == module && *e == export)
+    {
+        return Some((*min, *max));
+    }
+    let sig = STD_SIGS
+        .iter()
+        .find(|(m, e, _)| *m == module && *e == export)
+        .map(|(_, _, sig)| *sig)?;
+    parse_sig_arity(sig)
+}
+
+/// 无法仅由展示签名表达的参数范围。`None` max 表示无上限。
+const STD_ARITY: &[(&str, &str, usize, Option<usize>)] = &[
+    ("math", "range", 1, Some(3)),
+    ("math", "min", 1, None),
+    ("math", "max", 1, None),
+    ("net", "listen", 1, Some(2)),
+    ("net", "listen_tls", 3, Some(4)),
+    ("net", "bind_udp", 1, Some(2)),
+    ("net", "ws_connect", 2, Some(3)),
+    ("net", "ws_connect_tls", 2, Some(3)),
+    ("http", "serve", 2, Some(3)),
+    ("http", "serve_tls", 4, Some(5)),
+    ("log", "debug", 0, None),
+    ("log", "info", 0, None),
+    ("log", "warn", 0, None),
+    ("log", "error", 0, None),
+    ("format", "format", 1, None),
+    ("path", "join", 0, None),
+    ("io", "write_line", 0, None),
+    ("io", "eprint", 0, None),
+    ("io", "read_line", 0, Some(1)),
+    ("text", "split", 1, Some(3)),
+    ("dict", "get", 2, Some(3)),
+    ("dict", "merge", 0, None),
+    ("time", "format", 2, Some(3)),
+    ("time", "parse", 2, Some(3)),
+    ("time", "parts", 1, Some(2)),
+    ("time", "sleep", 0, Some(1)),
+    ("time", "sleep_ms", 0, Some(1)),
+];
+
+fn parse_sig_arity(sig: &str) -> Option<(usize, Option<usize>)> {
+    let start = sig.find('(')?;
+    let end = sig.rfind(')')?;
+    let inner = sig[start + 1..end].trim();
+    if inner.is_empty() {
+        return Some((0, Some(0)));
+    }
+    if inner == "..." || inner == "*args" {
+        return Some((0, None));
+    }
+    let mut min = 0usize;
+    let mut max = 0usize;
+    let mut unbounded = false;
+    for part in inner.split(',') {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        if p == "..." || p.starts_with('*') {
+            unbounded = true;
+            continue;
+        }
+        max += 1;
+        if !p.ends_with('?') && !p.ends_with("?]") && !p.contains('[') {
+            min += 1;
+        }
+    }
+    Some((min, if unbounded { None } else { Some(max) }))
 }
 
 pub struct Snippet {

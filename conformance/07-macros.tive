@@ -1,0 +1,8 @@
+use std.test.{ assert_eq }
+macro sq(x) {
+    return quote(ex) with (x) {
+        var ex = eval(x)
+        ex * ex
+    }
+}
+assert_eq(sq{6}, 36)

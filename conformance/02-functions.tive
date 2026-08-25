@@ -1,0 +1,3 @@
+use std.test.{ assert_eq }
+func add(a, b) { a + b }
+assert_eq(add(2, 3), 5)

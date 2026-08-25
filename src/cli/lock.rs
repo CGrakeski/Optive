@@ -1,4 +1,4 @@
-//! `Optive.lock` — 可复现依赖图。
+//! `Optive.lock` v2 — 可复现、可校验的依赖图。
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use super::manifest::{Dependency, Manifest, RevSpec};
 
 pub const ROOT_PARENT: &str = "__root__";
+pub const LOCK_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LockFile {
@@ -18,13 +19,19 @@ pub struct LockFile {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LockEdge {
-    /// `__root__` 或 content id
+    /// `__root__` 或父包的 `package_id`。
     pub parent: String,
     pub name: String,
-    pub git: String,
-    /// 钉死的 object id（commit SHA）；tag 在解析时已剥皮。
-    pub rev: String,
-    pub id: String,
+    /// 规范化后的 Git 来源。
+    pub source: String,
+    /// 完整 commit object id；tag/branch 均已解析。
+    pub commit: String,
+    /// commit 对应的 Git tree object id。
+    pub tree: String,
+    /// 物化工作树内容摘要（SHA-256；排除 VCS/构建缓存）。
+    pub content_digest: String,
+    /// `sha256(source NUL commit)`，用于 CAS 路径和依赖边父节点。
+    pub package_id: String,
     /// 意图：toml 声明的 branch（可追 tip）；与 `tag` 互斥。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
@@ -38,7 +45,10 @@ pub struct LockEdge {
 
 impl LockFile {
     pub const fn new(edges: Vec<LockEdge>) -> Self {
-        Self { version: 1, edges }
+        Self {
+            version: LOCK_VERSION,
+            edges,
+        }
     }
 
     pub fn load(path: &Path) -> Result<Option<Self>, String> {
@@ -47,15 +57,24 @@ impl LockFile {
         }
         let text =
             fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let lock: Self =
-            toml::from_str(&text).map_err(|e| format!("invalid {}: {e}", path.display()))?;
-        if lock.version != 1 {
+        let value: toml::Value = toml::from_str(&text)
+            .map_err(|e| rebuild_error(path, &format!("invalid TOML: {e}")))?;
+        let version = value
+            .get("version")
+            .and_then(toml::Value::as_integer)
+            .and_then(|v| u32::try_from(v).ok());
+        if version != Some(LOCK_VERSION) {
             return Err(format!(
-                "unsupported {}: version {} (expected 1)",
+                "unsupported {} lock format (found version {}, expected {LOCK_VERSION}); delete {} and regenerate it with `Optive update`",
                 path.display(),
-                lock.version
+                version.map_or_else(|| "missing".into(), |v| v.to_string()),
+                path.display()
             ));
         }
+        let lock: Self = value
+            .try_into()
+            .map_err(|e| rebuild_error(path, &format!("invalid v{LOCK_VERSION} data: {e}")))?;
+        lock.validate(path)?;
         Ok(Some(lock))
     }
 
@@ -96,6 +115,66 @@ impl LockFile {
     pub fn root_edges(&self) -> impl Iterator<Item = &LockEdge> {
         self.edges.iter().filter(|e| e.parent == ROOT_PARENT)
     }
+
+    fn validate(&self, path: &Path) -> Result<(), String> {
+        let mut ids = std::collections::BTreeSet::new();
+        let mut keys = std::collections::BTreeSet::new();
+        for edge in &self.edges {
+            if edge.source != super::store::normalize_git_url(&edge.source) {
+                return Err(rebuild_error(
+                    path,
+                    &format!("edge `{}` source is not normalized", edge.name),
+                ));
+            }
+            if !is_full_object_id(&edge.commit) {
+                return Err(rebuild_error(
+                    path,
+                    &format!("edge `{}` commit is not a full object id", edge.name),
+                ));
+            }
+            if !is_full_object_id(&edge.tree) {
+                return Err(rebuild_error(
+                    path,
+                    &format!("edge `{}` tree is not a full object id", edge.name),
+                ));
+            }
+            if !is_sha256(&edge.content_digest) {
+                return Err(rebuild_error(
+                    path,
+                    &format!("edge `{}` content_digest is not SHA-256", edge.name),
+                ));
+            }
+            let expected_id = super::store::content_id(&edge.source, &edge.commit);
+            if edge.package_id != expected_id {
+                return Err(rebuild_error(
+                    path,
+                    &format!(
+                        "edge `{}` package_id {} does not match source+commit ({expected_id})",
+                        edge.name, edge.package_id
+                    ),
+                ));
+            }
+            if !keys.insert((edge.parent.as_str(), edge.name.as_str())) {
+                return Err(rebuild_error(
+                    path,
+                    &format!("duplicate dependency edge ({}, {})", edge.parent, edge.name),
+                ));
+            }
+            ids.insert(edge.package_id.as_str());
+        }
+        for edge in &self.edges {
+            if edge.parent != ROOT_PARENT && !ids.contains(edge.parent.as_str()) {
+                return Err(rebuild_error(
+                    path,
+                    &format!(
+                        "edge `{}` references unknown parent package_id {}",
+                        edge.name, edge.parent
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn intent_matches_edge(dep: &Dependency, edge: &LockEdge) -> bool {
@@ -105,15 +184,18 @@ fn intent_matches_edge(dep: &Dependency, edge: &LockEdge) -> bool {
             edge.tag.as_deref() == Some(v.as_str())
                 && edge.branch.is_none()
                 && !edge.pinned
-                && (dep.git.is_empty() || normalize_cmp(&dep.git) == normalize_cmp(&edge.git))
+                && (dep.git.is_empty() || normalize_cmp(&dep.git) == edge.source)
         }
         _ => {
-            if normalize_cmp(&dep.git) != normalize_cmp(&edge.git) {
+            if normalize_cmp(&dep.git) != edge.source {
                 return false;
             }
             match &dep.rev {
                 RevSpec::Commit(r) => {
-                    edge.pinned && r == &edge.rev && edge.branch.is_none() && edge.tag.is_none()
+                    edge.pinned
+                        && normalize_object_id(r) == edge.commit
+                        && edge.branch.is_none()
+                        && edge.tag.is_none()
                 }
                 RevSpec::Tag(t) => {
                     edge.tag.as_deref() == Some(t.as_str()) && edge.branch.is_none() && !edge.pinned
@@ -138,18 +220,43 @@ fn normalize_cmp(url: &str) -> String {
     super::store::normalize_git_url(url)
 }
 
+fn normalize_object_id(id: &str) -> String {
+    id.trim().to_ascii_lowercase()
+}
+
+fn is_full_object_id(id: &str) -> bool {
+    matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn is_sha256(digest: &str) -> bool {
+    digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn rebuild_error(path: &Path, reason: &str) -> String {
+    format!(
+        "invalid {}: {reason}; this lock format is not migrated automatically—delete {} and regenerate it with `Optive update`",
+        path.display(),
+        path.display()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cli::manifest::Dependency;
 
-    fn edge(git: &str, tag: Option<&str>) -> LockEdge {
+    fn edge(source: &str, tag: Option<&str>) -> LockEdge {
+        let source = normalize_cmp(source);
+        let commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
         LockEdge {
             parent: ROOT_PARENT.into(),
             name: "p".into(),
-            git: git.into(),
-            rev: "abc".into(),
-            id: "id".into(),
+            package_id: super::super::store::content_id(&source, &commit),
+            source,
+            commit,
+            tree: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            content_digest: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                .into(),
             branch: None,
             tag: tag.map(str::to_string),
             pinned: false,
@@ -176,5 +283,19 @@ mod tests {
             &dep,
             &edge("https://anywhere.example/x.git", Some("0.1.0"))
         ));
+    }
+
+    #[test]
+    fn old_lock_requires_delete_and_rebuild() {
+        let dir = std::env::temp_dir().join(format!("optive_lock_v1_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Optive.lock");
+        fs::write(&path, "version = 1\nedges = []\n").unwrap();
+        let err = LockFile::load(&path).unwrap_err();
+        assert!(err.contains("expected 2"), "{err}");
+        assert!(err.contains("delete"), "{err}");
+        assert!(err.contains("Optive update"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

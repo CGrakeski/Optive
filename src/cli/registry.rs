@@ -33,6 +33,7 @@ pub fn load_pack_index() -> Result<BTreeMap<String, String>, Box<dyn std::error:
         )
         .into());
     }
+    crate::cli::index_trust::verify_index_dir(&index_dir())?;
     let text =
         fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     parse_pack_index(&text).map_err(|e| format!("invalid {}: {e}", path.display()).into())

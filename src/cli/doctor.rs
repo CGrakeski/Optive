@@ -60,6 +60,10 @@ pub fn print_env() {
         println!("OPTIVE_INDEX_URL (env):  {v}");
     }
     println!(
+        "index trust:             {}",
+        super::index_trust::describe_policy()
+    );
+    println!(
         "OPTIVE_USE_LOCAL_DEPS:   {}",
         if home::use_local_deps() { "1" } else { "0" }
     );
@@ -191,16 +195,16 @@ fn doctor_project(
         if !home::use_local_deps() {
             let store = Store::open()?;
             for e in &lock.edges {
-                let path = store.pack_abs(&e.id);
+                let path = store.pack_abs(&e.package_id);
                 if !path.is_dir() {
-                    if let Some(rec) = store.lookup(&e.id)? {
+                    if let Some(rec) = store.lookup(&e.package_id)? {
                         if !rec.path.is_dir() {
                             *errors += 1;
-                            println!("missing pack: {} ({})", e.name, e.id);
+                            println!("missing pack: {} ({})", e.name, e.package_id);
                         }
                     } else {
                         *errors += 1;
-                        println!("missing pack index entry: {} ({})", e.name, e.id);
+                        println!("missing pack index entry: {} ({})", e.name, e.package_id);
                     }
                 } else if verbose {
                     println!("  pack ok: {} -> {}", e.name, path.display());
@@ -214,7 +218,7 @@ fn doctor_project(
     if !project.manifest.dependencies.is_empty() {
         *warnings += 1;
         println!(
-            "sandbox: {} project dependenc{} run with full host caps by default; pass --sandbox for untrusted packs",
+            "sandbox: {} project dependenc{} default to read-only package roots without network/env/FFI; pass --trust-deps to grant host capabilities",
             project.manifest.dependencies.len(),
             if project.manifest.dependencies.len() == 1 { "y" } else { "ies" }
         );
@@ -330,7 +334,7 @@ pub fn list_deps(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     for (name, dep) in &project.manifest.dependencies {
         let edge = root_edges.get(name.as_str()).copied();
         let (path, present) = resolve_dep_path(&project, name, edge, store.as_ref());
-        let effective = edge.map_or_else(|| "—".into(), |e| short_rev(&e.rev));
+        let effective = edge.map_or_else(|| "—".into(), |e| short_rev(&e.commit));
         let mode = rev_mode_label(&dep.rev);
         let path_disp = match (&path, present) {
             (Some(p), true) => display_path(p),
@@ -344,7 +348,7 @@ pub fn list_deps(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
         println!("    {}  {}", color::dim("path"), path_disp);
         if verbose {
             if let Some(e) = edge {
-                println!("    {}  {}", color::dim("id"), short_id(&e.id));
+                println!("    {}  {}", color::dim("id"), short_id(&e.package_id));
             }
         }
         println!();
@@ -365,8 +369,8 @@ pub fn list_deps(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
                         "  {} → {}  {}  {}",
                         color::dim(&parent),
                         color::purple(&e.name),
-                        short_rev(&e.rev),
-                        color::dim(&short_git(&e.git))
+                        short_rev(&e.commit),
+                        color::dim(&short_git(&e.source))
                     );
                 }
                 println!();
@@ -431,7 +435,7 @@ fn resolve_dep_path(
         let ok = p.is_dir();
         return (Some(p), ok);
     }
-    let Some(id) = edge.map(|e| e.id.as_str()) else {
+    let Some(id) = edge.map(|e| e.package_id.as_str()) else {
         return (None, false);
     };
     if let Some(store) = store {

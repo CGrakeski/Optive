@@ -1,13 +1,12 @@
-//! Optive LSP：诊断、补全、悬停、定义、引用、大纲、签名、格式化。
+//! Optive LSP：诊断、补全、悬停、定义、引用、重命名、语义高亮、code action。
 //!
-//! 传输：stdio JSON-RPC（`Content-Length`）。不实现 DAP / 重命名 / 语义高亮。
+//! 传输：stdio JSON-RPC（`Content-Length`）。增量 `textDocumentSync`。
 
-mod catalog;
-mod symbols;
-mod workspace;
+pub(crate) mod symbols;
+pub(crate) mod workspace;
 
 use std::collections::HashMap;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 
 use serde_json::{json, Value as Json};
 
@@ -17,10 +16,11 @@ use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::token::{Token, TokenKind};
 
-use catalog::{
+use crate::api_registry::{
     handle_member_sig, handle_members, std_export_doc, std_export_sig, std_module_doc, BUILTINS,
-    KEYWORDS, SNIPPETS, STD_EXPORTS, STD_MODULES,
+    SNIPPETS, STD_EXPORTS, STD_MODULES,
 };
+use crate::token::KEYWORDS;
 use symbols::{
     import_path_for_name, index_program, index_source, infer_receiver_from_index, parse_for_lsp,
     FileIndex, KIND_CLASS, KIND_FIELD, KIND_FUNC, KIND_KEYWORD, KIND_METHOD, KIND_MODULE,
@@ -36,11 +36,16 @@ pub fn run_stdio() -> io::Result<()> {
     let mut reader = stdin.lock();
     let mut stdout = io::stdout();
     let mut docs: HashMap<String, String> = HashMap::new();
-    while let Some(msg) = read_rpc(&mut reader)? {
+    while let Some(msg) = crate::rpc::read_json(&mut reader)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+    {
         let method = msg.get("method").and_then(Json::as_str).unwrap_or("");
         let id = msg.get("id").cloned();
         match method {
             "initialize" => {
+                if let Some(params) = msg.get("params") {
+                    workspace::configure_roots(params);
+                }
                 write_rpc(
                     &mut stdout,
                     json!({
@@ -48,9 +53,14 @@ pub fn run_stdio() -> io::Result<()> {
                         "id": id,
                         "result": {
                             "capabilities": {
-                                "textDocumentSync": 1,
+                                "textDocumentSync": {
+                                    "openClose": true,
+                                    "change": 2
+                                },
                                 "definitionProvider": true,
                                 "referencesProvider": true,
+                                "renameProvider": true,
+                                "workspaceSymbolProvider": true,
                                 "documentSymbolProvider": true,
                                 "hoverProvider": true,
                                 "completionProvider": {
@@ -61,7 +71,21 @@ pub fn run_stdio() -> io::Result<()> {
                                     "retriggerCharacters": [","]
                                 },
                                 "inlayHintProvider": true,
-                                "documentFormattingProvider": true
+                                "documentFormattingProvider": true,
+                                "codeActionProvider": {
+                                    "codeActionKinds": ["quickfix", "refactor"]
+                                },
+                                "semanticTokensProvider": {
+                                    "legend": {
+                                        "tokenTypes": [
+                                            "keyword", "variable", "function", "number",
+                                            "string", "comment", "operator", "type", "parameter"
+                                        ],
+                                        "tokenModifiers": []
+                                    },
+                                    "full": true,
+                                    "range": false
+                                }
                             },
                             "serverInfo": { "name": "Optive", "version": env!("CARGO_PKG_VERSION") }
                         }
@@ -89,7 +113,8 @@ pub fn run_stdio() -> io::Result<()> {
                         .unwrap_or("")
                         .to_string();
                     docs.insert(uri.clone(), text.clone());
-                    publish_diags(&mut stdout, &uri, &text)?;
+                    workspace::upsert_index(&uri, &text);
+                    publish_diags(&mut stdout, &uri, &text, &docs)?;
                 }
             }
             "textDocument/didChange" => {
@@ -98,12 +123,15 @@ pub fn run_stdio() -> io::Result<()> {
                     .and_then(Json::as_str)
                 {
                     let uri = uri.to_string();
-                    if let Some(text) = msg
-                        .pointer("/params/contentChanges/0/text")
-                        .and_then(Json::as_str)
+                    if let Some(changes) = msg
+                        .pointer("/params/contentChanges")
+                        .and_then(Json::as_array)
                     {
-                        docs.insert(uri.clone(), text.to_string());
-                        publish_diags(&mut stdout, &uri, text)?;
+                        let mut text = docs.get(&uri).cloned().unwrap_or_default();
+                        apply_content_changes(&mut text, changes);
+                        workspace::upsert_index(&uri, &text);
+                        docs.insert(uri.clone(), text.clone());
+                        publish_diags(&mut stdout, &uri, &text, &docs)?;
                     }
                 }
             }
@@ -113,6 +141,7 @@ pub fn run_stdio() -> io::Result<()> {
                     .and_then(Json::as_str)
                 {
                     docs.remove(uri);
+                    workspace::drop_index(uri);
                 }
             }
             "textDocument/definition" => {
@@ -171,6 +200,41 @@ pub fn run_stdio() -> io::Result<()> {
                     json!({"jsonrpc":"2.0","id": id, "result": formatting(&text)}),
                 )?;
             }
+            "textDocument/rename" => {
+                let (uri, line, character, text) = doc_pos(&docs, &msg);
+                let new_name = msg
+                    .pointer("/params/newName")
+                    .and_then(Json::as_str)
+                    .unwrap_or("");
+                write_rpc(
+                    &mut stdout,
+                    json!({"jsonrpc":"2.0","id": id, "result": rename_in(&text, &uri, line, character, new_name, &docs)}),
+                )?;
+            }
+            "textDocument/semanticTokens/full" => {
+                let (_, _, _, text) = doc_pos(&docs, &msg);
+                write_rpc(
+                    &mut stdout,
+                    json!({"jsonrpc":"2.0","id": id, "result": semantic_tokens(&text)}),
+                )?;
+            }
+            "textDocument/codeAction" => {
+                let (uri, _, _, text) = doc_pos(&docs, &msg);
+                write_rpc(
+                    &mut stdout,
+                    json!({"jsonrpc":"2.0","id": id, "result": code_actions(&text, &uri, &docs)}),
+                )?;
+            }
+            "workspace/symbol" => {
+                let query = msg
+                    .pointer("/params/query")
+                    .and_then(Json::as_str)
+                    .unwrap_or("");
+                write_rpc(
+                    &mut stdout,
+                    json!({"jsonrpc":"2.0","id": id, "result": workspace_symbol(query)}),
+                )?;
+            }
             _ => {
                 if id.is_some() {
                     write_rpc(
@@ -188,9 +252,18 @@ pub fn run_stdio() -> io::Result<()> {
     Ok(())
 }
 
-pub fn diagnostics(source: &str, _file: &str) -> Vec<(usize, usize, String)> {
+pub fn diagnostics(source: &str, file: &str) -> Vec<(usize, usize, String)> {
+    diagnostics_in(source, file, &HashMap::new())
+}
+
+#[must_use]
+pub fn diagnostics_in(
+    source: &str,
+    file: &str,
+    docs: &HashMap<String, String>,
+) -> Vec<(usize, usize, String)> {
     match Parser::parse(source) {
-        Ok(_) => Vec::new(),
+        Ok(program) => crate::semantic::analyze_in(&program, file, docs),
         Err(ParseError::Message {
             line,
             column,
@@ -239,32 +312,28 @@ pub fn completion_in(
     let partial_l = partial.to_ascii_lowercase();
     let mut items: Vec<Json> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let idx = index_source(source);
-    let line_1 = lsp_line.saturating_add(1);
+    let (idx, line_1) = source_index(source, lsp_line);
 
     let mut push = |label: &str, kind: u8, detail: &str, sort: &str, snippet: Option<&str>| {
-        if !partial_l.is_empty() && !label.to_ascii_lowercase().starts_with(&partial_l) {
-            return;
-        }
-        if !seen.insert(label.to_string()) {
-            return;
-        }
-        let mut it = json!({
-            "label": label,
-            "kind": kind,
-            "detail": detail,
-            "sortText": sort,
-            "insertText": snippet.unwrap_or(label)
-        });
-        if snippet.is_some() {
-            it["insertTextFormat"] = json!(2);
-        }
-        items.push(it);
+        push_completion(
+            &mut items, &mut seen, &partial_l, label, kind, detail, sort, snippet,
+        );
     };
 
     if parent == "std" {
         for m in STD_MODULES {
             push(m, KIND_MODULE, "std submodule", "0", None);
+        }
+        for (module, export) in STD_EXPORTS {
+            if module.is_empty() {
+                push(
+                    export,
+                    KIND_FUNC,
+                    &std_export_doc(module, export),
+                    "0",
+                    None,
+                );
+            }
         }
         return Json::Array(items);
     }
@@ -368,8 +437,7 @@ pub fn hover_in(
     if let Some((_, doc)) = BUILTINS.iter().find(|(n, _)| *n == typed) {
         return hover_md(doc);
     }
-    let idx = index_source(source);
-    let line_1 = lsp_line.saturating_add(1);
+    let (idx, line_1) = source_index(source, lsp_line);
     if let Some((parent, name)) = typed.rsplit_once('.') {
         if let Some(ty) = infer_receiver_from_index(&idx, parent) {
             if let Some(m) = idx.members_of(&ty).into_iter().find(|s| s.name == name) {
@@ -473,9 +541,8 @@ fn definition_name(
     typed: &str,
     docs: &HashMap<String, String>,
 ) -> Json {
-    let line_1 = lsp_line.saturating_add(1);
     let name = typed.rsplit('.').next().unwrap_or(typed);
-    let idx = index_source(source);
+    let (idx, line_1) = source_index(source, lsp_line);
 
     if let Some((parent, exp)) = typed.rsplit_once('.') {
         if let Some(ty) = infer_receiver_from_index(&idx, parent) {
@@ -1262,6 +1329,40 @@ pub fn formatting(source: &str) -> Json {
     }])
 }
 
+fn source_index(source: &str, lsp_line: usize) -> (FileIndex, usize) {
+    (index_source(source), lsp_line.saturating_add(1))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_completion(
+    items: &mut Vec<Json>,
+    seen: &mut std::collections::HashSet<String>,
+    partial_l: &str,
+    label: &str,
+    kind: u8,
+    detail: &str,
+    sort: &str,
+    snippet: Option<&str>,
+) {
+    if !partial_l.is_empty() && !label.to_ascii_lowercase().starts_with(partial_l) {
+        return;
+    }
+    if !seen.insert(label.to_string()) {
+        return;
+    }
+    let mut it = json!({
+        "label": label,
+        "kind": kind,
+        "detail": detail,
+        "sortText": sort,
+        "insertText": snippet.unwrap_or(label)
+    });
+    if snippet.is_some() {
+        it["insertTextFormat"] = json!(2);
+    }
+    items.push(it);
+}
+
 fn dotted_prefix(source: &str, lsp_line: usize, lsp_col: usize) -> String {
     let line = source.lines().nth(lsp_line).unwrap_or("");
     let chars: Vec<char> = line.chars().collect();
@@ -1348,8 +1449,314 @@ fn location_json(uri: &str, line: usize, character: usize) -> Json {
     })
 }
 
-fn publish_diags(out: &mut impl Write, uri: &str, text: &str) -> io::Result<()> {
-    let diags: Vec<Json> = diagnostics(text, uri)
+fn apply_content_changes(text: &mut String, changes: &[Json]) {
+    for change in changes {
+        if change.get("range").is_none() {
+            if let Some(full) = change.get("text").and_then(Json::as_str) {
+                *text = full.to_string();
+            }
+            continue;
+        }
+        let Some(range) = change.get("range") else {
+            continue;
+        };
+        let sl = range
+            .pointer("/start/line")
+            .and_then(Json::as_u64)
+            .unwrap_or(0) as usize;
+        let sc = range
+            .pointer("/start/character")
+            .and_then(Json::as_u64)
+            .unwrap_or(0) as usize;
+        let el = range
+            .pointer("/end/line")
+            .and_then(Json::as_u64)
+            .unwrap_or(0) as usize;
+        let ec = range
+            .pointer("/end/character")
+            .and_then(Json::as_u64)
+            .unwrap_or(0) as usize;
+        let replacement = change.get("text").and_then(Json::as_str).unwrap_or("");
+        let start = lsp_pos_to_offset(text, sl, sc);
+        let end = lsp_pos_to_offset(text, el, ec).max(start);
+        text.replace_range(start..end, replacement);
+    }
+}
+
+fn lsp_pos_to_offset(text: &str, line: usize, character: usize) -> usize {
+    let mut offset = 0usize;
+    for (i, src_line) in text.split('\n').enumerate() {
+        if i == line {
+            let mut u16_count = 0usize;
+            for (byte_i, ch) in src_line.char_indices() {
+                if u16_count >= character {
+                    return offset + byte_i;
+                }
+                u16_count += ch.len_utf16();
+            }
+            return offset + src_line.len();
+        }
+        offset += src_line.len() + 1;
+    }
+    text.len()
+}
+
+#[must_use]
+pub fn rename_in(
+    source: &str,
+    uri: &str,
+    lsp_line: usize,
+    lsp_col: usize,
+    new_name: &str,
+    docs: &HashMap<String, String>,
+) -> Json {
+    if new_name.is_empty() || !is_ident(new_name) {
+        return Json::Null;
+    }
+    let refs = references_in(source, uri, lsp_line, lsp_col, docs);
+    let Some(arr) = refs.as_array() else {
+        return Json::Null;
+    };
+    let mut changes: HashMap<String, Vec<Json>> = HashMap::new();
+    for loc in arr {
+        let turi = loc.get("uri").and_then(Json::as_str).unwrap_or(uri);
+        let range = loc.get("range").cloned().unwrap_or(json!({}));
+        let start = range
+            .pointer("/start/character")
+            .and_then(Json::as_u64)
+            .unwrap_or(0) as usize;
+        let line = range
+            .pointer("/start/line")
+            .and_then(Json::as_u64)
+            .unwrap_or(0) as usize;
+        let old = if turi == uri {
+            ident_at_line(source, line, start).unwrap_or_else(|| new_name.to_string())
+        } else {
+            docs.get(turi)
+                .and_then(|s| ident_at_line(s, line, start))
+                .unwrap_or_else(|| new_name.to_string())
+        };
+        let end_col = start + utf16_len(&old);
+        changes.entry(turi.to_string()).or_default().push(json!({
+            "range": {
+                "start": { "line": line, "character": start },
+                "end": { "line": line, "character": end_col }
+            },
+            "newText": new_name
+        }));
+    }
+    json!({ "changes": changes })
+}
+
+fn is_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+fn ident_at_line(source: &str, lsp_line: usize, character: usize) -> Option<String> {
+    let line = source.lines().nth(lsp_line)?;
+    let mut u16_count = 0usize;
+    let mut start = 0usize;
+    let chars: Vec<char> = line.chars().collect();
+    for (i, ch) in chars.iter().enumerate() {
+        if u16_count >= character {
+            start = i;
+            break;
+        }
+        u16_count += ch.len_utf16();
+        start = i + 1;
+    }
+    while start > 0 {
+        let c = chars[start - 1];
+        if c == '_' || c.is_ascii_alphanumeric() {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    let mut end = start;
+    while end < chars.len() {
+        let c = chars[end];
+        if c == '_' || c.is_ascii_alphanumeric() {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    if start == end {
+        None
+    } else {
+        Some(chars[start..end].iter().collect())
+    }
+}
+
+#[must_use]
+pub fn workspace_symbol(query: &str) -> Json {
+    let items: Vec<Json> = workspace::workspace_symbols(query)
+        .into_iter()
+        .map(|(uri, s)| {
+            json!({
+                "name": s.name,
+                "kind": s.kind,
+                "containerName": s.container,
+                "location": location_json(&uri, s.line.saturating_sub(1), s.col.saturating_sub(1))
+            })
+        })
+        .collect();
+    Json::Array(items)
+}
+
+#[must_use]
+pub fn semantic_tokens(source: &str) -> Json {
+    let Ok(tokens) = Lexer::new(source).tokenize() else {
+        return json!({ "data": [] });
+    };
+    let mut data = Vec::new();
+    let mut prev_line = 0u32;
+    let mut prev_start = 0u32;
+    for t in &tokens {
+        if matches!(t.kind, TokenKind::End) {
+            continue;
+        }
+        let Some(ty) = token_type_index(t.kind) else {
+            continue;
+        };
+        let line = t.line.saturating_sub(1) as u32;
+        let start = t.column.saturating_sub(1) as u32;
+        let length = utf16_len(&t.value).max(1) as u32;
+        let delta_line = line.saturating_sub(prev_line);
+        let delta_start = if delta_line == 0 {
+            start.saturating_sub(prev_start)
+        } else {
+            start
+        };
+        data.extend_from_slice(&[delta_line, delta_start, length, ty, 0]);
+        prev_line = line;
+        prev_start = start;
+    }
+    json!({ "data": data })
+}
+
+fn token_type_index(kind: TokenKind) -> Option<u32> {
+    Some(match kind {
+        TokenKind::Identifier => 1,
+        TokenKind::NumLiteral => 3,
+        TokenKind::StringLiteral | TokenKind::FStringLiteral | TokenKind::BytesLiteral => 4,
+        TokenKind::KwLet
+        | TokenKind::KwVar
+        | TokenKind::KwConst
+        | TokenKind::KwFunc
+        | TokenKind::KwGen
+        | TokenKind::KwFriend
+        | TokenKind::KwDo
+        | TokenKind::KwReturn
+        | TokenKind::KwIf
+        | TokenKind::KwElif
+        | TokenKind::KwElse
+        | TokenKind::KwAnd
+        | TokenKind::KwOr
+        | TokenKind::KwNot
+        | TokenKind::KwLoop
+        | TokenKind::KwWhile
+        | TokenKind::KwBreak
+        | TokenKind::KwContinue
+        | TokenKind::KwImport
+        | TokenKind::KwUse
+        | TokenKind::KwAs
+        | TokenKind::KwIntern
+        | TokenKind::KwExport
+        | TokenKind::KwWith
+        | TokenKind::KwMake
+        | TokenKind::KwFor
+        | TokenKind::KwIn
+        | TokenKind::KwIs
+        | TokenKind::KwThen
+        | TokenKind::KwHandle
+        | TokenKind::KwGo
+        | TokenKind::KwPar
+        | TokenKind::KwSnap
+        | TokenKind::KwAwait
+        | TokenKind::KwSelect
+        | TokenKind::KwYield
+        | TokenKind::KwSuspend
+        | TokenKind::KwVariant
+        | TokenKind::KwEnum
+        | TokenKind::KwStruct
+        | TokenKind::KwProtocol
+        | TokenKind::KwMacro
+        | TokenKind::KwQuote
+        | TokenKind::KwTyped
+        | TokenKind::KwMatch
+        | TokenKind::KwCase
+        | TokenKind::KwTry
+        | TokenKind::KwCatch
+        | TokenKind::KwThrow
+        | TokenKind::KwDel
+        | TokenKind::KwOutside
+        | TokenKind::KwOverload => 0,
+        TokenKind::LineComment | TokenKind::BlockComment => 5,
+        TokenKind::Plus
+        | TokenKind::Minus
+        | TokenKind::Star
+        | TokenKind::Slash
+        | TokenKind::EqEq
+        | TokenKind::Ne
+        | TokenKind::Lt
+        | TokenKind::Assign => 6,
+        _ => return None,
+    })
+}
+
+#[must_use]
+pub fn code_actions(source: &str, uri: &str, docs: &HashMap<String, String>) -> Json {
+    let diags = diagnostics_in(source, uri, docs);
+    let mut actions = Vec::new();
+    for (line, col, message) in diags {
+        if let Some(name) = message
+            .strip_prefix("unused import `")
+            .and_then(|s| s.strip_suffix('`'))
+        {
+            let sl = line.saturating_sub(1);
+            actions.push(json!({
+                "title": format!("Remove unused import `{name}`"),
+                "kind": "quickfix",
+                "edit": {
+                    "changes": {
+                        uri: [{
+                            "range": {
+                                "start": { "line": sl, "character": 0 },
+                                "end": { "line": sl + 1, "character": 0 }
+                            },
+                            "newText": ""
+                        }]
+                    }
+                }
+            }));
+        }
+        if message.contains("Channel, Mutex, or Atomic") {
+            actions.push(json!({
+                "title": "Wrap shared state in Mutex",
+                "kind": "refactor",
+                "diagnostics": [{ "message": message }],
+                "command": {
+                    "title": "See docs/concurrency.md",
+                    "command": "optive.explainMutex",
+                    "arguments": [{ "line": line, "column": col }]
+                }
+            }));
+        }
+    }
+    Json::Array(actions)
+}
+
+fn publish_diags(
+    out: &mut impl Write,
+    uri: &str,
+    text: &str,
+    docs: &HashMap<String, String>,
+) -> io::Result<()> {
+    let diags: Vec<Json> = diagnostics_in(text, uri, docs)
         .into_iter()
         .map(|(line, col, message)| {
             let sl = line.saturating_sub(1);
@@ -1375,39 +1782,8 @@ fn publish_diags(out: &mut impl Write, uri: &str, text: &str) -> io::Result<()> 
     )
 }
 
-fn read_rpc(reader: &mut impl BufRead) -> io::Result<Option<Json>> {
-    let mut headers = String::new();
-    loop {
-        let mut line = String::new();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            return Ok(None);
-        }
-        if line == "\r\n" || line == "\n" {
-            break;
-        }
-        headers.push_str(&line);
-    }
-    let mut len = 0usize;
-    for h in headers.lines() {
-        let h = h.trim_end_matches('\r');
-        if let Some(rest) = h.strip_prefix("Content-Length:") {
-            len = rest.trim().parse().unwrap_or(0);
-        }
-    }
-    if len == 0 {
-        return Ok(None);
-    }
-    let mut buf = vec![0u8; len];
-    std::io::Read::read_exact(reader, &mut buf)?;
-    Ok(serde_json::from_slice(&buf).ok())
-}
-
 fn write_rpc(out: &mut impl Write, v: Json) -> io::Result<()> {
-    let body = serde_json::to_vec(&v)?;
-    write!(out, "Content-Length: {}\r\n\r\n", body.len())?;
-    out.write_all(&body)?;
-    out.flush()
+    crate::rpc::write_json(out, &v)
 }
 
 #[cfg(test)]
@@ -1423,6 +1799,20 @@ mod tests {
     #[test]
     fn diagnostics_clean_source() {
         assert!(diagnostics("let x = 1\n", "x.tive").is_empty());
+    }
+
+    #[test]
+    fn diagnostics_undefined_name() {
+        let diags = diagnostics("print(no_such_name)\n", "x.tive");
+        assert!(diags.iter().any(|(_, _, m)| m.contains("undefined name")));
+    }
+
+    #[test]
+    fn diagnostics_unknown_std_and_arity() {
+        let unknown = diagnostics("std.math.nope_fn\n", "x.tive");
+        assert!(unknown.iter().any(|(_, _, m)| m.contains("unknown export")));
+        let arity = diagnostics("len()\n", "x.tive");
+        assert!(arity.iter().any(|(_, _, m)| m.contains("expects")));
     }
 
     #[test]
@@ -1643,5 +2033,86 @@ mod tests {
         let loc = definition_in(main, main_uri, 1, 4, &docs);
         assert_eq!(loc["uri"], lib_uri, "{loc}");
         assert_eq!(loc["range"]["start"]["line"], 0);
+    }
+
+    #[test]
+    fn incremental_change_applies_range() {
+        let mut text = "let x = 1\n".to_string();
+        apply_content_changes(
+            &mut text,
+            &[json!({
+                "range": {
+                    "start": { "line": 0, "character": 8 },
+                    "end": { "line": 0, "character": 9 }
+                },
+                "text": "2"
+            })],
+        );
+        assert_eq!(text, "let x = 2\n");
+    }
+
+    #[test]
+    fn rename_replaces_definition_and_use() {
+        let src = "func add(a, b) { a + b }\nadd(1, 2)\n";
+        let edit = rename_in(src, "file:///x.tive", 1, 0, "sum", &HashMap::new());
+        let edits = edit["changes"]["file:///x.tive"].as_array().unwrap();
+        assert!(edits.len() >= 2, "{edit}");
+    }
+
+    #[test]
+    fn semantic_tokens_include_keywords() {
+        let data = semantic_tokens("let x = 1\n");
+        assert!(data["data"].as_array().unwrap().len() >= 5, "{data}");
+    }
+
+    #[test]
+    fn code_action_unused_import() {
+        let src = "use std.math.{ sin }\nlet x = 1\nprint(x)\n";
+        let acts = code_actions(src, "file:///x.tive", &HashMap::new());
+        let titles: Vec<&str> = acts
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a["title"].as_str())
+            .collect();
+        assert!(
+            titles.iter().any(|t| t.contains("unused import")),
+            "{titles:?}"
+        );
+    }
+
+    #[test]
+    fn cli_lsp_diagnostics_agree() {
+        let src = "print(no_such_name)\n";
+        let lsp = diagnostics(src, "x.tive");
+        let sem = crate::semantic::analyze_source(src);
+        assert_eq!(lsp, sem);
+    }
+
+    #[test]
+    fn workspace_symbol_finds_indexed_func() {
+        workspace::upsert_index("file:///tmp/ws/lib.tive", "func greet(name) { name }\n");
+        let items = workspace_symbol("greet");
+        let names: Vec<&str> = items
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|it| it["name"].as_str())
+            .collect();
+        assert!(names.contains(&"greet"), "{items}");
+    }
+
+    #[test]
+    fn references_include_other_file() {
+        let (docs, lib_uri, main_uri) = ws_docs();
+        let main = docs.get(&main_uri).unwrap();
+        let refs = references_in(main, &main_uri, 1, 0, &docs);
+        let uris: Vec<&str> = refs
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|l| l["uri"].as_str())
+            .collect();
+        assert!(uris.contains(&lib_uri.as_str()), "{refs}");
     }
 }

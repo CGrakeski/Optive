@@ -1,6 +1,135 @@
 use crate::error::LexError;
 use crate::token::{keyword_or_ident, Token, TokenKind};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputStatus {
+    Complete,
+    Incomplete,
+}
+
+impl InputStatus {
+    #[must_use]
+    pub const fn is_incomplete(self) -> bool {
+        matches!(self, Self::Incomplete)
+    }
+}
+
+/// Classify whether more input can complete the current token/delimiter stream.
+///
+/// This deliberately does not validate syntax; it only tracks lexical constructs that may span
+/// REPL reads: delimiters, block comments, and normal/raw/f/bytes (including triple) literals.
+#[must_use]
+pub fn input_status(source: &str) -> InputStatus {
+    #[derive(Clone, Copy)]
+    enum State {
+        Code,
+        LineComment,
+        BlockComment,
+        String {
+            raw: bool,
+            triple: bool,
+            escaped: bool,
+        },
+    }
+
+    let chars: Vec<char> = source.chars().collect();
+    let mut state = State::Code;
+    let (mut paren, mut bracket, mut brace) = (0usize, 0usize, 0usize);
+    let mut i = 0usize;
+    while i < chars.len() {
+        match state {
+            State::LineComment => {
+                if chars[i] == '\n' {
+                    state = State::Code;
+                }
+                i += 1;
+            }
+            State::BlockComment => {
+                if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    state = State::Code;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            State::String {
+                raw,
+                triple,
+                escaped,
+            } => {
+                if triple
+                    && chars[i] == '"'
+                    && chars.get(i + 1) == Some(&'"')
+                    && chars.get(i + 2) == Some(&'"')
+                {
+                    state = State::Code;
+                    i += 3;
+                } else if !triple && chars[i] == '"' && (raw || !escaped) {
+                    state = State::Code;
+                    i += 1;
+                } else {
+                    let next_escaped = !raw && !escaped && chars[i] == '\\';
+                    state = State::String {
+                        raw,
+                        triple,
+                        escaped: next_escaped,
+                    };
+                    i += 1;
+                }
+            }
+            State::Code => {
+                if chars[i] == '#' || (chars[i] == '/' && chars.get(i + 1) == Some(&'/')) {
+                    state = State::LineComment;
+                    i += usize::from(chars[i] == '/');
+                } else if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                    state = State::BlockComment;
+                    i += 2;
+                } else {
+                    let at_token_start = i == 0 || !is_ident_continue(chars[i - 1]);
+                    let (raw, quote_at) = if at_token_start
+                        && matches!(chars[i], 'r' | 'f' | 'b')
+                        && chars.get(i + 1) == Some(&'"')
+                    {
+                        (chars[i] == 'r', i + 1)
+                    } else if chars[i] == '"' {
+                        (false, i)
+                    } else {
+                        match chars[i] {
+                            '(' => paren += 1,
+                            ')' => paren = paren.saturating_sub(1),
+                            '[' => bracket += 1,
+                            ']' => bracket = bracket.saturating_sub(1),
+                            '{' => brace += 1,
+                            '}' => brace = brace.saturating_sub(1),
+                            _ => {}
+                        }
+                        i += 1;
+                        continue;
+                    };
+                    let triple = chars.get(quote_at + 1) == Some(&'"')
+                        && chars.get(quote_at + 2) == Some(&'"');
+                    state = State::String {
+                        raw,
+                        triple,
+                        escaped: false,
+                    };
+                    i = quote_at + if triple { 3 } else { 1 };
+                }
+            }
+        }
+    }
+
+    if matches!(state, State::BlockComment | State::String { .. })
+        || paren > 0
+        || bracket > 0
+        || brace > 0
+    {
+        InputStatus::Incomplete
+    } else {
+        InputStatus::Complete
+    }
+}
+
 pub struct Lexer {
     source: String,
     pos: usize,

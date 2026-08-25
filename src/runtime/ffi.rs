@@ -9,6 +9,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+#[cfg(not(target_os = "android"))]
 use libffi::middle::{Arg, Cif, CodePtr, Type as FfiType};
 use libloading::Library;
 use parking_lot::ReentrantMutex;
@@ -24,12 +25,17 @@ use crate::Result;
 use crate::shared::Shared;
 
 /// 跨线程持有的 FFI 调用描述；默认经 per-callable 锁调用（同符号串行，异符号可并行）。
+#[cfg(not(target_os = "android"))]
 pub(crate) struct FfiCallable {
     cif: Cif,
     code: CodePtr,
     /// 同符号互斥；同步回调重入同一符号时用可重入锁。
     lock: ReentrantMutex<()>,
 }
+
+/// Android 交叉编不链 libffi；类型仍在，供卸荷池签名共用。
+#[cfg(target_os = "android")]
+pub(crate) struct FfiCallable;
 
 // SAFETY: 指针指向已加载库内的稳定符号与 libffi 分配的 CIF；
 // 调用侧持 per-callable（或全局串行）锁，且不同 CIF 可并行（libffi 惯例）。
@@ -216,6 +222,7 @@ impl AbiType {
         }
     }
 
+    #[cfg(not(target_os = "android"))]
     pub(crate) fn ffi_type(&self) -> FfiType {
         match self {
             Self::Void => FfiType::void(),
@@ -277,6 +284,12 @@ fn type_annotation_name(vm: &Vm, ty: &Expr) -> Result<String> {
 
 pub fn load_library(vm: &mut Vm, path: &str) -> Result<Value> {
     vm.caps.check_ffi("frompath")?;
+    if vm.caps.fs_restricted() {
+        return Err(RuntimeError::io_err(
+            "frompath: dynamic library loading is disabled with filesystem sandboxing because the \
+             platform loader cannot consume an already-authorized file handle",
+        ));
+    }
     let lib = unsafe { Library::new(path) }
         .map_err(|e| RuntimeError::msg(format!("failed to load dynamic library '{path}': {e}")))?;
     Ok(Value::DllHandle(Arc::new(DllHandle {
@@ -296,6 +309,20 @@ fn parse_call_conv(s: &str) -> Result<CallConv> {
 }
 
 /// 内置 `extern(handle[, symbol[, abi]])` → 装饰器。
+#[cfg(target_os = "android")]
+pub fn builtin_extern(_vm: &mut Vm, _args: &[Value]) -> Result<Value> {
+    Err(RuntimeError::msg(android_libffi_msg("extern")))
+}
+
+#[cfg(target_os = "android")]
+fn android_libffi_msg(op: &str) -> String {
+    format!(
+        "{op}: libffi is not linked on Android (Windows hosts cannot build libffi-sys for this target)"
+    )
+}
+
+/// 内置 `extern(handle[, symbol[, abi]])` → 装饰器。
+#[cfg(not(target_os = "android"))]
 pub fn builtin_extern(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     vm.caps.check_ffi("extern")?;
     if args.is_empty() || args.len() > 3 {
@@ -361,6 +388,7 @@ pub fn builtin_extern(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }))
 }
 
+#[cfg(not(target_os = "android"))]
 fn bind_extern_function(
     vm: &mut Vm,
     handle: Arc<DllHandle>,
@@ -559,6 +587,7 @@ fn bind_extern_function(
     )))
 }
 
+#[cfg(not(target_os = "android"))]
 fn apply_call_conv(cif: &mut Cif, conv: CallConv) -> Result<()> {
     use libffi::middle::ffi_abi_FFI_DEFAULT_ABI;
     match conv {
@@ -584,14 +613,35 @@ fn apply_call_conv(cif: &mut Cif, conv: CallConv) -> Result<()> {
     }
 }
 
+#[cfg(target_os = "android")]
+pub(crate) fn invoke_native_call(
+    _ffi: &FfiCallable,
+    _storage: &mut [ArgStorage],
+    _ret_abi: AbiType,
+    _use_serial: bool,
+) -> Result<RetStorage> {
+    Err(RuntimeError::msg(android_libffi_msg("extern")))
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn invoke_native_call_sampled(
+    _ffi: &FfiCallable,
+    _storage: &mut [ArgStorage],
+    _ret_abi: AbiType,
+    _use_serial: bool,
+) -> Result<(RetStorage, i32)> {
+    Err(RuntimeError::msg(android_libffi_msg("extern")))
+}
+
 /// 持锁执行 libffi call，并采样 errno（调用线程 TLS）。
+#[cfg(not(target_os = "android"))]
 pub(crate) fn invoke_native_call(
     ffi: &FfiCallable,
     storage: &mut [ArgStorage],
     ret_abi: AbiType,
     use_serial: bool,
 ) -> Result<RetStorage> {
-    crate::gc::ffi_enter();
+    let _guard = crate::gc::NativeCallGuard::enter();
     let result = (|| {
         let ffi_args: Vec<Arg> = storage.iter_mut().map(ArgStorage::as_arg).collect();
         let raw = if use_serial {
@@ -604,18 +654,18 @@ pub(crate) fn invoke_native_call(
         super::ffi_extra::sample_error_codes();
         Ok(raw)
     })();
-    crate::gc::ffi_leave();
     result
 }
 
 /// 卸荷线程用：返回 `(结果, errno)`，不依赖调用方 TLS。
+#[cfg(not(target_os = "android"))]
 pub(crate) fn invoke_native_call_sampled(
     ffi: &FfiCallable,
     storage: &mut [ArgStorage],
     ret_abi: AbiType,
     use_serial: bool,
 ) -> Result<(RetStorage, i32)> {
-    crate::gc::ffi_enter();
+    let _guard = crate::gc::NativeCallGuard::enter();
     let result = (|| {
         let ffi_args: Vec<Arg> = storage.iter_mut().map(ArgStorage::as_arg).collect();
         let raw = if use_serial {
@@ -628,7 +678,6 @@ pub(crate) fn invoke_native_call_sampled(
         let errno = super::ffi_extra::sample_error_codes_value();
         Ok((raw, errno))
     })();
-    crate::gc::ffi_leave();
     result
 }
 
@@ -657,6 +706,7 @@ pub(crate) enum ArgStorage {
 }
 
 impl ArgStorage {
+    #[cfg(not(target_os = "android"))]
     fn as_arg(&mut self) -> Arg {
         match self {
             Self::I8(v) => Arg::new(v),
@@ -807,6 +857,7 @@ pub(crate) enum RetStorage {
     CStruct(Vec<u8>),
 }
 
+#[cfg(not(target_os = "android"))]
 unsafe fn call_cif(cif: &Cif, code: CodePtr, args: &[Arg], ret: &AbiType) -> Result<RetStorage> {
     Ok(match ret {
         AbiType::Void => {

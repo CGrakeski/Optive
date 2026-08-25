@@ -49,6 +49,18 @@ pub struct Package {
     /// 入口脚本；默认依次尝试 `src/main.tive`、`main.tive`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<String>,
+    /// 本包声明需要的能力；不能自行授予，须由 CLI/宿主授权。
+    #[serde(
+        default,
+        skip_serializing_if = "optive::caps::CapabilityRequest::is_empty"
+    )]
+    pub capabilities: optive::caps::CapabilityRequest,
+    /// 语言语义版本，例如 `0.2`。缺省表示接受当前解释器语言版本。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language_version: Option<String>,
+    /// 最低解释器版本，例如 `0.2.0` 或 `>=0.2.0`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_optive: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,7 +242,10 @@ pub struct Project {
 
 impl Project {
     /// 解析入口 `.tive` 文件的绝对路径（相对 root join，便于显示时 `strip_prefix`）。
-    pub fn entry_path(&self) -> Result<PathBuf, String> {
+    pub fn entry_path_with_caps(
+        &self,
+        caps: &optive::caps::Capabilities,
+    ) -> Result<PathBuf, String> {
         if let Some(entry) = &self.manifest.package.entry {
             use std::path::{Component, Path};
             let entry_path = Path::new(entry);
@@ -250,7 +265,10 @@ impl Project {
                 ));
             }
             let p = self.root.join(entry);
-            if !p.is_file() {
+            if !caps
+                .is_file("project entry", &p)
+                .map_err(|e| e.to_string())?
+            {
                 return Err(format!(
                     "entry not found: {} (from {})",
                     p.display(),
@@ -258,19 +276,24 @@ impl Project {
                 ));
             }
             // 纵深防御：能 canonicalize 时再确认未逃出包根（返回值仍用 join 路径，便于相对显示）。
-            if let (Ok(canon_root), Ok(canon)) = (self.root.canonicalize(), p.canonicalize()) {
-                if !canon.starts_with(&canon_root) {
-                    return Err(format!(
-                        "entry escapes package root: {entry} (from {})",
-                        self.manifest_path.display()
-                    ));
+            if !caps.fs_restricted() {
+                if let (Ok(canon_root), Ok(canon)) = (self.root.canonicalize(), p.canonicalize()) {
+                    if !canon.starts_with(&canon_root) {
+                        return Err(format!(
+                            "entry escapes package root: {entry} (from {})",
+                            self.manifest_path.display()
+                        ));
+                    }
                 }
             }
             return Ok(p);
         }
         for candidate in ["src/main.tive", "main.tive"] {
             let p = self.root.join(candidate);
-            if p.is_file() {
+            if caps
+                .is_file("project entry", &p)
+                .map_err(|e| e.to_string())?
+            {
                 return Ok(p);
             }
         }
@@ -438,6 +461,33 @@ pub fn load_project(manifest_path: &Path) -> Result<Project, String> {
             manifest_path.display()
         ));
     }
+    if let Some(lang) = &manifest.package.language_version {
+        if !optive::versions::language_compatible(lang) {
+            return Err(format!(
+                "{}: language_version `{lang}` is not compatible with this interpreter ({})",
+                manifest_path.display(),
+                optive::versions::LANGUAGE_VERSION
+            ));
+        }
+    }
+    if let Some(req) = &manifest.package.requires_optive {
+        match optive::versions::satisfies_requires_optive(req, env!("CARGO_PKG_VERSION")) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(format!(
+                    "{}: requires_optive `{req}` is not satisfied by Optive {}",
+                    manifest_path.display(),
+                    env!("CARGO_PKG_VERSION")
+                ))
+            }
+            Err(e) => {
+                return Err(format!(
+                    "{}: invalid requires_optive `{req}`: {e}",
+                    manifest_path.display()
+                ))
+            }
+        }
+    }
     let root = manifest_path
         .parent()
         .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf);
@@ -565,6 +615,56 @@ entry = "src/main.tive"
         let err = load_project(&path).unwrap_err();
         assert!(err.contains("[package].version is not supported"), "{err}");
         assert!(err.contains("Optive publish"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn language_version_and_requires_optive_are_validated() {
+        let dir = std::env::temp_dir().join(format!("optive_langver_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Optive.toml");
+        fs::write(
+            &path,
+            r#"
+[package]
+name = "demo"
+language_version = "0.1"
+"#,
+        )
+        .unwrap();
+        let err = load_project(&path).unwrap_err();
+        assert!(err.contains("language_version"), "{err}");
+        fs::write(
+            &path,
+            format!(
+                r#"
+[package]
+name = "demo"
+language_version = "{}"
+requires_optive = ">=99.0.0"
+"#,
+                optive::versions::LANGUAGE_VERSION
+            ),
+        )
+        .unwrap();
+        let err = load_project(&path).unwrap_err();
+        assert!(err.contains("requires_optive"), "{err}");
+        fs::write(
+            &path,
+            format!(
+                r#"
+[package]
+name = "demo"
+language_version = "{}"
+requires_optive = ">={}"
+"#,
+                optive::versions::LANGUAGE_VERSION,
+                env!("CARGO_PKG_VERSION")
+            ),
+        )
+        .unwrap();
+        assert!(load_project(&path).is_ok());
         let _ = fs::remove_dir_all(&dir);
     }
 

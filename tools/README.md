@@ -8,7 +8,9 @@
 |------|------|
 | [`bench-compare.sh`](bench-compare.sh) | 在 base 分支与当前工作树上各跑一次 criterion 基准并对比。 |
 | [`syntax/tive.tmLanguage.json`](syntax/tive.tmLanguage.json) | `.tive` 的 TextMate 语法。 |
+| [`gen-tm-keywords.py`](gen-tm-keywords.py) | 从 `src/frontend/token.rs` 的 `KEYWORDS` 重写 TextMate 关键字。 |
 | [`fuzz/`](fuzz/README.md) | 可选 `cargo-fuzz`（不进默认 workspace）。CI 冒烟是根目录 `tests/fuzz_frontend.rs`。 |
+| [`check-stdlib-coverage.py`](check-stdlib-coverage.py) | 核对 `docs/stdlib.md` 与 `src/lsp/catalog.rs` 的模块/导出。CI：`.github/workflows/docs.yml`。 |
 
 > **与 REPL 的区别**：交互式 REPL 的输入着色在解释器内（`src/cli/repl_highlight.rs`，Lexer + ANSI），不读本目录 TextMate。编辑器高亮用下面步骤；关 REPL 高亮用 `OPTIVE_REPL_HIGHLIGHT=0`。
 
@@ -43,6 +45,4 @@ const tm = require("./tools/syntax/tive.tmLanguage.json");
 - `tools/gen-opcodes.py` —— 从单一来源生成 `Instruction` 枚举与 `HotCode` 的 `H_*` 常量映射。
 - `tools/update-snapshots.sh` —— 集成测试快照更新助手。
 - `tools/release.sh` —— 本地复刻 `release.yml`。
-- `tools/check-stdlib-coverage.py` —— 核对 `docs/stdlib.md` 与 `src/stdlib/` 注册是否一致。
-
-> 原则：`tools/` 只放**有人会用**的东西；纯占位的空目录/脚本不预先创建，需要时再补。VS Code 扩展在旁路仓 `OptivePlugin`，不在本目录创建 `vscode-extension/`。
+> 原则：`tools/` 只放**有人会用**的东西；纯占位的空目录/脚本不预先创建，需要时再补。VS Code 扩展在旁路仓 `OptivePlugin`，不在本目录创建 `vscode-extension/`。手册站用本仓 `docs/` + mdBook（`mdbook build docs`），不要再手抄一份 Sphinx API。

@@ -1,15 +1,13 @@
-use crate::codegen::Generator;
 use crate::error::RuntimeError;
 use crate::hot_code;
 use crate::opcode::{FunctionObject, Instruction, ModuleGlobalEnv};
-use crate::parser::Parser;
 use crate::std_modules;
 use crate::value::{ModuleObject, Value};
 use crate::vm::{DepPackage, Vm};
 use crate::Result;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
-use std::fs;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -79,6 +77,7 @@ fn install_std_macros(vm: &mut Vm, std_mod: &Shared<ModuleObject>) -> Result<()>
     let exports = run_module_source(
         vm,
         source,
+        "<std.macros>",
         "macros",
         PathBuf::from("<std.macros>"),
         String::new(),
@@ -174,30 +173,101 @@ fn resolve_builtin_path(vm: &Vm, module_name: &str) -> Option<Shared<ModuleObjec
     Some(current)
 }
 
+/// 模块初始化期间临时切换源码与包解析上下文；任何 `Result::Err` 提前返回都会恢复。
+struct ModuleContextGuard<'a> {
+    vm: &'a mut Vm,
+    source_file: String,
+    current_source: Option<Arc<str>>,
+    import_base: PathBuf,
+    package_id: String,
+    package_root: Option<PathBuf>,
+    caps: crate::caps::Capabilities,
+}
+
+impl<'a> ModuleContextGuard<'a> {
+    fn new(
+        vm: &'a mut Vm,
+        source: &str,
+        source_file: &str,
+        import_base: PathBuf,
+        package_id: String,
+        package_root: Option<PathBuf>,
+    ) -> Self {
+        let previous_source_file = std::mem::replace(&mut vm.source_file, source_file.to_string());
+        let previous_source = vm.current_source.replace(Arc::from(source));
+        let previous_base = std::mem::replace(&mut vm.import_base, import_base);
+        let previous_package_id = std::mem::replace(&mut vm.current_package_id, package_id.clone());
+        let previous_package_root = std::mem::replace(&mut vm.package_root, package_root.clone());
+        let active = if package_id != "__root__" {
+            package_root
+                .as_ref()
+                .map(|root| vm.host_caps.restrict_for_dependency(root))
+                .unwrap_or_else(|| vm.host_caps.clone())
+        } else {
+            vm.host_caps.clone()
+        };
+        let previous_caps = std::mem::replace(&mut vm.caps, active);
+        Self {
+            vm,
+            source_file: previous_source_file,
+            current_source: previous_source,
+            import_base: previous_base,
+            package_id: previous_package_id,
+            package_root: previous_package_root,
+            caps: previous_caps,
+        }
+    }
+}
+
+impl Deref for ModuleContextGuard<'_> {
+    type Target = Vm;
+
+    fn deref(&self) -> &Self::Target {
+        self.vm
+    }
+}
+
+impl DerefMut for ModuleContextGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.vm
+    }
+}
+
+impl Drop for ModuleContextGuard<'_> {
+    fn drop(&mut self) {
+        self.vm.source_file = std::mem::take(&mut self.source_file);
+        self.vm.current_source = self.current_source.take();
+        self.vm.import_base = std::mem::take(&mut self.import_base);
+        self.vm.current_package_id = std::mem::take(&mut self.package_id);
+        self.vm.package_root = self.package_root.take();
+        self.vm.caps = std::mem::replace(&mut self.caps, crate::caps::Capabilities::full());
+    }
+}
+
 fn run_module_source(
     vm: &mut Vm,
     source: &str,
+    source_file: &str,
     package_name: &str,
     import_base: PathBuf,
     package_id: String,
     package_root: Option<PathBuf>,
 ) -> Result<HashMap<String, Value>> {
-    let program = Parser::parse(source).map_err(|e| RuntimeError::msg(e.to_string()))?;
-    let compiled = Generator::new().compile(&program)?;
+    let mut context = ModuleContextGuard::new(
+        vm,
+        source,
+        source_file,
+        import_base,
+        package_id,
+        package_root,
+    );
+    let vm = &mut *context;
+    let compiled = crate::compile_with_context(vm, source, source_file)?;
     let snap = vm.snapshot_for_module_init();
     let exports = vm.begin_module_init(&snap, package_name);
-    let prev_base = vm.import_base.clone();
-    let prev_pkg = vm.current_package_id.clone();
-    let prev_root = vm.package_root.clone();
-    vm.import_base = import_base;
-    vm.current_package_id = package_id;
-    vm.package_root = package_root;
     let module_overload_keys: Vec<String> = compiled.overload_tables.keys().cloned().collect();
     vm.load_program(compiled)?;
     let run_result = vm.run();
-    vm.import_base = prev_base;
-    vm.current_package_id = prev_pkg;
-    vm.package_root = prev_root;
     run_result?;
     let module_env = Arc::new(vm.snapshot_module_global_env());
     let new_functions: HashMap<String, Arc<FunctionObject>> = vm.functions.with_ref(|m| {
@@ -310,7 +380,15 @@ fn rebound_struct_def_methods(
 
 fn load_user_module(vm: &mut Vm, module_name: &str) -> Result<Value> {
     let path_components: Vec<&str> = module_name.split('.').collect();
-    if path_components.is_empty() {
+    if path_components.is_empty()
+        || path_components.iter().any(|part| {
+            part.is_empty()
+                || *part == ".."
+                || part.contains('/')
+                || part.contains('\\')
+                || Path::new(part).is_absolute()
+        })
+    {
         return Err(RuntimeError::value_err(format!(
             "invalid module name: {module_name}"
         )));
@@ -332,7 +410,7 @@ fn load_user_module(vm: &mut Vm, module_name: &str) -> Result<Value> {
 
     // 2) 当前包内相对包根的模块（依赖包或根项目）
     if let Some(root) = vm.package_root.clone() {
-        if let Some(file_path) = locate_under_root(&root, &path_components) {
+        if let Some(file_path) = locate_under_root(&vm.caps, &root, &path_components)? {
             return load_file_as_module(
                 vm,
                 module_name,
@@ -346,7 +424,7 @@ fn load_user_module(vm: &mut Vm, module_name: &str) -> Result<Value> {
 
     // 3) 根包：传统搜索路径（项目本地模块）
     if vm.current_package_id == "__root__" {
-        if let Ok(file_path) = locate_module_file(&path_components) {
+        if let Ok(file_path) = locate_module_file(&vm.caps, &path_components) {
             let import_base = file_path
                 .parent()
                 .map_or_else(|| vm.import_base.clone(), std::path::Path::to_path_buf);
@@ -382,13 +460,13 @@ fn load_from_package(
 ) -> Result<Value> {
     let logical = path_components[0];
     let file_path = if path_components.len() == 1 {
-        resolve_package_entry_file(&binding.path, logical)?.ok_or_else(|| {
+        resolve_package_entry_file(vm, &binding.path, logical)?.ok_or_else(|| {
             RuntimeError::msg(format!(
-                "package `{logical}` has no entry (tried [package].entry, main.tive, {logical}.tive)"
+                "package `{logical}` has no entry (tried [package].entry, src/main.tive, main.tive, {logical}.tive)"
             ))
         })?
     } else {
-        locate_under_root(&binding.path, &path_components[1..]).ok_or_else(|| {
+        locate_under_root(&vm.caps, &binding.path, &path_components[1..])?.ok_or_else(|| {
             let rest = path_components[1..].join("/");
             RuntimeError::msg(format!(
                 "Module not found: '{rest}' under package root {}",
@@ -415,7 +493,7 @@ fn load_file_as_module(
     package_id: String,
     package_root: Option<PathBuf>,
 ) -> Result<Value> {
-    let source = read_module_file(file_path)?;
+    let source = read_module_file(vm, file_path)?;
     let placeholder = Shared::new(ModuleObject::new_user(last.to_string()));
     vm.module_cache
         .insert(module_name.to_string(), placeholder.clone());
@@ -425,6 +503,7 @@ fn load_file_as_module(
     match run_module_source(
         vm,
         &source,
+        &file_path.to_string_lossy(),
         module_name,
         import_base,
         package_id,
@@ -441,13 +520,21 @@ fn load_file_as_module(
     }
 }
 
-fn resolve_package_entry_file(package_root: &Path, logical_name: &str) -> Result<Option<PathBuf>> {
+fn resolve_package_entry_file(
+    vm: &Vm,
+    package_root: &Path,
+    logical_name: &str,
+) -> Result<Option<PathBuf>> {
     for name in ["Optive.toml"] {
         let p = package_root.join(name);
-        if !p.is_file() {
+        if !vm.caps.is_file("package manifest", &p)? {
             continue;
         }
-        let text = fs::read_to_string(&p)
+        let checked_manifest =
+            secure_package_path(package_root, Path::new(name), vm.caps.fs_restricted())?;
+        let text = vm
+            .caps
+            .read_to_string("package manifest", &checked_manifest)
             .map_err(|e| RuntimeError::msg(format!("cannot read {}: {e}", p.display())))?;
         let val: toml::Value = text
             .parse()
@@ -457,8 +544,8 @@ fn resolve_package_entry_file(package_root: &Path, logical_name: &str) -> Result
             .and_then(|pkg| pkg.get("entry"))
             .and_then(|e| e.as_str())
         {
-            let ep = package_root.join(entry);
-            if ep.is_file() {
+            let ep = secure_package_path(package_root, Path::new(entry), vm.caps.fs_restricted())?;
+            if vm.caps.is_file("package entry", &ep)? {
                 return Ok(Some(ep));
             }
             return Err(RuntimeError::msg(format!(
@@ -470,48 +557,92 @@ fn resolve_package_entry_file(package_root: &Path, logical_name: &str) -> Result
         }
         break;
     }
-    let main = package_root.join("main.tive");
-    if main.is_file() {
-        return Ok(Some(main));
-    }
-    let named = package_root.join(format!("{logical_name}.tive"));
-    if named.is_file() {
-        return Ok(Some(named));
+    for relative in [
+        PathBuf::from("src/main.tive"),
+        PathBuf::from("main.tive"),
+        PathBuf::from(format!("{logical_name}.tive")),
+    ] {
+        let candidate = secure_package_path(package_root, &relative, vm.caps.fs_restricted())?;
+        if vm.caps.is_file("package entry", &candidate)? {
+            return Ok(Some(candidate));
+        }
     }
     Ok(None)
 }
 
-fn locate_under_root(root: &Path, path_components: &[&str]) -> Option<PathBuf> {
-    if path_components.is_empty() {
-        return None;
+fn secure_package_path(package_root: &Path, relative: &Path, strict: bool) -> Result<PathBuf> {
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(RuntimeError::msg(format!(
+            "package entry must be relative and must not contain '..': {}",
+            relative.display()
+        )));
     }
-    let last = *path_components.last()?;
+    let candidate = package_root.join(relative);
+    if strict {
+        let package_gate = crate::caps::Capabilities::sandbox(vec![package_root.to_path_buf()]);
+        return package_gate.resolve_fs_path(
+            "package entry",
+            candidate,
+            crate::caps::FsAccess::Read,
+        );
+    }
+    if let (Ok(root), Ok(resolved)) = (package_root.canonicalize(), candidate.canonicalize()) {
+        if !resolved.starts_with(root) {
+            return Err(RuntimeError::msg(format!(
+                "package entry escapes package root: {}",
+                relative.display()
+            )));
+        }
+    }
+    Ok(candidate)
+}
+
+fn locate_under_root(
+    caps: &crate::caps::Capabilities,
+    root: &Path,
+    path_components: &[&str],
+) -> Result<Option<PathBuf>> {
+    if path_components.is_empty() {
+        return Ok(None);
+    }
+    let Some(last) = path_components.last().copied() else {
+        return Ok(None);
+    };
     let prefix = &path_components[..path_components.len() - 1];
     let mut dir = root.to_path_buf();
     for part in prefix {
         dir.push(part);
     }
     let file_candidate = dir.join(format!("{last}.tive"));
-    if file_candidate.is_file() {
-        return Some(file_candidate);
+    if caps.is_file("module lookup", &file_candidate)? {
+        return Ok(Some(file_candidate));
     }
     let package_candidate = dir.join(last).join("main.tive");
-    if package_candidate.is_file() {
-        return Some(package_candidate);
+    if caps.is_file("module lookup", &package_candidate)? {
+        return Ok(Some(package_candidate));
     }
-    None
+    Ok(None)
 }
 
-fn read_module_file(file_path: &Path) -> Result<String> {
-    fs::read_to_string(file_path).map_err(|e| {
-        RuntimeError::msg(format!(
-            "failed to read module file {}: {e}",
-            file_path.display()
-        ))
-    })
+fn read_module_file(vm: &Vm, file_path: &Path) -> Result<String> {
+    vm.caps
+        .read_to_string("module import", file_path)
+        .map_err(|e| {
+            RuntimeError::msg(format!(
+                "failed to read module file {}: {e}",
+                file_path.display()
+            ))
+        })
 }
 
-fn locate_module_file(path_components: &[&str]) -> Result<PathBuf> {
+fn locate_module_file(
+    caps: &crate::caps::Capabilities,
+    path_components: &[&str],
+) -> Result<PathBuf> {
     let last = path_components
         .last()
         .copied()
@@ -523,11 +654,11 @@ fn locate_module_file(path_components: &[&str]) -> Result<PathBuf> {
             dir.push(part);
         }
         let file_candidate = dir.join(format!("{last}.tive"));
-        if file_candidate.is_file() {
+        if caps.is_file("module lookup", &file_candidate)? {
             return Ok(file_candidate);
         }
         let package_candidate = dir.join(last).join("main.tive");
-        if package_candidate.is_file() {
+        if caps.is_file("module lookup", &package_candidate)? {
             return Ok(package_candidate);
         }
     }
@@ -540,9 +671,17 @@ fn locate_module_file(path_components: &[&str]) -> Result<PathBuf> {
 
 /// 解析 import/use 字符串路径对应的脚本路径。
 pub fn resolve_import_path(path: &str, base_dir: &Path) -> Result<PathBuf> {
+    resolve_import_path_with_caps(path, base_dir, &crate::caps::Capabilities::full())
+}
+
+fn resolve_import_path_with_caps(
+    path: &str,
+    base_dir: &Path,
+    caps: &crate::caps::Capabilities,
+) -> Result<PathBuf> {
     let path_obj = Path::new(path);
     if path_obj.is_absolute() {
-        if path_obj.is_file() {
+        if caps.is_file("module import", path_obj)? {
             return Ok(path_obj.to_path_buf());
         }
         return Err(RuntimeError::msg(format!("Module file not found: {path}")));
@@ -553,34 +692,42 @@ pub fn resolve_import_path(path: &str, base_dir: &Path) -> Result<PathBuf> {
         || path.contains('\\')
     {
         let candidate = base_dir.join(path);
-        if candidate.is_file() {
-            return Ok(candidate.canonicalize().unwrap_or(candidate));
+        if caps.is_file("module import", &candidate)? {
+            return Ok(candidate);
         }
         if !path.ends_with(".tive") {
             let with_ext = candidate.with_extension("tive");
-            if with_ext.is_file() {
-                return Ok(with_ext.canonicalize().unwrap_or(with_ext));
+            if caps.is_file("module import", &with_ext)? {
+                return Ok(with_ext);
             }
         }
         return Err(RuntimeError::msg(format!("Module file not found: {path}")));
     }
-    locate_string_module(path, Some(base_dir))
+    locate_string_module_with_caps(caps, path, Some(base_dir))
 }
 
 pub fn locate_string_module(path: &str, base_dir: Option<&Path>) -> Result<PathBuf> {
+    locate_string_module_with_caps(&crate::caps::Capabilities::full(), path, base_dir)
+}
+
+fn locate_string_module_with_caps(
+    caps: &crate::caps::Capabilities,
+    path: &str,
+    base_dir: Option<&Path>,
+) -> Result<PathBuf> {
     let path_obj = Path::new(path);
-    if path_obj.is_file() {
+    if caps.is_file("module lookup", path_obj)? {
         return Ok(path_obj.to_path_buf());
     }
     if let Some(base) = base_dir {
         let candidate = base.join(path);
-        if candidate.is_file() {
+        if caps.is_file("module lookup", &candidate)? {
             return Ok(candidate);
         }
     }
     for base in module_search_paths(base_dir) {
         let candidate = base.join(path);
-        if candidate.is_file() {
+        if caps.is_file("module lookup", &candidate)? {
             return Ok(candidate);
         }
     }
@@ -628,12 +775,16 @@ pub fn load_string_module(vm: &mut Vm, path: &str) -> Result<Value> {
             return find_module_segments(vm, &parts);
         }
     }
-    let file_path = resolve_import_path(path, &vm.import_base)?;
-    let canonical = file_path.to_string_lossy().to_string();
+    let file_path = resolve_import_path_with_caps(path, &vm.import_base, &vm.caps)?;
+    let canonical = file_path
+        .canonicalize()
+        .unwrap_or_else(|_| file_path.clone())
+        .to_string_lossy()
+        .to_string();
     if let Some(cached) = vm.module_cache.get(&canonical) {
         return Ok(Value::Module(cached.clone()));
     }
-    let source = read_module_file(&file_path)?;
+    let source = read_module_file(vm, &file_path)?;
     let alias = file_path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -645,6 +796,7 @@ pub fn load_string_module(vm: &mut Vm, path: &str) -> Result<Value> {
     let exports = run_module_source(
         vm,
         &source,
+        &file_path.to_string_lossy(),
         &alias,
         import_base,
         vm.current_package_id.clone(),

@@ -20,7 +20,7 @@ Optive -c "print(1 + 2)"
 Optive new my_app && cd my_app && Optive run
 ```
 
-完整上手：[docs/tutorial/](docs/tutorial/README.md)。文档索引：[docs/README.md](docs/README.md)。
+完整上手：[docs/tutorial/](docs/tutorial/README.md)。文档索引：[docs/README.md](docs/README.md)。本地手册站：`mdbook build docs`。
 
 ## 常用命令
 
@@ -29,16 +29,16 @@ Optive new my_app && cd my_app && Optive run
 | `Optive` / `Optive <file.tive>` / `-c` | REPL、跑文件、跑参数 |
 | `new` · `run` · `up` · `test` | 项目：脚手架、按 lock 跑、更新后跑、跑 `tests/` |
 | `add` · `search` · `index sync` | 依赖与官方索引（Gitee Optindex） |
-| `fmt` · `debug` · `lsp` | 格式化、CLI 调试器、语言服务（诊断 + 跳转） |
+| `fmt` · `debug` · `lsp` · `dap` | 格式化、CLI 调试器、语言服务、DAP 适配器 |
 
-能力开关：`--sandbox` `--no-network` `--no-ffi` `--allow-ffi` `--allow-path`。`--no-network` 关掉 `std.http` 和 `std.net`。
+能力开关：`--sandbox` `--no-network` `--no-ffi` `--allow-ffi` `--allow-path`。`--sandbox` 是对抗式能力边界：禁网/环境写入/FFI，项目根可写、依赖根只读；受限模式拒绝 SQLite 文件库。`--no-network` 关掉 `std.http` 和 `std.net`。
 
 命令与环境变量全文：[docs/cli.md](docs/cli.md)。依赖模型：[docs/deps.md](docs/deps.md)。
 
 ## 文档
 
 - **教程**（按这个读）：[docs/tutorial/](docs/tutorial/README.md)
-- **参考**：语言 · 标准库 · CLI · 依赖 · 并发 · FFI · 调试 · LSP — 见 [docs/README.md](docs/README.md)
+- **参考**：语言 · 标准库 · CLI · 依赖 · 并发 · FFI · 调试 / DAP · LSP — 见 [docs/README.md](docs/README.md)
 
 > 文档与实现冲突时，以源码和测试为准。
 

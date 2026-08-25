@@ -1,0 +1,8 @@
+use std.test.{ assert_true }
+var ok = false
+try {
+  throw ValueError("boom")
+} catch (e) {
+  ok = true
+}
+assert_true(ok)

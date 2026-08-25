@@ -23,67 +23,12 @@ use crate::Result;
 
 use crate::shared::Shared;
 
-fn collect_assigned_names(body: &Block, out: &mut HashSet<String>) {
-    for s in body {
-        match &s.stmt {
-            Stmt::Assign {
-                target: LValue::Name(n),
-                ..
-            } => {
-                out.insert(n.clone());
-            }
-            Stmt::VarDecl {
-                name, is_var: true, ..
-            } => {
-                // 块内新建 var 无妨；跨任务写的是 Assign。
-                let _ = name;
-            }
-            Stmt::If {
-                then_block,
-                elifs,
-                else_block,
-                ..
-            } => {
-                collect_assigned_names(then_block, out);
-                for (_, b) in elifs {
-                    collect_assigned_names(b, out);
-                }
-                if let Some(b) = else_block {
-                    collect_assigned_names(b, out);
-                }
-            }
-            Stmt::While { body, .. }
-            | Stmt::Loop { body, .. }
-            | Stmt::For { body, .. }
-            | Stmt::With { body, .. }
-            | Stmt::Block(body) => collect_assigned_names(body, out),
-            Stmt::Try {
-                body,
-                catches,
-                else_block,
-            } => {
-                collect_assigned_names(body, out);
-                for c in catches {
-                    collect_assigned_names(&c.body, out);
-                }
-                if let Some(b) = else_block {
-                    collect_assigned_names(b, out);
-                }
-            }
-            Stmt::Match {
-                cases, else_block, ..
-            } => {
-                for c in cases {
-                    collect_assigned_names(&c.body, out);
-                }
-                if let Some(b) = else_block {
-                    collect_assigned_names(b, out);
-                }
-            }
-            _ => {}
-        }
-    }
-}
+mod helpers;
+
+use helpers::{
+    collect_assigned_names, const_default_value, destruct_bound_names, select_sleep_seconds_expr,
+    split_destruct_elems,
+};
 
 #[derive(Clone, Copy)]
 enum CompKind {
@@ -119,6 +64,7 @@ pub struct Generator {
     declared_temps: HashSet<String>,
     global_index: FxHashMap<String, usize>,
     next_global_sym: usize,
+    codegen_error: Option<RuntimeError>,
     current_func: Option<String>,
     block_depth: usize,
     captured_names: HashSet<String>,
@@ -154,6 +100,7 @@ impl Generator {
             declared_temps: HashSet::new(),
             global_index: FxHashMap::default(),
             next_global_sym: 0,
+            codegen_error: None,
             current_func: None,
             block_depth: 0,
             captured_names: HashSet::new(),
@@ -228,7 +175,11 @@ impl Generator {
             self.program.global_names[slot] = name.to_string();
         } else if existing != name {
             // 不变量：同一槽只能有一个名字。静默保留旧名会导致 Store/Load 绑错导出。
-            panic!("internal: global slot {slot} claimed by both `{existing}` and `{name}`");
+            self.codegen_error.get_or_insert_with(|| {
+                RuntimeError::msg(format!(
+                    "compile error: global slot {slot} claimed by both `{existing}` and `{name}`"
+                ))
+            });
         }
     }
 
@@ -501,6 +452,9 @@ impl Generator {
     pub fn compile(mut self, program: &Program) -> Result<CompiledProgram> {
         for stmt in &program.stmts {
             self.gen_stmt(stmt, true)?;
+        }
+        if let Some(err) = self.codegen_error.take() {
+            return Err(err);
         }
         self.cg.emit(Instruction::Ret);
         self.cg.patch_labels().map_err(RuntimeError::msg)?;
@@ -2088,7 +2042,30 @@ impl Generator {
             .return_wrapper
             .as_ref()
             .map(|e| monomorph::substitute_expr(e, &type_names));
-        let mut gen = Self::new();
+        Self::specialize_generic_template_in(
+            Self::new(),
+            template,
+            ctx,
+            cache,
+            key,
+            params,
+            body,
+            return_type,
+            return_wrapper,
+        )
+    }
+
+    fn specialize_generic_template_in(
+        mut gen: Self,
+        template: &GenericFunctionTemplate,
+        ctx: &TypeCheckContext,
+        cache: &mut HashMap<String, Arc<FunctionObject>>,
+        key: String,
+        params: Vec<FuncParam>,
+        body: crate::ast::Block,
+        return_type: Option<Expr>,
+        return_wrapper: Option<Expr>,
+    ) -> Result<Arc<FunctionObject>> {
         gen.program.struct_defs.clone_from(&ctx.struct_defs);
         gen.program.protocols.clone_from(&ctx.protocols);
         gen.program.functions.clone_from(cache);
@@ -2224,6 +2201,7 @@ impl Generator {
             declared_temps: HashSet::new(),
             global_index: self.global_index.clone(),
             next_global_sym: self.next_global_sym,
+            codegen_error: None,
             current_func: Some(name.to_string()),
             block_depth: 0,
             captured_names,
@@ -2265,6 +2243,9 @@ impl Generator {
                 }
             }
         }
+        if let Some(err) = sub.codegen_error.take() {
+            return Err(err);
+        }
         sub.cg.patch_labels().map_err(RuntimeError::msg)?;
         let mut body = std::mem::take(&mut sub.cg.code);
         let entry_env: Vec<Option<crate::specialize::Tag>> = params
@@ -2293,6 +2274,9 @@ impl Generator {
                 continue;
             }
             self.global_slot(name);
+        }
+        if let Some(err) = self.codegen_error.take() {
+            return Err(err);
         }
         self.next_global_sym = self.next_global_sym.max(sub.next_global_sym);
         let uses_name_map = crate::opcode::function_uses_name_map(&body);
@@ -2488,6 +2472,7 @@ impl Generator {
             declared_temps: HashSet::new(),
             global_index: self.global_index.clone(),
             next_global_sym: self.next_global_sym,
+            codegen_error: None,
             current_func: None,
             block_depth: 0,
             captured_names: HashSet::new(),
@@ -2496,6 +2481,9 @@ impl Generator {
         };
         for s in body {
             sub.gen_stmt(s, false)?;
+        }
+        if let Some(err) = sub.codegen_error.take() {
+            return Err(err);
         }
         sub.cg.emit(Instruction::Push(Value::None));
         sub.cg.emit(Instruction::Ret);
@@ -3736,95 +3724,65 @@ impl Generator {
     }
 }
 
-type DestructSplit<'a> = (
-    Vec<&'a DestructPattern>,
-    Option<&'a DestructElem>,
-    Vec<&'a DestructPattern>,
-);
-
-fn split_destruct_elems(
-    elems: &[DestructElem],
-) -> std::result::Result<DestructSplit<'_>, RuntimeError> {
-    let mut before = Vec::new();
-    let mut after = Vec::new();
-    let mut rest = None;
-    for elem in elems {
-        match elem {
-            DestructElem::Pat(p) => {
-                if rest.is_some() {
-                    after.push(p);
-                } else {
-                    before.push(p);
-                }
-            }
-            DestructElem::Rest(_) | DestructElem::RestDiscard => {
-                if rest.is_some() {
-                    return Err(RuntimeError::msg("multiple *rest in destructuring pattern"));
-                }
-                rest = Some(elem);
-            }
-        }
-    }
-    Ok((before, rest, after))
-}
-
-fn destruct_bound_names(pattern: &DestructPattern) -> Vec<String> {
-    let mut out = Vec::new();
-    collect_destruct_names(pattern, &mut out);
-    out
-}
-
-fn collect_destruct_names(pattern: &DestructPattern, out: &mut Vec<String>) {
-    match pattern {
-        DestructPattern::Name(n) => out.push(n.clone()),
-        DestructPattern::Discard => {}
-        DestructPattern::Tuple(elems) | DestructPattern::List(elems) => {
-            for el in elems {
-                match el {
-                    DestructElem::Pat(p) => collect_destruct_names(p, out),
-                    DestructElem::Rest(n) => out.push(n.clone()),
-                    DestructElem::RestDiscard => {}
-                }
-            }
-        }
-    }
-}
-
-fn const_default_value(expr: &Expr) -> Option<Value> {
-    match &expr.kind {
-        ExprKind::None => Some(Value::None),
-        ExprKind::Bool(b) => Some(Value::Bool(*b)),
-        ExprKind::String(s) => Some(Value::Text(s.clone())),
-        ExprKind::Number(s) => Num::from_literal(s).ok().map(Value::Num),
-        _ => None,
-    }
-}
-
-/// 识别 `sleep(secs)` / `std.time.sleep(secs)` 等单参数 sleep 调用，返回秒数表达式。
-fn select_sleep_seconds_expr(event: &Expr) -> Option<&Expr> {
-    let ExprKind::Call { callee, args } = &event.kind else {
-        return None;
-    };
-    if args.len() != 1 || args[0].name.is_some() || args[0].is_splat || args[0].is_kwsplat {
-        return None;
-    }
-    if call_ends_with_sleep(callee) {
-        Some(&args[0].value)
-    } else {
-        None
-    }
-}
-
-fn call_ends_with_sleep(expr: &Expr) -> bool {
-    match &expr.kind {
-        ExprKind::Var(name) => name == "sleep",
-        ExprKind::Member { field, .. } => field == "sleep",
-        _ => false,
-    }
-}
-
 impl Default for Generator {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conflicting_global_slot_is_compile_error() {
+        let mut generator = Generator::new();
+        assert_eq!(generator.global_slot("first"), 0);
+        generator.ensure_global_name_at(0, "second");
+
+        let Err(err) = generator.compile(&Program { stmts: Vec::new() }) else {
+            panic!("slot conflict must be propagated");
+        };
+        assert!(err.message().contains("claimed by both"));
+    }
+
+    #[test]
+    fn specialize_generic_template_reports_slot_conflict() {
+        let mut gen = Generator::new();
+        assert_eq!(gen.global_slot("first"), 0);
+        gen.ensure_global_name_at(0, "second");
+
+        let template = GenericFunctionTemplate {
+            name: "id".into(),
+            type_params: Vec::new(),
+            params: Vec::new(),
+            body: Vec::new(),
+            return_type: None,
+            return_strong: false,
+            return_wrapper: None,
+            is_generator: false,
+            source: None,
+            source_file: "<test>".into(),
+        };
+        let ctx = TypeCheckContext {
+            struct_defs: HashMap::new(),
+            functions: HashMap::new(),
+            protocols: HashMap::new(),
+        };
+        let mut cache = HashMap::new();
+        let Err(err) = Generator::specialize_generic_template_in(
+            gen,
+            &template,
+            &ctx,
+            &mut cache,
+            "id".into(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+        ) else {
+            panic!("slot conflict must be propagated from specialize_generic_template");
+        };
+        assert!(err.message().contains("claimed by both"));
     }
 }

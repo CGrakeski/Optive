@@ -1,15 +1,7 @@
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::dbg_macro
-)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod cli;
 
 use std::env;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -239,7 +231,7 @@ fn main() {
                 return;
             }
             "fmt" => {
-                if let Err(e) = cmd_fmt(&args[2..]) {
+                if let Err(e) = cli::fmt_cmd::cmd_fmt(&args[2..]) {
                     color::eprint_error(format!("Error: {e}"));
                     process::exit(1);
                 }
@@ -254,8 +246,15 @@ fn main() {
             }
             "test" => {
                 let (caps, rest) = parse_caps_or_exit(&args);
+                let (opts, rest) = match cli::test_cmd::take_test_flags(&rest) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        color::eprint_error(format!("Error: {e}"));
+                        process::exit(2);
+                    }
+                };
                 let (path, script_args) = parse_project_path_and_script_args(&rest);
-                if let Err(e) = cli::test_cmd::cmd_test(path.as_deref(), caps, &script_args) {
+                if let Err(e) = cli::test_cmd::cmd_test(path.as_deref(), caps, &script_args, opts) {
                     color::eprint_error(format!("Error: {e}"));
                     process::exit(1);
                 }
@@ -269,6 +268,15 @@ fn main() {
                 let path = args.get(2).map(PathBuf::from);
                 if let Err(e) = cli::check::cmd_check(path.as_deref()) {
                     color::eprint_error(format!("Error: {e}"));
+                    process::exit(1);
+                }
+                return;
+            }
+            "dap" => {
+                let launcher: optive::dap::LaunchBootstrap =
+                    std::sync::Arc::new(cli::debug_cmd::prepare_dap_vm);
+                if let Err(e) = optive::dap::run_stdio_with_launcher(launcher) {
+                    color::eprint_error(format!("DAP: {e}"));
                     process::exit(1);
                 }
                 return;
@@ -360,47 +368,9 @@ fn cmd_new(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `Optive fmt <file> [-o|--out]`：默认写回；`-o` / `--out` 只打印到 stdout。
-fn cmd_fmt(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut out_only = false;
-    let mut file: Option<&str> = None;
-    for a in args {
-        match a.as_str() {
-            "-o" | "--out" => out_only = true,
-            "-h" | "--help" => {
-                println!("usage: Optive fmt <filename> [-o|--out]");
-                println!("  default: write formatted source back to <filename>");
-                println!("  -o, --out: print formatted source to stdout only");
-                return Ok(());
-            }
-            s if s.starts_with('-') => {
-                return Err(format!("unknown fmt flag: {s}").into());
-            }
-            s => {
-                if file.is_some() {
-                    return Err("usage: Optive fmt <filename> [-o|--out]".into());
-                }
-                file = Some(s);
-            }
-        }
-    }
-    let Some(path) = file else {
-        return Err("usage: Optive fmt <filename> [-o|--out]".into());
-    };
-    let source = fs::read_to_string(path)?;
-    let formatted = optive::fmt::format_source(&source)
-        .map_err(|e| optive::diagnostics::format_parse_error(&source, path, &e))?;
-    if out_only {
-        print!("{formatted}");
-    } else {
-        fs::write(path, formatted)?;
-    }
-    Ok(())
-}
-
 fn cmd_run(
     path: Option<&Path>,
-    caps: Capabilities,
+    mut caps: Capabilities,
     script_args: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let project = cli::manifest::find_project(path)?;
@@ -408,7 +378,11 @@ fn cmd_run(
     let ensured = cli::deps::ensure_for_run(&project)?;
     print_ensure_report(&ensured);
     env::set_current_dir(&project.root)?;
-    let entry = project.entry_path()?;
+    caps.configure_project_fs(
+        &project.root,
+        ensured.dep_map.values().map(|binding| binding.path.clone()),
+    );
+    let entry = project.entry_path_with_caps(&caps)?;
     let entry_display = entry
         .strip_prefix(&project.root)
         .unwrap_or(&entry)
@@ -427,7 +401,7 @@ fn cmd_run(
 
 fn cmd_up(
     path: Option<&Path>,
-    caps: Capabilities,
+    mut caps: Capabilities,
     script_args: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let project = cli::manifest::find_project(path)?;
@@ -436,7 +410,11 @@ fn cmd_up(
     let ensured = cli::deps::ensure_for_update(&project, None)?;
     print_ensure_report(&ensured);
     env::set_current_dir(&project.root)?;
-    let entry = project.entry_path()?;
+    caps.configure_project_fs(
+        &project.root,
+        ensured.dep_map.values().map(|binding| binding.path.clone()),
+    );
+    let entry = project.entry_path_with_caps(&caps)?;
     let entry_display = entry
         .strip_prefix(&project.root)
         .unwrap_or(&entry)
@@ -714,11 +692,16 @@ fn run_script_path_with_deps(
     path: &Path,
     project_root: &Path,
     ensured: &EnsureResult,
-    caps: Capabilities,
+    mut caps: Capabilities,
     argv_override: Option<Vec<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let source =
-        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    caps.configure_project_fs(
+        project_root,
+        ensured.dep_map.values().map(|binding| binding.path.clone()),
+    );
+    let source = caps
+        .read_to_string("script entry", path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let file = path.to_string_lossy().to_string();
     run_in_vm(&source, &file, caps, argv_override, |vm| {
         inject_dep_map(vm, ensured, project_root);
@@ -733,8 +716,9 @@ fn run_script_file(path: &str, caps: Capabilities) {
 }
 
 fn run_script_path(path: &Path, caps: Capabilities) -> Result<(), Box<dyn std::error::Error>> {
-    let source =
-        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let source = caps
+        .read_to_string("script entry", path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let file = path.to_string_lossy().to_string();
     run_in_vm(&source, &file, caps, None, |_| {})
 }
@@ -752,7 +736,7 @@ fn run_in_vm(
     setup: impl FnOnce(&mut Vm),
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut vm = Vm::new();
-    vm.caps = caps;
+    vm.install_caps(caps);
     vm.argv_override = argv_override;
     setup(&mut vm);
     match run_source_in_vm(&mut vm, source, file) {
@@ -791,6 +775,7 @@ fn print_help() {
     println!("{}", t_cli(CliMsg::HelpTest));
     println!("{}", t_cli(CliMsg::HelpCheck));
     println!("{}", t_cli(CliMsg::HelpLsp));
+    println!("{}", t_cli(CliMsg::HelpDap));
     println!("{}", t_cli(CliMsg::HelpIndex));
     println!("{}", t_cli(CliMsg::HelpIndexChange));
     println!("{}", t_cli(CliMsg::HelpCustom));
@@ -801,6 +786,11 @@ fn print_help() {
     println!("{}", t_cli(CliMsg::HelpNoFfi));
     println!("{}", t_cli(CliMsg::HelpAllowFfi));
     println!("{}", t_cli(CliMsg::HelpAllowPath));
+    println!("{}", t_cli(CliMsg::HelpTrustDeps));
+    println!("{}", t_cli(CliMsg::HelpAllowDepNetwork));
+    println!("{}", t_cli(CliMsg::HelpAllowDepEnv));
+    println!("{}", t_cli(CliMsg::HelpAllowDepProcess));
+    println!("{}", t_cli(CliMsg::HelpAllowDepFfi));
     println!("{}", t_cli(CliMsg::HelpH));
     println!("{}", t_cli(CliMsg::HelpV));
     println!();
@@ -809,6 +799,8 @@ fn print_help() {
     println!("{}", t_cli(CliMsg::HelpLocalDeps));
     println!("{}", t_cli(CliMsg::HelpOptiveCustomEnv));
     println!("{}", t_cli(CliMsg::HelpOptiveIndexUrl));
+    println!("{}", t_cli(CliMsg::HelpOptiveIndexPin));
+    println!("{}", t_cli(CliMsg::HelpOptiveIndexPolicy));
     println!();
     println!("{}", t_cli(CliMsg::HelpFiles));
 }

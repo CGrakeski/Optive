@@ -248,6 +248,88 @@ gc()
 }
 
 #[test]
+fn ffi_inflight_clears_after_leave() {
+    let gc = optive::gc::SharedGc::new();
+    gc.ffi_enter();
+    gc.ffi_leave();
+    assert!(
+        gc.wait_ffi_quiescent(),
+        "FFI inflight must drop to zero after leave"
+    );
+}
+
+#[test]
+fn blocking_native_guard_is_reentrant_safe() {
+    let _ = optive::gc::blocking_native(|| 1 + 1);
+}
+
+#[test]
+fn blocking_native_pins_inflight_until_return() {
+    let gc = std::sync::Arc::new(optive::gc::SharedGc::new());
+    optive::gc::install_current_gc(gc.clone());
+    let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started2 = started.clone();
+    let stop2 = stop.clone();
+    let gc2 = gc.clone();
+    let handle = std::thread::spawn(move || {
+        optive::gc::install_current_gc(gc2);
+        optive::gc::blocking_native(|| {
+            started2.store(true, std::sync::atomic::Ordering::Release);
+            while !stop2.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            1
+        })
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !started.load(std::sync::atomic::Ordering::Acquire) {
+        if std::time::Instant::now() > deadline {
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            let _ = handle.join();
+            panic!("blocking_native worker did not start in time");
+        }
+        std::thread::yield_now();
+    }
+    assert!(
+        gc.native_calls_inflight() >= 1,
+        "blocking native must stay visible to STW"
+    );
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    handle.join().unwrap();
+    assert_eq!(gc.native_calls_inflight(), 0);
+    optive::gc::clear_current_gc();
+}
+
+#[test]
+fn host_cancel_aborts_eval() {
+    let mut vm = Vm::with_workers(1);
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    vm.set_host_cancel(flag);
+    let err = optive::run_source_in_vm(&mut vm, "loop (1000000) { }\n1\n", "<cancel>");
+    assert!(err.is_err(), "cancelled VM must not complete the loop");
+}
+
+#[test]
+fn high_allocation_then_gc() {
+    let src = r"
+var i = 0
+loop (4000) {
+  let a = []
+  a.append(a)
+  i = i + 1
+}
+gc()
+";
+    let mut vm = Vm::with_workers(2);
+    let v = optive::run_source_in_vm(&mut vm, src, "<gc-alloc>").expect("run");
+    match v {
+        Value::Num(n) => assert!(n.to_i64().unwrap_or(0) >= 1),
+        other => panic!("expected num, got {}", other.display_string()),
+    }
+}
+
+#[test]
 fn gc_smoke_default() {
     let _ = run_source("gc()").expect("gc");
 }

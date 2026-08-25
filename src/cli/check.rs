@@ -1,10 +1,11 @@
-//! `Optive check [path]`：只做词法/语法，不启动 VM。
+//! `Optive check [path]`：词法/语法 + 与 LSP 共享的名字/`std.*`/arity，不启动 VM。
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use optive::diagnostics;
-use optive::parser::Parser;
+use optive::error::ParseError;
+use optive::lsp;
 
 use super::color;
 use super::manifest;
@@ -18,13 +19,28 @@ pub fn cmd_check(path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> 
     for file in &files {
         let display = file.display().to_string().replace('\\', "/");
         match fs::read_to_string(file) {
-            Ok(src) => match Parser::parse(&src) {
-                Ok(_) => println!("ok {display}"),
-                Err(e) => {
+            Ok(src) => {
+                let diags = lsp::diagnostics(&src, &display);
+                if diags.is_empty() {
+                    println!("ok {display}");
+                } else {
                     errors += 1;
-                    eprintln!("{}", diagnostics::format_parse_error(&src, &display, &e));
+                    for (line, column, message) in diags {
+                        eprintln!(
+                            "{}",
+                            diagnostics::format_parse_error(
+                                &src,
+                                &display,
+                                &ParseError::Message {
+                                    line,
+                                    column,
+                                    message,
+                                }
+                            )
+                        );
+                    }
                 }
-            },
+            }
             Err(e) => {
                 errors += 1;
                 eprintln!("cannot read {display}: {e}");
@@ -56,7 +72,7 @@ fn collect_targets(path: Option<&Path>) -> Result<Vec<PathBuf>, Box<dyn std::err
     }
 }
 
-fn project_tive_files(root: &Path) -> Vec<PathBuf> {
+pub(super) fn project_tive_files(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     collect_tive(root.join("src"), &mut files);
     collect_tive(root.join("tests"), &mut files);

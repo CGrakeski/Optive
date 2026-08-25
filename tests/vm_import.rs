@@ -253,6 +253,83 @@ m.probe_c()
 }
 
 #[test]
+fn imported_traceback_and_debug_stack_use_real_source_path() {
+    use optive::debug::{self, DebugState, StopReason};
+    use optive::shared::Shared;
+    use optive::vm::Vm;
+
+    let module_path = std::path::Path::new("tests/import_fixtures/module_metadata.tive");
+    let source = r#"
+import "tests/import_fixtures/module_metadata.tive" as m
+m.explode()
+"#;
+    let mut vm = Vm::new();
+    let err = optive::run_source_in_vm(&mut vm, source, "<test>")
+        .expect_err("imported function should throw");
+    let message = err.to_string();
+    assert!(
+        message.contains("module_metadata.tive")
+            && message.contains("throw ValueError(\"module metadata boom\")"),
+        "traceback did not use imported source metadata: {message}"
+    );
+
+    let debug_source = r#"
+import "tests/import_fixtures/module_metadata.tive" as m
+m.never_called()
+"#;
+    let mut vm = Vm::new();
+    vm.source_file = "<test>".into();
+    vm.current_source = Some(std::sync::Arc::from(debug_source));
+    let state = Shared::new(DebugState {
+        stop_on_entry: false,
+        ..Default::default()
+    });
+    state
+        .borrow_mut()
+        .add_line_breakpoint(&module_path.to_string_lossy(), 6);
+    debug::attach(&mut vm, state.clone());
+    let compiled =
+        optive::compile_with_context(&vm, debug_source, "<test>").expect("compile entry");
+    vm.load_program(compiled).expect("load entry");
+    assert!(vm
+        .run_until_debug_break()
+        .expect("run to imported breakpoint")
+        .is_none());
+    assert_eq!(state.borrow().stop_reason, Some(StopReason::Breakpoint));
+    let (actual_file, _) = debug::current_location(&vm);
+    assert_eq!(
+        debug::normalize_path(&actual_file),
+        debug::normalize_path(&module_path.to_string_lossy())
+    );
+    let stack = debug::stack_frames(&vm);
+    assert!(
+        stack.iter().any(|frame| debug::normalize_path(&frame.file)
+            == debug::normalize_path(&module_path.to_string_lossy())),
+        "stack did not contain imported module path: {stack:?}"
+    );
+}
+
+#[test]
+fn nested_import_failure_restores_entry_context() {
+    use optive::vm::Vm;
+
+    let source = r#"import "import_fixtures/context_outer.tive" as outer"#;
+    let entry = "tests/context_entry.tive";
+    let root = std::env::current_dir().expect("cwd");
+    let mut vm = Vm::new();
+    vm.current_package_id = "context-root".into();
+    vm.package_root = Some(root.clone());
+
+    optive::run_source_in_vm(&mut vm, source, entry).expect_err("nested import should fail");
+
+    assert_eq!(vm.source_file, entry);
+    assert_eq!(vm.current_source.as_deref(), Some(source));
+    assert_eq!(vm.import_base, std::path::PathBuf::from("tests"));
+    assert_eq!(vm.current_package_id, "context-root");
+    assert_eq!(vm.package_root.as_deref(), Some(root.as_path()));
+}
+
+#[test]
 fn string_import_undeclared_dep_is_explicit() {
     use optive::run_source_in_vm;
     use optive::vm::{DepPackage, Vm};

@@ -280,6 +280,11 @@ impl SharedGc {
         self.ffi_inflight.fetch_sub(1, Ordering::AcqRel);
     }
 
+    #[must_use]
+    pub fn native_calls_inflight(&self) -> usize {
+        self.ffi_inflight.load(Ordering::Acquire)
+    }
+
     /// 等待非协作 FFI 结束（最多 `OPTIVE_STW_TIMEOUT_MS`）。
     pub fn wait_ffi_quiescent(&self) -> bool {
         let ms = std::env::var("OPTIVE_STW_TIMEOUT_MS")
@@ -724,6 +729,29 @@ fn value_needs_mark(v: &Value) -> bool {
             | Value::Sync(_)
             | Value::SyncGuard(_)
     )
+}
+
+/// FFI / 阻塞原生调用 RAII：进入后 STW 会等待或回退，避免阻塞线程被当成 mutator。
+pub struct NativeCallGuard;
+
+impl NativeCallGuard {
+    #[must_use]
+    pub fn enter() -> Self {
+        ffi_enter();
+        Self
+    }
+}
+
+impl Drop for NativeCallGuard {
+    fn drop(&mut self) {
+        ffi_leave();
+    }
+}
+
+/// 在阻塞原生 / 宿主 I/O 期间钉住 GC safepoint。
+pub fn blocking_native<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = NativeCallGuard::enter();
+    f()
 }
 
 #[inline]

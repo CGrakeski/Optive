@@ -2,15 +2,31 @@
   "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
   "name": "Optive",
   "scopeName": "source.tive",
-  "fileTypes": ["tive"],
+  "fileTypes": [
+    "tive"
+  ],
   "patterns": [
-    { "include": "#comments" },
-    { "include": "#strings" },
-    { "include": "#numbers" },
-    { "include": "#keywords" },
-    { "include": "#types" },
-    { "include": "#identifiers" },
-    { "include": "#punctuation" }
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#types"
+    },
+    {
+      "include": "#identifiers"
+    },
+    {
+      "include": "#punctuation"
+    }
   ],
   "repository": {
     "comments": {
@@ -23,7 +39,11 @@
           "name": "comment.block.tive",
           "begin": "/\\*",
           "end": "\\*/",
-          "patterns": [{ "include": "#comments" }]
+          "patterns": [
+            {
+              "include": "#comments"
+            }
+          ]
         }
       ]
     },
@@ -34,7 +54,9 @@
           "begin": "(r|f)?\"\"\"",
           "end": "\"\"\"",
           "beginCaptures": {
-            "1": { "name": "punctuation.definition.string.begin.tive" }
+            "1": {
+              "name": "punctuation.definition.string.begin.tive"
+            }
           }
         },
         {
@@ -43,14 +65,20 @@
           "begin": "f\"",
           "end": "\"|$",
           "beginCaptures": {
-            "0": { "name": "punctuation.definition.string.begin.tive" }
+            "0": {
+              "name": "punctuation.definition.string.begin.tive"
+            }
           },
           "patterns": [
             {
               "name": "meta.interpolation.tive",
               "begin": "\\{",
               "end": "\\}",
-              "patterns": [{ "include": "$self" }]
+              "patterns": [
+                {
+                  "include": "$self"
+                }
+              ]
             }
           ]
         },
@@ -59,7 +87,9 @@
           "begin": "r\"",
           "end": "\"|$",
           "beginCaptures": {
-            "0": { "name": "punctuation.definition.string.begin.tive" }
+            "0": {
+              "name": "punctuation.definition.string.begin.tive"
+            }
           }
         },
         {
@@ -67,7 +97,9 @@
           "begin": "(?<![rRfF])\"",
           "end": "\"|$",
           "beginCaptures": {
-            "0": { "name": "punctuation.definition.string.begin.tive" }
+            "0": {
+              "name": "punctuation.definition.string.begin.tive"
+            }
           },
           "patterns": [
             {
@@ -102,15 +134,15 @@
       "patterns": [
         {
           "name": "keyword.control.tive",
-          "match": "\\b(if|elif|else|then|loop|while|for|in|break|continue|return|match|case|do|handle|try|catch|throw|outside)\\b"
+          "match": "\\b(continue|outside|suspend|handle|return|select|await|break|catch|match|throw|while|yield|case|elif|else|loop|snap|then|for|gen|par|try|do|go|if|in)\\b"
         },
         {
           "name": "keyword.operator.logical.tive",
-          "match": "\\b(and|or|not|is)\\b"
+          "match": "\\b(and|not|is|or)\\b"
         },
         {
           "name": "keyword.declaration.tive",
-          "match": "\\b(let|var|const|func|friend|struct|enum|variant|protocol|macro|quote|typed|overload|import|use|as|intern|export|with|make|del)\\b"
+          "match": "\\b(overload|protocol|variant|export|friend|import|intern|struct|const|macro|quote|typed|enum|func|make|with|del|let|use|var|as)\\b"
         }
       ]
     },

@@ -84,6 +84,44 @@ fn diagnostics_parse_error() {
 }
 
 #[test]
+fn diagnostics_undefined_name() {
+    let d = diagnostics("print(no_such_name)\n", "t.tive");
+    assert!(d.iter().any(|(_, _, m)| m.contains("undefined name")));
+}
+
+#[test]
+fn diagnostics_unknown_std_export() {
+    let d = diagnostics("std.math.nope_fn\n", "t.tive");
+    assert!(d.iter().any(|(_, _, m)| m.contains("unknown export")));
+}
+
+#[test]
+fn diagnostics_use_registry_arity() {
+    let rational = diagnostics("rational(1)\n", "t.tive");
+    assert!(
+        rational
+            .iter()
+            .any(|(_, _, message)| message.contains("expects 2 argument")),
+        "{rational:?}"
+    );
+    assert!(
+        diagnostics("rational(1, 2)\n", "t.tive").is_empty(),
+        "rational accepts exactly two arguments"
+    );
+    assert!(
+        diagnostics("std.math.min(1)\nstd.math.max(1, 2, 3)\n", "t.tive").is_empty(),
+        "math min/max accept one or more arguments"
+    );
+    let empty_min = diagnostics("std.math.min()\n", "t.tive");
+    assert!(
+        empty_min
+            .iter()
+            .any(|(_, _, message)| message.contains("expects 1+ argument")),
+        "{empty_min:?}"
+    );
+}
+
+#[test]
 fn signature_help_active_arg() {
     let src = "func add(a, b) { a + b }\nadd(1, \n";
     let sh = signature_help(src, 1, 7);

@@ -40,14 +40,13 @@ hex = "0.4"
 digest = "0.10"
 hmac = "0.12"
 gix = { version = "0.85", features = ["blocking-network-client", "worktree-mutation", "blocking-http-transport-reqwest-rust-tls", "merge"] }
-reqwest = { version = "0.11", features = ["rustls-tls-native-roots", "blocking"] }
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls-native-roots", "blocking"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 rustls-native-certs = "0.8"
 rustls-pemfile = "2"
 tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
 indicatif = "0"
 libloading = "0.8"
-libffi = "3.2"
 toml = "0.8"
 toml_edit = "0.22"
 serde = { version = "1", features = ["derive"] }
@@ -62,6 +61,13 @@ csv = "1"
 parking_lot = "0.12"
 crossbeam-deque = "0.8"
 num_cpus = "1"
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-bundle-always"] }
+cap-std = "4.0.3"
+
+## Android 交叉编不拉 libffi-sys：其 build 在 Windows 宿主上走 MSVC/`cl.exe`，
+## 无法为 `aarch64-linux-android` 编 libffi。该目标上 `extern`/`C.callback` 运行时报错。
+[target.'cfg(not(target_os = "android"))'.dependencies]
+libffi = "3.2"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -71,6 +77,10 @@ rcgen = "0.13"
 name = "optive"
 harness = false
 path = "benches/optive.rs"
+
+[[example]]
+name = "embed"
+path = "examples/embed.rs"
 
 [profile.release]
 lto = "thin"

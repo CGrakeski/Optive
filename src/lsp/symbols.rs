@@ -360,6 +360,7 @@ fn body_hi(body: &Block, start: usize, enclose_hi: usize) -> usize {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_sym(
     idx: &mut FileIndex,
     name: String,
@@ -422,454 +423,18 @@ fn mark_export(idx: &mut FileIndex, vis: Visibility) {
 
 fn walk_stmt(st: &LocatedStmt, lo: usize, hi: usize, idx: &mut FileIndex) {
     match &st.stmt {
-        Stmt::VarDecl {
-            visibility,
-            name,
-            is_var,
-            is_const,
-            type_expr,
-            init,
-            ..
-        } => {
-            let kw = if *is_const {
-                "const"
-            } else if *is_var {
-                "var"
-            } else {
-                "let"
-            };
-            let ty = type_expr
-                .as_ref()
-                .and_then(ty_from_ann)
-                .or_else(|| init.as_ref().map(|e| infer_expr_in(e, Some(idx))))
-                .unwrap_or(Ty::Unknown);
-            let mut detail = format!("{kw} {name}");
-            if ty != Ty::Unknown {
-                detail.push_str(&format!(": {}", ty.label()));
-            }
-            push_sym(
-                idx,
-                name.clone(),
-                KIND_VAR,
-                detail,
-                st.line,
-                st.column,
-                st.line,
-                hi,
-                None,
-            );
-            if let Some(s) = last_sym(idx) {
-                s.ty = ty;
-            }
-            mark_export(idx, *visibility);
-            if let Some(e) = init {
-                walk_expr(e, idx);
-            }
-        }
-        Stmt::DestructDecl { pattern, init, .. } => {
-            for n in destruct_names(pattern) {
-                push_sym(
-                    idx,
-                    n.clone(),
-                    KIND_VAR,
-                    format!("let {n}"),
-                    st.line,
-                    st.column,
-                    st.line,
-                    hi,
-                    None,
-                );
-            }
-            walk_expr(init, idx);
-        }
-        Stmt::FuncDecl {
-            visibility,
-            name,
-            params,
-            body,
-            decorators,
-            ..
-        } => {
-            let sig = format!("func {name}({})", format_params(params));
-            push_sym(
-                idx,
-                name.clone(),
-                KIND_FUNC,
-                sig,
-                st.line,
-                st.column,
-                lo,
-                hi,
-                None,
-            );
-            if let Some(s) = last_sym(idx) {
-                s.ty = Ty::Func;
-            }
-            mark_export(idx, *visibility);
-            let inner_hi = body_hi(body, st.line, hi);
-            for p in params {
-                let ty = p
-                    .type_expr
-                    .as_ref()
-                    .and_then(ty_from_ann)
-                    .unwrap_or(Ty::Unknown);
-                let mut detail = format!("param {}", p.name);
-                if ty != Ty::Unknown {
-                    detail.push_str(&format!(": {}", ty.label()));
-                }
-                push_sym(
-                    idx,
-                    p.name.clone(),
-                    KIND_VAR,
-                    detail,
-                    st.line,
-                    st.column,
-                    st.line,
-                    inner_hi,
-                    None,
-                );
-                if let Some(s) = last_sym(idx) {
-                    s.ty = ty;
-                }
-            }
-            for d in decorators {
-                walk_expr(d, idx);
-            }
-            walk_block(body, st.line, inner_hi, idx);
-        }
-        Stmt::FriendFuncDecl {
-            visibility,
-            name,
-            params,
-            body,
-            ..
-        } => {
-            let ps = params.as_deref().unwrap_or(&[]);
-            push_sym(
-                idx,
-                name.clone(),
-                KIND_FUNC,
-                format!("func {name}({})", format_params(ps)),
-                st.line,
-                st.column,
-                lo,
-                hi,
-                None,
-            );
-            if let Some(s) = last_sym(idx) {
-                s.ty = Ty::Func;
-            }
-            mark_export(idx, *visibility);
-            if let Some(body) = body {
-                let inner_hi = body_hi(body, st.line, hi);
-                for p in ps {
-                    push_sym(
-                        idx,
-                        p.name.clone(),
-                        KIND_VAR,
-                        format!("param {}", p.name),
-                        st.line,
-                        st.column,
-                        st.line,
-                        inner_hi,
-                        None,
-                    );
-                }
-                walk_block(body, st.line, inner_hi, idx);
-            }
-        }
-        Stmt::StructDecl {
-            visibility,
-            name,
-            fields,
-            methods,
-            ..
-        } => {
-            push_sym(
-                idx,
-                name.clone(),
-                KIND_CLASS,
-                format!("struct {name}"),
-                st.line,
-                st.column,
-                lo,
-                hi,
-                None,
-            );
-            if let Some(s) = last_sym(idx) {
-                s.ty = Ty::Struct(name.clone());
-            }
-            mark_export(idx, *visibility);
-            for f in fields {
-                let ty = f
-                    .type_expr
-                    .as_ref()
-                    .and_then(ty_from_ann)
-                    .unwrap_or(Ty::Unknown);
-                let mut detail = format!("{name}.{}", f.name);
-                if ty != Ty::Unknown {
-                    detail.push_str(&format!(": {}", ty.label()));
-                }
-                push_sym(
-                    idx,
-                    f.name.clone(),
-                    KIND_FIELD,
-                    detail,
-                    st.line,
-                    st.column,
-                    lo,
-                    hi,
-                    Some(name.clone()),
-                );
-                if let Some(s) = last_sym(idx) {
-                    s.ty = ty;
-                }
-            }
-            for m in methods {
-                push_sym(
-                    idx,
-                    m.name.clone(),
-                    KIND_METHOD,
-                    format!("func {}({})", m.name, format_params(&m.params)),
-                    st.line,
-                    st.column,
-                    lo,
-                    hi,
-                    Some(name.clone()),
-                );
-                let inner_hi = block_hi(&m.body, st.line);
-                for p in &m.params {
-                    push_sym(
-                        idx,
-                        p.name.clone(),
-                        KIND_VAR,
-                        format!("param {}", p.name),
-                        st.line,
-                        st.column,
-                        st.line,
-                        inner_hi,
-                        None,
-                    );
-                }
-                walk_block(&m.body, st.line, inner_hi, idx);
-            }
-        }
-        Stmt::EnumDecl {
-            visibility,
-            name,
-            members,
-            methods,
-            ..
-        } => {
-            push_sym(
-                idx,
-                name.clone(),
-                KIND_CLASS,
-                format!("enum {name}"),
-                st.line,
-                st.column,
-                lo,
-                hi,
-                None,
-            );
-            if let Some(s) = last_sym(idx) {
-                s.ty = Ty::Struct(name.clone());
-            }
-            mark_export(idx, *visibility);
-            for m in members {
-                push_sym(
-                    idx,
-                    m.name.clone(),
-                    KIND_FIELD,
-                    format!("{name}.{}", m.name),
-                    st.line,
-                    st.column,
-                    lo,
-                    hi,
-                    Some(name.clone()),
-                );
-            }
-            for m in methods {
-                let inner_hi = block_hi(&m.body, st.line);
-                walk_block(&m.body, st.line, inner_hi, idx);
-            }
-        }
-        Stmt::VariantDecl {
-            visibility,
-            name,
-            cases,
-            ..
-        } => {
-            push_sym(
-                idx,
-                name.clone(),
-                KIND_CLASS,
-                format!("variant {name}"),
-                st.line,
-                st.column,
-                lo,
-                hi,
-                None,
-            );
-            if let Some(s) = last_sym(idx) {
-                s.ty = Ty::Struct(name.clone());
-            }
-            mark_export(idx, *visibility);
-            for c in cases {
-                push_sym(
-                    idx,
-                    c.name.clone(),
-                    KIND_FIELD,
-                    format!("{name}.{}", c.name),
-                    st.line,
-                    st.column,
-                    lo,
-                    hi,
-                    Some(name.clone()),
-                );
-            }
-        }
-        Stmt::ProtocolDecl {
-            visibility,
-            name,
-            members,
-            ..
-        } => {
-            push_sym(
-                idx,
-                name.clone(),
-                KIND_INTERFACE,
-                format!("protocol {name}"),
-                st.line,
-                st.column,
-                lo,
-                hi,
-                None,
-            );
-            mark_export(idx, *visibility);
-            for m in members {
-                match m {
-                    crate::ast::ProtocolMember::Method { name: mn, params } => {
-                        push_sym(
-                            idx,
-                            mn.clone(),
-                            KIND_METHOD,
-                            format!("func {mn}({})", format_params(params)),
-                            st.line,
-                            st.column,
-                            lo,
-                            hi,
-                            Some(name.clone()),
-                        );
-                    }
-                    crate::ast::ProtocolMember::Field { name: fnm, .. } => {
-                        push_sym(
-                            idx,
-                            fnm.clone(),
-                            KIND_FIELD,
-                            format!("{name}.{fnm}"),
-                            st.line,
-                            st.column,
-                            lo,
-                            hi,
-                            Some(name.clone()),
-                        );
-                    }
-                }
-            }
-        }
-        Stmt::MacroDecl {
-            visibility,
-            name,
-            body,
-            ..
-        } => {
-            push_sym(
-                idx,
-                name.clone(),
-                KIND_FUNC,
-                format!("macro {name}"),
-                st.line,
-                st.column,
-                lo,
-                hi,
-                None,
-            );
-            mark_export(idx, *visibility);
-            let inner_hi = block_hi(body, st.line);
-            walk_block(body, st.line, inner_hi, idx);
-        }
-        Stmt::Import {
-            path,
-            alias,
-            path_is_string,
-            ..
-        } => {
-            let key = alias.as_deref().unwrap_or(path.as_str());
-            let key = if *path_is_string {
-                Path::new(key)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(key)
-            } else {
-                key.rsplit('.').next().unwrap_or(key)
-            };
-            push_sym(
-                idx,
-                key.to_string(),
-                KIND_MODULE,
-                format!("import {path}"),
-                st.line,
-                st.column,
-                lo,
-                hi,
-                None,
-            );
-            if let Some(s) = last_sym(idx) {
-                s.ty = Ty::Module;
-                s.module_spec = Some(path.clone());
-            }
-        }
-        Stmt::Use { module, items } => {
-            let mod_s = match module {
-                ModuleRef::Qualified(p) => p.join("."),
-                ModuleRef::FilePath { path, .. } => path.clone(),
-            };
-            for it in items {
-                let name = it.alias.as_deref().unwrap_or(it.name.as_str());
-                push_sym(
-                    idx,
-                    name.to_string(),
-                    KIND_FUNC,
-                    format!("use {mod_s}.{}", it.name),
-                    st.line,
-                    st.column,
-                    lo,
-                    hi,
-                    None,
-                );
-                if let Some(s) = last_sym(idx) {
-                    s.imported_from = Some((mod_s.clone(), it.name.clone()));
-                    s.ty = Ty::Func;
-                }
-            }
-        }
-        Stmt::If {
-            cond,
-            then_block,
-            elifs,
-            else_block,
-        } => {
-            walk_expr(cond, idx);
-            walk_block(then_block, st.line, block_hi(then_block, hi), idx);
-            for (c, b) in elifs {
-                walk_expr(c, idx);
-                walk_block(b, st.line, block_hi(b, hi), idx);
-            }
-            if let Some(b) = else_block {
-                walk_block(b, st.line, block_hi(b, hi), idx);
-            }
-        }
+        Stmt::VarDecl { .. } => walk_var_decl(st, hi, idx),
+        Stmt::DestructDecl { .. } => walk_destruct_decl(st, hi, idx),
+        Stmt::FuncDecl { .. } => walk_func(st, lo, hi, idx),
+        Stmt::FriendFuncDecl { .. } => walk_friend_func(st, lo, hi, idx),
+        Stmt::StructDecl { .. } => walk_struct(st, lo, hi, idx),
+        Stmt::EnumDecl { .. } => walk_enum(st, lo, hi, idx),
+        Stmt::VariantDecl { .. } => walk_variant(st, lo, hi, idx),
+        Stmt::ProtocolDecl { .. } => walk_protocol(st, lo, hi, idx),
+        Stmt::MacroDecl { .. } => walk_macro(st, lo, hi, idx),
+        Stmt::Import { .. } => walk_import(st, lo, hi, idx),
+        Stmt::Use { .. } => walk_use(st, lo, hi, idx),
+        Stmt::If { .. } => walk_if(st, hi, idx),
         Stmt::While { cond, body } => {
             walk_expr(cond, idx);
             walk_block(body, st.line, block_hi(body, hi), idx);
@@ -880,101 +445,10 @@ fn walk_stmt(st: &LocatedStmt, lo: usize, hi: usize, idx: &mut FileIndex) {
             }
             walk_block(body, st.line, block_hi(body, hi), idx);
         }
-        Stmt::For { items, body } => {
-            let inner_hi = block_hi(body, hi);
-            for it in items {
-                walk_expr(&it.iterable, idx);
-                push_sym(
-                    idx,
-                    it.name.clone(),
-                    KIND_VAR,
-                    format!("for {}", it.name),
-                    st.line,
-                    st.column,
-                    st.line,
-                    inner_hi,
-                    None,
-                );
-            }
-            walk_block(body, st.line, inner_hi, idx);
-        }
-        Stmt::Try {
-            body,
-            catches,
-            else_block,
-        } => {
-            walk_block(body, st.line, block_hi(body, hi), idx);
-            for c in catches {
-                let inner_hi = block_hi(&c.body, hi);
-                if let CatchPattern::Bind { name, .. } = &c.pattern {
-                    push_sym(
-                        idx,
-                        name.clone(),
-                        KIND_VAR,
-                        format!("catch {name}"),
-                        st.line,
-                        st.column,
-                        st.line,
-                        inner_hi,
-                        None,
-                    );
-                }
-                walk_block(&c.body, st.line, inner_hi, idx);
-            }
-            if let Some(b) = else_block {
-                walk_block(b, st.line, block_hi(b, hi), idx);
-            }
-        }
-        Stmt::Match {
-            subject,
-            cases,
-            else_block,
-        } => {
-            walk_expr(subject, idx);
-            for c in cases {
-                let inner_hi = block_hi(&c.body, hi);
-                for n in pattern_names(&c.pattern) {
-                    push_sym(
-                        idx,
-                        n.clone(),
-                        KIND_VAR,
-                        format!("case {n}"),
-                        st.line,
-                        st.column,
-                        st.line,
-                        inner_hi,
-                        None,
-                    );
-                }
-                walk_block(&c.body, st.line, inner_hi, idx);
-            }
-            if let Some(b) = else_block {
-                walk_block(b, st.line, block_hi(b, hi), idx);
-            }
-        }
-        Stmt::With {
-            context,
-            body,
-            alias,
-            ..
-        } => {
-            walk_expr(context, idx);
-            let inner_hi = block_hi(body, hi);
-            if let Some(a) = alias {
-                push_sym(
-                    idx,
-                    a.clone(),
-                    KIND_VAR,
-                    format!("with {a}"),
-                    st.line,
-                    st.column,
-                    st.line,
-                    inner_hi,
-                    None,
-                );
-            }
-            walk_block(body, st.line, inner_hi, idx);
-        }
+        Stmt::For { .. } => walk_for(st, hi, idx),
+        Stmt::Try { .. } => walk_try(st, hi, idx),
+        Stmt::Match { .. } => walk_match(st, hi, idx),
+        Stmt::With { .. } => walk_with(st, hi, idx),
         Stmt::Return(e) | Stmt::Yield(e) => {
             if let Some(e) = e {
                 walk_expr(e, idx);
@@ -990,6 +464,642 @@ fn walk_stmt(st: &LocatedStmt, lo: usize, hi: usize, idx: &mut FileIndex) {
         Stmt::Block(b) => walk_block(b, st.line, block_hi(b, hi), idx),
         Stmt::Break | Stmt::Continue | Stmt::Comment { .. } => {}
     }
+}
+
+fn walk_var_decl(st: &LocatedStmt, hi: usize, idx: &mut FileIndex) {
+    let Stmt::VarDecl {
+        visibility,
+        name,
+        is_var,
+        is_const,
+        type_expr,
+        init,
+        ..
+    } = &st.stmt
+    else {
+        return;
+    };
+
+    let kw = if *is_const {
+        "const"
+    } else if *is_var {
+        "var"
+    } else {
+        "let"
+    };
+    let ty = type_expr
+        .as_ref()
+        .and_then(ty_from_ann)
+        .or_else(|| init.as_ref().map(|e| infer_expr_in(e, Some(idx))))
+        .unwrap_or(Ty::Unknown);
+    let mut detail = format!("{kw} {name}");
+    if ty != Ty::Unknown {
+        detail.push_str(&format!(": {}", ty.label()));
+    }
+    push_sym(
+        idx,
+        name.clone(),
+        KIND_VAR,
+        detail,
+        st.line,
+        st.column,
+        st.line,
+        hi,
+        None,
+    );
+    if let Some(s) = last_sym(idx) {
+        s.ty = ty;
+    }
+    mark_export(idx, *visibility);
+    if let Some(e) = init {
+        walk_expr(e, idx);
+    }
+}
+
+fn walk_destruct_decl(st: &LocatedStmt, hi: usize, idx: &mut FileIndex) {
+    let Stmt::DestructDecl { pattern, init, .. } = &st.stmt else {
+        return;
+    };
+
+    for n in destruct_names(pattern) {
+        push_sym(
+            idx,
+            n.clone(),
+            KIND_VAR,
+            format!("let {n}"),
+            st.line,
+            st.column,
+            st.line,
+            hi,
+            None,
+        );
+    }
+    walk_expr(init, idx);
+}
+
+fn walk_func(st: &LocatedStmt, lo: usize, hi: usize, idx: &mut FileIndex) {
+    let Stmt::FuncDecl {
+        visibility,
+        name,
+        params,
+        body,
+        decorators,
+        ..
+    } = &st.stmt
+    else {
+        return;
+    };
+
+    let sig = format!("func {name}({})", format_params(params));
+    push_sym(
+        idx,
+        name.clone(),
+        KIND_FUNC,
+        sig,
+        st.line,
+        st.column,
+        lo,
+        hi,
+        None,
+    );
+    if let Some(s) = last_sym(idx) {
+        s.ty = Ty::Func;
+    }
+    mark_export(idx, *visibility);
+    let inner_hi = body_hi(body, st.line, hi);
+    for p in params {
+        let ty = p
+            .type_expr
+            .as_ref()
+            .and_then(ty_from_ann)
+            .unwrap_or(Ty::Unknown);
+        let mut detail = format!("param {}", p.name);
+        if ty != Ty::Unknown {
+            detail.push_str(&format!(": {}", ty.label()));
+        }
+        push_sym(
+            idx,
+            p.name.clone(),
+            KIND_VAR,
+            detail,
+            st.line,
+            st.column,
+            st.line,
+            inner_hi,
+            None,
+        );
+        if let Some(s) = last_sym(idx) {
+            s.ty = ty;
+        }
+    }
+    for d in decorators {
+        walk_expr(d, idx);
+    }
+    walk_block(body, st.line, inner_hi, idx);
+}
+
+fn walk_friend_func(st: &LocatedStmt, lo: usize, hi: usize, idx: &mut FileIndex) {
+    let Stmt::FriendFuncDecl {
+        visibility,
+        name,
+        params,
+        body,
+        ..
+    } = &st.stmt
+    else {
+        return;
+    };
+
+    let ps = params.as_deref().unwrap_or(&[]);
+    push_sym(
+        idx,
+        name.clone(),
+        KIND_FUNC,
+        format!("func {name}({})", format_params(ps)),
+        st.line,
+        st.column,
+        lo,
+        hi,
+        None,
+    );
+    if let Some(s) = last_sym(idx) {
+        s.ty = Ty::Func;
+    }
+    mark_export(idx, *visibility);
+    if let Some(body) = body {
+        let inner_hi = body_hi(body, st.line, hi);
+        for p in ps {
+            push_sym(
+                idx,
+                p.name.clone(),
+                KIND_VAR,
+                format!("param {}", p.name),
+                st.line,
+                st.column,
+                st.line,
+                inner_hi,
+                None,
+            );
+        }
+        walk_block(body, st.line, inner_hi, idx);
+    }
+}
+
+fn walk_struct(st: &LocatedStmt, lo: usize, hi: usize, idx: &mut FileIndex) {
+    let Stmt::StructDecl {
+        visibility,
+        name,
+        fields,
+        methods,
+        ..
+    } = &st.stmt
+    else {
+        return;
+    };
+
+    push_sym(
+        idx,
+        name.clone(),
+        KIND_CLASS,
+        format!("struct {name}"),
+        st.line,
+        st.column,
+        lo,
+        hi,
+        None,
+    );
+    if let Some(s) = last_sym(idx) {
+        s.ty = Ty::Struct(name.clone());
+    }
+    mark_export(idx, *visibility);
+    for f in fields {
+        let ty = f
+            .type_expr
+            .as_ref()
+            .and_then(ty_from_ann)
+            .unwrap_or(Ty::Unknown);
+        let mut detail = format!("{name}.{}", f.name);
+        if ty != Ty::Unknown {
+            detail.push_str(&format!(": {}", ty.label()));
+        }
+        push_sym(
+            idx,
+            f.name.clone(),
+            KIND_FIELD,
+            detail,
+            st.line,
+            st.column,
+            lo,
+            hi,
+            Some(name.clone()),
+        );
+        if let Some(s) = last_sym(idx) {
+            s.ty = ty;
+        }
+    }
+    for m in methods {
+        push_sym(
+            idx,
+            m.name.clone(),
+            KIND_METHOD,
+            format!("func {}({})", m.name, format_params(&m.params)),
+            st.line,
+            st.column,
+            lo,
+            hi,
+            Some(name.clone()),
+        );
+        let inner_hi = block_hi(&m.body, st.line);
+        for p in &m.params {
+            push_sym(
+                idx,
+                p.name.clone(),
+                KIND_VAR,
+                format!("param {}", p.name),
+                st.line,
+                st.column,
+                st.line,
+                inner_hi,
+                None,
+            );
+        }
+        walk_block(&m.body, st.line, inner_hi, idx);
+    }
+}
+
+fn walk_enum(st: &LocatedStmt, lo: usize, hi: usize, idx: &mut FileIndex) {
+    let Stmt::EnumDecl {
+        visibility,
+        name,
+        members,
+        methods,
+        ..
+    } = &st.stmt
+    else {
+        return;
+    };
+
+    push_sym(
+        idx,
+        name.clone(),
+        KIND_CLASS,
+        format!("enum {name}"),
+        st.line,
+        st.column,
+        lo,
+        hi,
+        None,
+    );
+    if let Some(s) = last_sym(idx) {
+        s.ty = Ty::Struct(name.clone());
+    }
+    mark_export(idx, *visibility);
+    for m in members {
+        push_sym(
+            idx,
+            m.name.clone(),
+            KIND_FIELD,
+            format!("{name}.{}", m.name),
+            st.line,
+            st.column,
+            lo,
+            hi,
+            Some(name.clone()),
+        );
+    }
+    for m in methods {
+        let inner_hi = block_hi(&m.body, st.line);
+        walk_block(&m.body, st.line, inner_hi, idx);
+    }
+}
+
+fn walk_variant(st: &LocatedStmt, lo: usize, hi: usize, idx: &mut FileIndex) {
+    let Stmt::VariantDecl {
+        visibility,
+        name,
+        cases,
+        ..
+    } = &st.stmt
+    else {
+        return;
+    };
+
+    push_sym(
+        idx,
+        name.clone(),
+        KIND_CLASS,
+        format!("variant {name}"),
+        st.line,
+        st.column,
+        lo,
+        hi,
+        None,
+    );
+    if let Some(s) = last_sym(idx) {
+        s.ty = Ty::Struct(name.clone());
+    }
+    mark_export(idx, *visibility);
+    for c in cases {
+        push_sym(
+            idx,
+            c.name.clone(),
+            KIND_FIELD,
+            format!("{name}.{}", c.name),
+            st.line,
+            st.column,
+            lo,
+            hi,
+            Some(name.clone()),
+        );
+    }
+}
+
+fn walk_protocol(st: &LocatedStmt, lo: usize, hi: usize, idx: &mut FileIndex) {
+    let Stmt::ProtocolDecl {
+        visibility,
+        name,
+        members,
+        ..
+    } = &st.stmt
+    else {
+        return;
+    };
+
+    push_sym(
+        idx,
+        name.clone(),
+        KIND_INTERFACE,
+        format!("protocol {name}"),
+        st.line,
+        st.column,
+        lo,
+        hi,
+        None,
+    );
+    mark_export(idx, *visibility);
+    for m in members {
+        match m {
+            crate::ast::ProtocolMember::Method { name: mn, params } => {
+                push_sym(
+                    idx,
+                    mn.clone(),
+                    KIND_METHOD,
+                    format!("func {mn}({})", format_params(params)),
+                    st.line,
+                    st.column,
+                    lo,
+                    hi,
+                    Some(name.clone()),
+                );
+            }
+            crate::ast::ProtocolMember::Field { name: fnm, .. } => {
+                push_sym(
+                    idx,
+                    fnm.clone(),
+                    KIND_FIELD,
+                    format!("{name}.{fnm}"),
+                    st.line,
+                    st.column,
+                    lo,
+                    hi,
+                    Some(name.clone()),
+                );
+            }
+        }
+    }
+}
+
+fn walk_macro(st: &LocatedStmt, lo: usize, hi: usize, idx: &mut FileIndex) {
+    let Stmt::MacroDecl {
+        visibility,
+        name,
+        body,
+        ..
+    } = &st.stmt
+    else {
+        return;
+    };
+
+    push_sym(
+        idx,
+        name.clone(),
+        KIND_FUNC,
+        format!("macro {name}"),
+        st.line,
+        st.column,
+        lo,
+        hi,
+        None,
+    );
+    mark_export(idx, *visibility);
+    let inner_hi = block_hi(body, st.line);
+    walk_block(body, st.line, inner_hi, idx);
+}
+
+fn walk_import(st: &LocatedStmt, lo: usize, hi: usize, idx: &mut FileIndex) {
+    let Stmt::Import {
+        path,
+        alias,
+        path_is_string,
+        ..
+    } = &st.stmt
+    else {
+        return;
+    };
+
+    let key = alias.as_deref().unwrap_or(path.as_str());
+    let key = if *path_is_string {
+        Path::new(key)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(key)
+    } else {
+        key.rsplit('.').next().unwrap_or(key)
+    };
+    push_sym(
+        idx,
+        key.to_string(),
+        KIND_MODULE,
+        format!("import {path}"),
+        st.line,
+        st.column,
+        lo,
+        hi,
+        None,
+    );
+    if let Some(s) = last_sym(idx) {
+        s.ty = Ty::Module;
+        s.module_spec = Some(path.clone());
+    }
+}
+
+fn walk_use(st: &LocatedStmt, lo: usize, hi: usize, idx: &mut FileIndex) {
+    let Stmt::Use { module, items } = &st.stmt else {
+        return;
+    };
+
+    let mod_s = match module {
+        ModuleRef::Qualified(p) => p.join("."),
+        ModuleRef::FilePath { path, .. } => path.clone(),
+    };
+    for it in items {
+        let name = it.alias.as_deref().unwrap_or(it.name.as_str());
+        push_sym(
+            idx,
+            name.to_string(),
+            KIND_FUNC,
+            format!("use {mod_s}.{}", it.name),
+            st.line,
+            st.column,
+            lo,
+            hi,
+            None,
+        );
+        if let Some(s) = last_sym(idx) {
+            s.imported_from = Some((mod_s.clone(), it.name.clone()));
+            s.ty = Ty::Func;
+        }
+    }
+}
+
+fn walk_if(st: &LocatedStmt, hi: usize, idx: &mut FileIndex) {
+    let Stmt::If {
+        cond,
+        then_block,
+        elifs,
+        else_block,
+    } = &st.stmt
+    else {
+        return;
+    };
+
+    walk_expr(cond, idx);
+    walk_block(then_block, st.line, block_hi(then_block, hi), idx);
+    for (c, b) in elifs {
+        walk_expr(c, idx);
+        walk_block(b, st.line, block_hi(b, hi), idx);
+    }
+    if let Some(b) = else_block {
+        walk_block(b, st.line, block_hi(b, hi), idx);
+    }
+}
+
+fn walk_for(st: &LocatedStmt, hi: usize, idx: &mut FileIndex) {
+    let Stmt::For { items, body } = &st.stmt else {
+        return;
+    };
+
+    let inner_hi = block_hi(body, hi);
+    for it in items {
+        walk_expr(&it.iterable, idx);
+        push_sym(
+            idx,
+            it.name.clone(),
+            KIND_VAR,
+            format!("for {}", it.name),
+            st.line,
+            st.column,
+            st.line,
+            inner_hi,
+            None,
+        );
+    }
+    walk_block(body, st.line, inner_hi, idx);
+}
+
+fn walk_try(st: &LocatedStmt, hi: usize, idx: &mut FileIndex) {
+    let Stmt::Try {
+        body,
+        catches,
+        else_block,
+    } = &st.stmt
+    else {
+        return;
+    };
+
+    walk_block(body, st.line, block_hi(body, hi), idx);
+    for c in catches {
+        let inner_hi = block_hi(&c.body, hi);
+        if let CatchPattern::Bind { name, .. } = &c.pattern {
+            push_sym(
+                idx,
+                name.clone(),
+                KIND_VAR,
+                format!("catch {name}"),
+                st.line,
+                st.column,
+                st.line,
+                inner_hi,
+                None,
+            );
+        }
+        walk_block(&c.body, st.line, inner_hi, idx);
+    }
+    if let Some(b) = else_block {
+        walk_block(b, st.line, block_hi(b, hi), idx);
+    }
+}
+
+fn walk_match(st: &LocatedStmt, hi: usize, idx: &mut FileIndex) {
+    let Stmt::Match {
+        subject,
+        cases,
+        else_block,
+    } = &st.stmt
+    else {
+        return;
+    };
+
+    walk_expr(subject, idx);
+    for c in cases {
+        let inner_hi = block_hi(&c.body, hi);
+        for n in pattern_names(&c.pattern) {
+            push_sym(
+                idx,
+                n.clone(),
+                KIND_VAR,
+                format!("case {n}"),
+                st.line,
+                st.column,
+                st.line,
+                inner_hi,
+                None,
+            );
+        }
+        walk_block(&c.body, st.line, inner_hi, idx);
+    }
+    if let Some(b) = else_block {
+        walk_block(b, st.line, block_hi(b, hi), idx);
+    }
+}
+
+fn walk_with(st: &LocatedStmt, hi: usize, idx: &mut FileIndex) {
+    let Stmt::With {
+        context,
+        body,
+        alias,
+        ..
+    } = &st.stmt
+    else {
+        return;
+    };
+
+    walk_expr(context, idx);
+    let inner_hi = block_hi(body, hi);
+    if let Some(a) = alias {
+        push_sym(
+            idx,
+            a.clone(),
+            KIND_VAR,
+            format!("with {a}"),
+            st.line,
+            st.column,
+            st.line,
+            inner_hi,
+            None,
+        );
+    }
+    walk_block(body, st.line, inner_hi, idx);
 }
 
 fn walk_lvalue(lv: &LValue, idx: &mut FileIndex) {
@@ -1319,14 +1429,14 @@ pub fn infer_expr_in(expr: &Expr, idx: Option<&FileIndex>) -> Ty {
         ExprKind::TypeConvert { type_expr, .. } => ty_from_ann(type_expr).unwrap_or(Ty::Unknown),
         ExprKind::Call { callee, .. } => {
             if let Some(path) = expr_path(callee) {
-                if let Some(ty) = super::catalog::std_call_type(&path) {
+                if let Some(ty) = crate::api_registry::std_call_type(&path) {
                     return Ty::Struct(ty.to_string());
                 }
             }
             if let ExprKind::Member { object, field } = &callee.kind {
                 let recv = infer_expr_in(object, idx);
                 if let Ty::Struct(n) = &recv {
-                    if let Some(ty) = super::catalog::handle_method_result(n, field) {
+                    if let Some(ty) = crate::api_registry::handle_method_result(n, field) {
                         return Ty::Struct(ty.to_string());
                     }
                 }

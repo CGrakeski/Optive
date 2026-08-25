@@ -11,6 +11,8 @@
 
 mod common;
 
+use std::time::{Duration, Instant};
+
 use optive::error::ExceptionKind;
 use optive::value::Value;
 use optive::vm::Vm;
@@ -415,5 +417,63 @@ if (n != 4) { return -2 }
 sum
 "#,
         "6",
+    );
+}
+
+/// 2 个 CPU `go` 在 2 个 OS worker 上必须重叠推进，而不是轮流切片。
+/// 墙钟倍率断言默认关闭，避免测试机争用导致间歇失败；设置
+/// `OPTIVE_ASSERT_MN_OVERLAP=1` 时对多次重复取最佳 1-worker / 2-worker 时间再比。
+#[test]
+fn mn_two_cpu_tasks_overlap_on_two_workers() {
+    if num_cpus::get() < 2 {
+        return;
+    }
+    let src = r"
+func burn() {
+  var n = 0
+  loop (400000) { n = n + 1 }
+  return n
+}
+func start(wg) {
+  go do {
+    burn()
+    wg.done()
+  }
+}
+let wg = WaitGroup(2)
+start(wg)
+start(wg)
+wg.wait()
+1
+";
+    {
+        let mut vm = Vm::with_workers(2);
+        optive::run_source_in_vm(&mut vm, src, "<overlap-2>").expect("run 2");
+    }
+    if std::env::var_os("OPTIVE_ASSERT_MN_OVERLAP").is_none() {
+        return;
+    }
+    const REPS: usize = 5;
+    let mut best1 = Duration::MAX;
+    let mut best2 = Duration::MAX;
+    for _ in 0..REPS {
+        let t1 = {
+            let start = Instant::now();
+            let mut vm = Vm::with_workers(1);
+            optive::run_source_in_vm(&mut vm, src, "<overlap-1>").expect("run 1");
+            start.elapsed()
+        };
+        let t2 = {
+            let start = Instant::now();
+            let mut vm = Vm::with_workers(2);
+            optive::run_source_in_vm(&mut vm, src, "<overlap-2>").expect("run 2");
+            start.elapsed()
+        };
+        best1 = best1.min(t1);
+        best2 = best2.min(t2);
+    }
+    assert!(
+        best2 * 4 < best1 * 3,
+        "2 workers should overlap CPU tasks (2w < 0.75× 1w): 1w={best1:?} 2w={best2:?}"
     );
 }

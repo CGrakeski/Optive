@@ -1,0 +1,6 @@
+use std.test.{ assert_eq }
+let ch = Channel()
+go do {
+  ch.send(41)
+}
+assert_eq(ch.recv() + 1, 42)

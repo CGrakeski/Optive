@@ -63,6 +63,10 @@ pub struct DebugState {
     pub started: bool,
     /// 未捕获异常停下时暂存错误文案。
     pub last_uncaught: Option<String>,
+    /// DAP `exceptionBreakpointFilters`: 未捕获异常（默认开）。
+    pub exception_uncaught: bool,
+    /// 每次 `throw` 都停（`raised`）。
+    pub exception_raised: bool,
     /// 步进/断点焦点；默认 `All`（任意纤程均可停）。
     pub step_focus: StepFocus,
     /// `fiber N` 列表下标（仅展示；`All`/`Main` 时为 `None`）。
@@ -97,6 +101,8 @@ impl Default for DebugState {
             stop_on_entry: true,
             started: false,
             last_uncaught: None,
+            exception_uncaught: true,
+            exception_raised: false,
             step_focus: StepFocus::All,
             focus_fiber_index: None,
         }
@@ -514,6 +520,19 @@ pub fn stack_frames(vm: &Vm) -> Vec<ErrorStackFrame> {
 ///
 /// 把当前可见的局部名作为词法绑定注入到 snippet，使其能引用 `i` / `total` 等。
 pub fn eval_in_paused_vm(vm: &mut Vm, expr_src: &str) -> Result<Value> {
+    let budget = std::env::var("OPTIVE_DEBUG_EVAL_BUDGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(100_000);
+    eval_in_paused_vm_with_budget(vm, expr_src, budget)
+}
+
+pub fn eval_in_paused_vm_with_budget(
+    vm: &mut Vm,
+    expr_src: &str,
+    instruction_budget: usize,
+) -> Result<Value> {
     let wrapped = format!("{expr_src}\n");
     let program = crate::parser::Parser::parse(&wrapped).map_err(|e| {
         RuntimeError::msg(crate::diagnostics::format_parse_error(
@@ -525,7 +544,7 @@ pub fn eval_in_paused_vm(vm: &mut Vm, expr_src: &str) -> Result<Value> {
     let names = vm.debug_visible_local_names();
 
     let compiled = crate::codegen::Generator::compile_snippet(&program, &names)?;
-    vm.eval_debug_snippet(&names, compiled)
+    vm.eval_debug_snippet(&names, compiled, instruction_budget)
 }
 
 pub fn set_local_or_global(vm: &mut Vm, name: &str, value: Value) -> Result<()> {
@@ -552,6 +571,28 @@ pub fn debug_set(vm: &mut Vm, lhs: &str, expr: &str) -> Result<()> {
 
 pub fn list_locals(vm: &Vm) -> Vec<(String, Value)> {
     vm.debug_list_locals()
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod eval_budget_tests {
+    use super::*;
+
+    #[test]
+    fn debug_evaluate_has_hard_instruction_budget() {
+        let mut vm = Vm::with_workers(1);
+        let err = eval_in_paused_vm_with_budget(&mut vm, "loop { }", 16).unwrap_err();
+        assert!(
+            err.message().contains("instruction budget exceeded"),
+            "{err}"
+        );
+        assert_eq!(
+            eval_in_paused_vm_with_budget(&mut vm, "1 + 2", 100)
+                .unwrap()
+                .display_string(),
+            "3"
+        );
+    }
 }
 
 fn break_spec_next_kw(spec: &str) -> Option<usize> {

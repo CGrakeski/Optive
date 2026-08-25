@@ -36,6 +36,10 @@ jobs:
             target: x86_64-apple-darwin
             artifact: Optive
             archive: optive-${{ github.ref_name }}-x86_64-macos.tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: Optive
+            archive: optive-${{ github.ref_name }}-aarch64-linux.tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: Optive.exe
@@ -52,8 +56,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      - name: Verify locked dependency input
+        run: cargo metadata --locked --format-version 1 --no-deps
       - name: Build release
-        run: cargo build --release --target ${{ matrix.target }} --bin Optive
+        run: cargo build --locked --release --target ${{ matrix.target }} --bin Optive
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
@@ -77,6 +83,8 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -87,6 +95,10 @@ jobs:
           set -eux
           cd dist
           sha256sum optive-* > SHA256SUMS
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:

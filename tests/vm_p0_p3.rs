@@ -254,6 +254,12 @@ fn p3_global_repr() {
 #[test]
 fn p3_repl_continuation_detection() {
     assert!(repl_needs_continuation("let x = ("));
+    assert!(repl_needs_continuation("/* block"));
+    assert!(repl_needs_continuation(r#"r"raw"#));
+    assert!(repl_needs_continuation(r#"f"value {x}"#));
+    assert!(repl_needs_continuation(r#"b"bytes"#));
+    assert!(repl_needs_continuation(r#""""triple"#));
+    assert!(!repl_needs_continuation("/* block */"));
     assert!(!repl_needs_continuation("1 + 2"));
 }
 

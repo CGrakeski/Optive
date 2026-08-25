@@ -19,8 +19,8 @@ use crate::shared::SyncCell;
 use crate::value::{Num, Value};
 use crate::Result;
 
-const MAGIC: &[u8; 4] = b"OTBC";
-const FORMAT: u16 = 3;
+const MAGIC: &[u8; 4] = b"TIVC";
+const FORMAT: u16 = crate::versions::BYTECODE_FORMAT_VERSION;
 
 static STORES: AtomicU64 = AtomicU64::new(0);
 static HITS: AtomicU64 = AtomicU64::new(0);
@@ -1013,7 +1013,7 @@ mod tests {
         let _ = fs::create_dir_all(&dir);
         let src = "1 + 2\n";
         let prog = crate::compile(src).expect("compile");
-        let path = dir.join("t.otbc");
+        let path = dir.join("t.tivc");
         assert!(store(&path, &prog));
         let loaded = load(&path).expect("load");
         let mut vm = Vm::new();

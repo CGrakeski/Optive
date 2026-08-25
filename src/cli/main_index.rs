@@ -97,7 +97,13 @@ fn sync_from(url: &str) -> Result<(), Box<dyn Error>> {
         }
         git_ops::remove_checkout(&index_path)?;
     }
-    git_ops::force_clone_or_sync(url, index_path.as_path())
+    git_ops::force_clone_or_sync(url, index_path.as_path())?;
+    let head = super::index_trust::verify_index_dir(&index_path)?;
+    if let Some(head) = head {
+        let sig = if head.signed { "signed" } else { "unsigned" };
+        println!("  HEAD {} ({sig})", head.commit);
+    }
+    Ok(())
 }
 
 pub fn sync_index() -> Result<(), Box<dyn Error>> {

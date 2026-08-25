@@ -21,6 +21,47 @@ use crate::Result;
 use crate::scheduler::{self, MnScheduler};
 use crate::shared::{Shared, SharedMap, SharedTable, SyncCell};
 use crossbeam_deque::Worker;
+
+mod debug_helpers;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+type OutputCallback = dyn Fn(OutputStream, &str) + Send + Sync;
+
+#[derive(Clone)]
+pub struct OutputSink(Arc<OutputCallback>);
+
+impl OutputSink {
+    pub fn new(f: impl Fn(OutputStream, &str) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+
+    fn write(&self, stream: OutputStream, text: &str) {
+        (self.0)(stream, text);
+    }
+}
+
+impl Default for OutputSink {
+    fn default() -> Self {
+        Self::new(|stream, text| {
+            use std::io::Write;
+            match stream {
+                OutputStream::Stdout => {
+                    let _ = std::io::stdout().write_all(text.as_bytes());
+                    let _ = std::io::stdout().flush();
+                }
+                OutputStream::Stderr => {
+                    let _ = std::io::stderr().write_all(text.as_bytes());
+                    let _ = std::io::stderr().flush();
+                }
+            }
+        })
+    }
+}
 /// 运行时可见的已安装依赖包。
 #[derive(Debug, Clone)]
 pub struct DepPackage {
@@ -353,6 +394,7 @@ pub struct ErrorStackFrame {
     pub source: Option<Arc<str>>,
 }
 
+/// 字节码虚拟机（**非稳定**实现细节）。宿主应使用 [`crate::embed`]，不要依赖本结构字段。
 pub struct Vm {
     pub code: Arc<Vec<Instruction>>,
     /// 与 code 等长的紧凑热操作码。
@@ -404,6 +446,8 @@ pub struct Vm {
     user_call_deferred: bool,
     script_global_names: Vec<String>,
     script_globals: Vec<Value>,
+    /// 本 OS 线程私有的全局函数 `Arc`（拷贝热字节码），避免跨核争用同一 `FunctionObject`。
+    local_fn_hot: Vec<Option<Arc<FunctionObject>>>,
     /// 定义处绑定注解时优先从此模块环境取名（方法/导入后再绑定时用）。
     pub(crate) annotation_bind_env: Option<Arc<crate::opcode::ModuleGlobalEnv>>,
     local_frame_pool: Vec<Vec<Value>>,
@@ -507,14 +551,29 @@ pub struct Vm {
     pub debug: Option<Shared<crate::debug::DebugState>>,
     /// `debug.is_some()` 的布尔缓存，热路径避免加载 Option 指针。
     pub(crate) debug_active: bool,
+    /// `Optive test --cover`；与 debug 分开，不改热调用路径。
+    pub cover: Option<Shared<crate::coverage::CoverageState>>,
+    pub(crate) cover_active: bool,
+    /// `std.test.each` 行结果，供测试运行器打印。
+    pub test_case_log: Vec<String>,
+    /// `std.test.tmp_dir` 创建的目录，用例结束后删。
+    pub test_tmp_dirs: Vec<std::path::PathBuf>,
     /// `!const_names.is_empty()` 的布尔缓存，热路径 `StoreFast` 零额外加载。
     pub(crate) has_const_names: bool,
     /// `!pending_const.is_empty()` 缓存，避免热 `StoreGlobal` 每次查 HashSet。
     pub(crate) has_pending_const: bool,
     /// 运行时能力隔离：网络 / 文件系统 / 环境变量网关。默认全开。
     pub caps: crate::caps::Capabilities,
+    /// 入口/项目宿主能力；依赖模块初始化会临时换成 `restrict_for_dependency`。
+    pub host_caps: crate::caps::Capabilities,
     /// 若设置，`std.os.args()` 返回此列表（`run`/`up` 注入入口可见 argv）。
     pub argv_override: Option<Vec<String>>,
+    output_sink: OutputSink,
+    debug_eval_budget: Option<usize>,
+    /// 宿主取消标志（embedding）；不进入热分派。
+    pub(crate) host_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub metrics: Option<Shared<crate::metrics::Metrics>>,
+    pub(crate) metrics_active: bool,
 }
 
 #[derive(Clone)]
@@ -750,12 +809,36 @@ impl Vm {
         self
     }
 
+    /// helper 线程认领任务的次数（M:1 为 0）。
+    #[must_use]
+    pub fn helper_runs(&self) -> usize {
+        self.mn.helper_runs()
+    }
+
     /// 覆盖协作切片预算（测试用；勿用进程级 `OPTIVE_SUSPEND_BUDGET`，以免污染并行测试）。
     pub fn with_suspend_budget(mut self, budget: usize) -> Self {
         let b = clamp_suspend_budget(budget);
         self.suspend_budget = b;
         self.budget_left = b;
         self
+    }
+
+    pub fn set_output_sink(&mut self, sink: OutputSink) {
+        self.output_sink = sink;
+    }
+
+    pub fn set_host_cancel(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.host_cancel = Some(flag);
+    }
+
+    /// 安装入口能力，并记住宿主基线供依赖模块降权。
+    pub fn install_caps(&mut self, caps: crate::caps::Capabilities) {
+        self.host_caps = caps.clone();
+        self.caps = caps;
+    }
+
+    pub fn write_output(&self, stream: OutputStream, text: &str) {
+        self.output_sink.write(stream, text);
     }
 
     /// 指定 worker 数与 GC 模式（helper 与主线程共享同一 `SharedGc`）。
@@ -825,6 +908,7 @@ impl Vm {
             user_call_deferred: false,
             script_global_names: Vec::new(),
             script_globals: Vec::new(),
+            local_fn_hot: Vec::new(),
             annotation_bind_env: None,
             local_frame_pool: Vec::new(),
             call_args_buf: Vec::with_capacity(CALL_ARGS_BUF_INIT_CAP),
@@ -882,10 +966,20 @@ impl Vm {
             pending_gen_yield: None,
             debug: None,
             debug_active: false,
+            cover: None,
+            cover_active: false,
+            test_case_log: Vec::new(),
+            test_tmp_dirs: Vec::new(),
             has_const_names: false,
             has_pending_const: false,
             caps: crate::caps::Capabilities::full(),
+            host_caps: crate::caps::Capabilities::full(),
             argv_override: None,
+            output_sink: OutputSink::default(),
+            debug_eval_budget: None,
+            host_cancel: None,
+            metrics: None,
+            metrics_active: false,
         };
         let mn = MnScheduler::new(workers);
         mn.register_stealer(vm.local_worker.stealer());
@@ -1489,6 +1583,18 @@ impl Vm {
         self.pending_ret = None;
         self.hot_failed = false;
         self.hot_error = None;
+        self.local_fn_hot.clear();
+    }
+
+    /// 清掉顶层 `const` 绑定并回到入口，使同一已加载程序可再跑一遍。
+    ///
+    /// 保留 M:N worker 池。`reset_execution` 不够：`const let` 仍在 `const_names` 里。
+    pub fn reset_script_bindings(&mut self) {
+        self.reset_execution();
+        self.const_names.clear();
+        self.has_const_names = false;
+        self.pending_const.clear();
+        self.has_pending_const = false;
     }
 
     pub(crate) fn snapshot_module_global_env(&self) -> ModuleGlobalEnv {
@@ -1540,6 +1646,70 @@ impl Vm {
             .iter()
             .map(|name| self.globals.get(name).unwrap_or(Value::None))
             .collect();
+        self.publish_script_globals();
+    }
+
+    fn publish_script_globals(&self) {
+        if !self.mn_parallel {
+            return;
+        }
+        self.mn.publish_script_globals(
+            self.script_global_names.clone(),
+            self.script_globals.clone(),
+        );
+    }
+
+    fn pull_script_globals_if_helper(&mut self) {
+        if !self.mn_parallel || self.mn_primary {
+            return;
+        }
+        let (names, vals) = self.mn.snapshot_script_globals();
+        if names.is_empty() {
+            return;
+        }
+        self.script_global_names = names;
+        self.script_globals = vals;
+        self.rebuild_local_fn_hot();
+    }
+
+    fn localize_function(f: &FunctionObject) -> Arc<FunctionObject> {
+        let mut c = f.clone();
+        c.hot.ops = Arc::from(f.hot.ops.as_ref());
+        c.hot.args = Arc::from(f.hot.args.as_ref());
+        c.body = Arc::new((*f.body).clone());
+        c.line_map = Arc::new((*f.line_map).clone());
+        c.column_map = Arc::new((*f.column_map).clone());
+        Arc::new(c)
+    }
+
+    fn rebuild_local_fn_hot(&mut self) {
+        self.local_fn_hot.clear();
+        self.local_fn_hot.reserve(self.script_globals.len());
+        for v in &self.script_globals {
+            let slot = match v {
+                Value::Function(f) => Some(Self::localize_function(f)),
+                Value::Cell(c) => match &*c.borrow() {
+                    Value::Function(f) => Some(Self::localize_function(f)),
+                    _ => None,
+                },
+                _ => None,
+            };
+            self.local_fn_hot.push(slot);
+        }
+    }
+
+    fn sync_local_fn_hot(&mut self, idx: usize, val: &Value) {
+        if idx >= self.local_fn_hot.len() {
+            return;
+        }
+        self.local_fn_hot[idx] = match val {
+            Value::Function(f) => Some(Self::localize_function(f)),
+            Value::Cell(c) => match &*c.borrow() {
+                Value::Function(f) => Some(Self::localize_function(f)),
+                _ => None,
+            },
+            _ => None,
+        };
     }
 
     /// 按名字写入全局；若该名在 script 表中则同步槽位。
@@ -1551,8 +1721,9 @@ impl Vm {
         }
         if let Some(script_idx) = self.script_global_names.iter().position(|n| n == name) {
             if script_idx < self.script_globals.len() {
-                self.script_globals[script_idx] = val;
+                self.script_globals[script_idx] = val.clone();
             }
+            self.sync_local_fn_hot(script_idx, &val);
         }
     }
 
@@ -1565,6 +1736,18 @@ impl Vm {
 
     fn load_script_global(&self, idx: usize) -> Result<Value> {
         if let Some(env) = self.active_module_global_env() {
+            if idx < self.script_globals.len()
+                && env.global_names.get(idx) == self.script_global_names.get(idx)
+            {
+                if let Some(v) = self.script_globals.get(idx) {
+                    if !matches!(v, Value::None) {
+                        return Ok(match v {
+                            Value::Cell(c) => c.borrow().clone(),
+                            other => other.clone(),
+                        });
+                    }
+                }
+            }
             let Some(name) = env.global_names.get(idx) else {
                 return Err(RuntimeError::msg(format!(
                     "internal: LoadGlobal({idx}) out of range for function global table (len {})",
@@ -1575,6 +1758,17 @@ impl Vm {
                 return Err(RuntimeError::msg(format!(
                     "internal: LoadGlobal({idx}) resolves to empty global name"
                 )));
+            }
+            // M:N helper：先读任务开始时拉下的本地槽，避免每条 LoadGlobal 抢 SharedMap。
+            if let Some(script_idx) = self.script_global_names.iter().position(|n| n == name) {
+                if let Some(v) = self.script_globals.get(script_idx) {
+                    if !matches!(v, Value::None) {
+                        return Ok(match v {
+                            Value::Cell(c) => c.borrow().clone(),
+                            other => other.clone(),
+                        });
+                    }
+                }
             }
             // 优先用模块快照；否则回退到活动 globals，以便 REPL 前向引用
             //（先定义 `a` 再定义 `b`）仍能解析，并使 LoadGlobal 下标绑定到
@@ -1674,6 +1868,7 @@ impl Vm {
         if idx < self.script_globals.len() {
             self.script_globals[idx] = val.clone();
         }
+        self.sync_local_fn_hot(idx, &val);
         if !self
             .globals
             .set_inplace(self.script_global_names[idx].as_str(), val.clone())
@@ -2295,9 +2490,7 @@ impl Vm {
         let a = self.pop()?;
         let result = match (&a, &b) {
             (Value::Num(_), Value::Num(_)) => a.div(&b)?,
-            _ => {
-                self.dispatch_binary_arith(&a, &b, "__truediv__", "__rtruediv__", |x, y| x.div(y))?
-            }
+            _ => self.dispatch_binary_arith(&a, &b, "__div__", "__rdiv__", |x, y| x.div(y))?,
         };
         self.push_value(result);
         Ok(())
@@ -2342,7 +2535,11 @@ impl Vm {
     }
 
     #[inline]
-    fn exec_cmp_num(&mut self, pred: impl Fn(std::cmp::Ordering) -> bool) -> Result<()> {
+    fn exec_cmp_num(
+        &mut self,
+        method: &str,
+        pred: impl Fn(std::cmp::Ordering) -> bool,
+    ) -> Result<()> {
         let b = self.pop_hot();
         let a = self.pop_hot();
         let result = if let (StackVal::Int(x), StackVal::Int(y)) = (&a, &b) {
@@ -2363,9 +2560,7 @@ impl Vm {
                 }
                 (Value::Text(x), Value::Text(y)) => pred(x.as_str().cmp(y.as_str())),
                 _ => {
-                    return Err(RuntimeError::type_err(
-                        "comparison requires num or text (lexicographic)",
-                    ))
+                    self.dispatch_compare(&av, &bv, method, |x, y| Ok(pred(compare_values(x, y)?)))?
                 }
             }
         };
@@ -2686,7 +2881,7 @@ impl Vm {
                 let a = self.pop_hot();
                 self.op_push(a);
                 self.op_push(b);
-                if let Err(e) = self.exec_cmp_num(|c| c == std::cmp::Ordering::Less) {
+                if let Err(e) = self.exec_cmp_num("__lt__", |c| c == std::cmp::Ordering::Less) {
                     self.set_hot_error(e);
                     return HotFlow::Fail;
                 }
@@ -2701,7 +2896,7 @@ impl Vm {
                 let a = self.pop_hot();
                 self.op_push(a);
                 self.op_push(b);
-                if let Err(e) = self.exec_cmp_num(|c| c == std::cmp::Ordering::Greater) {
+                if let Err(e) = self.exec_cmp_num("__gt__", |c| c == std::cmp::Ordering::Greater) {
                     self.set_hot_error(e);
                     return HotFlow::Fail;
                 }
@@ -2716,7 +2911,7 @@ impl Vm {
                 let a = self.pop_hot();
                 self.op_push(a);
                 self.op_push(b);
-                if let Err(e) = self.exec_cmp_num(|c| c != std::cmp::Ordering::Less) {
+                if let Err(e) = self.exec_cmp_num("__ge__", |c| c != std::cmp::Ordering::Less) {
                     self.set_hot_error(e);
                     return HotFlow::Fail;
                 }
@@ -3057,6 +3252,20 @@ impl Vm {
             self.set_hot_error(RuntimeError::msg("stack underflow"));
             return HotFlow::Fail;
         }
+        if let Some(Some(f)) = self.local_fn_hot.get(global_idx) {
+            if Self::func_is_hot_callable(f, argc) {
+                let func = f.clone();
+                self.pc = pc + 1;
+                if self.try_elide_ret_fast_call(&func, argc) {
+                    return HotFlow::Cont;
+                }
+                if let Err(e) = self.setup_lightweight_user_call_stack(func, argc) {
+                    self.set_hot_error(e);
+                    return HotFlow::Fail;
+                }
+                return HotFlow::Switched;
+            }
+        }
         let func = match self.resolve_global_function_hot(global_idx) {
             Ok(Some(f)) if Self::func_is_hot_callable(&f, argc) => f,
             Ok(Some(_) | None) => return HotFlow::Cold,
@@ -3079,7 +3288,11 @@ impl Vm {
 
     #[inline(never)]
     fn dispatch_hot_load_global_slow(&mut self, idx: usize) -> HotFlow {
-        if self.user_call_frames.is_empty() && idx < self.script_globals.len() {
+        let aligned = self.user_call_frames.is_empty()
+            || self.active_module_global_env().map_or(true, |env| {
+                env.global_names.get(idx) == self.script_global_names.get(idx)
+            });
+        if aligned && idx < self.script_globals.len() {
             // SAFETY: idx < len
             let sv = match unsafe { self.script_globals.get_unchecked(idx) } {
                 Value::None => {
@@ -3131,6 +3344,10 @@ impl Vm {
             return HotFlow::Fail;
         }
         let name = name.clone();
+        if idx < self.script_globals.len() {
+            self.script_globals[idx] = num.clone();
+        }
+        self.sync_local_fn_hot(idx, &num);
         if !self.globals.set_inplace(name.as_str(), num.clone()) {
             self.globals.insert(name, num);
         }
@@ -3212,6 +3429,7 @@ impl Vm {
     }
 
     pub fn run(&mut self) -> Result<Value> {
+        self.fail_if_host_cancelled()?;
         match self.run_interpreter(None)? {
             InterpResult::Value(Some(v)) => Ok(v),
             InterpResult::Value(None) => Ok(self.stack_top()),
@@ -3312,12 +3530,23 @@ impl Vm {
                         return Ok(r);
                     }
                 }
+                if self.cover_active {
+                    crate::coverage::record_hit(self);
+                }
                 if self.pending_suspend {
                     return self.complete_task_suspend();
                 }
                 let pc = self.pc;
                 if pc >= code_len {
                     break 'hot;
+                }
+                if let Some(remaining) = self.debug_eval_budget.as_mut() {
+                    if *remaining == 0 {
+                        return Err(RuntimeError::msg(
+                            "debug evaluate instruction budget exceeded",
+                        ));
+                    }
+                    *remaining -= 1;
                 }
                 match self.dispatch_hot_u8(ops, args, pc) {
                     // Cont first, no guard: empty/nested loops hit this every insn.
@@ -3502,7 +3731,15 @@ impl Vm {
         }
         let tb = traceback::capture_traceback(self);
         let exc = traceback::set_exception_traceback(&exc, tb);
-        self.active_exception = Some(exc);
+        self.active_exception = Some(exc.clone());
+        if let Some(dbg) = &self.debug {
+            if dbg.borrow().exception_raised {
+                let mut st = dbg.borrow_mut();
+                st.request_break(crate::debug::StopReason::Breakpoint);
+                crate::debug::mark_stopped(self, &mut st);
+                self.debug_break_requested = true;
+            }
+        }
         if self.dispatch_to_handler()? {
             return Ok(());
         }
@@ -4136,7 +4373,7 @@ impl Vm {
                 self.exec_mul_num()?;
                 let n = self.load_fast_sv(rhs_slot);
                 self.op_push(n);
-                self.exec_cmp_num(|c| c == std::cmp::Ordering::Greater)?;
+                self.exec_cmp_num("__gt__", |c| c == std::cmp::Ordering::Greater)?;
             }
             StepAction::LoadFastModEq0 { lhs_slot, rhs_slot } => {
                 let a = self.load_fast_sv(lhs_slot);
@@ -6272,30 +6509,28 @@ impl Vm {
         self.name_to_slot.push(None);
         self.locals_stack.push(Vec::new());
 
+        let nslots = func.frame_slots.max(argc);
+        let entry_pc = func.entry_pc;
+        let frame_slots = func.frame_slots;
         self.user_call_frames.push(UserCallFrame {
-            saved_code: self.code.clone(),
-            saved_hot_ops: self.hot_ops.clone(),
-            saved_hot_args: self.hot_args.clone(),
+            saved_code: std::mem::replace(&mut self.code, func.body.clone()),
+            saved_hot_ops: std::mem::replace(&mut self.hot_ops, func.hot.ops.clone()),
+            saved_hot_args: std::mem::replace(&mut self.hot_args, func.hot.args.clone()),
             saved_pc: self.pc,
-            saved_line_map: self.active_line_map.clone(),
-            saved_column_map: self.active_column_map.clone(),
-            func: func.clone(),
+            saved_line_map: std::mem::replace(&mut self.active_line_map, func.line_map.clone()),
+            saved_column_map: std::mem::replace(
+                &mut self.active_column_map,
+                func.column_map.clone(),
+            ),
+            func,
             pushed_func_stack: true,
         });
-
-        self.code = func.body.clone();
-        self.hot_ops = func.hot.ops.clone();
-        self.hot_args = func.hot.args.clone();
-        self.active_line_map = func.line_map.clone();
-        self.active_column_map = func.column_map.clone();
-
-        let nslots = func.frame_slots.max(argc);
         let base = self.lw_sp;
         self.push_lw_base(base);
         self.lw_base = base;
         self.lw_depth += 1;
-        self.lw_entry_pc = func.entry_pc;
-        self.lw_frame_slots = func.frame_slots;
+        self.lw_entry_pc = entry_pc;
+        self.lw_frame_slots = frame_slots;
         let need = base + nslots;
         if need > self.lw_slots.len() {
             self.lw_slots.resize(need, StackVal::Empty);
@@ -6307,7 +6542,7 @@ impl Vm {
             self.lw_slots[base + i] = StackVal::Empty;
         }
         self.lw_sp = need;
-        self.pc = func.entry_pc;
+        self.pc = entry_pc;
         Ok(())
     }
 
@@ -6405,23 +6640,6 @@ impl Vm {
         Ok(())
     }
 
-    pub(crate) fn line_from_map(line_map: &[usize], pc: usize) -> usize {
-        if pc == 0 {
-            return line_map.first().copied().unwrap_or(0);
-        }
-        line_map.get(pc.saturating_sub(1)).copied().unwrap_or(0)
-    }
-
-    pub(crate) fn current_column(&self) -> usize {
-        if self.pc == 0 {
-            return self.active_column_map.first().copied().unwrap_or(1);
-        }
-        self.active_column_map
-            .get(self.pc.saturating_sub(1))
-            .copied()
-            .unwrap_or(1)
-    }
-
     /// 在 unwind 前快照调用栈，供诊断展示。
     fn record_error_stack(&mut self) {
         let mut frames = Vec::new();
@@ -6477,22 +6695,15 @@ impl Vm {
         if let Some(dbg) = &self.debug {
             if self.task_ctx.is_none() {
                 let mut st = dbg.borrow_mut();
-                st.last_uncaught = Some(finalized.message().to_string());
-                st.request_break(crate::debug::StopReason::Uncaught);
-                crate::debug::mark_stopped(self, &mut st);
-                return Ok(InterpResult::DebugBreak);
+                if st.exception_uncaught {
+                    st.last_uncaught = Some(finalized.message().to_string());
+                    st.request_break(crate::debug::StopReason::Uncaught);
+                    crate::debug::mark_stopped(self, &mut st);
+                    return Ok(InterpResult::DebugBreak);
+                }
             }
         }
         Err(finalized)
-    }
-
-    #[inline]
-    pub const fn debug_call_depth(&self) -> usize {
-        self.user_call_frames.len() + self.lw_depth
-    }
-
-    pub fn debug_current_func_name(&self) -> Option<String> {
-        self.func_stack.last().map(|f| f.name.clone())
     }
 
     pub fn debug_store_local(&mut self, name: &str, value: Value) -> bool {
@@ -6717,9 +6928,11 @@ impl Vm {
         &mut self,
         bindings: &[String],
         program: crate::opcode::CompiledProgram,
+        instruction_budget: usize,
     ) -> Result<Value> {
         let saved = self.snapshot_for_eval();
         let dbg = self.debug.take();
+        let saved_eval_budget = self.debug_eval_budget.replace(instruction_budget.max(1));
 
         // 取每个绑定名的当前值（必须在隔离调用栈之前，否则 func_stack 为空）。
         let values: Vec<Value> = bindings
@@ -6786,6 +6999,7 @@ impl Vm {
         self.user_call_deferred = saved_call_deferred;
         self.debug = dbg;
         self.debug_active = self.debug.is_some();
+        self.debug_eval_budget = saved_eval_budget;
         result
     }
 
@@ -6797,11 +7011,6 @@ impl Vm {
         } else {
             self.pending_main_yield = true;
         }
-    }
-
-    /// 当前调度任务（主纤程为 `None`）。
-    pub fn debug_current_task(&self) -> Option<Shared<crate::value::TaskInner>> {
-        self.task_ctx.as_ref().map(|c| c.task.clone())
     }
 
     /// 无偏 `0..bound`（bound > 0）；xorshift* + Lemire。
@@ -6831,50 +7040,6 @@ impl Vm {
             }
         }
         (m >> 64) as usize
-    }
-
-    pub fn debug_build_stack_frames(&self) -> Vec<ErrorStackFrame> {
-        let mut frames = Vec::new();
-        for (i, ucf) in self.user_call_frames.iter().enumerate() {
-            let (func, file, source) = if i == 0 {
-                (
-                    "<module>".to_string(),
-                    self.source_file.clone(),
-                    self.current_source.clone(),
-                )
-            } else {
-                let caller = &self.user_call_frames[i - 1].func;
-                (
-                    caller.name.clone(),
-                    caller.source_file.clone(),
-                    caller.source.clone(),
-                )
-            };
-            frames.push(ErrorStackFrame {
-                func,
-                file,
-                line: Self::line_from_map(&ucf.saved_line_map, ucf.saved_pc),
-                column: Self::line_from_map(&ucf.saved_column_map, ucf.saved_pc).max(1),
-                source,
-            });
-        }
-        let (func, file, source) = if let Some(f) = self.func_stack.last() {
-            (f.name.clone(), f.source_file.clone(), f.source.clone())
-        } else {
-            (
-                "<module>".to_string(),
-                self.source_file.clone(),
-                self.current_source.clone(),
-            )
-        };
-        frames.push(ErrorStackFrame {
-            func,
-            file,
-            line: crate::debug::line_at_pc(self),
-            column: crate::debug::column_at_pc(self).max(1),
-            source,
-        });
-        frames
     }
 
     pub(crate) fn dispatch_overload(
@@ -7347,11 +7512,22 @@ impl Vm {
     pub(crate) fn spawn_task(&mut self, callable: Value, args: Vec<Value>) -> Value {
         // go 任务可能经 SharedMap / module_env 读顶层绑定；刷平行槽。
         self.flush_script_globals_to_map();
+        self.publish_script_globals();
         let task = Shared::new(TaskInner::pending(callable, args));
-        self.enqueue_task(task.clone());
+        self.enqueue_new_task(task.clone());
         Value::Task(task)
     }
 
+    /// 新 `go` / TaskGroup：M:N 进全局 injector，主线程与 helper 公平取完整任务。
+    fn enqueue_new_task(&mut self, task: Shared<TaskInner>) {
+        if self.mn_parallel {
+            self.mn.push_task(task);
+        } else {
+            self.ready_tasks.push_back(task);
+        }
+    }
+
+    /// 时间片挂起后重入队：留在本 worker local，保持亲和、避免无谓迁移。
     fn enqueue_task(&mut self, task: Shared<TaskInner>) {
         if self.mn_parallel {
             // M:N：injector 不可遍历，靠弱表给 GC 补根；挂起重入队是热路径。
@@ -7439,6 +7615,7 @@ impl Vm {
             user_call_deferred: false,
             script_global_names: self.script_global_names.clone(),
             script_globals: self.script_globals.clone(),
+            local_fn_hot: Vec::new(),
             annotation_bind_env: None,
             local_frame_pool: Vec::new(),
             call_args_buf: Vec::with_capacity(CALL_ARGS_BUF_INIT_CAP),
@@ -7493,10 +7670,20 @@ impl Vm {
             pending_gen_yield: None,
             debug: self.debug.clone(),
             debug_active: self.debug_active,
+            cover: self.cover.clone(),
+            cover_active: self.cover_active,
+            test_case_log: Vec::new(),
+            test_tmp_dirs: Vec::new(),
             has_const_names: self.has_const_names,
             has_pending_const: self.has_pending_const,
             caps: self.caps.clone(),
+            host_caps: self.host_caps.clone(),
             argv_override: self.argv_override.clone(),
+            output_sink: self.output_sink.clone(),
+            debug_eval_budget: None,
+            host_cancel: self.host_cancel.clone(),
+            metrics: self.metrics.clone(),
+            metrics_active: self.metrics_active,
         }
     }
 
@@ -7538,7 +7725,7 @@ impl Vm {
     /// 阻塞等待时：
     /// - 已在任务纤程内（`sched_depth>0`）：**禁止再入** `scheduler_run_one`
     ///   （嵌套 capture 会破坏外层栈）；改为挂起本任务，让外层调度器继续；
-    /// - 否则先跑就绪队列；M:N 下再短等。
+    /// - 否则抽干就绪队列（wait-as-worker）；M:N 下再短等。
     pub(crate) fn wait_or_deadlock(&mut self, msg: &str) -> Result<()> {
         self.poll_gc_safepoint();
         if self.debug_break_requested {
@@ -7549,7 +7736,18 @@ impl Vm {
             self.block_suspend = true;
             return Ok(());
         }
-        if self.scheduler_run_one()? {
+        if self.mn_parallel {
+            let mut ran = false;
+            while self.scheduler_run_one()? {
+                ran = true;
+                if self.debug_break_requested {
+                    return Ok(());
+                }
+            }
+            if self.debug_break_requested || ran {
+                return Ok(());
+            }
+        } else if self.scheduler_run_one()? {
             return Ok(());
         }
         if self.debug_break_requested {
@@ -7613,33 +7811,44 @@ impl Vm {
     #[inline(always)]
     fn tick_budget(&mut self) {
         // wrapping_sub: avoid per-insn overflow-check branches; refill when exhausted.
+        // 热循环（H_GOTO）每次迭代都进这里：不要在预算未耗尽时读 STW 原子，
+        // 否则 M:N 每条回跳都多一次跨核缓存行探测，串行路径没有这笔税。
+        // STW 仍在预算耗尽时 poll（默认 8192 tick 内停车）。
         self.budget_left = self.budget_left.wrapping_sub(1);
         if self.budget_left != 0 {
-            // M:1: no STW — shortest hot return.
-            if !self.mn_parallel {
-                return;
-            }
-            if self
-                .mn
-                .stw_requested
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
-                self.poll_gc_safepoint();
-            }
             return;
         }
         self.budget_left = clamp_suspend_budget(self.suspend_budget);
+        if self.metrics_active {
+            crate::metrics::sample(self);
+        }
         if self.mn_parallel {
             self.poll_gc_safepoint();
             if self.mn_primary && self.mn.gc_request_pending() {
                 self.maybe_auto_gc();
             }
         }
+        // 安全点与时间片解耦：M:N 下仅当本 worker 或 injector 仍有其它活时才挂起。
+        if !self.should_timeslice_preempt() {
+            return;
+        }
         if self.task_ctx.is_some() {
             self.pending_suspend = true;
         } else if self.mn_parallel || !self.ready_tasks.is_empty() {
             self.pending_main_yield = true;
         }
+    }
+
+    /// M:1 保持协作切片；M:N 仅当本 worker local 还有其它就绪任务时让出。
+    ///
+    /// 不读 `Injector::is_empty()`：该方法允许把空队列报成非空，会让时间片永远开着。
+    /// injector 里的活由空闲 worker 自己去偷，不必打断正在跑的独占 CPU 任务。
+    #[inline]
+    fn should_timeslice_preempt(&self) -> bool {
+        if !self.mn_parallel {
+            return true;
+        }
+        !self.local_worker.is_empty()
     }
 
     fn task_ptr_key(task: &Shared<TaskInner>) -> usize {
@@ -7898,6 +8107,14 @@ impl Vm {
         } else {
             None
         };
+        if self.mn_parallel {
+            if !self.mn_primary {
+                self.mn.note_helper_run();
+                self.pull_script_globals_if_helper();
+            } else if self.local_fn_hot.is_empty() {
+                self.rebuild_local_fn_hot();
+            }
+        }
         let key = Self::task_ptr_key(&task);
         // 认领：仅 Pending/Suspended 可进入 Running。重复入队的副本直接跳过。
         let state = {
@@ -8382,7 +8599,8 @@ impl Vm {
                 task.borrow_mut().request_cancel();
             }
         }
-        self.enqueue_task(task.clone());
+        self.publish_script_globals();
+        self.enqueue_new_task(task.clone());
         Ok(Value::Task(task))
     }
 
@@ -8506,10 +8724,22 @@ impl Vm {
 
     /// 若当前任务已取消，返回 `Cancelled` 宿主错误。
     pub(crate) fn fail_if_current_task_cancelled(&self) -> Result<()> {
+        self.fail_if_host_cancelled()?;
         if let Some(ctx) = &self.task_ctx {
             if ctx.task.borrow().is_cancelled() {
                 return Err(RuntimeError::cancelled("task cancelled"));
             }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn fail_if_host_cancelled(&self) -> Result<()> {
+        if self
+            .host_cancel
+            .as_ref()
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err(RuntimeError::cancelled("host cancelled"));
         }
         Ok(())
     }

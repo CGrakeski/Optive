@@ -6,7 +6,10 @@
     clippy::unimplemented,
     clippy::dbg_macro
 )]
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use std::sync::Arc;
+use std::time::Duration;
+
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use optive::run_source;
 use optive::run_source_in_vm;
 use optive::vm::Vm;
@@ -30,12 +33,7 @@ loop (100000) { sum = sum + 1 }
 sum
 ";
 
-/// 较小区间，避免 criterion 采样过久；完整版见 `tests/benchmarks.rs`。
-const PARALLEL_PRIMES: &str = r"
-const let FROM = 2
-const let TO = 10001
-const let WORKERS = 8
-
+const IS_PRIME: &str = r"
 func is_prime(n) {
   if (n < 2) { return false }
   if (n == 2) { return true }
@@ -48,56 +46,167 @@ func is_prime(n) {
   }
   return true
 }
+";
 
-func worker(id, lo, hi, box, wg) {
+/// π(100001) = 9592（100001 非素数）。串行与并行必须同值。
+const PRIMES_TO: u32 = 100_001;
+const PRIMES_EXPECT: &str = "9592";
+
+/// 较小区间 + 固定 8 个 `go` 切块。测启动税，不测加速比。
+fn parallel_primes_chunked_src(to: u32) -> String {
+    format!(
+        r"
+const let FROM = 2
+const let TO = {to}
+const let WORKERS = 8
+{IS_PRIME}
+func worker(id, lo, hi, box, wg) {{
   var n = lo
   var local = 0
-  loop {
-    if (n > hi) { break }
-    if (is_prime(n)) { local = local + 1 }
+  loop {{
+    if (n > hi) {{ break }}
+    if (is_prime(n)) {{ local = local + 1 }}
     n = n + 1
-  }
+  }}
   let g = box.lock()
   var rows = g.get()
   rows.append(local)
   g.set(rows)
   g.unlock()
   wg.done()
-}
+}}
 
-func start_worker(id, lo, hi, box, wg) {
-  go do { worker(id, lo, hi, box, wg) }
-}
+func start_worker(id, lo, hi, box, wg) {{
+  go do {{ worker(id, lo, hi, box, wg) }}
+}}
 
 let box = Mutex([])
 let wg = WaitGroup(WORKERS)
 let span = TO - FROM + 1
 let chunk = span / WORKERS
 var wid = 0
-loop (WORKERS) {
+loop (WORKERS) {{
   let lo = FROM + wid * chunk
   let hi = lo + chunk - 1
   start_worker(wid, lo, hi, box, wg)
   wid = wid + 1
-}
+}}
 wg.wait()
 let g = box.lock()
 let rows = g.get()
 g.unlock()
 var total = 0
 var i = 0
-loop {
-  if (i >= rows.len()) { break }
+loop {{
+  if (i >= rows.len()) {{ break }}
   total = total + rows[i]
   i = i + 1
-}
+}}
 total
-";
+"
+    )
+}
 
-fn run_primes(workers: usize) {
+/// 无 `go` 的单循环。加速比的分子。
+///
+/// 只扫奇数（2 单独计入）：与并行相同的试除量。若串行仍走 `n+=1`，
+/// 偶数 worker 在 `n=2+id; n+=N`（N 为偶数）下几乎不做试除，加速比会被钉死。
+fn sequential_primes_src(to: u32) -> String {
+    format!(
+        r"
+const let TO = {to}
+{IS_PRIME}
+func count_primes() {{
+  var total = 1
+  var n = 3
+  loop {{
+    if (n > TO) {{ break }}
+    if (is_prime(n)) {{ total = total + 1 }}
+    n = n + 2
+  }}
+  return total
+}}
+count_primes()
+"
+    )
+}
+
+/// `tasks` 个 `go`，在奇数上轮转：`n = 3+2*id; n += 2*tasks`。任务数 = OS worker。
+fn cyclic_primes_src(to: u32, tasks: usize) -> String {
+    format!(
+        r"
+const let TO = {to}
+const let STEP = {tasks}
+const let ODD_STEP = STEP + STEP
+{IS_PRIME}
+func worker(id, box, wg) {{
+  var n = 3 + id * 2
+  var local = 0
+  if (id == 0) {{ local = 1 }}
+  loop {{
+    if (n > TO) {{ break }}
+    if (is_prime(n)) {{ local = local + 1 }}
+    n = n + ODD_STEP
+  }}
+  let g = box.lock()
+  var rows = g.get()
+  rows.append(local)
+  g.set(rows)
+  g.unlock()
+  wg.done()
+}}
+
+func start_worker(id, box, wg) {{
+  go do {{ worker(id, box, wg) }}
+}}
+
+let box = Mutex([])
+let wg = WaitGroup(STEP)
+var wid = 0
+loop (STEP) {{
+  start_worker(wid, box, wg)
+  wid = wid + 1
+}}
+wg.wait()
+let g = box.lock()
+let rows = g.get()
+g.unlock()
+var total = 0
+var i = 0
+loop {{
+  if (i >= rows.len()) {{ break }}
+  total = total + rows[i]
+  i = i + 1
+}}
+total
+"
+    )
+}
+
+fn run_primes(workers: usize, src: &str) {
     let mut vm = Vm::with_workers(workers);
-    let v = run_source_in_vm(&mut vm, PARALLEL_PRIMES, "<bench>").unwrap();
+    let v = run_source_in_vm(&mut vm, src, "<bench>").unwrap();
     black_box(v);
+}
+
+fn bench_reused_vm(bencher: &mut criterion::Bencher<'_>, os_workers: usize, src: &str) {
+    let compiled = optive::compile(src).expect("compile primes");
+    let mut vm = Vm::with_workers(os_workers);
+    vm.source_file = "<bench>".into();
+    vm.current_source = Some(Arc::from(src));
+    vm.load_program(compiled).expect("load primes");
+    let warm = vm.run().expect("primes warmup");
+    assert_eq!(
+        warm.display_string(),
+        PRIMES_EXPECT,
+        "prime count must match sequential and parallel"
+    );
+    black_box(warm);
+    bencher.iter(|| {
+        vm.reset_script_bindings();
+        let v = vm.run().unwrap();
+        black_box(v);
+    });
 }
 
 fn bench_run_source(c: &mut Criterion, name: &str, src: &'static str) {
@@ -122,10 +231,30 @@ fn bench_arith_loop(c: &mut Criterion) {
 }
 
 fn bench_parallel_primes(c: &mut Criterion) {
+    let src = parallel_primes_chunked_src(10_001);
     let mut group = c.benchmark_group("parallel_primes_to_10001");
     group.sample_size(10);
-    group.bench_function("workers=1", |b| b.iter(|| run_primes(1)));
-    group.bench_function("workers=4", |b| b.iter(|| run_primes(4)));
+    group.bench_function("workers=1", |b| b.iter(|| run_primes(1, &src)));
+    group.bench_function("workers=4", |b| b.iter(|| run_primes(4, &src)));
+    group.finish();
+}
+
+/// 加速比 = sequential / par/N。串行无 `go`；并行 `go` 个数 = OS worker，奇数轮转划分。
+fn bench_primes_speedup(c: &mut Criterion) {
+    let mut group = c.benchmark_group("primes_to_100001");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(2));
+    group.measurement_time(Duration::from_secs(12));
+
+    let seq = sequential_primes_src(PRIMES_TO);
+    group.bench_function("sequential", |b| bench_reused_vm(b, 1, &seq));
+
+    for n in [2usize, 4, 8] {
+        let src = cyclic_primes_src(PRIMES_TO, n);
+        group.bench_with_input(BenchmarkId::new("par", n), &n, |b, &w| {
+            bench_reused_vm(b, w, &src);
+        });
+    }
     group.finish();
 }
 
@@ -134,6 +263,7 @@ criterion_group!(
     bench_fib,
     bench_empty_loop,
     bench_arith_loop,
-    bench_parallel_primes
+    bench_parallel_primes,
+    bench_primes_speedup
 );
 criterion_main!(benches);

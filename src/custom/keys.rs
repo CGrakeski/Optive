@@ -48,6 +48,7 @@ pub enum CliMsg {
     HelpTest,
     HelpCheck,
     HelpLsp,
+    HelpDap,
     HelpIndex,
     HelpIndexChange,
     HelpCustom,
@@ -57,6 +58,11 @@ pub enum CliMsg {
     HelpNoFfi,
     HelpAllowFfi,
     HelpAllowPath,
+    HelpTrustDeps,
+    HelpAllowDepNetwork,
+    HelpAllowDepEnv,
+    HelpAllowDepProcess,
+    HelpAllowDepFfi,
     HelpH,
     HelpV,
     HelpEnvHeader,
@@ -65,6 +71,8 @@ pub enum CliMsg {
     HelpFiles,
     HelpOptiveCustomEnv,
     HelpOptiveIndexUrl,
+    HelpOptiveIndexPin,
+    HelpOptiveIndexPolicy,
     CustomChanging,
     CustomDone,
     CustomAdded,
@@ -131,6 +139,7 @@ impl CliMsg {
             Self::HelpTest => "cli.help.test",
             Self::HelpCheck => "cli.help.check",
             Self::HelpLsp => "cli.help.lsp",
+            Self::HelpDap => "cli.help.dap",
             Self::HelpIndex => "cli.help.index",
             Self::HelpIndexChange => "cli.help.index_change",
             Self::HelpCustom => "cli.help.custom",
@@ -140,6 +149,11 @@ impl CliMsg {
             Self::HelpNoFfi => "cli.help.no_ffi",
             Self::HelpAllowFfi => "cli.help.allow_ffi",
             Self::HelpAllowPath => "cli.help.allow_path",
+            Self::HelpTrustDeps => "cli.help.trust_deps",
+            Self::HelpAllowDepNetwork => "cli.help.allow_dep_network",
+            Self::HelpAllowDepEnv => "cli.help.allow_dep_env",
+            Self::HelpAllowDepProcess => "cli.help.allow_dep_process",
+            Self::HelpAllowDepFfi => "cli.help.allow_dep_ffi",
             Self::HelpH => "cli.help.h",
             Self::HelpV => "cli.help.v",
             Self::HelpEnvHeader => "cli.help.env_header",
@@ -148,6 +162,8 @@ impl CliMsg {
             Self::HelpFiles => "cli.help.files",
             Self::HelpOptiveCustomEnv => "cli.help.optive_custom_env",
             Self::HelpOptiveIndexUrl => "cli.help.optive_index_url",
+            Self::HelpOptiveIndexPin => "cli.help.optive_index_pin",
+            Self::HelpOptiveIndexPolicy => "cli.help.optive_index_policy",
             Self::CustomChanging => "cli.custom.changing",
             Self::CustomDone => "cli.custom.done",
             Self::CustomAdded => "cli.custom.added",
@@ -176,11 +192,16 @@ impl CliMsg {
             Self::HelpDepsDoctor => "  Optive deps doctor [-v]        Diagnose deps / lock / orphans",
             Self::HelpEnv => "  Optive env                     Print OPTIVE_HOME and paths",
             Self::HelpChange => "  Optive change track_latest=...   Toggle tip-following (warns)",
-            Self::HelpFmt => "  Optive fmt <file> [-o|--out]   Format a .tive file (default: write back)",
+            Self::HelpFmt => "  Optive fmt [path] [--check] [-o|--out]  Format a file or project",
             Self::HelpDebug => "  Optive debug [file|path]       Debug a script or project entry",
-            Self::HelpTest => "  Optive test [path] [-- args...]  Run tests/**/*.tive (deps like `run`)",
-            Self::HelpCheck => "  Optive check [path]             Parse src/ and tests/ (or a .tive file)",
-            Self::HelpLsp => "  Optive lsp                     Language server (stdio JSON-RPC)",
+            Self::HelpTest => {
+                "  Optive test [path] [--cover] [--filter P] [--jobs N] [--junit F] [--lcov F] [--cobertura F] [--cover-min N] [-- args...]"
+            }
+            Self::HelpCheck => {
+                "  Optive check [path]             Parse + name/std/arity check (no VM)"
+            }
+            Self::HelpLsp => "  Optive lsp                     Language server (diagnostics, rename, tokens)",
+            Self::HelpDap => "  Optive dap                     Debug adapter (stdio DAP; breakpoints / fibers)",
             Self::HelpIndex => "  Optive index sync              Fetch the package index (default: Gitee optindex)",
             Self::HelpIndexChange => "  Optive index change <url>      Set index git remote + sync",
             Self::HelpCustom => "  Optive custom ...                Manage customization packs",
@@ -188,8 +209,17 @@ impl CliMsg {
             Self::HelpSandbox => "  --sandbox[=DIR]          No network, no env, no FFI; fs limited to DIR (default: cwd)",
             Self::HelpNoNetwork => "  --no-network            Disable std.http / std.net",
             Self::HelpNoFfi => "  --no-ffi                Disable C.frompath / extern",
-            Self::HelpAllowFfi => "  --allow-ffi             Allow native FFI (overrides sandbox default)",
+            Self::HelpAllowFfi => {
+                "  --allow-ffi             Permit FFI (does not change filesystem sandboxing)"
+            }
             Self::HelpAllowPath => "  --allow-path DIR         Allow fs access under DIR (repeatable; combines with --sandbox)",
+            Self::HelpTrustDeps => "  --trust-deps             Let dependencies inherit host capabilities",
+            Self::HelpAllowDepNetwork => "  --allow-dep-network      Allow network from dependency code",
+            Self::HelpAllowDepEnv => "  --allow-dep-env          Allow env from dependency code",
+            Self::HelpAllowDepProcess => {
+                "  --allow-dep-process      Allow std.os.run/capture from dependency code"
+            }
+            Self::HelpAllowDepFfi => "  --allow-dep-ffi          Allow FFI from dependency code",
             Self::HelpH => "  Optive -h, --help              Show this help",
             Self::HelpV => "  Optive -V, --version           Show version",
             Self::HelpEnvHeader => "Env:",
@@ -197,6 +227,8 @@ impl CliMsg {
             Self::HelpLocalDeps => "  OPTIVE_USE_LOCAL_DEPS=1  Debug: install into project deps/",
             Self::HelpOptiveCustomEnv => "  OPTIVE_CUSTOM=a,b        Override active customization packs",
             Self::HelpOptiveIndexUrl => "  OPTIVE_INDEX_URL         Override package index git remote (default: gitee.com/CGrakeski/optindex)",
+            Self::HelpOptiveIndexPin => "  OPTIVE_INDEX_PIN         Require index HEAD to equal this full commit id",
+            Self::HelpOptiveIndexPolicy => "  OPTIVE_INDEX_POLICY      Index trust: off (default), signed, or strict",
             Self::HelpFiles => "Files: Optive.toml, Optive.lock, Optive.cache, .optive/bc (bytecode), Custom.toml",
             Self::CustomChanging => "Changing...",
             Self::CustomDone => "Done.",

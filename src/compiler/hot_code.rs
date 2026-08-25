@@ -64,6 +64,10 @@ impl HotCode {
     pub fn encode(code: &[Instruction]) -> Self {
         let mut ops = Vec::with_capacity(code.len());
         let mut args = Vec::with_capacity(code.len());
+        // BindFast also registers name -> slot when the function needs name lookup
+        // (notably __make_closure__ upgrading an enclosing local to a shared Cell).
+        // Encoding it as H_STORE_FAST would silently skip that semantic side effect.
+        let uses_name_map = crate::opcode::function_uses_name_map(code);
         for ins in code {
             let (op, arg) = match ins {
                 Instruction::PushSmall(n) => (H_PUSH_SMALL, *n),
@@ -93,7 +97,7 @@ impl HotCode {
                     slot,
                     is_const: false,
                     ..
-                } => (H_STORE_FAST, *slot as i64),
+                } if !uses_name_map => (H_STORE_FAST, *slot as i64),
                 Instruction::LoadFastLtImm { slot, imm } => {
                     (H_LOAD_FAST_LT_IMM, encode_slot_imm(*slot, *imm))
                 }
@@ -171,4 +175,36 @@ pub fn encode_two_slots(a: usize, b: usize) -> i64 {
 pub fn decode_two_slots(arg: i64) -> (usize, usize) {
     let (a, b) = decode_slot_imm(arg);
     (a, b as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bind_fast_stays_cold_when_name_map_is_required() {
+        let code = [
+            Instruction::BindFast {
+                slot: 0,
+                name: "x".into(),
+                is_const: false,
+            },
+            Instruction::Load("__make_closure__".into()),
+        ];
+
+        let hot = HotCode::encode(&code);
+        assert_eq!(hot.ops[0], H_COLD);
+    }
+
+    #[test]
+    fn bind_fast_remains_hot_without_name_lookup() {
+        let code = [Instruction::BindFast {
+            slot: 0,
+            name: "x".into(),
+            is_const: false,
+        }];
+
+        let hot = HotCode::encode(&code);
+        assert_eq!(hot.ops[0], H_STORE_FAST);
+    }
 }

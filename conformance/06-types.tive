@@ -1,0 +1,5 @@
+use std.test.{ assert_eq }
+let n :: num = 3
+let s :: text = "hi"
+assert_eq(n + 1, 4)
+assert_eq(s, "hi")

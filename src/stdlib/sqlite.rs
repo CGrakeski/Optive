@@ -21,11 +21,18 @@ pub(super) fn build_sqlite_module() -> Shared<ModuleObject> {
 fn sqlite_open(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     expect_arity("open", args, 1)?;
     let path = expect_text("open", args, 0)?;
-    if path != ":memory:" {
-        vm.caps.check_fs("open", &path)?;
-    }
-    let conn = Connection::open(&path)
-        .map_err(|e| RuntimeError::io_err(format!("sqlite.open {path}: {e}")))?;
+    let checked = if path == ":memory:" {
+        std::path::PathBuf::from(&path)
+    } else if vm.caps.fs_restricted() {
+        return Err(RuntimeError::io_err(
+            "sqlite.open: file databases are disabled in sandbox because SQLite cannot open an \
+             already-authorized file handle; use ':memory:'",
+        ));
+    } else {
+        std::path::PathBuf::from(&path)
+    };
+    let conn = Connection::open(&checked)
+        .map_err(|e| RuntimeError::io_err(format!("sqlite.open {}: {e}", checked.display())))?;
     Ok(wrap_db(conn))
 }
 

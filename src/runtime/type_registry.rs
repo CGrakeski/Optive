@@ -26,12 +26,85 @@ pub mod names {
     pub const BYTES: &str = "bytes";
     pub const ITERATOR: &str = "iterator";
     pub const TYPE: &str = "type";
+    pub const I8: &str = "i8";
+    pub const U8: &str = "u8";
+    pub const I16: &str = "i16";
+    pub const U16: &str = "u16";
+    pub const I32: &str = "i32";
+    pub const U32: &str = "u32";
+    pub const I64: &str = "i64";
+    pub const U64: &str = "u64";
+    pub const ISIZE: &str = "isize";
+    pub const USIZE: &str = "usize";
+    pub const F32: &str = "f32";
+    pub const F64: &str = "f64";
+    pub const PTR: &str = "ptr";
 
     pub const ALL_PRIMITIVES: &[&str] = &[
-        NUM, TEXT, BOOL, NONE, LIST, DICT, SET, TUPLE, BYTES, ITERATOR,
-        // 定宽 / 指针：与 `SizedNum::ALL_NAMES` + ptr 对齐（见下方 assert）
-        "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "isize", "usize", "f32", "f64", "ptr",
+        NUM, TEXT, BOOL, NONE, LIST, DICT, SET, TUPLE, BYTES, ITERATOR, I8, U8, I16, U16, I32, U32,
+        I64, U64, ISIZE, USIZE, F32, F64, PTR,
     ];
+}
+
+/// 启动时公开到全局作用域的核心类型名（单一来源）。
+pub const CORE_GLOBAL_TYPE_NAMES: &[&str] = &[
+    names::TEXT,
+    names::NUM,
+    names::BOOL,
+    names::LIST,
+    names::DICT,
+    names::SET,
+    names::TUPLE,
+    names::BYTES,
+    names::ITERATOR,
+    names::NONE,
+    names::TYPE,
+    "AST",
+    "Frame",
+    "Traceback",
+    names::PTR,
+    names::I8,
+    names::U8,
+    names::I16,
+    names::U16,
+    names::I32,
+    names::U32,
+    names::I64,
+    names::U64,
+    names::ISIZE,
+    names::USIZE,
+    names::F32,
+    names::F64,
+    "Channel",
+    "Stream",
+    "Mutex",
+    "RWMutex",
+    "RwLock",
+    "WaitGroup",
+    "Semaphore",
+    "Once",
+    "Barrier",
+    "Cond",
+    "Atomic",
+    "Union",
+    "Maybe",
+    "Never",
+    "Literal",
+    "Callable",
+    "Tuple",
+    "Covariant",
+    "Contravariant",
+    "Invariant",
+    "function",
+];
+
+/// 所有运行时公开全局类型名，包括异常类型。
+pub fn global_type_names() -> impl Iterator<Item = &'static str> {
+    CORE_GLOBAL_TYPE_NAMES.iter().copied().chain(
+        crate::error::ExceptionKind::ALL
+            .iter()
+            .map(|kind| kind.type_name()),
+    )
 }
 
 /// 运行时值标签 → 原始类型名（供方法 / magic 查找）。
@@ -41,21 +114,8 @@ pub const fn value_primitive_type(val: &Value) -> Option<&'static str> {
         Value::None => Some(names::NONE),
         Value::Bool(_) => Some(names::BOOL),
         Value::Num(_) => Some(names::NUM),
-        Value::Sized(s) => Some(match s {
-            crate::sized::SizedNum::I8(_) => "i8",
-            crate::sized::SizedNum::U8(_) => "u8",
-            crate::sized::SizedNum::I16(_) => "i16",
-            crate::sized::SizedNum::U16(_) => "u16",
-            crate::sized::SizedNum::I32(_) => "i32",
-            crate::sized::SizedNum::U32(_) => "u32",
-            crate::sized::SizedNum::I64(_) => "i64",
-            crate::sized::SizedNum::U64(_) => "u64",
-            crate::sized::SizedNum::Isize(_) => "isize",
-            crate::sized::SizedNum::Usize(_) => "usize",
-            crate::sized::SizedNum::F32(_) => "f32",
-            crate::sized::SizedNum::F64(_) => "f64",
-        }),
-        Value::Ptr(_) => Some("ptr"),
+        Value::Sized(s) => Some(s.type_name()),
+        Value::Ptr(_) => Some(names::PTR),
         Value::Text(_) => Some(names::TEXT),
         Value::List(_) => Some(names::LIST),
         Value::Dict(_) => Some(names::DICT),
@@ -102,7 +162,7 @@ pub fn check_primitive_instance(vm: &Vm, val: &Value, type_name: &str) -> Option
             val,
             Value::Function(_) | Value::Builtin(_) | Value::GenericFunction(_)
         ),
-        "ptr" => matches!(val, Value::Ptr(_)),
+        n if n == names::PTR => matches!(val, Value::Ptr(_)),
         "Layout" => matches!(val, Value::Layout(_)),
         n if crate::sized::SizedNum::ALL_NAMES.contains(&n) => {
             matches!(val, Value::Sized(s) if s.type_name() == n)
@@ -190,48 +250,48 @@ pub fn protocol_has_method(type_name: &str, method: &str) -> bool {
 }
 
 const PROTOCOL_METHODS: &[(&str, &str)] = &[
-    ("num", "__add__"),
-    ("num", "__sub__"),
-    ("num", "__mul__"),
-    ("num", "__div__"),
-    ("num", "__mod__"),
-    ("num", "__pow__"),
-    ("num", "__and__"),
-    ("num", "__or__"),
-    ("num", "__xor__"),
-    ("num", "__lshift__"),
-    ("num", "__rshift__"),
-    ("num", "__radd__"),
-    ("num", "__rsub__"),
-    ("num", "__rmul__"),
-    ("num", "__rdiv__"),
-    ("num", "__rmod__"),
-    ("num", "__rpow__"),
-    ("num", "__rand__"),
-    ("num", "__ror__"),
-    ("num", "__rxor__"),
-    ("num", "__rlshift__"),
-    ("num", "__rrshift__"),
-    ("num", "__neg__"),
-    ("num", "__invert__"),
-    ("text", "__add__"),
-    ("text", "__mul__"),
-    ("text", "__rmul__"),
+    (names::NUM, "__add__"),
+    (names::NUM, "__sub__"),
+    (names::NUM, "__mul__"),
+    (names::NUM, "__div__"),
+    (names::NUM, "__mod__"),
+    (names::NUM, "__pow__"),
+    (names::NUM, "__and__"),
+    (names::NUM, "__or__"),
+    (names::NUM, "__xor__"),
+    (names::NUM, "__lshift__"),
+    (names::NUM, "__rshift__"),
+    (names::NUM, "__radd__"),
+    (names::NUM, "__rsub__"),
+    (names::NUM, "__rmul__"),
+    (names::NUM, "__rdiv__"),
+    (names::NUM, "__rmod__"),
+    (names::NUM, "__rpow__"),
+    (names::NUM, "__rand__"),
+    (names::NUM, "__ror__"),
+    (names::NUM, "__rxor__"),
+    (names::NUM, "__rlshift__"),
+    (names::NUM, "__rrshift__"),
+    (names::NUM, "__neg__"),
+    (names::NUM, "__invert__"),
+    (names::TEXT, "__add__"),
+    (names::TEXT, "__mul__"),
+    (names::TEXT, "__rmul__"),
 ];
 
 #[must_use]
 pub fn sample_value_for_type_name(name: &str) -> Value {
     match name {
-        "num" => Value::Num(Num::Small(0)),
-        "text" => Value::Text(String::new()),
-        "bool" => Value::Bool(false),
-        "nonetype" => Value::None,
-        "list" => Value::List(Shared::new(Vec::new())),
-        "dict" => Value::Dict(Shared::new(DictMap::new())),
-        "set" => Value::Set(Shared::new(crate::value::SetMap::new())),
-        "tuple" => Value::Tuple(Arc::from([])),
-        "bytes" => Value::Bytes(Arc::new(Vec::new())),
-        "iterator" => Value::Iterator(Shared::new(crate::value::IteratorState::from_list(
+        names::NUM => Value::Num(Num::Small(0)),
+        names::TEXT => Value::Text(String::new()),
+        names::BOOL => Value::Bool(false),
+        names::NONE => Value::None,
+        names::LIST => Value::List(Shared::new(Vec::new())),
+        names::DICT => Value::Dict(Shared::new(DictMap::new())),
+        names::SET => Value::Set(Shared::new(crate::value::SetMap::new())),
+        names::TUPLE => Value::Tuple(Arc::from([])),
+        names::BYTES => Value::Bytes(Arc::new(Vec::new())),
+        names::ITERATOR => Value::Iterator(Shared::new(crate::value::IteratorState::from_list(
             Vec::new(),
         ))),
         other => Value::type_ref(other),
@@ -254,7 +314,7 @@ pub fn value_to_type_value(_vm: &Vm, val: &Value) -> Value {
                 ))
             }
         }
-        Value::TypeSpec(_) | Value::TypeRef(_) => Value::TypeRef("type".to_string()),
+        Value::TypeSpec(_) | Value::TypeRef(_) => Value::TypeRef(names::TYPE.to_string()),
         _ => Value::TypeRef(val.type_name().to_string()),
     }
 }
@@ -379,10 +439,10 @@ fn set_match_distance(vm: &Vm, val: &Value, params: &[Value]) -> Option<usize> {
 #[must_use]
 pub fn primitive_value_to_type_value(val: &Value) -> Option<Value> {
     match val {
-        Value::None => Some(Value::TypeRef("nonetype".to_string())),
-        Value::Bool(_) => Some(Value::TypeRef("bool".to_string())),
-        Value::Num(_) => Some(Value::TypeRef("num".to_string())),
-        Value::Text(_) => Some(Value::TypeRef("text".to_string())),
+        Value::None => Some(Value::TypeRef(names::NONE.to_string())),
+        Value::Bool(_) => Some(Value::TypeRef(names::BOOL.to_string())),
+        Value::Num(_) => Some(Value::TypeRef(names::NUM.to_string())),
+        Value::Text(_) => Some(Value::TypeRef(names::TEXT.to_string())),
         Value::List(lst) => {
             let elems: Vec<Value> = lst
                 .borrow()
@@ -394,29 +454,29 @@ pub fn primitive_value_to_type_value(val: &Value) -> Option<Value> {
                 .collect();
             if elems.is_empty() {
                 Some(Value::TypeSpec(TypeSpecData::new(
-                    "list",
-                    vec![Value::TypeRef("num".to_string())],
+                    names::LIST,
+                    vec![Value::TypeRef(names::NUM.to_string())],
                 )))
             } else if elems
                 .windows(2)
                 .all(|w| crate::types::type_values_equal(&w[0], &w[1]))
             {
                 Some(Value::TypeSpec(TypeSpecData::new(
-                    "list",
+                    names::LIST,
                     vec![elems[0].clone()],
                 )))
             } else {
                 Some(Value::TypeSpec(TypeSpecData::new(
-                    "list",
+                    names::LIST,
                     vec![Value::TypeSpec(TypeSpecData::new("Union", elems))],
                 )))
             }
         }
-        Value::Dict(_) => Some(Value::TypeRef("dict".to_string())),
-        Value::Set(_) => Some(Value::TypeRef("set".to_string())),
+        Value::Dict(_) => Some(Value::TypeRef(names::DICT.to_string())),
+        Value::Set(_) => Some(Value::TypeRef(names::SET.to_string())),
         Value::Tuple(t) => {
             if t.is_empty() {
-                Some(Value::TypeRef("tuple".to_string()))
+                Some(Value::TypeRef(names::TUPLE.to_string()))
             } else {
                 let params: Vec<Value> = t
                     .iter()
@@ -425,11 +485,11 @@ pub fn primitive_value_to_type_value(val: &Value) -> Option<Value> {
                             .unwrap_or_else(|| Value::TypeRef(e.type_name().to_string()))
                     })
                     .collect();
-                Some(Value::TypeSpec(TypeSpecData::new("tuple", params)))
+                Some(Value::TypeSpec(TypeSpecData::new(names::TUPLE, params)))
             }
         }
-        Value::Bytes(_) => Some(Value::TypeRef("bytes".to_string())),
-        Value::Iterator(_) => Some(Value::TypeRef("iterator".to_string())),
+        Value::Bytes(_) => Some(Value::TypeRef(names::BYTES.to_string())),
+        Value::Iterator(_) => Some(Value::TypeRef(names::ITERATOR.to_string())),
         _ => None,
     }
 }
@@ -476,13 +536,13 @@ fn list_infer(field_ty: &Value, val_ty: &Value, inferred: &mut HashMap<String, V
     let Value::TypeSpec(field) = field_ty else {
         return false;
     };
-    if field.name != "list" || field.args.len() != 1 {
+    if field.name != names::LIST || field.args.len() != 1 {
         return false;
     }
     let Value::TypeSpec(val) = val_ty else {
         return false;
     };
-    if val.name != "list" || val.args.len() != 1 {
+    if val.name != names::LIST || val.args.len() != 1 {
         return false;
     }
     crate::types::infer_from_field_type_inner(&field.args[0], &val.args[0], inferred)
@@ -596,13 +656,13 @@ const fn ptr_form_accepts(_vm: &Vm, val: &Value, params: &[Value]) -> bool {
 
 fn lookup_type_form(name: &str) -> Option<&'static TypeFormEntry> {
     let name = if crate::ptr_registry::is_ptr_type_name(name) {
-        "ptr"
+        names::PTR
     } else {
         name
     };
     static FORMS: &[(&str, TypeFormEntry)] = &[
         (
-            "ptr",
+            names::PTR,
             TypeFormEntry {
                 match_distance: ptr_form_match_distance,
                 accepts: ptr_form_accepts,
@@ -611,7 +671,7 @@ fn lookup_type_form(name: &str) -> Option<&'static TypeFormEntry> {
             },
         ),
         (
-            "list",
+            names::LIST,
             TypeFormEntry {
                 match_distance: list_match_distance,
                 accepts: list_accepts,
@@ -620,7 +680,7 @@ fn lookup_type_form(name: &str) -> Option<&'static TypeFormEntry> {
             },
         ),
         (
-            "dict",
+            names::DICT,
             TypeFormEntry {
                 match_distance: dict_match_distance,
                 accepts: dict_accepts,
@@ -629,7 +689,7 @@ fn lookup_type_form(name: &str) -> Option<&'static TypeFormEntry> {
             },
         ),
         (
-            "set",
+            names::SET,
             TypeFormEntry {
                 match_distance: set_match_distance,
                 accepts: set_accepts,
@@ -834,25 +894,27 @@ pub fn call_primitive_ctor(
     args: Vec<Value>,
 ) -> Option<Result<Value>> {
     match type_name {
-        "text" if args.len() == 1 => Some(Ok(Value::Text(args[0].print_string()))),
-        "num" if args.len() == 1 => Some(coerce_to_num(&args[0], type_ctor_error)),
-        "bool" if args.len() == 1 => Some(Ok(Value::Bool(args[0].is_truthy()))),
-        "list" if args.is_empty() => Some(Ok(Value::List(Shared::new(Vec::new())))),
-        "list" if args.len() == 1 => Some(construct_list(&args[0])),
-        "dict" if args.len().is_multiple_of(2) => Some(construct_dict_kv(args)),
-        "dict" => Some(Err(type_ctor_arity_error(
-            "dict",
+        names::TEXT if args.len() == 1 => Some(Ok(Value::Text(args[0].print_string()))),
+        names::NUM if args.len() == 1 => Some(coerce_to_num(&args[0], type_ctor_error)),
+        names::BOOL if args.len() == 1 => Some(Ok(Value::Bool(args[0].is_truthy()))),
+        names::LIST if args.is_empty() => Some(Ok(Value::List(Shared::new(Vec::new())))),
+        names::LIST if args.len() == 1 => Some(construct_list(&args[0])),
+        names::DICT if args.len().is_multiple_of(2) => Some(construct_dict_kv(args)),
+        names::DICT => Some(Err(type_ctor_arity_error(
+            names::DICT,
             "requires an even number of alternating key, value arguments",
             args.len(),
         ))),
-        "set" if args.is_empty() => Some(Ok(Value::Set(Shared::new(crate::value::SetMap::new())))),
-        "set" => Some(construct_set(args)),
-        "tuple" => Some(Ok(Value::Tuple(args.into()))),
-        "bytes" if args.is_empty() => Some(Ok(Value::Bytes(Arc::new(Vec::new())))),
-        "bytes" if args.len() == 1 => Some(construct_bytes(&args[0])),
-        "iterator" if args.len() == 1 => Some(construct_iterator(&args[0])),
-        "iterator" if args.is_empty() => Some(Err(type_ctor_arity_error(
-            "iterator",
+        names::SET if args.is_empty() => {
+            Some(Ok(Value::Set(Shared::new(crate::value::SetMap::new()))))
+        }
+        names::SET => Some(construct_set(args)),
+        names::TUPLE => Some(Ok(Value::Tuple(args.into()))),
+        names::BYTES if args.is_empty() => Some(Ok(Value::Bytes(Arc::new(Vec::new())))),
+        names::BYTES if args.len() == 1 => Some(construct_bytes(&args[0])),
+        names::ITERATOR if args.len() == 1 => Some(construct_iterator(&args[0])),
+        names::ITERATOR if args.is_empty() => Some(Err(type_ctor_arity_error(
+            names::ITERATOR,
             "expects 1 argument",
             0,
         ))),
@@ -866,9 +928,9 @@ pub fn call_primitive_ctor(
         "Barrier" => Some(crate::concurrency::construct_barrier(&args)),
         "Cond" => Some(crate::concurrency::construct_cond(&args)),
         "Atomic" => Some(crate::concurrency::construct_atomic(&args)),
-        "type" if args.len() == 1 => Some(Ok(Value::type_ref(args[0].type_name()))),
-        "type" => Some(Err(type_ctor_arity_error(
-            "type",
+        names::TYPE if args.len() == 1 => Some(Ok(Value::type_ref(args[0].type_name()))),
+        names::TYPE => Some(Err(type_ctor_arity_error(
+            names::TYPE,
             "expects 1 argument",
             args.len(),
         ))),
@@ -883,15 +945,15 @@ pub fn call_primitive_convert(
     value: &Value,
 ) -> Option<Result<Value>> {
     match type_name {
-        "text" => Some(Ok(Value::Text(value.print_string()))),
-        "num" => Some(coerce_to_num(value, type_convert_error)),
-        "bool" => Some(Ok(Value::Bool(value.is_truthy()))),
-        "list" => Some(convert_to_list(vm, value)),
-        "set" => Some(convert_to_set(vm, value)),
-        "tuple" => Some(convert_to_tuple(vm, value)),
-        "bytes" => Some(convert_to_bytes(value)),
-        "iterator" => Some(convert_to_iterator(value)),
-        "ptr" => Some(convert_to_ptr(value)),
+        names::TEXT => Some(Ok(Value::Text(value.print_string()))),
+        names::NUM => Some(coerce_to_num(value, type_convert_error)),
+        names::BOOL => Some(Ok(Value::Bool(value.is_truthy()))),
+        names::LIST => Some(convert_to_list(vm, value)),
+        names::SET => Some(convert_to_set(vm, value)),
+        names::TUPLE => Some(convert_to_tuple(vm, value)),
+        names::BYTES => Some(convert_to_bytes(value)),
+        names::ITERATOR => Some(convert_to_iterator(value)),
+        names::PTR => Some(convert_to_ptr(value)),
         n if crate::sized::SizedNum::ALL_NAMES.contains(&n) => Some(convert_to_sized(n, value)),
         n if crate::c_types::lookup_c_type(n).is_some() => Some(convert_to_c_type(n, value)),
         _ => None,
@@ -904,10 +966,12 @@ fn convert_to_ptr(value: &Value) -> Result<Value> {
         Value::Sized(crate::sized::SizedNum::Usize(u)) => Ok(Value::Ptr(*u)),
         Value::Sized(crate::sized::SizedNum::Isize(i)) => Ok(Value::Ptr(*i as usize)),
         Value::Num(n) => {
-            let i = n.to_i64().ok_or_else(|| type_convert_error("ptr", value))?;
+            let i = n
+                .to_i64()
+                .ok_or_else(|| type_convert_error(names::PTR, value))?;
             Ok(Value::Ptr(i as usize))
         }
-        other => Err(type_convert_error("ptr", other)),
+        other => Err(type_convert_error(names::PTR, other)),
     }
 }
 
@@ -976,15 +1040,15 @@ fn convert_to_sized(type_name: &str, value: &Value) -> Result<Value> {
         }))
     };
     match type_name {
-        "i8" => make_int(8, true),
-        "u8" => make_int(8, false),
-        "i16" => make_int(16, true),
-        "u16" => make_int(16, false),
-        "i32" => make_int(32, true),
-        "u32" => make_int(32, false),
-        "i64" => make_int(64, true),
-        "u64" => make_int(64, false),
-        "isize" => {
+        names::I8 => make_int(8, true),
+        names::U8 => make_int(8, false),
+        names::I16 => make_int(16, true),
+        names::U16 => make_int(16, false),
+        names::I32 => make_int(32, true),
+        names::U32 => make_int(32, false),
+        names::I64 => make_int(64, true),
+        names::U64 => make_int(64, false),
+        names::ISIZE => {
             let n = match value {
                 Value::Num(n) => n
                     .to_i64()
@@ -997,7 +1061,7 @@ fn convert_to_sized(type_name: &str, value: &Value) -> Result<Value> {
             };
             Ok(Value::Sized(SizedNum::Isize(n as isize)))
         }
-        "usize" => {
+        names::USIZE => {
             let n = match value {
                 Value::Num(n) => n
                     .to_i64()
@@ -1009,7 +1073,7 @@ fn convert_to_sized(type_name: &str, value: &Value) -> Result<Value> {
             };
             Ok(Value::Sized(SizedNum::Usize(n as usize)))
         }
-        "f32" => {
+        names::F32 => {
             let f = match value {
                 Value::Num(n) => n.to_f64_checked()?,
                 Value::Sized(s) => s.to_f64(),
@@ -1017,7 +1081,7 @@ fn convert_to_sized(type_name: &str, value: &Value) -> Result<Value> {
             };
             Ok(Value::Sized(SizedNum::F32(f as f32)))
         }
-        "f64" => {
+        names::F64 => {
             let f = match value {
                 Value::Num(n) => n.to_f64_checked()?,
                 Value::Sized(s) => s.to_f64(),
@@ -1034,32 +1098,32 @@ fn convert_to_c_type(type_name: &str, value: &Value) -> Result<Value> {
     // 转到对应语言定宽类型
     let lang = match abi {
         crate::ffi::AbiType::Void => return Ok(Value::None),
-        crate::ffi::AbiType::Bool => "bool",
-        crate::ffi::AbiType::I8 => "i8",
-        crate::ffi::AbiType::U8 => "u8",
-        crate::ffi::AbiType::I16 => "i16",
-        crate::ffi::AbiType::U16 => "u16",
-        crate::ffi::AbiType::I32 => "i32",
-        crate::ffi::AbiType::U32 => "u32",
-        crate::ffi::AbiType::I64 => "i64",
-        crate::ffi::AbiType::U64 => "u64",
-        crate::ffi::AbiType::Isize => "isize",
-        crate::ffi::AbiType::Usize => "usize",
-        crate::ffi::AbiType::F32 => "f32",
-        crate::ffi::AbiType::F64 => "f64",
+        crate::ffi::AbiType::Bool => names::BOOL,
+        crate::ffi::AbiType::I8 => names::I8,
+        crate::ffi::AbiType::U8 => names::U8,
+        crate::ffi::AbiType::I16 => names::I16,
+        crate::ffi::AbiType::U16 => names::U16,
+        crate::ffi::AbiType::I32 => names::I32,
+        crate::ffi::AbiType::U32 => names::U32,
+        crate::ffi::AbiType::I64 => names::I64,
+        crate::ffi::AbiType::U64 => names::U64,
+        crate::ffi::AbiType::Isize => names::ISIZE,
+        crate::ffi::AbiType::Usize => names::USIZE,
+        crate::ffi::AbiType::F32 => names::F32,
+        crate::ffi::AbiType::F64 => names::F64,
         crate::ffi::AbiType::Pointer
         | crate::ffi::AbiType::CharPtr
-        | crate::ffi::AbiType::WCharPtr => "ptr",
+        | crate::ffi::AbiType::WCharPtr => names::PTR,
         crate::ffi::AbiType::CStruct { .. } => {
             return Err(crate::error::RuntimeError::type_err(
                 "cannot convert to C struct type by name; construct the struct",
             ));
         }
     };
-    if lang == "bool" {
+    if lang == names::BOOL {
         return Ok(Value::Bool(value.is_truthy()));
     }
-    if lang == "ptr" {
+    if lang == names::PTR {
         return convert_to_ptr(value);
     }
     convert_to_sized(lang, value)
@@ -1068,7 +1132,7 @@ fn convert_to_c_type(type_name: &str, value: &Value) -> Result<Value> {
 fn construct_list(arg: &Value) -> Result<Value> {
     match arg {
         Value::List(lst) => Ok(Value::List(lst.clone())),
-        other => Err(type_ctor_error("list", other)),
+        other => Err(type_ctor_error(names::LIST, other)),
     }
 }
 
@@ -1111,13 +1175,13 @@ fn construct_bytes(arg: &Value) -> Result<Value> {
                         out.push(v as u8);
                     }
                     other => {
-                        return Err(type_ctor_error("bytes", other));
+                        return Err(type_ctor_error(names::BYTES, other));
                     }
                 }
             }
             Ok(Value::Bytes(Arc::new(out)))
         }
-        other => Err(type_ctor_error("bytes", other)),
+        other => Err(type_ctor_error(names::BYTES, other)),
     }
 }
 
@@ -1125,7 +1189,7 @@ fn construct_iterator(arg: &Value) -> Result<Value> {
     match arg {
         Value::List(lst) => Ok(IteratorState::from_list(lst.borrow().clone()).into_value()),
         Value::Iterator(it) => Ok(Value::Iterator(it.clone())),
-        other => Err(type_ctor_error("iterator", other)),
+        other => Err(type_ctor_error(names::ITERATOR, other)),
     }
 }
 
@@ -1148,7 +1212,7 @@ fn convert_to_list(vm: &mut Vm, arg: &Value) -> Result<Value> {
                 .collect();
             Ok(Value::List(Shared::new(items)))
         }
-        other => Err(type_convert_error("list", other)),
+        other => Err(type_convert_error(names::LIST, other)),
     }
 }
 
@@ -1176,7 +1240,7 @@ fn convert_to_set(vm: &mut Vm, arg: &Value) -> Result<Value> {
             }
             Ok(Value::Set(Shared::new(set)))
         }
-        other => Err(type_convert_error("set", other)),
+        other => Err(type_convert_error(names::SET, other)),
     }
 }
 
@@ -1199,7 +1263,7 @@ fn convert_to_tuple(vm: &mut Vm, arg: &Value) -> Result<Value> {
             }
             Ok(Value::Tuple(out.into()))
         }
-        other => Err(type_convert_error("tuple", other)),
+        other => Err(type_convert_error(names::TUPLE, other)),
     }
 }
 
@@ -1208,7 +1272,7 @@ fn convert_to_bytes(arg: &Value) -> Result<Value> {
         Value::Bytes(b) => Ok(Value::Bytes(b.clone())),
         Value::Text(s) => Ok(Value::Bytes(Arc::new(s.as_bytes().to_vec()))),
         Value::List(lst) => construct_bytes(&Value::List(lst.clone())),
-        other => Err(type_convert_error("bytes", other)),
+        other => Err(type_convert_error(names::BYTES, other)),
     }
 }
 
@@ -1225,7 +1289,7 @@ fn convert_to_iterator(arg: &Value) -> Result<Value> {
             Ok(IteratorState::from_list(items).into_value())
         }
         Value::Iterator(it) => Ok(Value::Iterator(it.clone())),
-        other => Err(type_convert_error("iterator", other)),
+        other => Err(type_convert_error(names::ITERATOR, other)),
     }
 }
 
@@ -1253,7 +1317,7 @@ fn coerce_to_num(arg: &Value, on_mismatch: fn(&str, &Value) -> RuntimeError) -> 
             }
         }
         Value::Bool(b) => Ok(Value::Num(Num::Small(i64::from(*b)))),
-        other => Err(on_mismatch("num", other)),
+        other => Err(on_mismatch(names::NUM, other)),
     }
 }
 
@@ -1775,8 +1839,8 @@ fn install_primitive_methods(vm: &mut Vm) {
         }),
     );
 
-    methods.insert("num".into(), num_methods);
-    methods.insert("text".into(), text_methods);
+    methods.insert(names::NUM.into(), num_methods);
+    methods.insert(names::TEXT.into(), text_methods);
     vm.primitive_methods = methods;
 }
 
@@ -2094,57 +2158,7 @@ pub fn get_bytes_method(bytes: &Arc<Vec<u8>>, field: &str) -> Result<Value> {
 }
 
 fn install_primitive_type_globals(vm: &mut Vm) {
-    for ty in [
-        "text",
-        "num",
-        "bool",
-        "list",
-        "dict",
-        "set",
-        "tuple",
-        "bytes",
-        "iterator",
-        "nonetype",
-        "type",
-        "AST",
-        "Frame",
-        "Traceback",
-        "ptr",
-        "i8",
-        "u8",
-        "i16",
-        "u16",
-        "i32",
-        "u32",
-        "i64",
-        "u64",
-        "isize",
-        "usize",
-        "f32",
-        "f64",
-        "Channel",
-        "Stream",
-        "Mutex",
-        "RWMutex",
-        "RwLock",
-        "WaitGroup",
-        "Semaphore",
-        "Once",
-        "Barrier",
-        "Cond",
-        "Atomic",
-        // 类型形态 / 特殊类型名：注解求值走 load_name，必须是全局类型句柄
-        "Union",
-        "Maybe",
-        "Never",
-        "Literal",
-        "Callable",
-        "Tuple",
-        "Covariant",
-        "Contravariant",
-        "Invariant",
-        "function",
-    ] {
+    for &ty in CORE_GLOBAL_TYPE_NAMES {
         vm.globals.or_insert_with(ty.into(), || Value::type_ref(ty));
     }
     // 优先使用元类型句柄，覆盖同名的旧式内建函数。

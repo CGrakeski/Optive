@@ -10,6 +10,7 @@
 mod common;
 
 use common::{assert_num, assert_text, bool_val, value};
+use optive::run_source;
 use optive::value::Value;
 
 #[test]
@@ -80,6 +81,56 @@ s
 std.time.parse("1970-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")
 "#,
         "0",
+    );
+}
+
+#[test]
+fn time_tz_shanghai_and_offset() {
+    assert_text(
+        r#"
+std.time.format(0, "%Y-%m-%d %H:%M:%S", "Asia/Shanghai")
+"#,
+        "1970-01-01 08:00:00",
+    );
+    assert_num(
+        r#"
+std.time.parse("1970-01-01 08:00:00", "%Y-%m-%d %H:%M:%S", "Asia/Shanghai")
+"#,
+        "0",
+    );
+    assert_text(
+        r#"
+std.time.format(0, "%z", "Asia/Shanghai")
+"#,
+        "+0800",
+    );
+    assert_text(
+        r#"
+std.time.format(0, "%H:%M:%S", "+08:00")
+"#,
+        "08:00:00",
+    );
+    assert_text(
+        r#"
+std.time.format(0, "%H:%M:%S", 28800)
+"#,
+        "08:00:00",
+    );
+    assert_num(
+        r#"
+std.time.parts(0, "Asia/Shanghai")["hour"]
+"#,
+        "8",
+    );
+}
+
+#[test]
+fn time_unknown_zone_errors() {
+    let err = run_source(r#"std.time.format(0, "%Y", "Not/AZone")"#).expect_err("zone");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unknown time zone") || msg.contains("ValueError"),
+        "{msg}"
     );
 }
 

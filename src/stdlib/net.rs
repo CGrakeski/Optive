@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::Mutex;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -16,13 +17,56 @@ use crate::value::{DictMap, ModuleObject, Num, Value, ValueKey};
 use crate::vm::Vm;
 use crate::Result;
 
-use super::{expect_arity, expect_int, expect_text, exports, named_builtin, submodule};
+use super::{
+    expect_arity, expect_int, expect_text, expect_text_or_bytes, exports, io_map, named_builtin,
+    submodule,
+};
 
 type ConnSlot = Arc<Mutex<Option<ConnInner>>>;
 
 fn conn_slots() -> &'static Mutex<HashMap<usize, ConnSlot>> {
     static SLOTS: OnceLock<Mutex<HashMap<usize, ConnSlot>>> = OnceLock::new();
     SLOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct ConnRegistration {
+    key: AtomicUsize,
+    slot: Weak<Mutex<Option<ConnInner>>>,
+}
+
+impl ConnRegistration {
+    fn new(slot: &ConnSlot) -> Self {
+        Self {
+            key: AtomicUsize::new(0),
+            slot: Arc::downgrade(slot),
+        }
+    }
+
+    fn set_key(&self, key: usize) {
+        self.key.store(key, Ordering::Release);
+    }
+
+    fn remove(&self) {
+        let key = self.key.load(Ordering::Acquire);
+        if key != 0 {
+            let Some(slot) = self.slot.upgrade() else {
+                return;
+            };
+            let mut slots = conn_slots().lock();
+            if slots
+                .get(&key)
+                .is_some_and(|registered| Arc::ptr_eq(registered, &slot))
+            {
+                slots.remove(&key);
+            }
+        }
+    }
+}
+
+impl Drop for ConnRegistration {
+    fn drop(&mut self) {
+        self.remove();
+    }
 }
 
 pub(super) fn build_net_module() -> Shared<ModuleObject> {
@@ -69,8 +113,7 @@ fn net_listen(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     };
     let port = check_port("listen", port)?;
     let bind = format!("{host}:{port}");
-    let listener = TcpListener::bind(&bind)
-        .map_err(|e| RuntimeError::io_err(format!("listen {bind}: {e}")))?;
+    let listener = TcpListener::bind(&bind).map_err(|e| io_map(&format!("listen {bind}"), e))?;
     Ok(wrap_listener(listener, None))
 }
 
@@ -95,13 +138,13 @@ fn net_listen_tls(vm: &mut Vm, args: &[Value]) -> Result<Value> {
             ));
         }
     };
-    vm.caps.check_fs("listen_tls", &cert)?;
-    vm.caps.check_fs("listen_tls", &key)?;
+    let cert_file = vm.caps.open_read("listen_tls certificate", &cert)?;
+    let key_file = vm.caps.open_read("listen_tls private key", &key)?;
     let port = check_port("listen_tls", port)?;
-    let config = load_server_config(&cert, &key)?;
+    let config = load_server_config(cert_file, key_file)?;
     let bind = format!("{host}:{port}");
-    let listener = TcpListener::bind(&bind)
-        .map_err(|e| RuntimeError::io_err(format!("listen_tls {bind}: {e}")))?;
+    let listener =
+        TcpListener::bind(&bind).map_err(|e| io_map(&format!("listen_tls {bind}"), e))?;
     Ok(wrap_listener(listener, Some(config)))
 }
 
@@ -111,8 +154,8 @@ fn net_connect(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let host = expect_text("connect", args, 0)?;
     let port = check_port("connect", expect_int("connect", args, 1)?)?;
     let addr = format!("{host}:{port}");
-    let stream = TcpStream::connect(&addr)
-        .map_err(|e| RuntimeError::io_err(format!("connect {addr}: {e}")))?;
+    let stream = crate::gc::blocking_native(|| TcpStream::connect(&addr))
+        .map_err(|e| io_map(&format!("connect {addr}"), e))?;
     let _ = stream.set_nodelay(true);
     Ok(wrap_conn(ConnInner::Plain(stream)))
 }
@@ -123,8 +166,8 @@ fn net_connect_tls(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let host = expect_text("connect_tls", args, 0)?;
     let port = check_port("connect_tls", expect_int("connect_tls", args, 1)?)?;
     let addr = format!("{host}:{port}");
-    let tcp = TcpStream::connect(&addr)
-        .map_err(|e| RuntimeError::io_err(format!("connect_tls {addr}: {e}")))?;
+    let tcp = crate::gc::blocking_native(|| TcpStream::connect(&addr))
+        .map_err(|e| io_map(&format!("connect_tls {addr}"), e))?;
     let _ = tcp.set_nodelay(true);
     let tls = tls_wrap(tcp, &host)?;
     Ok(wrap_conn(ConnInner::Tls(Box::new(tls))))
@@ -146,8 +189,7 @@ fn net_bind_udp(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     };
     let port = check_port("bind_udp", port)?;
     let bind = format!("{host}:{port}");
-    let sock = UdpSocket::bind(&bind)
-        .map_err(|e| RuntimeError::io_err(format!("bind_udp {bind}: {e}")))?;
+    let sock = UdpSocket::bind(&bind).map_err(|e| io_map(&format!("bind_udp {bind}"), e))?;
     Ok(wrap_udp(sock))
 }
 
@@ -174,8 +216,8 @@ fn net_ws_connect(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let port = check_port("ws_connect", expect_int("ws_connect", args, 1)?)?;
     let path = ws_path(args, "ws_connect")?;
     let addr = format!("{host}:{port}");
-    let tcp = TcpStream::connect(&addr)
-        .map_err(|e| RuntimeError::io_err(format!("ws_connect {addr}: {e}")))?;
+    let tcp = crate::gc::blocking_native(|| TcpStream::connect(&addr))
+        .map_err(|e| io_map(&format!("ws_connect {addr}"), e))?;
     let _ = tcp.set_nodelay(true);
     let uri = format!("ws://{host}:{port}{path}");
     handshake_client(&uri, ConnInner::Plain(tcp))
@@ -187,8 +229,8 @@ fn net_ws_connect_tls(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let port = check_port("ws_connect_tls", expect_int("ws_connect_tls", args, 1)?)?;
     let path = ws_path(args, "ws_connect_tls")?;
     let addr = format!("{host}:{port}");
-    let tcp = TcpStream::connect(&addr)
-        .map_err(|e| RuntimeError::io_err(format!("ws_connect_tls {addr}: {e}")))?;
+    let tcp = crate::gc::blocking_native(|| TcpStream::connect(&addr))
+        .map_err(|e| io_map(&format!("ws_connect_tls {addr}"), e))?;
     let _ = tcp.set_nodelay(true);
     let tls = tls_wrap(tcp, &host)?;
     let uri = format!("wss://{host}:{port}{path}");
@@ -196,8 +238,7 @@ fn net_ws_connect_tls(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 }
 
 fn handshake_client(uri: &str, stream: ConnInner) -> Result<Value> {
-    let (ws, _) = tungstenite::client(uri, stream)
-        .map_err(|e| RuntimeError::io_err(format!("ws_connect: {e}")))?;
+    let (ws, _) = tungstenite::client(uri, stream).map_err(|e| io_map("ws_connect", e))?;
     Ok(wrap_ws(ws))
 }
 
@@ -205,8 +246,7 @@ fn net_ws_accept(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     vm.caps.check_network("ws_accept")?;
     expect_arity("ws_accept", args, 1)?;
     let stream = take_conn(&args[0])?;
-    let ws =
-        tungstenite::accept(stream).map_err(|e| RuntimeError::io_err(format!("ws_accept: {e}")))?;
+    let ws = tungstenite::accept(stream).map_err(|e| io_map("ws_accept", e))?;
     Ok(wrap_ws(ws))
 }
 
@@ -235,45 +275,42 @@ fn tls_wrap(
     let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
         .map_err(|e| RuntimeError::value_err(format!("connect_tls: invalid host {host}: {e}")))?;
     let conn = rustls::ClientConnection::new(Arc::new(config), server_name)
-        .map_err(|e| RuntimeError::io_err(format!("connect_tls: {e}")))?;
+        .map_err(|e| io_map("connect_tls", e))?;
     Ok(rustls::StreamOwned::new(conn, tcp))
 }
 
-pub(super) fn load_server_config(cert_path: &str, key_path: &str) -> Result<Arc<ServerConfig>> {
+pub(super) fn load_server_config(cert_file: File, key_file: File) -> Result<Arc<ServerConfig>> {
     ensure_crypto();
-    let certs = load_certs(cert_path)?;
-    let key = load_key(key_path)?;
+    let certs = load_certs(cert_file)?;
+    let key = load_key(key_file)?;
     let config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
-        .map_err(|e| RuntimeError::io_err(format!("tls cert: {e}")))?;
+        .map_err(|e| io_map("tls cert", e))?;
     Ok(Arc::new(config))
 }
 
-fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
-    let f = File::open(path).map_err(|e| RuntimeError::io_err(format!("tls cert {path}: {e}")))?;
-    let mut r = BufReader::new(f);
+fn load_certs(file: File) -> Result<Vec<CertificateDer<'static>>> {
+    let mut r = BufReader::new(file);
     rustls_pemfile::certs(&mut r)
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| RuntimeError::io_err(format!("tls cert {path}: {e}")))
+        .map_err(|e| io_map("tls cert", e))
 }
 
-fn load_key(path: &str) -> Result<PrivateKeyDer<'static>> {
-    let f = File::open(path).map_err(|e| RuntimeError::io_err(format!("tls key {path}: {e}")))?;
-    let mut r = BufReader::new(f);
+fn load_key(file: File) -> Result<PrivateKeyDer<'static>> {
+    let mut r = BufReader::new(file);
     rustls_pemfile::private_key(&mut r)
-        .map_err(|e| RuntimeError::io_err(format!("tls key {path}: {e}")))?
-        .ok_or_else(|| RuntimeError::io_err(format!("tls key {path}: no private key")))
+        .map_err(|e| io_map("tls key", e))?
+        .ok_or_else(|| RuntimeError::io_err("tls key: no private key"))
 }
 
 pub(super) fn accept_tls(tcp: TcpStream, config: &Arc<ServerConfig>) -> Result<ConnInner> {
     let _ = tcp.set_nodelay(true);
-    let mut conn = ServerConnection::new(config.clone())
-        .map_err(|e| RuntimeError::io_err(format!("tls accept: {e}")))?;
+    let mut conn = ServerConnection::new(config.clone()).map_err(|e| io_map("tls accept", e))?;
     let mut tcp = tcp;
     while conn.is_handshaking() {
         conn.complete_io(&mut tcp)
-            .map_err(|e| RuntimeError::io_err(format!("tls handshake: {e}")))?;
+            .map_err(|e| io_map("tls handshake", e))?;
     }
     Ok(ConnInner::TlsServer(Box::new(StreamOwned::new(conn, tcp))))
 }
@@ -354,9 +391,7 @@ fn wrap_listener(listener: TcpListener, tls: Option<Arc<ServerConfig>>) -> Value
                     let ln = guard
                         .as_ref()
                         .ok_or_else(|| RuntimeError::io_err("accept: listener is closed"))?;
-                    let (stream, _) = ln
-                        .accept()
-                        .map_err(|e| RuntimeError::io_err(format!("accept: {e}")))?;
+                    let (stream, _) = ln.accept().map_err(|e| io_map("accept", e))?;
                     drop(guard);
                     let _ = stream.set_nodelay(true);
                     let conn = if let Some(cfg) = &tls_accept {
@@ -374,9 +409,7 @@ fn wrap_listener(listener: TcpListener, tls: Option<Arc<ServerConfig>>) -> Value
                     let ln = guard
                         .as_ref()
                         .ok_or_else(|| RuntimeError::io_err("addr: listener is closed"))?;
-                    let a = ln
-                        .local_addr()
-                        .map_err(|e| RuntimeError::io_err(format!("addr: {e}")))?;
+                    let a = ln.local_addr().map_err(|e| io_map("addr", e))?;
                     Ok(Value::Text(a.to_string()))
                 }),
             ),
@@ -395,10 +428,12 @@ fn wrap_listener(listener: TcpListener, tls: Option<Arc<ServerConfig>>) -> Value
 
 fn wrap_conn(stream: ConnInner) -> Value {
     let inner = Arc::new(Mutex::new(Some(stream)));
+    let registration = Arc::new(ConnRegistration::new(&inner));
     let read_h = inner.clone();
     let write_h = inner.clone();
     let peer_h = inner.clone();
     let close_h = inner.clone();
+    let close_registration = registration.clone();
     let module = Shared::new(ModuleObject {
         name: "Conn".into(),
         exports: exports(&[
@@ -425,9 +460,7 @@ fn wrap_conn(stream: ConnInner) -> Value {
                     let s = guard
                         .as_mut()
                         .ok_or_else(|| RuntimeError::io_err("read: connection is closed"))?;
-                    let got = s
-                        .read(&mut buf)
-                        .map_err(|e| RuntimeError::io_err(format!("read: {e}")))?;
+                    let got = s.read(&mut buf).map_err(|e| io_map("read", e))?;
                     buf.truncate(got);
                     Ok(Value::Bytes(Arc::new(buf)))
                 }),
@@ -436,23 +469,13 @@ fn wrap_conn(stream: ConnInner) -> Value {
                 "write",
                 Value::builtin("write", move |_vm, args| {
                     expect_arity("write", args, 1)?;
-                    let bytes = match &args[0] {
-                        Value::Text(s) => s.as_bytes().to_vec(),
-                        Value::Bytes(b) => b.as_ref().clone(),
-                        _ => {
-                            return Err(RuntimeError::type_err(
-                                "write: argument must be text or bytes",
-                            ));
-                        }
-                    };
+                    let bytes = expect_text_or_bytes("write", args, 0)?;
                     let mut guard = write_h.lock();
                     let s = guard
                         .as_mut()
                         .ok_or_else(|| RuntimeError::io_err("write: connection is closed"))?;
-                    s.write_all(&bytes)
-                        .map_err(|e| RuntimeError::io_err(format!("write: {e}")))?;
-                    s.flush()
-                        .map_err(|e| RuntimeError::io_err(format!("write: {e}")))?;
+                    s.write_all(&bytes).map_err(|e| io_map("write", e))?;
+                    s.flush().map_err(|e| io_map("write", e))?;
                     Ok(Value::Num(Num::Small(bytes.len() as i64)))
                 }),
             ),
@@ -463,15 +486,14 @@ fn wrap_conn(stream: ConnInner) -> Value {
                     let s = guard
                         .as_ref()
                         .ok_or_else(|| RuntimeError::io_err("peer: connection is closed"))?;
-                    let a = s
-                        .peer_addr()
-                        .map_err(|e| RuntimeError::io_err(format!("peer: {e}")))?;
+                    let a = s.peer_addr().map_err(|e| io_map("peer", e))?;
                     Ok(Value::Text(a.to_string()))
                 }),
             ),
             (
                 "close",
                 Value::builtin("close", move |_vm, _| {
+                    close_registration.remove();
                     if let Some(mut s) = close_h.lock().take() {
                         s.shutdown_tls();
                     }
@@ -482,7 +504,9 @@ fn wrap_conn(stream: ConnInner) -> Value {
         children: HashMap::new(),
         is_user: false,
     });
-    conn_slots().lock().insert(module.as_ptr() as usize, inner);
+    let key = module.as_ptr() as usize;
+    registration.set_key(key);
+    conn_slots().lock().insert(key, inner);
     Value::Module(module)
 }
 
@@ -532,9 +556,7 @@ fn wrap_udp(sock: UdpSocket) -> Value {
                     let s = guard
                         .as_ref()
                         .ok_or_else(|| RuntimeError::io_err("send_to: socket is closed"))?;
-                    let n = s
-                        .send_to(&bytes, &dest)
-                        .map_err(|e| RuntimeError::io_err(format!("send_to: {e}")))?;
+                    let n = s.send_to(&bytes, &dest).map_err(|e| io_map("send_to", e))?;
                     Ok(Value::Num(Num::Small(n as i64)))
                 }),
             ),
@@ -547,9 +569,7 @@ fn wrap_udp(sock: UdpSocket) -> Value {
                         .as_ref()
                         .ok_or_else(|| RuntimeError::io_err("recv_from: socket is closed"))?;
                     let mut buf = vec![0u8; 65535];
-                    let (n, from) = s
-                        .recv_from(&mut buf)
-                        .map_err(|e| RuntimeError::io_err(format!("recv_from: {e}")))?;
+                    let (n, from) = s.recv_from(&mut buf).map_err(|e| io_map("recv_from", e))?;
                     buf.truncate(n);
                     let mut d = DictMap::new();
                     d.insert(ValueKey::Text("data".into()), Value::Bytes(Arc::new(buf)));
@@ -571,9 +591,7 @@ fn wrap_udp(sock: UdpSocket) -> Value {
                     let s = guard
                         .as_ref()
                         .ok_or_else(|| RuntimeError::io_err("addr: socket is closed"))?;
-                    let a = s
-                        .local_addr()
-                        .map_err(|e| RuntimeError::io_err(format!("addr: {e}")))?;
+                    let a = s.local_addr().map_err(|e| io_map("addr", e))?;
                     Ok(Value::Text(a.to_string()))
                 }),
             ),
@@ -614,8 +632,7 @@ fn wrap_ws(ws: tungstenite::WebSocket<ConnInner>) -> Value {
                     let ws = guard
                         .as_mut()
                         .ok_or_else(|| RuntimeError::io_err("send: websocket is closed"))?;
-                    ws.send(msg)
-                        .map_err(|e| RuntimeError::io_err(format!("send: {e}")))?;
+                    ws.send(msg).map_err(|e| io_map("send", e))?;
                     Ok(Value::None)
                 }),
             ),
@@ -628,9 +645,7 @@ fn wrap_ws(ws: tungstenite::WebSocket<ConnInner>) -> Value {
                         .as_mut()
                         .ok_or_else(|| RuntimeError::io_err("recv: websocket is closed"))?;
                     loop {
-                        let msg = ws
-                            .read()
-                            .map_err(|e| RuntimeError::io_err(format!("recv: {e}")))?;
+                        let msg = ws.read().map_err(|e| io_map("recv", e))?;
                         match msg {
                             tungstenite::Message::Text(t) => return Ok(Value::Text(t.to_string())),
                             tungstenite::Message::Binary(b) => {
@@ -658,4 +673,40 @@ fn wrap_ws(ws: tungstenite::WebSocket<ConnInner>) -> Value {
         children: HashMap::new(),
         is_user: false,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let client = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        (client, server)
+    }
+
+    #[test]
+    fn conn_slots_do_not_grow_after_conn_lifetime() {
+        let baseline = conn_slots().lock().len();
+        for i in 0..32 {
+            let (client, server) = tcp_pair();
+            let conn = wrap_conn(ConnInner::Plain(server));
+            assert_eq!(conn_slots().lock().len(), baseline + 1);
+            if i % 2 == 0 {
+                let Value::Module(module) = &conn else {
+                    panic!("connection is not module");
+                };
+                let close = module.borrow().get_export("close").expect("close");
+                let Value::Builtin(close) = close else {
+                    panic!("close is not builtin");
+                };
+                close.call(&mut Vm::new(), &[]).expect("close");
+                assert_eq!(conn_slots().lock().len(), baseline);
+            }
+            drop(conn);
+            drop(client);
+            assert_eq!(conn_slots().lock().len(), baseline);
+        }
+    }
 }

@@ -64,7 +64,7 @@ pub fn run_with_caps(
     caps: optive::caps::Capabilities,
 ) -> Result<Value, optive::RuntimeError> {
     let mut vm = optive::vm::Vm::new();
-    vm.caps = caps;
+    vm.install_caps(caps);
     optive::run_source_in_vm(&mut vm, source, "<test>")
 }
 

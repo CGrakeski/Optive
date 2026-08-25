@@ -1,0 +1,4 @@
+use std.test.{ assert_eq }
+import "../src/main.tive" as app
+
+assert_eq(app.add(20, 22), 42)

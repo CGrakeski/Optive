@@ -64,27 +64,30 @@ fn level_name(lv: u8) -> &'static str {
     }
 }
 
-fn log_debug(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    emit(LV_DEBUG, "DEBUG", args)
+fn log_debug(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    emit(vm, LV_DEBUG, "DEBUG", args)
 }
-fn log_info(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    emit(LV_INFO, "INFO", args)
+fn log_info(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    emit(vm, LV_INFO, "INFO", args)
 }
-fn log_warn(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    emit(LV_WARN, "WARN", args)
+fn log_warn(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    emit(vm, LV_WARN, "WARN", args)
 }
-fn log_error(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
-    emit(LV_ERROR, "ERROR", args)
+fn log_error(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    emit(vm, LV_ERROR, "ERROR", args)
 }
 
-fn emit(min: u8, tag: &str, args: &[Value]) -> Result<Value> {
+fn emit(vm: &Vm, min: u8, tag: &str, args: &[Value]) -> Result<Value> {
     if current_level() <= min {
         let msg = args
             .iter()
             .map(Value::display_string)
             .collect::<Vec<_>>()
             .join(" ");
-        eprintln!("{} {tag} {msg}", utc_stamp());
+        vm.write_output(
+            crate::vm::OutputStream::Stderr,
+            &format!("{} {tag} {msg}\n", utc_stamp()),
+        );
     }
     Ok(Value::None)
 }
@@ -110,25 +113,6 @@ fn utc_stamp() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let (y, mo, d, hh, mm, ss) = unix_to_utc(secs);
+    let (y, mo, d, hh, mm, ss) = super::time::utc_parts_from_secs(secs as i64);
     format!("{y:04}-{mo:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
-}
-
-fn unix_to_utc(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
-    let tod = secs % 86400;
-    let hh = (tod / 3600) as u32;
-    let mm = ((tod % 3600) / 60) as u32;
-    let ss = (tod % 60) as u32;
-    let days = (secs / 86400) as i64;
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = (yoe as i64) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let mo = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
-    let y = (y + i64::from(mo <= 2)) as i32;
-    (y, mo, d, hh, mm, ss)
 }

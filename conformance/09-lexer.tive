@@ -1,0 +1,5 @@
+use std.test.{ assert_eq }
+// line comment
+/* block comment */
+let _n = 0x10
+assert_eq(_n, 16)

@@ -1,0 +1,55 @@
+name: Docs
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "docs/**"
+      - "src/lsp/catalog.rs"
+      - "tools/check-stdlib-coverage.py"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    paths:
+      - "docs/**"
+      - "src/lsp/catalog.rs"
+      - "tools/check-stdlib-coverage.py"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stdlib coverage
+        run: python3 tools/check-stdlib-coverage.py
+      - name: mdBook
+        uses: peaceiris/actions-mdbook@v2
+        with:
+          mdbook-version: "0.4.40"
+      - name: Build book
+        run: mdbook build docs
+
+  pages:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: check
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: peaceiris/actions-mdbook@v2
+        with:
+          mdbook-version: "0.4.40"
+      - run: mdbook build docs
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/book
+      - id: deploy
+        uses: actions/deploy-pages@v4

@@ -37,8 +37,32 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: rustfmt check
         run: cargo fmt --all -- --check
-      - name: clippy (all targets, deny warnings)
-        run: cargo clippy --all-targets -- -D warnings
+      - name: clippy (all targets and features, deny warnings)
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Stdlib documentation coverage
+        run: python3 tools/check-stdlib-coverage.py
+      - name: Build Optive self-check binary
+        run: cargo build --locked --bin Optive
+      - name: Optive check, test, and fmt self-check
+        shell: bash
+        env:
+          OPTIVE_HOME: ${{ runner.temp }}/optive-home
+          OPTIVE_CUSTOM: en-US
+        run: |
+          set -euo pipefail
+          source_fixture=.github/fixtures/optive-self-check
+          fixture="$RUNNER_TEMP/optive-self-check"
+          optive=target/debug/Optive
+          mkdir -p "$OPTIVE_HOME"
+          cp -R "$source_fixture" "$fixture"
+          "$optive" check "$fixture"
+          "$optive" test "$fixture"
+          formatted="$fixture/src/main.tive"
+          second_pass="$RUNNER_TEMP/optive-fmt-self-check.second.tive"
+          "$optive" fmt "$formatted"
+          "$optive" fmt "$formatted" --out > "$second_pass"
+          cmp "$formatted" "$second_pass"
+          "$optive" fmt --check "$fixture"
 
   # 三平台构建 + 测试。集成测试会 spawn 已构建的 `Optive` 二进制，
   # `cargo test` 默认会先编译 bin，故无需额外步骤。
@@ -56,13 +80,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --bin Optive
+        run: cargo build --locked --bin Optive
       - name: Test (default — 跳过被 ignore 的慢基准；含 vm_concurrency / vm_gc_mn / fuzz_frontend)
-        run: cargo test
+        run: cargo test --locked --all-features
       - name: Test (ignored 基准，仅作冒烟)
         # 慢的 fib(30) 等；CI 上只验证能跑通，不读性能数据。
         if: matrix.os == 'ubuntu-latest'
-        run: cargo test -- --ignored
+        run: cargo test --locked --all-features -- --ignored
 
   # release 构建冒烟：确保 release profile（LTO + overflow-checks）也能编译通过并运行。
   build-release:
@@ -75,7 +99,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build (release)
-        run: cargo build --release --bin Optive
+        run: cargo build --locked --release --bin Optive
       - name: Smoke run
         run: ./target/release/Optive -V
 
@@ -93,9 +117,38 @@ jobs:
       - name: cargo audit
         run: cargo audit
 
-  # concurrent GC 验收（门禁前置；默认仍为 stw）。PR 不跑，nightly / 手动触发。
+  # CycloneDX SBOM + 显式许可证白名单；两者都以已提交 Cargo.lock 为输入。
+  supply-chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-cyclonedx
+      - name: Verify locked dependency graph
+        run: cargo metadata --locked --format-version 1 --no-deps
+      - name: Check dependency licenses
+        run: cargo deny --locked --all-features check licenses
+      - name: Generate CycloneDX SBOM
+        run: cargo cyclonedx --format json --all-features --target all --spec-version 1.5 --override-filename optive.cdx
+      - name: Verify SBOM and unchanged lockfile
+        run: |
+          python3 -m json.tool optive.cdx.json >/dev/null
+          git diff --exit-code -- Cargo.lock
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: optive-cyclonedx-sbom
+          path: optive.cdx.json
+          if-no-files-found: error
+          retention-days: 30
+
+  # concurrent GC 正确性进入 PR 门禁（默认运行时仍为 stw）。
   gc-concurrent:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -108,6 +161,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: GC correctness under concurrent mode
         run: |
-          cargo test --test vm_gc_mn
-          cargo test --test vm_gc_mode_compare
+          cargo test --locked --test vm_gc_mn
+          cargo test --locked --test vm_gc_mode_compare -- --skip compare_stw_vs_concurrent
 

@@ -1,22 +1,19 @@
 //! `Optive debug`：交互式调试器 REPL。
 
-use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-use optive::codegen::Generator;
 use optive::debug::{
     self, debug_set, eval_in_paused_vm, format_location, format_source_window, list_fibers,
     list_locals, parse_break_spec, reason_label, stack_frames, DebugState, StepFocus, StepMode,
     StopReason,
 };
-use optive::diagnostics;
 use optive::opcode::Instruction;
-use optive::parser::Parser;
 use optive::shared::Shared;
 use optive::value::Value;
 use optive::vm::{DepPackage, Vm};
+use serde_json::Value as Json;
 
 use super::color;
 use super::lock::ROOT_PARENT;
@@ -36,18 +33,23 @@ pub fn cmd_debug(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 fn debug_project(
     path: Option<&Path>,
-    caps: optive::caps::Capabilities,
+    mut caps: optive::caps::Capabilities,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let project = super::manifest::find_project(path)?;
     color::status_line(&format!("Debug project {}", project.root.display()));
     let ensured = super::deps::ensure_for_run(&project)?;
     std::env::set_current_dir(&project.root)?;
-    let entry = project.entry_path()?;
-    let source =
-        fs::read_to_string(&entry).map_err(|e| format!("cannot read {}: {e}", entry.display()))?;
+    caps.configure_project_fs(
+        &project.root,
+        ensured.dep_map.values().map(|binding| binding.path.clone()),
+    );
+    let entry = project.entry_path_with_caps(&caps)?;
+    let source = caps
+        .read_to_string("script entry", &entry)
+        .map_err(|e| format!("cannot read {}: {e}", entry.display()))?;
     let file = entry.to_string_lossy().to_string();
     let mut vm = Vm::new();
-    vm.caps = caps;
+    vm.install_caps(caps);
     inject_dep_map(&mut vm, &ensured, &project.root);
     run_debug_session(&mut vm, &source, &file)
 }
@@ -56,11 +58,12 @@ fn debug_script_file(
     path: &Path,
     caps: optive::caps::Capabilities,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let source =
-        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let source = caps
+        .read_to_string("script entry", path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let file = path.to_string_lossy().to_string();
     let mut vm = Vm::new();
-    vm.caps = caps;
+    vm.install_caps(caps);
     run_debug_session(&mut vm, &source, &file)
 }
 
@@ -75,8 +78,58 @@ pub fn inject_dep_map(vm: &mut Vm, ensured: &EnsureResult, project_root: &Path) 
             },
         );
     }
+    vm.caps.configure_project_fs(
+        project_root,
+        ensured.dep_map.values().map(|binding| binding.path.clone()),
+    );
+    vm.host_caps = vm.caps.clone();
     vm.current_package_id = ROOT_PARENT.to_string();
     vm.package_root = Some(project_root.to_path_buf());
+}
+
+/// DAP 启动准备：项目内文件复用依赖解析/能力注入；无清单时保持单文件行为。
+pub fn prepare_dap_vm(args: &Json, file: &str) -> Result<Vm, String> {
+    let cap_args: Vec<String> = args
+        .get("caps")
+        .and_then(Json::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Json::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let (caps, rest) = super::caps::parse_caps(&cap_args).map_err(|e| e.to_string())?;
+    if !rest.is_empty() {
+        return Err(format!("unknown DAP caps option(s): {}", rest.join(" ")));
+    }
+
+    let file_path = Path::new(file);
+    let explicit_project = args
+        .get("projectRoot")
+        .and_then(Json::as_str)
+        .map(Path::new);
+    let project_start = explicit_project.or_else(|| file_path.parent());
+    let mut vm = Vm::new();
+    vm.install_caps(caps);
+    if let Some(start) = project_start {
+        match super::manifest::find_project(Some(start)) {
+            Ok(project) => {
+                let ensured = super::deps::ensure_for_run(&project).map_err(|e| e.to_string())?;
+                std::env::set_current_dir(&project.root).map_err(|e| {
+                    format!(
+                        "cannot set project working directory to {}: {e}",
+                        project.root.display()
+                    )
+                })?;
+                inject_dep_map(&mut vm, &ensured, &project.root);
+            }
+            Err(e) if explicit_project.is_some() => return Err(e),
+            Err(_) => {}
+        }
+    }
+    Ok(vm)
 }
 
 fn run_debug_session(
@@ -94,10 +147,7 @@ fn run_debug_session(
             vm.import_base = parent.to_path_buf();
         }
     }
-    let program =
-        Parser::parse(source).map_err(|e| diagnostics::format_parse_error(source, file, &e))?;
-    let mut compiled = Generator::new().compile(&program)?;
-    diagnostics::attach_function_sources(&mut compiled, source, file);
+    let compiled = optive::compile_with_context(vm, source, file)?;
     vm.load_program(compiled)?;
 
     println!("Optive debugger — type `help` for commands");

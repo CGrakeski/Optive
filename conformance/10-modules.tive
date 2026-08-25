@@ -1,0 +1,5 @@
+use std.test.{ assert_eq }
+export func add(a, b) { a + b }
+intern func hidden() { 0 }
+assert_eq(add(1, 2), 3)
+assert_eq(hidden(), 0)

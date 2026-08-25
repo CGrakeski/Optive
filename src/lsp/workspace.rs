@@ -1,9 +1,48 @@
 //! 工作区文档：解析 `import` / `use` 到源码，供跨文件跳转与补全。
+//! 维护增量符号索引（打开的文档）。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
 
 use super::symbols::{index_source, FileIndex, Symbol};
+
+static WORKSPACE_ROOTS: OnceLock<RwLock<Vec<PathBuf>>> = OnceLock::new();
+static DOC_INDEX: OnceLock<RwLock<HashMap<String, FileIndex>>> = OnceLock::new();
+
+pub fn configure_roots(params: &serde_json::Value) {
+    let roots = roots_from_params(params);
+    if let Ok(mut configured) = WORKSPACE_ROOTS
+        .get_or_init(|| RwLock::new(Vec::new()))
+        .write()
+    {
+        *configured = roots;
+    }
+}
+
+fn roots_from_params(params: &serde_json::Value) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(uri) = params.get("rootUri").and_then(serde_json::Value::as_str) {
+        if let Some(path) = uri_to_path(uri) {
+            roots.push(path);
+        }
+    }
+    if let Some(folders) = params
+        .get("workspaceFolders")
+        .and_then(serde_json::Value::as_array)
+    {
+        for folder in folders {
+            if let Some(uri) = folder.get("uri").and_then(serde_json::Value::as_str) {
+                if let Some(path) = uri_to_path(uri) {
+                    roots.push(path);
+                }
+            }
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
 
 #[must_use]
 pub fn is_std_spec(spec: &str) -> bool {
@@ -30,7 +69,7 @@ pub fn load_module(
         if let Some(found) = lookup_docs(docs, &uri) {
             return Some(found);
         }
-        if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Ok(text) = workspace_caps().read_to_string("LSP import", &path) {
             return Some((uri, text));
         }
     }
@@ -44,6 +83,9 @@ pub fn load_index(
     docs: &HashMap<String, String>,
 ) -> Option<(String, FileIndex)> {
     let (uri, src) = load_module(from_uri, spec, docs)?;
+    if let Some(idx) = cached_index(&uri) {
+        return Some((uri, idx));
+    }
     Some((uri, index_source(&src)))
 }
 
@@ -133,6 +175,14 @@ fn same_path(a: &Path, b: &Path) -> bool {
 }
 
 pub fn resolve_import_file(doc_uri: &str, spec: &str) -> Option<PathBuf> {
+    let spec_path = Path::new(spec);
+    if spec_path.is_absolute()
+        || spec_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
     let doc = uri_to_path(doc_uri)?;
     let base = doc.parent().unwrap_or(Path::new("."));
     let cand = if spec.ends_with(".tive") {
@@ -141,11 +191,44 @@ pub fn resolve_import_file(doc_uri: &str, spec: &str) -> Option<PathBuf> {
         base.join(format!("{spec}.tive"))
     };
     if cand.is_file() {
-        return Some(cand);
+        return workspace_checked(cand);
     }
     let with_slash = spec.replace('.', std::path::MAIN_SEPARATOR_STR);
     let cand2 = base.join(format!("{with_slash}.tive"));
-    cand2.is_file().then_some(cand2)
+    cand2.is_file().then(|| workspace_checked(cand2)).flatten()
+}
+
+fn workspace_checked(path: PathBuf) -> Option<PathBuf> {
+    let roots = configured_roots()?;
+    workspace_checked_with_roots(path, &roots)
+}
+
+fn configured_roots() -> Option<Vec<PathBuf>> {
+    Some(
+        WORKSPACE_ROOTS
+            .get_or_init(|| RwLock::new(Vec::new()))
+            .read()
+            .ok()?
+            .clone(),
+    )
+}
+
+fn workspace_caps() -> crate::caps::Capabilities {
+    let roots = configured_roots().unwrap_or_default();
+    if roots.is_empty() {
+        crate::caps::Capabilities::full()
+    } else {
+        crate::caps::Capabilities::sandbox(roots)
+    }
+}
+
+fn workspace_checked_with_roots(path: PathBuf, roots: &[PathBuf]) -> Option<PathBuf> {
+    if roots.is_empty() {
+        return Some(path);
+    }
+    let gate = crate::caps::Capabilities::sandbox(roots.to_vec());
+    gate.resolve_fs_path("LSP import", path, crate::caps::FsAccess::Read)
+        .ok()
 }
 
 pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
@@ -200,4 +283,85 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     out
+}
+
+fn doc_index() -> &'static RwLock<HashMap<String, FileIndex>> {
+    DOC_INDEX.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+pub fn upsert_index(uri: &str, source: &str) {
+    let idx = index_source(source);
+    if let Ok(mut map) = doc_index().write() {
+        map.insert(uri.to_string(), idx);
+    }
+}
+
+pub fn drop_index(uri: &str) {
+    if let Ok(mut map) = doc_index().write() {
+        map.remove(uri);
+    }
+}
+
+#[must_use]
+pub fn cached_index(uri: &str) -> Option<FileIndex> {
+    doc_index().read().ok()?.get(uri).cloned()
+}
+
+#[must_use]
+pub fn workspace_symbols(query: &str) -> Vec<(String, Symbol)> {
+    let q = query.trim().to_ascii_lowercase();
+    let Ok(map) = doc_index().read() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (uri, idx) in map.iter() {
+        for s in &idx.symbols {
+            if s.container.is_some() {
+                continue;
+            }
+            if q.is_empty() || s.name.to_ascii_lowercase().contains(&q) {
+                out.push((uri.clone(), s.clone()));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.1.name.cmp(&b.1.name).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disk_import_cannot_leave_workspace() {
+        let base = std::env::temp_dir().join(format!("optive_lsp_gate_{}", std::process::id()));
+        let root = base.join("workspace");
+        let outside = base.join("outside.tive");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("inside.tive"), "export let x = 1\n").unwrap();
+        std::fs::write(&outside, "export let secret = 1\n").unwrap();
+
+        assert!(workspace_checked_with_roots(
+            root.join("inside.tive"),
+            std::slice::from_ref(&root)
+        )
+        .is_some());
+        assert!(workspace_checked_with_roots(outside, &[root]).is_none());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn initialize_reads_root_uri_and_workspace_folders() {
+        let params = serde_json::json!({
+            "rootUri": "file:///tmp/root",
+            "workspaceFolders": [
+                { "uri": "file:///tmp/other", "name": "other" }
+            ]
+        });
+        let roots = roots_from_params(&params);
+        assert_eq!(roots.len(), 2);
+        assert!(roots.iter().any(|p| p.ends_with("root")));
+        assert!(roots.iter().any(|p| p.ends_with("other")));
+    }
 }

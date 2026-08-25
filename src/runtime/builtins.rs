@@ -69,9 +69,9 @@ pub fn install_globals(vm: &mut Vm) {
         vm.globals.insert(name.into(), Value::builtin_fn(name, f));
     }
 }
-fn builtin_print(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn builtin_print(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let out = crate::value::args_join_space(args);
-    println!("{out}");
+    vm.write_output(crate::vm::OutputStream::Stdout, &format!("{out}\n"));
     Ok(Value::None)
 }
 
@@ -502,21 +502,20 @@ fn builtin_next(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
 }
 
-fn builtin_input(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn builtin_input(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let prompt = if args.is_empty() {
         String::new()
     } else {
         args[0].print_string()
     };
-    read_line_with_prompt(&prompt)
+    read_line_with_prompt(vm, &prompt)
 }
 
 /// 带可选提示的行输入（`input` 与 `std.io.read_line` 共用）。
-pub(crate) fn read_line_with_prompt(prompt: &str) -> Result<Value> {
-    use std::io::{self, Write};
+pub(crate) fn read_line_with_prompt(vm: &Vm, prompt: &str) -> Result<Value> {
+    use std::io;
     if !prompt.is_empty() {
-        print!("{prompt}");
-        io::stdout().flush().ok();
+        vm.write_output(crate::vm::OutputStream::Stdout, prompt);
     }
     let mut line = String::new();
     io::stdin()

@@ -1,0 +1,5 @@
+[package]
+name = "ci_self_check"
+entry = "src/main.tive"
+
+[dependencies]

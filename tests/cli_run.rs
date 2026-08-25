@@ -139,12 +139,12 @@ id = "dead"
     let (code, stdout, stderr) = run_optive_env(&["run"], &root, &[("OPTIVE_USE_LOCAL_DEPS", "1")]);
     assert_ne!(code, 0, "stdout={stdout}");
     assert!(
-        stderr.contains("out of date")
+        stderr.contains("expected 2")
+            || stderr.contains("delete")
+            || stderr.contains("regenerate")
+            || stderr.contains("out of date")
             || stderr.contains("update")
-            || stderr.contains("up")
-            || stderr.contains("invalid")
-            || stderr.contains("pinned")
-            || stderr.contains("missing"),
+            || stderr.contains("invalid"),
         "stderr={stderr}"
     );
 }
@@ -288,6 +288,50 @@ greeter = { git = "https://github.com/example/greeter.git", rev = "ccccccccccccc
     let (code, stdout, stderr) = run_optive_env(&["run"], &root, &[("OPTIVE_USE_LOCAL_DEPS", "1")]);
     assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
     assert!(stdout.contains("hello"), "stdout={stdout}");
+}
+
+#[test]
+fn sandbox_reads_src_main_dependency_but_keeps_it_read_only() {
+    let root = tempfile_project("sandbox_dep_ro");
+    fs::write(
+        root.join("Optive.toml"),
+        r#"
+[package]
+name = "sandbox_dep_ro"
+entry = "src/main.tive"
+
+[dependencies]
+greeter = { git = "https://github.com/example/greeter.git", rev = "abababababababababababababababababababab" }
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/main.tive"),
+        "import greeter\nprint(greeter.hi)\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("deps/greeter/src")).unwrap();
+    fs::write(
+        root.join("deps/greeter/src/main.tive"),
+        "export let hi = \"hello from src\"\n",
+    )
+    .unwrap();
+
+    let env = [("OPTIVE_USE_LOCAL_DEPS", "1")];
+    let (code, stdout, stderr) = run_optive_env(&["run", "--sandbox"], &root, &env);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(stdout.contains("hello from src"), "stdout={stdout}");
+
+    fs::write(
+        root.join("src/main.tive"),
+        "std.fs.write_text(\"deps/greeter/hack.txt\", \"no\")\n",
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run_optive_env(&["run", "--sandbox"], &root, &env);
+    assert_ne!(code, 0, "stdout={stdout}");
+    assert!(stderr.contains("read-only dependency root"), "{stderr}");
+    assert!(!root.join("deps/greeter/hack.txt").exists());
 }
 
 #[test]
@@ -494,6 +538,14 @@ fn help_lists_test_and_index_sync() {
         stdout.contains("Optive test"),
         "help should mention test:\n{stdout}"
     );
+    assert!(
+        stdout.contains("Optive dap"),
+        "help should mention dap:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("--trust-deps"),
+        "help should mention --trust-deps:\n{stdout}"
+    );
 }
 
 #[test]
@@ -521,6 +573,216 @@ entry = "src/main.tive"
     assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
     assert!(stdout.contains("ok.tive"), "stdout={stdout}");
     assert!(stdout.contains("test result: ok"), "stdout={stdout}");
+}
+
+#[test]
+fn test_command_setup_and_each() {
+    let root = tempfile_project("tive_tests_setup");
+    fs::write(
+        root.join("Optive.toml"),
+        r#"
+[package]
+name = "tive_tests_setup"
+entry = "src/main.tive"
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/main.tive"), "print(1)\n").unwrap();
+    fs::create_dir_all(root.join("tests")).unwrap();
+    fs::write(root.join("tests/_setup.tive"), "let setup_flag = 7\n").unwrap();
+    fs::write(
+        root.join("tests/uses_setup.tive"),
+        r#"
+use std.test.{ assert_eq, each }
+assert_eq(setup_flag, 7)
+each("add", [[1, 2, 3], [2, 2, 4]], do(row) {
+    assert_eq(row[0] + row[1], row[2])
+})
+"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["test"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(
+        stdout.contains("add[0] ok") || stdout.contains("test result: ok"),
+        "stdout={stdout}"
+    );
+}
+
+#[test]
+fn test_command_uses_nearest_nested_fixtures() {
+    let root = tempfile_project("tive_tests_nested_fixture");
+    fs::write(
+        root.join("Optive.toml"),
+        "[package]\nname = \"nested_fixture\"\nentry = \"src/main.tive\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/main.tive"), "").unwrap();
+    fs::create_dir_all(root.join("tests/nested")).unwrap();
+    fs::write(root.join("tests/_setup.tive"), "let fixture_value = 1\n").unwrap();
+    fs::write(
+        root.join("tests/nested/_setup.tive"),
+        "let fixture_value = 2\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("tests/nested/_teardown.tive"),
+        "std.fs.write_text(\"nested-teardown.txt\", \"done\")\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("tests/nested/case.tive"),
+        "use std.test.{ assert_eq }\nassert_eq(fixture_value, 2)\n",
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["test"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(root.join("nested-teardown.txt").is_file());
+}
+
+#[test]
+fn test_command_runs_teardown_after_body_failure() {
+    let root = tempfile_project("tive_tests_failed_body_teardown");
+    fs::write(
+        root.join("Optive.toml"),
+        "[package]\nname = \"failed_body_teardown\"\nentry = \"src/main.tive\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/main.tive"), "").unwrap();
+    fs::create_dir_all(root.join("tests")).unwrap();
+    fs::write(
+        root.join("tests/_teardown.tive"),
+        "std.fs.write_text(\"body-teardown.txt\", \"done\")\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("tests/fails.tive"),
+        "use std.test.{ assert_eq }\nassert_eq(1, 2)\n",
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["test"], &root);
+    assert_ne!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(root.join("body-teardown.txt").is_file());
+}
+
+#[test]
+fn test_command_runs_teardown_after_setup_failure() {
+    let root = tempfile_project("tive_tests_failed_setup_teardown");
+    fs::write(
+        root.join("Optive.toml"),
+        "[package]\nname = \"failed_setup_teardown\"\nentry = \"src/main.tive\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/main.tive"), "").unwrap();
+    fs::create_dir_all(root.join("tests")).unwrap();
+    fs::write(
+        root.join("tests/_setup.tive"),
+        "throw AssertionError(\"setup failed\")\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("tests/_teardown.tive"),
+        "std.fs.write_text(\"setup-teardown.txt\", \"done\")\n",
+    )
+    .unwrap();
+    fs::write(root.join("tests/case.tive"), "none\n").unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["test"], &root);
+    assert_ne!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(root.join("setup-teardown.txt").is_file());
+}
+
+#[test]
+fn test_each_logs_every_assertion_failure_detail() {
+    let root = tempfile_project("tive_tests_each_failures");
+    fs::write(
+        root.join("Optive.toml"),
+        "[package]\nname = \"each_failures\"\nentry = \"src/main.tive\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/main.tive"), "").unwrap();
+    fs::create_dir_all(root.join("tests")).unwrap();
+    fs::write(
+        root.join("tests/each.tive"),
+        r#"
+use std.test.{ assert_eq, each }
+each("rows", [1, 2, 3], do(row) {
+    assert_eq(row, 0)
+})
+"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["test"], &root);
+    assert_ne!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    for index in 0..3 {
+        assert!(
+            stdout.contains(&format!("rows[{index}] FAILED:")),
+            "stdout={stdout}"
+        );
+    }
+    assert!(stdout.contains("1 != 0"), "stdout={stdout}");
+    assert!(stdout.contains("3 != 0"), "stdout={stdout}");
+}
+
+#[test]
+fn test_command_cover_writes_json() {
+    let root = tempfile_project("tive_tests_cover");
+    fs::write(
+        root.join("Optive.toml"),
+        r#"
+[package]
+name = "tive_tests_cover"
+entry = "src/main.tive"
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/main.tive"),
+        "export func never_called() {\n    let untouched = 41\n    return untouched + 1\n}\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("tests")).unwrap();
+    fs::write(
+        root.join("tests/ok.tive"),
+        "use std.test.{ assert_eq }\nimport \"../src/main.tive\" as app\nassert_eq(1, 1)\n",
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["test", "--cover"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(
+        stdout.contains("cover") || root.join(".optive/cover.json").is_file(),
+        "stdout={stdout}"
+    );
+    assert!(
+        root.join(".optive/cover.json").is_file(),
+        "missing cover.json"
+    );
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(root.join(".optive/cover.json")).expect("read cover report"),
+    )
+    .expect("parse cover report");
+    let module = &report["files"]["src/main.tive"];
+    assert!(
+        module.is_object(),
+        "report should use a stable project-relative module path: {report}"
+    );
+    let hit = module["hit"].as_u64().expect("module hit count");
+    let exec = module["exec"].as_u64().expect("module executable count");
+    assert!(
+        exec > hit,
+        "uncalled imported function lines must remain in the denominator: {module}"
+    );
 }
 
 #[test]
@@ -633,6 +895,30 @@ entry = "src/main.tive"
 }
 
 #[test]
+fn check_undefined_name_exits_1() {
+    let root = tempfile_project("check_undef");
+    fs::write(
+        root.join("Optive.toml"),
+        r#"
+[package]
+name = "check_undef"
+entry = "src/main.tive"
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/main.tive"), "print(no_such_name)\n").unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["check"], &root);
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("undefined name") || combined.contains("FAILED"),
+        "out={combined}"
+    );
+}
+
+#[test]
 fn check_reports_parse_error() {
     let root = tempfile_project("check_bad");
     fs::write(
@@ -654,6 +940,36 @@ entry = "src/main.tive"
         combined.contains("error") || combined.contains("FAILED") || combined.contains("lex"),
         "out={combined}"
     );
+}
+
+#[test]
+fn fmt_check_fails_when_dirty_and_passes_when_clean() {
+    let root = tempfile_project("fmt_check");
+    fs::write(
+        root.join("Optive.toml"),
+        r#"
+[package]
+name = "fmt_check"
+entry = "src/main.tive"
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    let dirty = "func add(a,b){\nreturn a+b\n}\n";
+    fs::write(root.join("src/main.tive"), dirty).unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["fmt", "--check"], &root);
+    assert_ne!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("would reformat") || combined.contains("need formatting"),
+        "out={combined}"
+    );
+
+    let (code, stdout, stderr) = run_optive(&["fmt"], &root);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let (code, stdout, stderr) = run_optive(&["fmt", "--check"], &root);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
 }
 
 fn tempfile_project(name: &str) -> PathBuf {

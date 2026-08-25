@@ -2,34 +2,35 @@
 //!
 //! 本地脚本拥有本机文件系统、进程与模块导入权限。
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::dbg_macro
-)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+#[path = "lsp/catalog.rs"]
+pub mod api_registry;
 pub mod compiler;
 pub mod custom;
+pub mod dap;
+pub mod embed;
 pub mod frontend;
 pub mod lsp;
+pub mod rpc;
 pub mod runtime;
+pub mod semantic;
 pub mod stdlib;
+pub mod versions;
 
 pub use compiler::{
     bc_cache, codegen, free_vars, hot_code, monomorph, opcode, protocol, specialize, stack_effect,
 };
 pub use frontend::{ast, diagnostics, error, fmt, lexer, parser, token};
 pub use runtime::{
-    builtins, c_types, caps, concurrency, debug, enum_variant, exceptions, ffi, ffi_extra,
-    ffi_pool, gc, module, ptr_registry, runtime_ast, scheduler, shared, sized, traceback,
-    type_registry, types, value, vm,
+    builtins, c_types, caps, concurrency, coverage, debug, enum_variant, exceptions, ffi,
+    ffi_extra, ffi_pool, gc, metrics, module, ptr_registry, runtime_ast, scheduler, shared, sized,
+    traceback, type_registry, types, value, vm,
 };
 pub use stdlib as std_modules;
 
 pub use error::{ExceptionKind, LexError, ParseError, RuntimeError};
+pub use lexer::InputStatus;
 pub use parser::Parser;
 pub use token::{Token, TokenKind};
 
@@ -52,30 +53,24 @@ pub fn compile(source: &str) -> Result<opcode::CompiledProgram> {
     Generator::new().compile(&program)
 }
 
-pub fn run_source(source: &str) -> Result<value::Value> {
-    let mut vm = vm::Vm::new();
-    run_source_in_vm(&mut vm, source, "<script>")
-}
-
-pub fn run_source_in_vm(vm: &mut vm::Vm, source: &str, file: &str) -> Result<value::Value> {
-    vm.source_file = file.to_string();
-    vm.current_source = Some(std::sync::Arc::from(source));
-    if file != "<script>" && file != "<repl>" {
-        let path = std::path::Path::new(file);
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                vm.import_base = parent.to_path_buf();
-            }
-        } else if path.extension().is_some() || file.contains('/') || file.contains('\\') {
-            vm.import_base =
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        }
-    }
+/// 使用运行时上下文编译源码，并在装载前补齐调试与覆盖率元数据。
+///
+/// 调用方仍负责设置 `Vm` 的当前源码上下文，并决定何时 `load_program`。
+pub fn compile_with_context(
+    vm: &vm::Vm,
+    source: &str,
+    file: &str,
+) -> Result<opcode::CompiledProgram> {
     let mut compiled = if crate::bc_cache::should_use(file) {
         let mut dep_ids: Vec<String> = vm.dep_map.values().map(|d| d.id.clone()).collect();
         dep_ids.sort();
-        let key = crate::bc_cache::key(env!("CARGO_PKG_VERSION"), file, source, &dep_ids.join(","));
-        let path = crate::bc_cache::cache_dir().join(format!("{key}.otbc"));
+        let key = crate::bc_cache::key(
+            &crate::versions::bytecode_cache_version(),
+            file,
+            source,
+            &dep_ids.join(","),
+        );
+        let path = crate::bc_cache::cache_dir().join(format!("{key}.tivc"));
         if let Some(cached) = crate::bc_cache::load(&path) {
             crate::bc_cache::note_hit();
             cached
@@ -95,6 +90,30 @@ pub fn run_source_in_vm(vm: &mut vm::Vm, source: &str, file: &str) -> Result<val
         Generator::new().compile(&program)?
     };
     diagnostics::attach_function_sources(&mut compiled, source, file);
+    crate::coverage::note_compiled(vm, file, &compiled);
+    Ok(compiled)
+}
+
+pub fn run_source(source: &str) -> Result<value::Value> {
+    let mut vm = vm::Vm::new();
+    run_source_in_vm(&mut vm, source, "<script>")
+}
+
+pub fn run_source_in_vm(vm: &mut vm::Vm, source: &str, file: &str) -> Result<value::Value> {
+    vm.source_file = file.to_string();
+    vm.current_source = Some(std::sync::Arc::from(source));
+    if file != "<script>" && file != "<repl>" {
+        let path = std::path::Path::new(file);
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                vm.import_base = parent.to_path_buf();
+            }
+        } else if path.extension().is_some() || file.contains('/') || file.contains('\\') {
+            vm.import_base =
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        }
+    }
+    let compiled = compile_with_context(vm, source, file)?;
     vm.load_program(compiled)?;
     vm.run().map_err(|e| {
         let stack = vm.take_error_stack();
@@ -131,55 +150,10 @@ fn format_runtime_error(
     }
 }
 
-/// REPL 辅助：检查源码是否有未闭合分隔符（忽略 `//` / `#` 行注释与字符串内容）。
+/// REPL 辅助：复用 lexer 的 incomplete-input 状态。
 #[must_use]
 pub fn repl_needs_continuation(source: &str) -> bool {
-    let mut paren = 0i32;
-    let mut bracket = 0i32;
-    let mut brace = 0i32;
-    let mut in_string = false;
-    let mut escape = false;
-    let mut line_comment = false;
-    let chars: Vec<char> = source.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let ch = chars[i];
-        if line_comment {
-            if ch == '\n' {
-                line_comment = false;
-            }
-            i += 1;
-            continue;
-        }
-        if in_string {
-            if escape {
-                escape = false;
-            } else if ch == '\\' {
-                escape = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            i += 1;
-            continue;
-        }
-        if ch == '#' || (ch == '/' && i + 1 < chars.len() && chars[i + 1] == '/') {
-            line_comment = true;
-            i += 1;
-            continue;
-        }
-        match ch {
-            '"' => in_string = true,
-            '(' => paren += 1,
-            ')' => paren -= 1,
-            '[' => bracket += 1,
-            ']' => bracket -= 1,
-            '{' => brace += 1,
-            '}' => brace -= 1,
-            _ => {}
-        }
-        i += 1;
-    }
-    in_string || paren > 0 || bracket > 0 || brace > 0
+    lexer::input_status(source).is_incomplete()
 }
 
 /// 运行源码并返回数值结果字符串（测试用）。

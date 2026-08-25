@@ -1,0 +1,8 @@
+export func explode() {
+    throw ValueError("module metadata boom")
+}
+
+export func never_called() {
+    let untouched = 41
+    return untouched + 1
+}

@@ -9,7 +9,7 @@
 mod common;
 
 use common::kinds;
-use optive::{tokenize, TokenKind};
+use optive::{lexer::input_status, tokenize, InputStatus, TokenKind};
 
 macro_rules! assert_kinds {
     ($src:expr, $($k:ident),+ $(,)?) => {
@@ -317,6 +317,46 @@ fn lex_multiple_statements_newlines() {
 #[test]
 fn lex_err_unterminated_string() {
     assert!(tokenize("\"hello").is_err());
+}
+
+#[test]
+fn incomplete_input_tracks_comments_and_literal_flavors() {
+    for source in [
+        "/* waiting",
+        r#"r"waiting"#,
+        r#"f"value {x}"#,
+        r#"b"waiting"#,
+        r#""""waiting"#,
+        r#"r"""waiting"#,
+        r#"f"""waiting"#,
+    ] {
+        assert_eq!(
+            input_status(source),
+            InputStatus::Incomplete,
+            "source: {source}"
+        );
+    }
+    for source in [
+        "/* done */",
+        r#"r"done""#,
+        r#"f"value {x}""#,
+        r#"b"done""#,
+        r#""""done""""#,
+        r#"r"""done""""#,
+        r#"f"""done""""#,
+        r#"r"hash # still string""#,
+    ] {
+        assert_eq!(
+            input_status(source),
+            InputStatus::Complete,
+            "source: {source}"
+        );
+    }
+    assert_eq!(
+        input_status(r#"r"hash # still"#),
+        InputStatus::Incomplete,
+        "hash inside an open raw string must not start a line comment"
+    );
 }
 
 #[test]

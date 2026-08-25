@@ -32,6 +32,10 @@ pub struct MnScheduler {
     busy_count: AtomicUsize,
     /// 已启动的辅助线程数。
     helpers_started: AtomicUsize,
+    /// helper 线程成功认领并开跑的任务次数（诊断 M:N 是否真在干活）。
+    helper_runs: AtomicUsize,
+    /// 主线程发布的脚本全局槽快照；helper 任务开始时拷到本地，避免热路径抢 SharedMap。
+    script_snap: Mutex<(Vec<String>, Vec<Value>)>,
     /// GC stop-the-world：请求置位后各 worker 在安全点停住。
     pub(crate) stw_requested: AtomicBool,
     stw_parked: AtomicUsize,
@@ -62,6 +66,8 @@ impl MnScheduler {
             worker_count: AtomicUsize::new(worker_count.max(1)),
             busy_count: AtomicUsize::new(0),
             helpers_started: AtomicUsize::new(0),
+            helper_runs: AtomicUsize::new(0),
+            script_snap: Mutex::new((Vec::new(), Vec::new())),
             stw_requested: AtomicBool::new(false),
             stw_parked: AtomicUsize::new(0),
             stw_failures: AtomicUsize::new(0),
@@ -183,7 +189,8 @@ impl MnScheduler {
     pub fn push_task(&self, task: Shared<TaskInner>) {
         self.note_scheduled_task(&task);
         self.injector.push(task);
-        self.notify_one();
+        // 一次 `go` 可能对应多个空闲 helper；`notify_one` 会漏叫醒。
+        self.notify_all();
     }
 
     pub fn notify_one(&self) {
@@ -270,6 +277,24 @@ impl MnScheduler {
 
     pub fn mark_helper_started(&self) {
         self.helpers_started.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn note_helper_run(&self) {
+        self.helper_runs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn helper_runs(&self) -> usize {
+        self.helper_runs.load(Ordering::Relaxed)
+    }
+
+    pub fn publish_script_globals(&self, names: Vec<String>, vals: Vec<Value>) {
+        *self.script_snap.lock() = (names, vals);
+    }
+
+    #[must_use]
+    pub fn snapshot_script_globals(&self) -> (Vec<String>, Vec<Value>) {
+        self.script_snap.lock().clone()
     }
 }
 
