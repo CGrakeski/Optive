@@ -97,7 +97,7 @@ jobs:
         with:
           shared-key: test
       - name: Fetch locked crates
-        run: cargo fetch --locked --all-features
+        run: cargo fetch --locked
       - name: Test (default — 跳过被 ignore 的慢基准；含 vm_concurrency / vm_gc_mn / fuzz_frontend)
         run: cargo test --locked --all-features
       - name: Test (ignored 基准，仅作冒烟)
