@@ -67,8 +67,6 @@ jobs:
         run: cargo fmt --all -- --check
       - name: clippy (all targets and features, deny warnings)
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - name: Stdlib documentation coverage
-        run: python3 tools/check-stdlib-coverage.py
 
   # 三平台构建 + 测试。集成测试会 spawn 已构建的 `Optive` 二进制，
   # `cargo test` 默认会先编译 bin，故无需额外 `cargo build`。

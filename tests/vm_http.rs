@@ -85,7 +85,7 @@ fn http_real_get_example_com() {
         r#"
 import std.http as http
 let r = http.get("https://example.com")
-r.status
+r["status"]
 "#,
         "200",
     );
@@ -93,7 +93,7 @@ r.status
         r#"
 import std.http as http
 let r = http.get("https://example.com")
-r.body
+r["body"]
 "#,
     );
     match body {

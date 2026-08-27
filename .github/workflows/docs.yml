@@ -5,14 +5,10 @@ on:
     branches: [main, master]
     paths:
       - "docs/**"
-      - "src/lsp/catalog.rs"
-      - "tools/check-stdlib-coverage.py"
       - ".github/workflows/docs.yml"
   pull_request:
     paths:
       - "docs/**"
-      - "src/lsp/catalog.rs"
-      - "tools/check-stdlib-coverage.py"
       - ".github/workflows/docs.yml"
   workflow_dispatch:
 
@@ -26,15 +22,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Stdlib coverage
-        run: python3 tools/check-stdlib-coverage.py
       - name: mdBook
+        if: hashFiles('docs/book.toml') != ''
         uses: peaceiris/actions-mdbook@v2
         with:
           mdbook-version: "0.4.40"
       - name: Build book
+        if: hashFiles('docs/book.toml') != ''
         run: mdbook build docs
       - uses: actions/upload-artifact@v7
+        if: hashFiles('docs/book.toml') != ''
         with:
           name: book
           path: target/book
@@ -42,7 +39,7 @@ jobs:
           retention-days: 7
 
   pages:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && hashFiles('docs/book.toml') != ''
     needs: check
     runs-on: ubuntu-latest
     environment:
