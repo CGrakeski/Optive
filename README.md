@@ -31,7 +31,7 @@ Optive new my_app && cd my_app && Optive run
 | `add` · `search` · `index sync` | 依赖与官方索引（Gitee Optindex） |
 | `fmt` · `debug` · `lsp` · `dap` | 格式化、CLI 调试器、语言服务、DAP 适配器 |
 
-能力开关：`--sandbox` `--no-network` `--no-ffi` `--allow-ffi` `--allow-path`。`--sandbox` 是对抗式能力边界：禁网/环境写入/FFI，项目根可写、依赖根只读；受限模式拒绝 SQLite 文件库。`--no-network` 关掉 `std.http` 和 `std.net`。
+能力开关：`--sandbox` `--no-network` `--no-ffi` `--allow-ffi` `--allow-path`。`--no-ffi` 与 `--allow-ffi` 不能同时出现。`--sandbox` 是对抗式能力边界：禁网/环境写入/FFI，项目根可写、依赖根只读；受限模式拒绝 SQLite 文件库。`--no-network` 关掉 `std.http` 和 `std.net`。
 
 命令与环境变量全文：[docs/cli.md](docs/cli.md)。依赖模型：[docs/deps.md](docs/deps.md)。
 

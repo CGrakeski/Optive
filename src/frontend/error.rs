@@ -163,6 +163,8 @@ impl RuntimeError {
         Self::typed(ExceptionKind::Runtime, message)
     }
 
+    /// `message` 是异常**正文**，不要带 `TypeError:` 这类类型名前缀。
+    /// 人读末行由 [`Self::uncaught_line`] / traceback 用 `kind` 拼一次。
     pub fn typed(kind: ExceptionKind, message: impl Into<String>) -> Self {
         Self::Host {
             kind,
@@ -196,6 +198,10 @@ impl RuntimeError {
 
     pub fn zero_div(message: impl Into<String>) -> Self {
         Self::typed(ExceptionKind::ZeroDivision, message)
+    }
+
+    pub fn recursion_err(message: impl Into<String>) -> Self {
+        Self::typed(ExceptionKind::RecursionError, message)
     }
 
     /// 按当前定制包渲染的除零错误（人读文案；类型名仍为 `ZeroDivisionError`）。
@@ -240,6 +246,12 @@ impl RuntimeError {
         }
     }
 
+    /// 未捕获时的人读末行：`TypeName: 正文`。`message` 本身不含类型名。
+    #[must_use]
+    pub fn uncaught_line(&self) -> String {
+        crate::custom::active_pack().format_exception_line(self.kind().type_name(), self.message())
+    }
+
     #[must_use]
     pub fn with_line(self, line: usize) -> Self {
         Self::AtLine {
@@ -247,5 +259,24 @@ impl RuntimeError {
             message: self.message().to_string(),
             line,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_message_is_body_uncaught_line_adds_kind() {
+        let err = RuntimeError::type_err("invalid num literal");
+        assert_eq!(err.message(), "invalid num literal");
+        assert_eq!(err.uncaught_line(), "TypeError: invalid num literal");
+        let rec = RuntimeError::recursion_err("maximum recursion depth exceeded");
+        assert_eq!(rec.kind(), ExceptionKind::RecursionError);
+        assert_eq!(rec.message(), "maximum recursion depth exceeded");
+        assert_eq!(
+            rec.uncaught_line(),
+            "RecursionError: maximum recursion depth exceeded"
+        );
     }
 }

@@ -69,7 +69,7 @@ COUNT{1, 2, 3}
 fn friend_func_dispatch_num_and_text() {
     assert_text(
         r#"
-friend func add(x:: num) { return text(x + 1) }
+friend func add(x:: num) { return text.(x + 1) }
 add.__dispatch__.append(do(x:: text) { return x + "!" })
 add(41)
 "#,
@@ -81,7 +81,7 @@ add(41)
 fn friend_func_dispatch_text_handler() {
     assert_text(
         r#"
-friend func add(x:: num) { return text(x) }
+friend func add(x:: num) { return text.(x) }
 add.__dispatch__.append(do(x:: text) { return x + "!" })
 add("hi")
 "#,
@@ -90,10 +90,10 @@ add("hi")
 }
 
 #[test]
-fn builtin_text_constructor() {
+fn builtin_text_convert() {
     assert_text(
         r"
-text(42)
+text.(42)
 ",
         "42",
     );

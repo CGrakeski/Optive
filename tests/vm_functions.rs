@@ -223,3 +223,160 @@ let result = {
 ",
     );
 }
+
+#[test]
+fn script_nested_assign_updates_unescaped() {
+    assert_num(
+        r"
+let x = 1
+if (true) {
+    x = x + 10
+}
+x
+",
+        "11",
+    );
+}
+
+#[test]
+fn script_unescaped_arith_loop() {
+    assert_num(
+        r"
+let sum = 0
+loop (1000) {
+    sum = sum + 1
+}
+sum
+",
+        "1000",
+    );
+}
+
+#[test]
+fn script_add_store_two_lets() {
+    assert_num(
+        r"
+let a = 10
+let b = 32
+a = a + b
+a
+",
+        "42",
+    );
+}
+
+#[test]
+fn escaped_top_level_sees_later_stores() {
+    assert_num(
+        r"
+let n = 1
+func f() { return n }
+n = 2
+f()
+",
+        "2",
+    );
+}
+
+#[test]
+fn heavy_call_from_script_does_not_clobber_fast_local() {
+    assert_num(
+        r"
+let x = 1
+func g() { return 1 }
+func f() { return g() + 1 }
+x = x + 1
+f() + x
+",
+        "4",
+    );
+}
+
+#[test]
+fn repl_flushes_unescaped_let_to_next_snippet() {
+    let mut vm = optive::vm::Vm::new();
+    let first = optive::run_source_in_vm(&mut vm, "let n = 1\nn", "<repl>").expect("first snippet");
+    assert_eq!(first.display_string(), "1");
+    let second = optive::run_source_in_vm(&mut vm, "n + 1", "<repl>").expect("second snippet");
+    assert_eq!(second.display_string(), "2");
+}
+
+#[test]
+fn go_do_ticker_increments_escaped_global() {
+    common::assert_num_w1(
+        r"
+var progressed = 0
+let ticker = go do {
+    var i = 0
+    while (i < 20) {
+        progressed = progressed + 1
+        i = i + 1
+        suspend
+    }
+    return progressed
+}
+await ticker
+",
+        "20",
+    );
+}
+
+#[test]
+fn go_do_ticker_increments_with_workers() {
+    let mut vm = optive::vm::Vm::with_workers(2);
+    let v = optive::run_source_in_vm(
+        &mut vm,
+        r"
+var progressed = 0
+await (go do {
+    var i = 0
+    while (i < 20) {
+        progressed = progressed + 1
+        i = i + 1
+        suspend
+    }
+    return progressed
+})
+",
+        "<test>",
+    )
+    .expect("run");
+    assert_eq!(v.display_string(), "20");
+}
+
+/// 脚本未逃逸槽（`n` 在 await 完成前为空）+ helper 上的 `go` 重帧迁回主线程。
+/// 若 install 后 `lw_depth` 误为 1，`LoadFast i` 会读到空的 `n` 槽。
+#[test]
+fn go_do_ticker_with_unescaped_await_binding() {
+    let mut vm = optive::vm::Vm::with_workers(2);
+    let v = optive::run_source_in_vm(
+        &mut vm,
+        r"
+let n = await (go do {
+    var i = 0
+    while (i < 20) {
+        i = i + 1
+        suspend
+    }
+    return i
+})
+n
+",
+        "<test>",
+    )
+    .expect("run");
+    assert_eq!(v.display_string(), "20");
+}
+
+#[test]
+fn go_do_reads_live_top_level() {
+    assert_num(
+        r"
+let n = 1
+n = 2
+let t = go do { return n + 1 }
+await t
+",
+        "3",
+    );
+}

@@ -161,6 +161,16 @@ sum([1, 2, 3])
 }
 
 #[test]
+fn p2_std_collections_sum_rejects_non_integer() {
+    run_err(
+        r#"
+use std.collections.{ sum }
+sum([1, "x"])
+"#,
+    );
+}
+
+#[test]
 fn p2_list_append_method() {
     assert_list(
         r"
@@ -348,4 +358,51 @@ b.value
 ",
         "99",
     );
+}
+
+#[test]
+fn rebind_global_function_updates_call() {
+    assert_num(
+        r"
+func f() { return 1 }
+f = do() { return 2 }
+f()
+",
+        "2",
+    );
+}
+
+#[test]
+fn overwrite_global_function_with_int_does_not_call_stale() {
+    run_err(
+        r"
+func f() { return 1 }
+f = 3
+f()
+",
+    );
+}
+
+#[test]
+fn reloading_program_does_not_call_stale_hot_function() {
+    let mut vm = Vm::with_workers(1);
+    let v1 = run_source_in_vm(
+        &mut vm,
+        "func a() { return 10 }\nfunc f() { return 1 }\nf()",
+        "<a>",
+    )
+    .expect("first snippet");
+    let v2 =
+        run_source_in_vm(&mut vm, "func f() { return 2 }\nf()", "<b>").expect("second snippet");
+    assert_eq!(v1.display_string(), "1");
+    assert_eq!(v2.display_string(), "2");
+}
+
+#[test]
+fn debug_list_globals_sees_hot_int_store() {
+    let mut vm = Vm::with_workers(1);
+    run_source_in_vm(&mut vm, "x = 0\nx = 42\n", "<g>").expect("run");
+    let found = vm.debug_list_globals().into_iter().find(|(k, _)| k == "x");
+    let (_, value) = found.expect("global x");
+    assert_eq!(value.display_string(), "42");
 }

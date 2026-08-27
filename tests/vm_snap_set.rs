@@ -53,14 +53,14 @@ snap maybe(0)
 
 #[test]
 fn empty_set_literal_comma() {
-    assert_num("{,}.len()", "0");
+    assert_num("len({,})", "0");
     assert_bool("1 in {,}", false);
     assert_num(
         r"
 let s = {,}
 s.add(1)
 s.add(2)
-s.len()
+len(s)
 ",
         "2",
     );
@@ -72,7 +72,7 @@ fn empty_brace_still_dict() {
         r#"
 let d = {}
 d["a"] = 1
-d.len()
+len(d)
 "#,
         "1",
     );

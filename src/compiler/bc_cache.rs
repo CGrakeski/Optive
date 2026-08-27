@@ -124,6 +124,12 @@ fn encode(prog: &CompiledProgram) -> Result<Vec<u8>> {
     write_usizes(&mut w, &prog.line_map);
     write_usizes(&mut w, &prog.column_map);
     write_strs(&mut w, &prog.global_names);
+    write_u32(&mut w, prog.script_frame_slots as u32);
+    write_u32(&mut w, prog.script_local_to_global.len() as u32);
+    for &(loc, glob) in &prog.script_local_to_global {
+        write_u32(&mut w, loc as u32);
+        write_u32(&mut w, glob as u32);
+    }
     write_ins_slice(&mut w, &prog.code)?;
     write_u32(&mut w, prog.functions.len() as u32);
     for (name, f) in &prog.functions {
@@ -152,6 +158,14 @@ fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
     let line_map = read_usizes(&mut r)?;
     let column_map = read_usizes(&mut r)?;
     let global_names = read_strs(&mut r)?;
+    let script_frame_slots = read_u32(&mut r)? as usize;
+    let nflush = read_u32(&mut r)? as usize;
+    let mut script_local_to_global = Vec::with_capacity(nflush);
+    for _ in 0..nflush {
+        let loc = read_u32(&mut r)? as usize;
+        let glob = read_u32(&mut r)? as usize;
+        script_local_to_global.push((loc, glob));
+    }
     let code = read_ins_vec(&mut r)?;
     let nfunc = read_u32(&mut r)? as usize;
     let mut functions = HashMap::new();
@@ -165,6 +179,8 @@ fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
     prog.line_map = line_map;
     prog.column_map = column_map;
     prog.global_names = global_names;
+    prog.script_frame_slots = script_frame_slots;
+    prog.script_local_to_global = script_local_to_global;
     prog.functions = functions;
     Ok(prog)
 }
@@ -502,6 +518,11 @@ fn encode_ins(w: &mut Vec<u8>, ins: &Instruction) -> Result<()> {
             write_u32(w, *slot as u32);
             w.extend_from_slice(&imm.to_le_bytes());
         }
+        LoadFastAddStore { dst, src } => {
+            w.push(129);
+            write_u32(w, *dst as u32);
+            write_u32(w, *src as u32);
+        }
         LoadFastSqrGt { sqr_slot, rhs_slot } => {
             w.push(127);
             write_u32(w, *sqr_slot as u32);
@@ -770,6 +791,10 @@ fn decode_ins(r: &mut Cursor<&[u8]>) -> Result<Instruction> {
             slot: read_u32(r)? as usize,
             imm: read_i64(r)?,
         },
+        129 => LoadFastAddStore {
+            dst: read_u32(r)? as usize,
+            src: read_u32(r)? as usize,
+        },
         127 => LoadFastSqrGt {
             sqr_slot: read_u32(r)? as usize,
             rhs_slot: read_u32(r)? as usize,
@@ -988,10 +1013,27 @@ mod tests {
         assert_eq!(back.functions.len(), prog.functions.len());
         assert_eq!(back.code.len(), prog.code.len());
         assert_eq!(back.hot.ops.len(), prog.hot.ops.len());
+        assert_eq!(back.script_frame_slots, prog.script_frame_slots);
+        assert_eq!(back.script_local_to_global, prog.script_local_to_global);
         let mut vm = Vm::new();
         vm.load_program(back).expect("load");
         let v = vm.run().expect("run");
         assert_eq!(v.display_string(), "3");
+    }
+
+    #[test]
+    fn roundtrip_script_fast_locals() {
+        let src = "let sum = 0\nsum = sum + 1\nsum\n";
+        let prog = crate::compile(src).expect("compile");
+        assert!(prog.script_frame_slots > 0);
+        let bytes = encode(&prog).expect("encode");
+        let back = decode(&bytes).expect("decode");
+        assert_eq!(back.script_frame_slots, prog.script_frame_slots);
+        assert_eq!(back.script_local_to_global, prog.script_local_to_global);
+        let mut vm = Vm::new();
+        vm.load_program(back).expect("load");
+        let v = vm.run().expect("run");
+        assert_eq!(v.display_string(), "1");
     }
 
     #[test]

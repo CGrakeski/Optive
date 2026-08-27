@@ -38,7 +38,7 @@ fn multiline_string_escapes() {
 fn string_hex_escape() {
     assert_text(r#""\x41\x42""#, "AB");
     assert_text(r#""hi\x20there""#, "hi there");
-    assert_num(r#""\x00".len()"#, "1");
+    assert_num(r#"len("\x00")"#, "1");
 }
 
 #[test]

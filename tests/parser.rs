@@ -408,6 +408,21 @@ fn parse_err_incomplete() {
 }
 
 #[test]
+fn parse_err_juxtaposed_top_level_stmts() {
+    parse_err("1 2 3");
+    parse_err("a = 1 b = 2");
+    assert_eq!(stmt_count("1\n2"), 2);
+}
+
+#[test]
+fn parse_err_numeric_member() {
+    parse_err("a.1");
+    parse_err("a .1");
+    parse_ok(".5");
+    parse_ok("1+.5");
+}
+
+#[test]
 fn parse_err_unclosed_paren() {
     parse_err("(1 + 2");
 }

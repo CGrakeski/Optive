@@ -162,7 +162,7 @@ fn random_sample(vm: &mut Vm, args: &[Value]) -> Result<Value> {
         ));
     }
     for i in 0..k {
-        let j = i + (rng_next() as usize) % (items.len() - i);
+        let j = i + rng_bounded((items.len() - i) as u64) as usize;
         items.swap(i, j);
     }
     Ok(Value::List(Shared::new(

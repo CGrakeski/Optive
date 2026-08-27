@@ -184,7 +184,7 @@ struct Lit {
 func next_lit(p) {
     let t = p.tokens[p.pos]
     p.pos = p.pos + 1
-    return Lit(num(t))
+    return Lit(num.(t))
 }
 
 func take3(a, b, c) {

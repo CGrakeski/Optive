@@ -137,13 +137,13 @@ fn format_runtime_error(
     if !stack.is_empty() {
         return RuntimeError::typed(
             kind,
-            diagnostics::format_runtime_with_stack(source, file, &message, stack),
+            diagnostics::format_runtime_with_stack(source, file, kind, &message, stack),
         );
     }
     if line > 0 {
         RuntimeError::typed(
             kind,
-            diagnostics::format_runtime_at_line(source, file, line, &message),
+            diagnostics::format_runtime_at_line(source, file, line, kind, &message),
         )
     } else {
         err.clone()

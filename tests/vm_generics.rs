@@ -181,7 +181,7 @@ type(a(1))
 func a[T](b: T) {
     return T
 }
-text(a(1))
+text.(a(1))
 ",
         "num",
     );
@@ -216,7 +216,7 @@ fn infer_from_list_and_arith() {
 func id[T](x: T) {
     return T
 }
-text(id([1, 2]))
+text.(id([1, 2]))
 ",
         "list",
     );
@@ -225,7 +225,7 @@ text(id([1, 2]))
 func id[T](x: T) {
     return T
 }
-text(id(1 + 2))
+text.(id(1 + 2))
 ",
         "num",
     );
@@ -239,7 +239,7 @@ func pair[A, B](a: A, b: B) {
     return [A, B]
 }
 let t = pair(1, "hi")
-text(t[0]) + "," + text(t[1])
+text.(t[0]) + "," + text.(t[1])
 "#,
         "num,text",
     );

@@ -1,4 +1,4 @@
-//! `Optive.lock` v2 — 可复现、可校验的依赖图。
+//! `Optive.lock` — 可复现、可校验的依赖图（`version = 1`；0.x 不迁移旧文件）。
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -7,9 +7,10 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use super::manifest::{Dependency, Manifest, RevSpec};
+use super::store::is_full_object_id;
 
 pub const ROOT_PARENT: &str = "__root__";
-pub const LOCK_VERSION: u32 = 2;
+pub const LOCK_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LockFile {
@@ -224,10 +225,6 @@ fn normalize_object_id(id: &str) -> String {
     id.trim().to_ascii_lowercase()
 }
 
-fn is_full_object_id(id: &str) -> bool {
-    matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
 fn is_sha256(digest: &str) -> bool {
     digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -287,13 +284,13 @@ mod tests {
 
     #[test]
     fn old_lock_requires_delete_and_rebuild() {
-        let dir = std::env::temp_dir().join(format!("optive_lock_v1_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("optive_lock_badver_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("Optive.lock");
-        fs::write(&path, "version = 1\nedges = []\n").unwrap();
+        fs::write(&path, "version = 99\nedges = []\n").unwrap();
         let err = LockFile::load(&path).unwrap_err();
-        assert!(err.contains("expected 2"), "{err}");
+        assert!(err.contains("expected 1"), "{err}");
         assert!(err.contains("delete"), "{err}");
         assert!(err.contains("Optive update"), "{err}");
         let _ = fs::remove_dir_all(&dir);

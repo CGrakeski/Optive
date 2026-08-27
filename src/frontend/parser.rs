@@ -38,6 +38,9 @@ impl Parser {
         p.skip_newlines_only();
         while !p.is_at_end() {
             stmts.push(p.parse_stmt()?);
+            if !p.at_top_level_stmt_boundary() {
+                return Err(p.error("unexpected token; statements must be separated by a newline"));
+            }
             p.skip_newlines_only();
         }
         Ok(Program { stmts })
@@ -158,6 +161,28 @@ impl Parser {
     /// 仅跳过换行，保留注释 token（语句边界用，以便收成 `Stmt::Comment`）。
     fn skip_newlines_only(&mut self) {
         while self.match_kind_raw(TokenKind::Newline) {}
+    }
+
+    /// 顶层禁止同一行并排语句（`1 2 3`）。换行可能已被表达式里的
+    /// `skip_newlines` 吃掉（为了 `1\n+\n2`），故用上一 token 的行号判断。
+    fn at_top_level_stmt_boundary(&self) -> bool {
+        let kind = self.current().kind;
+        if matches!(
+            kind,
+            TokenKind::End | TokenKind::Newline | TokenKind::LineComment | TokenKind::BlockComment
+        ) {
+            return true;
+        }
+        let Some(prev) = self.pos.checked_sub(1).and_then(|i| self.tokens.get(i)) else {
+            return true;
+        };
+        if matches!(
+            prev.kind,
+            TokenKind::Newline | TokenKind::LineComment | TokenKind::BlockComment
+        ) {
+            return true;
+        }
+        self.current().line > prev.line
     }
 
     fn match_kind_raw(&mut self, kind: TokenKind) -> bool {
@@ -2885,7 +2910,19 @@ impl Parser {
             TokenKind::BytesLiteral => {
                 let loc = self.loc_here();
                 let v = self.advance().value;
-                let bytes: Vec<u8> = v.chars().map(|c| c as u8).collect();
+                // 词法把每个字节编成 Latin-1 码点；`c as u8` 会截断非 Latin-1。
+                let bytes: Vec<u8> = v
+                    .chars()
+                    .map(|c| {
+                        u8::try_from(u32::from(c)).map_err(|_| {
+                            ParseError::here(
+                                loc.line,
+                                loc.column,
+                                "internal: bytes literal is not Latin-1",
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<u8>, ParseError>>()?;
                 Ok(Expr::new(loc, ExprKind::Bytes(bytes)))
             }
             TokenKind::Identifier => {

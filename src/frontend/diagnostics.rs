@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::error::{LexError, ParseError};
+use crate::error::{ExceptionKind, LexError, ParseError};
 use crate::vm::ErrorStackFrame;
 
 const CONTEXT_LINES: usize = 2;
@@ -50,8 +50,15 @@ fn format_located_error(
 
 /// 在已知行号时，带源码上下文格式化运行时错误。
 #[must_use]
-pub fn format_runtime_at_line(source: &str, file: &str, line: usize, message: &str) -> String {
+pub fn format_runtime_at_line(
+    source: &str,
+    file: &str,
+    line: usize,
+    kind: ExceptionKind,
+    message: &str,
+) -> String {
     let pack = crate::custom::active_pack();
+    let line_text = pack.format_exception_line(kind.type_name(), message);
     format_source_error(
         source,
         file,
@@ -59,7 +66,7 @@ pub fn format_runtime_at_line(source: &str, file: &str, line: usize, message: &s
         1,
         pack.parse_label_error(),
         pack.parse_arrow(),
-        message,
+        &line_text,
     )
 }
 
@@ -68,11 +75,12 @@ pub fn format_runtime_at_line(source: &str, file: &str, line: usize, message: &s
 pub fn format_runtime_with_stack(
     fallback_source: &str,
     fallback_file: &str,
+    kind: ExceptionKind,
     message: &str,
     stack: &[ErrorStackFrame],
 ) -> String {
     if stack.is_empty() {
-        return format_runtime_at_line(fallback_source, fallback_file, 1, message);
+        return format_runtime_at_line(fallback_source, fallback_file, 1, kind, message);
     }
 
     let pack = crate::custom::active_pack();
@@ -110,9 +118,10 @@ pub fn format_runtime_with_stack(
             }
         }
     }
-    // Python 风格：末行直接 `TypeName: message`，不再包一层 `Error:`。
-    out.push_str(message);
-    if !message.ends_with('\n') {
+    // 末行用 kind + 正文拼一次；message 不得已含类型名。
+    let last = pack.format_exception_line(kind.type_name(), message);
+    out.push_str(&last);
+    if !last.ends_with('\n') {
         out.push('\n');
     }
 
@@ -380,12 +389,19 @@ mod tests {
                 source: Some(Arc::from("func b() { c }")),
             },
         ];
-        let msg = format_runtime_with_stack("a()", "<repl>", "undefined name: c", &stack);
+        let msg = format_runtime_with_stack(
+            "a()",
+            "<repl>",
+            crate::error::ExceptionKind::NameError,
+            "undefined name: c",
+            &stack,
+        );
         assert!(msg.contains("Traceback"));
         assert!(msg.contains("in a"));
         assert!(msg.contains("in b"));
         assert!(msg.contains("b()"));
-        assert!(msg.contains("undefined name: c"));
+        assert!(msg.contains("NameError: undefined name: c"));
+        assert!(!msg.contains("NameError: NameError"));
         let lines: Vec<&str> = msg.lines().collect();
         let caret = lines
             .iter()

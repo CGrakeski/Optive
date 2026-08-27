@@ -196,6 +196,17 @@ m.describe(t)
 
 /// 导入后模块内非 export 函数仍须能读本模块级 `let`（`LoadGlobal` 走 `module_env`）。
 #[test]
+fn imported_module_top_export_is_ab() {
+    assert_text(
+        r#"
+import "tests/import_fixtures/module_internal_global.tive" as m
+m.TOP
+"#,
+        "ab",
+    );
+}
+
+#[test]
 fn imported_module_internal_func_sees_module_let() {
     assert_num(
         r#"
@@ -206,6 +217,26 @@ ok + r
 "#,
         "2",
     );
+}
+
+#[test]
+fn module_internal_global_as_script_defines_prefix() {
+    let src = concat!(
+        include_str!("import_fixtures/module_internal_global.tive"),
+        "\nlet r = if test_let() then 1 else 0\nr\n",
+    );
+    let mut vm = optive::vm::Vm::new();
+    let v = optive::run_source_in_vm(&mut vm, src, "<prefix_script>").expect("run");
+    let names: Vec<String> = vm
+        .debug_list_globals()
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "PREFIX"),
+        "PREFIX missing from globals: {names:?}"
+    );
+    assert_eq!(v.display_string(), "1");
 }
 
 /// `use` 引入的函数必须保留定义模块的 globals，不能被调用方 `module_env` 换绑。

@@ -221,3 +221,71 @@ x + 1
     .expect("compile");
     verify_stack_balance(&prog.code).expect("module code stack-balanced");
 }
+
+#[test]
+fn script_unescaped_arith_fuses_add_imm_store() {
+    let prog = compile(
+        r"
+let sum = 0
+loop (10) {
+    sum = sum + 1
+}
+sum
+",
+    )
+    .expect("compile");
+    assert!(
+        prog.script_frame_slots > 0,
+        "unescaped script let should open a script frame"
+    );
+    assert!(
+        prog.code
+            .iter()
+            .any(|ins| matches!(ins, Instruction::LoadFastAddImmStore { imm: 1, .. })),
+        "expected LoadFastAddImmStore on script body, got {:?}",
+        prog.code
+    );
+    verify_stack_balance(&prog.code).expect("script stack-balanced");
+}
+
+#[test]
+fn script_add_store_fuses_two_fast_locals() {
+    let prog = compile(
+        r"
+let a = 1
+let b = 2
+a = a + b
+a
+",
+    )
+    .expect("compile");
+    assert!(
+        prog.code
+            .iter()
+            .any(|ins| matches!(ins, Instruction::LoadFastAddStore { .. })),
+        "expected LoadFastAddStore, got {:?}",
+        prog.code
+    );
+}
+
+#[test]
+fn escaped_script_name_stays_global() {
+    let prog = compile(
+        r"
+let n = 1
+func f() { return n }
+n = 2
+f()
+",
+    )
+    .expect("compile");
+    assert_eq!(prog.script_frame_slots, 0);
+    assert!(
+        !prog
+            .code
+            .iter()
+            .any(|ins| matches!(ins, Instruction::LoadFast(_) | Instruction::StoreFast(_))),
+        "escaped n must not be a script fast local, got {:?}",
+        prog.code
+    );
+}

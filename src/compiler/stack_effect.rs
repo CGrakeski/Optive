@@ -156,6 +156,7 @@ impl Instruction {
             | Self::LeaveScope
             | Self::Label(_)
             | Self::LoadFastAddImmStore { .. }
+            | Self::LoadFastAddStore { .. }
             | Self::TypeCheck
             | Self::ResolveFuncTypes
             | Self::RegisterExport(_)

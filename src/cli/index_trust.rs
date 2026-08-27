@@ -8,6 +8,7 @@ use std::error::Error;
 use std::path::Path;
 
 use super::home;
+use super::store::is_full_object_id;
 
 /// 索引信任策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,13 +116,22 @@ fn verify_index_dir_with(
         return Ok(None);
     }
     let head = head.expect("git HEAD inspected");
+    check_index_head(&head, policy, pin, official_default)?;
+    Ok(Some(head))
+}
+
+fn check_index_head(
+    head: &IndexHead,
+    policy: IndexPolicy,
+    pin: Option<&str>,
+    official_default: bool,
+) -> Result<(), String> {
     if let Some(pin) = pin {
         if head.commit != pin {
             return Err(format!(
                 "index HEAD {} does not match OPTIVE_INDEX_PIN {pin}",
                 head.commit
-            )
-            .into());
+            ));
         }
     }
     let require_signed = match policy {
@@ -133,10 +143,9 @@ fn verify_index_dir_with(
         return Err(format!(
             "index HEAD {} is unsigned; official/strict policy requires a gpgsig or SSH signature header on the commit",
             head.commit
-        )
-        .into());
+        ));
     }
-    Ok(Some(head))
+    Ok(())
 }
 
 fn inspect_index_head(path: &Path) -> Result<Option<IndexHead>, Box<dyn Error>> {
@@ -168,16 +177,11 @@ fn commit_has_signature(data: &[u8]) -> bool {
     headers.lines().any(|line| {
         let line = line.trim_start();
         line.starts_with("gpgsig ")
-            || line.starts_with("gpgsig-sha256 ")
             || line.starts_with("gpgsig-sha256")
             || line.eq_ignore_ascii_case("gpgsig")
             || line.starts_with("-----BEGIN PGP SIGNATURE-----")
             || line.starts_with("-----BEGIN SSH SIGNATURE-----")
     })
-}
-
-fn is_full_object_id(id: &str) -> bool {
-    matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// 供 `Optive env` / doctor 打印。
@@ -220,6 +224,14 @@ gpgsig -----BEGIN PGP SIGNATURE-----\n \
  -----END PGP SIGNATURE-----\n\n\
 msg\n";
         assert!(commit_has_signature(signed));
+        let sha256 = b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+author a <a@b> 1 +0000\n\
+committer a <a@b> 1 +0000\n\
+gpgsig-sha256 -----BEGIN PGP SIGNATURE-----\n \
+ fake\n \
+ -----END PGP SIGNATURE-----\n\n\
+msg\n";
+        assert!(commit_has_signature(sha256));
         let ssh = b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
 -----BEGIN SSH SIGNATURE-----\n\
 fake\n\
@@ -239,7 +251,7 @@ msg mentions -----BEGIN PGP SIGNATURE-----\n";
             commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             signed: true,
         };
-        let err = enforce(
+        let err = check_index_head(
             &head,
             IndexPolicy::Off,
             Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
@@ -255,7 +267,7 @@ msg mentions -----BEGIN PGP SIGNATURE-----\n";
             commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             signed: false,
         };
-        let err = enforce(&head, IndexPolicy::Signed, None, false).unwrap_err();
+        let err = check_index_head(&head, IndexPolicy::Signed, None, false).unwrap_err();
         assert!(err.contains("unsigned"), "{err}");
     }
 
@@ -265,12 +277,12 @@ msg mentions -----BEGIN PGP SIGNATURE-----\n";
             commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             signed: false,
         };
-        assert!(enforce(&head, IndexPolicy::Strict, None, true).is_err());
+        assert!(check_index_head(&head, IndexPolicy::Strict, None, true).is_err());
         let signed = IndexHead {
             signed: true,
             ..head.clone()
         };
-        assert!(enforce(&signed, IndexPolicy::Strict, None, true).is_ok());
+        assert!(check_index_head(&signed, IndexPolicy::Strict, None, true).is_ok());
     }
 
     #[test]
@@ -279,31 +291,6 @@ msg mentions -----BEGIN PGP SIGNATURE-----\n";
             commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             signed: false,
         };
-        assert!(enforce(&head, IndexPolicy::Off, None, true).is_ok());
-    }
-
-    fn enforce(
-        head: &IndexHead,
-        policy: IndexPolicy,
-        pin: Option<&str>,
-        official_default: bool,
-    ) -> Result<(), String> {
-        if let Some(pin) = pin {
-            if head.commit != pin {
-                return Err(format!(
-                    "index HEAD {} does not match OPTIVE_INDEX_PIN {pin}",
-                    head.commit
-                ));
-            }
-        }
-        let require_signed = match policy {
-            IndexPolicy::Off => false,
-            IndexPolicy::Signed => true,
-            IndexPolicy::Strict => official_default || pin.is_none(),
-        };
-        if require_signed && !head.signed {
-            return Err(format!("index HEAD {} is unsigned", head.commit));
-        }
-        Ok(())
+        assert!(check_index_head(&head, IndexPolicy::Off, None, true).is_ok());
     }
 }

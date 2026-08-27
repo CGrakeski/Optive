@@ -146,11 +146,11 @@ fn dap_breakpoint_and_step_over_stdio() {
         .filter_map(|m| m["body"]["reason"].as_str())
         .collect();
     assert!(
-        reasons.iter().any(|r| *r == "entry"),
+        reasons.contains(&"entry"),
         "expected entry stop: {messages:#?}"
     );
     assert!(
-        reasons.iter().any(|r| *r == "breakpoint") && reasons.iter().any(|r| *r == "step"),
+        reasons.contains(&"breakpoint") && reasons.contains(&"step"),
         "expected breakpoint and step stops: {messages:#?}"
     );
     assert!(

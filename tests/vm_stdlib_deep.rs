@@ -8,7 +8,7 @@
 )]
 mod common;
 
-use common::{assert_bool, assert_num, assert_text};
+use common::{assert_bool, assert_num, assert_text, run_err};
 
 #[test]
 fn std_math_extra() {
@@ -99,6 +99,29 @@ use std.collections.{ flatten, chunk }
 str(flatten([[1, 2], [3]])) + str(chunk([1, 2, 3, 4, 5], 2))
 ",
         "[1, 2, 3][[1, 2], [3, 4], [5]]",
+    );
+}
+
+#[test]
+fn std_collections_nth_rejects_negative() {
+    assert_num(
+        r"
+use std.collections.{ nth }
+nth([10, 20, 30], 1)
+",
+        "20",
+    );
+    run_err(
+        r"
+use std.collections.{ nth }
+nth([1, 2, 3], -1)
+",
+    );
+    run_err(
+        r"
+use std.collections.{ nth }
+nth([1, 2], 9)
+",
     );
 }
 
@@ -243,6 +266,18 @@ let b = randint(1, 1000)
 a == b
 ",
         true,
+    );
+}
+
+#[test]
+fn std_random_sample_length() {
+    assert_num(
+        r"
+use std.random.{ seed, sample }
+seed(1)
+len(sample([1, 2, 3, 4], 2))
+",
+        "2",
     );
 }
 

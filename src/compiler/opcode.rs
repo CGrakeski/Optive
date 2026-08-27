@@ -102,6 +102,11 @@ pub enum Instruction {
         slot: usize,
         imm: i64,
     },
+    /// 融合：`LoadFast(dst); LoadFast(src); Add; StoreFast(dst)` → `dst += src`。
+    LoadFastAddStore {
+        dst: usize,
+        src: usize,
+    },
     /// 融合：`LoadFast(s); LoadFast(s); Mul; LoadFast(t); Gt` → `s*s > t`。
     LoadFastSqrGt {
         sqr_slot: usize,
@@ -500,6 +505,7 @@ pub fn compact_parallel(map: &[usize], old_to_new: &[usize]) -> Vec<usize> {
 /// - `GotoIfNot(next); Goto(t)` → `GotoIf(t)`
 /// - `LoadFast; PushSmall; Sub/Le/Lt/Gt/Eq` → `LoadFast*Imm`
 /// - `LoadFast; PushSmall; Add; StoreFast`（同槽）→ `LoadFastAddImmStore`
+/// - `LoadFast a; LoadFast b; Add; StoreFast a` → `LoadFastAddStore`
 /// - `d*d > n` → `LoadFastSqrGt`
 /// - `n % d == 0` → `LoadFastModEq0`
 ///
@@ -633,6 +639,26 @@ pub fn peephole_fuse(code: Vec<Instruction>) -> (Vec<Instruction>, Vec<usize>) {
                     new_code.push(Instruction::LoadFastAddImmStore {
                         slot: *slot,
                         imm: *imm,
+                    });
+                    i += 4;
+                    continue;
+                }
+            }
+            if let (
+                Instruction::LoadFast(dst),
+                Instruction::LoadFast(src),
+                Instruction::Add | Instruction::AddNumNum,
+                Instruction::StoreFast(store),
+            ) = (&code[i], &code[i + 1], &code[i + 2], &code[i + 3])
+            {
+                if dst == store && *dst < u32::MAX as usize && *src < u32::MAX as usize {
+                    let at = new_code.len();
+                    for k in 0..4 {
+                        remap[i + k] = at;
+                    }
+                    new_code.push(Instruction::LoadFastAddStore {
+                        dst: *dst,
+                        src: *src,
                     });
                     i += 4;
                     continue;
@@ -1122,6 +1148,10 @@ pub struct CompiledProgram {
     pub generic_functions: HashMap<String, Arc<GenericFunctionTemplate>>,
     /// 本编译单元经 LoadGlobal/StoreGlobal 引用的名字（index → name）。
     pub global_names: Vec<String>,
+    /// 脚本顶层快局部槽数（未逃逸 `let`/`var` + 编译临时）。0 表示不建脚本轻量帧。
+    pub script_frame_slots: usize,
+    /// 脚本快局部 → `global_names` 下标，供 `Ret`/REPL/模块导出 flush。
+    pub script_local_to_global: Vec<(usize, usize)>,
 }
 
 impl Default for CompiledProgram {
@@ -1147,6 +1177,8 @@ impl CompiledProgram {
             protocols: HashMap::new(),
             generic_functions: HashMap::new(),
             global_names: Vec::new(),
+            script_frame_slots: 0,
+            script_local_to_global: Vec::new(),
         }
     }
 }
@@ -1231,5 +1263,46 @@ impl Codegen {
 impl Default for Codegen {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fuses_load_fast_add_store() {
+        let code = vec![
+            Instruction::LoadFast(0),
+            Instruction::LoadFast(1),
+            Instruction::Add,
+            Instruction::StoreFast(0),
+        ];
+        let (out, _) = peephole_fuse(code);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [Instruction::LoadFastAddStore { dst: 0, src: 1 }]
+            ),
+            "got {out:?}"
+        );
+    }
+
+    #[test]
+    fn fuses_load_fast_add_imm_store() {
+        let code = vec![
+            Instruction::LoadFast(0),
+            Instruction::PushSmall(1),
+            Instruction::Add,
+            Instruction::StoreFast(0),
+        ];
+        let (out, _) = peephole_fuse(code);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [Instruction::LoadFastAddImmStore { slot: 0, imm: 1 }]
+            ),
+            "got {out:?}"
+        );
     }
 }

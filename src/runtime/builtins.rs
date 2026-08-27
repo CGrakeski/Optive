@@ -78,32 +78,20 @@ fn builtin_print(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 fn builtin_len(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(crate::error::RuntimeError::type_err(
-            "len requires 1 argument",
+            "len() takes exactly one argument",
         ));
     }
-    if let Some(r) = vm.try_call_magic(&args[0], "__len__", vec![]) {
+    let obj = &args[0];
+    if let Some(r) = vm.try_call_magic(obj, "__len__", vec![]) {
         return r;
     }
-    let n = match &args[0] {
-        Value::List(v) => v.borrow().len(),
-        Value::Text(s) => s.chars().count(),
-        Value::Dict(d) => d.borrow().len(),
-        Value::Set(s) => s.borrow().len(),
-        Value::Tuple(t) => t.len(),
-        Value::Bytes(b) => b.len(),
-        Value::Iterator(_) => {
-            return Err(crate::error::RuntimeError::type_err(
-                "len not supported for iterator",
-            ))
-        }
-        other => {
-            return Err(crate::error::RuntimeError::type_err(format!(
-                "len not supported for {}",
-                other.type_name()
-            )))
-        }
-    };
-    Ok(Value::Num(Num::Small(n as i64)))
+    match vm.get_attr_value(obj, "__len__") {
+        Ok(m) => vm.call_value(m, vec![]),
+        Err(_) => Err(crate::error::RuntimeError::type_err(format!(
+            "object of type '{}' has no __len__",
+            obj.type_name()
+        ))),
+    }
 }
 
 fn builtin_str(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -678,7 +666,7 @@ fn builtin_help(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.is_empty() {
         println!(
             "Optive help\n\
-             Builtins: print, len, type, range, iter, next, input, exit, help, eval, ...\n\
+             Builtins: print, len, str, repr, convert, iter, next, input, int, dict, eval, help, exit, ...\n\
              Import std: use std.math / std.io / std.json / ...\n\
              Typing:\n\
                : T      soft annotation\n\

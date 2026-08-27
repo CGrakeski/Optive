@@ -208,9 +208,11 @@ impl CliMsg {
             Self::HelpCapsHeader => "Runtime capability flags (apply to run / up / debug / test / <script> / -c):",
             Self::HelpSandbox => "  --sandbox[=DIR]          No network, no env, no FFI; fs limited to DIR (default: cwd)",
             Self::HelpNoNetwork => "  --no-network            Disable std.http / std.net",
-            Self::HelpNoFfi => "  --no-ffi                Disable C.frompath / extern",
+            Self::HelpNoFfi => {
+                "  --no-ffi                Disable C.frompath / extern (not with --allow-ffi)"
+            }
             Self::HelpAllowFfi => {
-                "  --allow-ffi             Permit FFI (does not change filesystem sandboxing)"
+                "  --allow-ffi             Permit FFI (not with --no-ffi; does not change filesystem sandboxing)"
             }
             Self::HelpAllowPath => "  --allow-path DIR         Allow fs access under DIR (repeatable; combines with --sandbox)",
             Self::HelpTrustDeps => "  --trust-deps             Let dependencies inherit host capabilities",

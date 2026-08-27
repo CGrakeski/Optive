@@ -78,7 +78,7 @@ calls
 fn type_convert_text_handler() {
     assert_text(
         r"
-text.__convert__.__dispatch__.append(do(t, v) { return text(v + 1) })
+text.__convert__.__dispatch__.append(do(t, v) { return str(v + 1) })
 text.(41)
 ",
         "42",
@@ -112,8 +112,7 @@ fn type_convert_list_iterator_roundtrip() {
     assert_list(
         r"
 use std.math.{ range }
-let it = iterator(range(3))
-list.(it)
+list.(range(3))
 ",
         "[0, 1, 2]",
     );
@@ -130,10 +129,42 @@ type(iterator.(xs))
 fn ctor_and_convert_errors_are_distinct() {
     for (src, needle) in [
         ("iterator(1)", "cannot construct iterator from num"),
+        ("iterator([1, 2])", "cannot construct iterator from list"),
+        ("iterator()", "is not constructed with ()"),
         ("iterator.(1)", "cannot convert num to iterator"),
         ("iterator.()", "cannot convert nonetype to iterator"),
+        (r#"num("a")"#, "cannot construct num from text"),
+        (r#"num.("a")"#, "invalid num literal"),
+        ("text(42)", "cannot construct text from num"),
+        ("bool(1)", "cannot construct bool from num"),
+        ("bytes([65, 66])", "cannot construct bytes from list"),
+        ("list(1)", "cannot construct list from num"),
     ] {
         let err = run_source(src).unwrap_err().to_string();
         assert!(err.contains(needle), "source: {src}, got: {err}");
+        assert!(
+            !err.contains("TypeError: TypeError"),
+            "doubled TypeError in {src}: {err}"
+        );
     }
+    assert_eq!(run_source(r#"num.("42")"#).unwrap().display_string(), "42");
+    assert_eq!(run_source("num(42)").unwrap().display_string(), "42");
+    assert_eq!(run_source("text.(42)").unwrap().display_string(), "\"42\"");
+    assert_eq!(
+        run_source(r#"text("hi")"#).unwrap().display_string(),
+        "\"hi\""
+    );
+    assert_eq!(run_source("bool.(1)").unwrap().display_string(), "true");
+    assert_eq!(
+        run_source("bytes.([65, 66]).decode()")
+            .unwrap()
+            .display_string(),
+        "\"AB\""
+    );
+    assert_eq!(
+        run_source("list.(iterator.([10, 20]))")
+            .unwrap()
+            .display_string(),
+        "[10, 20]"
+    );
 }

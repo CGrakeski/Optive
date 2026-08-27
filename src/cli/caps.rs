@@ -17,6 +17,7 @@ use optive::caps::{Capabilities, DepGrant, FsPolicy};
 /// - `--allow-path DIR`：把 DIR 加入文件系统允许根（可重复；不改变网络/环境）
 /// - `--allow-ffi`：仅在无文件系统限制时允许 FFI；受限模式仍拒绝路径 loader
 /// - `--no-ffi`：禁止原生 FFI（即使非 sandbox）
+/// - `--no-ffi` 与 `--allow-ffi` 互斥（`--sandbox --allow-ffi` 仍合法）
 /// - `--trust-deps`：第三方依赖继承入口能力（默认最小权限）
 /// - `--allow-dep-network` / `--allow-dep-env` / `--allow-dep-process` / `--allow-dep-ffi`：精细授权依赖
 pub fn parse_caps(
@@ -27,6 +28,8 @@ pub fn parse_caps(
     let mut process_off = false;
     let mut ffi_off = false;
     let mut ffi_on = false;
+    let mut saw_no_ffi = false;
+    let mut saw_allow_ffi = false;
     let mut sandbox = false;
     let mut dep_grant = DepGrant::none();
     let mut roots: Vec<PathBuf> = Vec::new();
@@ -37,8 +40,14 @@ pub fn parse_caps(
         let a = &args[i];
         match a.as_str() {
             "--no-network" => no_network = true,
-            "--no-ffi" => ffi_off = true,
-            "--allow-ffi" => ffi_on = true,
+            "--no-ffi" => {
+                saw_no_ffi = true;
+                ffi_off = true;
+            }
+            "--allow-ffi" => {
+                saw_allow_ffi = true;
+                ffi_on = true;
+            }
             "--trust-deps" => dep_grant.trust_all = true,
             "--allow-dep-network" => dep_grant.network = true,
             "--allow-dep-env" => dep_grant.env = true,
@@ -73,6 +82,10 @@ pub fn parse_caps(
             other => remaining.push(other.to_string()),
         }
         i += 1;
+    }
+
+    if saw_no_ffi && saw_allow_ffi {
+        return Err("--no-ffi and --allow-ffi cannot be used together".into());
     }
 
     let mut caps = Capabilities::full();
@@ -144,5 +157,28 @@ mod tests {
         let (caps, _) = parse_caps(&args).unwrap();
         assert!(caps.dep_grant.process);
         assert!(!caps.dep_grant.network);
+    }
+
+    #[test]
+    fn no_ffi_and_allow_ffi_are_mutex() {
+        let err = parse_caps(&["--no-ffi".into(), "--allow-ffi".into(), "x.tive".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--no-ffi"), "{err}");
+        assert!(err.contains("--allow-ffi"), "{err}");
+        assert!(err.contains("cannot be used together"), "{err}");
+
+        let err = parse_caps(&["--sandbox".into(), "--no-ffi".into(), "--allow-ffi".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot be used together"), "{err}");
+    }
+
+    #[test]
+    fn allow_ffi_still_overrides_sandbox() {
+        let (caps, _) = parse_caps(&["--sandbox".into(), "--allow-ffi".into()]).unwrap();
+        assert!(caps.ffi);
+        let (caps, _) = parse_caps(&["--no-ffi".into()]).unwrap();
+        assert!(!caps.ffi);
     }
 }

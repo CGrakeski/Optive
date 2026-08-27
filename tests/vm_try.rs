@@ -158,6 +158,20 @@ try {
 }
 
 #[test]
+fn convert_type_error_message_has_no_kind_prefix() {
+    assert_text(
+        r#"
+try {
+    num.("a")
+} catch (e: TypeError) {
+    e.message
+}
+"#,
+        "invalid num literal",
+    );
+}
+
+#[test]
 fn host_type_error_not_callable() {
     assert_num(
         r"

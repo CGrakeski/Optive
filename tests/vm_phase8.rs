@@ -124,7 +124,7 @@ with (b as v) {
 fn friend_func_dispatch_still_works() {
     assert_text(
         r#"
-friend func add(x:: num) { return text(x + 1) }
+friend func add(x:: num) { return text.(x + 1) }
 add.__dispatch__.append(do(x:: text) { return x + "!" })
 add(41)
 "#,

@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value as Json};
 
-use crate::debug::{self, list_locals, stack_frames, DebugState, StepMode, StopReason};
+use crate::debug::{
+    self, list_globals, list_locals, stack_frames, DebugState, StepMode, StopReason,
+};
 use crate::shared::Shared;
 use crate::vm::{OutputSink, OutputStream, Vm};
 
@@ -595,12 +597,10 @@ impl Session {
             .and_then(Json::as_i64)
             .unwrap_or(0);
         let vars = if refer == REF_GLOBALS {
-            vm.globals
-                .keys()
+            list_globals(vm)
                 .into_iter()
-                .filter_map(|k| {
-                    let v = vm.globals.get(&k)?;
-                    Some(json!({ "name": k, "value": v.display_string(), "variablesReference": 0 }))
+                .map(|(k, v)| {
+                    json!({ "name": k, "value": v.display_string(), "variablesReference": 0 })
                 })
                 .collect::<Vec<_>>()
         } else {

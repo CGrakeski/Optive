@@ -551,7 +551,7 @@ pub fn set_local_or_global(vm: &mut Vm, name: &str, value: Value) -> Result<()> 
     if vm.debug_store_local(name, value.clone()) {
         return Ok(());
     }
-    vm.globals.insert(name.to_string(), value);
+    vm.store_global_by_name(name, value);
     Ok(())
 }
 
@@ -571,6 +571,10 @@ pub fn debug_set(vm: &mut Vm, lhs: &str, expr: &str) -> Result<()> {
 
 pub fn list_locals(vm: &Vm) -> Vec<(String, Value)> {
     vm.debug_list_locals()
+}
+
+pub fn list_globals(vm: &Vm) -> Vec<(String, Value)> {
+    vm.debug_list_globals()
 }
 
 #[cfg(test)]

@@ -55,7 +55,9 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          # 默认 key 含 job id，同 target 的重跑也无法命中；按 triple 共享。
+          shared-key: release-${{ matrix.target }}
+          cache-on-failure: true
       - name: Verify locked dependency input
         run: cargo metadata --locked --format-version 1 --no-deps
       - name: Build release

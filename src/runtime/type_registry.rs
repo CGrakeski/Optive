@@ -277,6 +277,12 @@ const PROTOCOL_METHODS: &[(&str, &str)] = &[
     (names::TEXT, "__add__"),
     (names::TEXT, "__mul__"),
     (names::TEXT, "__rmul__"),
+    (names::TEXT, "__len__"),
+    (names::LIST, "__len__"),
+    (names::DICT, "__len__"),
+    (names::SET, "__len__"),
+    (names::TUPLE, "__len__"),
+    (names::BYTES, "__len__"),
 ];
 
 #[must_use]
@@ -869,22 +875,36 @@ pub fn type_form_implies(vm: &Vm, actual: &Value, bound: &Value) -> Option<bool>
 #[must_use]
 pub fn type_ctor_error(type_name: &str, src: &Value) -> RuntimeError {
     RuntimeError::type_err(format!(
-        "TypeError: cannot construct {type_name} from {}",
+        "cannot construct {type_name} from {}",
         src.type_name()
     ))
 }
 
 #[must_use]
 pub fn type_convert_error(type_name: &str, src: &Value) -> RuntimeError {
-    RuntimeError::type_err(format!(
-        "TypeError: cannot convert {} to {type_name}",
-        src.type_name()
-    ))
+    RuntimeError::type_err(format!("cannot convert {} to {type_name}", src.type_name()))
 }
 
 #[must_use]
 pub fn type_ctor_arity_error(type_name: &str, expected: &str, got: usize) -> RuntimeError {
-    RuntimeError::type_err(format!("TypeError: {type_name}() {expected}, got {got}"))
+    RuntimeError::type_err(format!("{type_name}() {expected}, got {got}"))
+}
+
+/// 同类型拷贝：`Type(obj)` 不是跨类型转换（转换用 `Type.(obj)`）。
+fn ctor_same(type_name: &str, arg: &Value) -> Result<Value> {
+    let ok = match type_name {
+        names::TEXT => matches!(arg, Value::Text(_)),
+        names::NUM => matches!(arg, Value::Num(_)),
+        names::BOOL => matches!(arg, Value::Bool(_)),
+        names::LIST => matches!(arg, Value::List(_)),
+        names::BYTES => matches!(arg, Value::Bytes(_)),
+        _ => false,
+    };
+    if ok {
+        Ok(arg.clone())
+    } else {
+        Err(type_ctor_error(type_name, arg))
+    }
 }
 
 /// 构造原始类型值：`type(args)` — 非类型转换。
@@ -894,11 +914,11 @@ pub fn call_primitive_ctor(
     args: Vec<Value>,
 ) -> Option<Result<Value>> {
     match type_name {
-        names::TEXT if args.len() == 1 => Some(Ok(Value::Text(args[0].print_string()))),
-        names::NUM if args.len() == 1 => Some(coerce_to_num(&args[0], type_ctor_error)),
-        names::BOOL if args.len() == 1 => Some(Ok(Value::Bool(args[0].is_truthy()))),
+        names::TEXT if args.len() == 1 => Some(ctor_same(names::TEXT, &args[0])),
+        names::NUM if args.len() == 1 => Some(ctor_same(names::NUM, &args[0])),
+        names::BOOL if args.len() == 1 => Some(ctor_same(names::BOOL, &args[0])),
         names::LIST if args.is_empty() => Some(Ok(Value::List(Shared::new(Vec::new())))),
-        names::LIST if args.len() == 1 => Some(construct_list(&args[0])),
+        names::LIST if args.len() == 1 => Some(ctor_same(names::LIST, &args[0])),
         names::DICT if args.len().is_multiple_of(2) => Some(construct_dict_kv(args)),
         names::DICT => Some(Err(type_ctor_arity_error(
             names::DICT,
@@ -911,12 +931,15 @@ pub fn call_primitive_ctor(
         names::SET => Some(construct_set(args)),
         names::TUPLE => Some(Ok(Value::Tuple(args.into()))),
         names::BYTES if args.is_empty() => Some(Ok(Value::Bytes(Arc::new(Vec::new())))),
-        names::BYTES if args.len() == 1 => Some(construct_bytes(&args[0])),
-        names::ITERATOR if args.len() == 1 => Some(construct_iterator(&args[0])),
-        names::ITERATOR if args.is_empty() => Some(Err(type_ctor_arity_error(
+        names::BYTES if args.len() == 1 => Some(ctor_same(names::BYTES, &args[0])),
+        names::ITERATOR if args.len() == 1 => {
+            // 无构造：已是 iterator 也必须走 iterator.(x)
+            Some(Err(type_ctor_error(names::ITERATOR, &args[0])))
+        }
+        names::ITERATOR => Some(Err(type_ctor_arity_error(
             names::ITERATOR,
-            "expects 1 argument",
-            0,
+            "is not constructed with (); use iterator.(value) to convert",
+            args.len(),
         ))),
         "Channel" | "channel" => Some(crate::concurrency::construct_channel(&args)),
         "Stream" => Some(crate::concurrency::construct_stream(&args)),
@@ -1129,13 +1152,6 @@ fn convert_to_c_type(type_name: &str, value: &Value) -> Result<Value> {
     convert_to_sized(lang, value)
 }
 
-fn construct_list(arg: &Value) -> Result<Value> {
-    match arg {
-        Value::List(lst) => Ok(Value::List(lst.clone())),
-        other => Err(type_ctor_error(names::LIST, other)),
-    }
-}
-
 fn construct_dict_kv(args: Vec<Value>) -> Result<Value> {
     let mut map = DictMap::new();
     let mut i = 0;
@@ -1155,42 +1171,25 @@ fn construct_set(args: Vec<Value>) -> Result<Value> {
     Ok(Value::Set(Shared::new(set)))
 }
 
-fn construct_bytes(arg: &Value) -> Result<Value> {
-    match arg {
-        Value::Bytes(b) => Ok(Value::Bytes(b.clone())),
-        Value::Text(s) => Ok(Value::Bytes(Arc::new(s.as_bytes().to_vec()))),
-        Value::List(lst) => {
-            let mut out = Vec::new();
-            for item in lst.borrow().iter() {
-                match item {
-                    Value::Num(n) => {
-                        let v = n.to_i64().ok_or_else(|| {
-                            RuntimeError::type_err("TypeError: byte value out of range")
-                        })?;
-                        if !(0..=255).contains(&v) {
-                            return Err(RuntimeError::type_err(
-                                "TypeError: byte value out of range 0..255",
-                            ));
-                        }
-                        out.push(v as u8);
-                    }
-                    other => {
-                        return Err(type_ctor_error(names::BYTES, other));
-                    }
+fn bytes_from_int_list(lst: &Shared<Vec<Value>>) -> Result<Value> {
+    let mut out = Vec::new();
+    for item in lst.borrow().iter() {
+        match item {
+            Value::Num(n) => {
+                let v = n
+                    .to_i64()
+                    .ok_or_else(|| RuntimeError::type_err("byte value out of range"))?;
+                if !(0..=255).contains(&v) {
+                    return Err(RuntimeError::type_err("byte value out of range 0..255"));
                 }
+                out.push(v as u8);
             }
-            Ok(Value::Bytes(Arc::new(out)))
+            other => {
+                return Err(type_convert_error(names::BYTES, other));
+            }
         }
-        other => Err(type_ctor_error(names::BYTES, other)),
     }
-}
-
-fn construct_iterator(arg: &Value) -> Result<Value> {
-    match arg {
-        Value::List(lst) => Ok(IteratorState::from_list(lst.borrow().clone()).into_value()),
-        Value::Iterator(it) => Ok(Value::Iterator(it.clone())),
-        other => Err(type_ctor_error(names::ITERATOR, other)),
-    }
+    Ok(Value::Bytes(Arc::new(out)))
 }
 
 fn convert_to_list(vm: &mut Vm, arg: &Value) -> Result<Value> {
@@ -1271,7 +1270,7 @@ fn convert_to_bytes(arg: &Value) -> Result<Value> {
     match arg {
         Value::Bytes(b) => Ok(Value::Bytes(b.clone())),
         Value::Text(s) => Ok(Value::Bytes(Arc::new(s.as_bytes().to_vec()))),
-        Value::List(lst) => construct_bytes(&Value::List(lst.clone())),
+        Value::List(lst) => bytes_from_int_list(lst),
         other => Err(type_convert_error(names::BYTES, other)),
     }
 }
@@ -1312,7 +1311,7 @@ fn coerce_to_num(arg: &Value, on_mismatch: fn(&str, &Value) -> RuntimeError) -> 
             } else {
                 Ok(Value::Num(Num::from_bigint(
                     s.parse::<num_bigint::BigInt>()
-                        .map_err(|_| RuntimeError::type_err("TypeError: invalid num literal"))?,
+                        .map_err(|_| RuntimeError::type_err("invalid num literal"))?,
                 )))
             }
         }
@@ -1336,6 +1335,38 @@ pub fn try_call_primitive_magic(
         Err(e) if e.kind() == crate::error::ExceptionKind::UnsupportedOp => None,
         Err(e) => Some(Err(e)),
     }
+}
+
+/// 把原始类型 magic 绑成 `self` 方法，使 `a.__len__()` 与 `len(a)` 走同一张表。
+pub fn bind_primitive_method(vm: &Vm, obj: &Value, field: &str) -> Option<Value> {
+    let type_name = value_primitive_type(obj)?;
+    let f = vm.primitive_methods.get(type_name)?.get(field)?.clone();
+    let self_val = obj.clone();
+    let name = field.to_string();
+    Some(Value::builtin(name, move |vm, args| {
+        let mut full = Vec::with_capacity(args.len() + 1);
+        full.push(self_val.clone());
+        full.extend_from_slice(args);
+        f(vm, &full)
+    }))
+}
+
+fn primitive_len_of(v: &Value) -> Result<Value> {
+    let n = match v {
+        Value::List(xs) => xs.borrow().len(),
+        Value::Text(s) => s.chars().count(),
+        Value::Dict(d) => d.borrow().len(),
+        Value::Set(s) => s.borrow().len(),
+        Value::Tuple(t) => t.len(),
+        Value::Bytes(b) => b.len(),
+        other => {
+            return Err(RuntimeError::type_err(format!(
+                "object of type '{}' has no __len__",
+                other.type_name()
+            )))
+        }
+    };
+    Ok(Value::Num(Num::Small(n as i64)))
 }
 
 fn value_add(a: &Value, b: &Value) -> Result<Value> {
@@ -1839,20 +1870,38 @@ fn install_primitive_methods(vm: &mut Vm) {
         }),
     );
 
+    let len_magic: BuiltinFn = Arc::new(|_vm, args| {
+        if args.len() != 1 {
+            return Err(RuntimeError::type_err("__len__ requires 1 argument"));
+        }
+        primitive_len_of(&args[0])
+    });
+    text_methods.insert("__len__".into(), len_magic.clone());
+
+    let mut list_methods = FxHashMap::default();
+    list_methods.insert("__len__".into(), len_magic.clone());
+    let mut dict_methods = FxHashMap::default();
+    dict_methods.insert("__len__".into(), len_magic.clone());
+    let mut set_methods = FxHashMap::default();
+    set_methods.insert("__len__".into(), len_magic.clone());
+    let mut tuple_methods = FxHashMap::default();
+    tuple_methods.insert("__len__".into(), len_magic.clone());
+    let mut bytes_methods = FxHashMap::default();
+    bytes_methods.insert("__len__".into(), len_magic);
+
     methods.insert(names::NUM.into(), num_methods);
     methods.insert(names::TEXT.into(), text_methods);
+    methods.insert(names::LIST.into(), list_methods);
+    methods.insert(names::DICT.into(), dict_methods);
+    methods.insert(names::SET.into(), set_methods);
+    methods.insert(names::TUPLE.into(), tuple_methods);
+    methods.insert(names::BYTES.into(), bytes_methods);
     vm.primitive_methods = methods;
 }
 
 pub fn get_text_method(text: &str, field: &str) -> Result<Value> {
     let text = text.to_string();
     match field {
-        "len" => Ok(Value::builtin(field, move |_vm, args| {
-            if !args.is_empty() {
-                return Err(RuntimeError::type_err("len takes no arguments"));
-            }
-            Ok(Value::Num(Num::Small(text.chars().count() as i64)))
-        })),
         "upper" => Ok(Value::builtin(field, move |_vm, _args| {
             Ok(Value::Text(text.to_uppercase()))
         })),
@@ -1892,15 +1941,6 @@ pub fn get_text_method(text: &str, field: &str) -> Result<Value> {
 
 pub fn get_list_method(list: &Shared<Vec<Value>>, field: &str) -> Result<Value> {
     match field {
-        "len" => {
-            let owned = list.clone();
-            Ok(Value::builtin(field, move |_vm, args| {
-                if !args.is_empty() {
-                    return Err(RuntimeError::type_err("len takes no arguments"));
-                }
-                Ok(Value::Num(Num::Small(owned.borrow().len() as i64)))
-            }))
-        }
         "append" => {
             let owned = list.clone();
             Ok(Value::builtin(field, move |vm, args| {
@@ -1975,15 +2015,6 @@ pub fn get_list_method(list: &Shared<Vec<Value>>, field: &str) -> Result<Value> 
 
 pub fn get_dict_method(dict: &Shared<DictMap>, field: &str) -> Result<Value> {
     match field {
-        "len" => {
-            let d = dict.clone();
-            Ok(Value::builtin(field, move |_vm, args| {
-                if !args.is_empty() {
-                    return Err(RuntimeError::type_err("len takes no arguments"));
-                }
-                Ok(Value::Num(Num::Small(d.borrow().len() as i64)))
-            }))
-        }
         "get" => {
             let d = dict.clone();
             Ok(Value::builtin(field, move |_vm, args| {
@@ -2055,15 +2086,6 @@ pub fn get_dict_method(dict: &Shared<DictMap>, field: &str) -> Result<Value> {
 
 pub fn get_set_method(set: &Shared<crate::value::SetMap>, field: &str) -> Result<Value> {
     match field {
-        "len" => {
-            let s = set.clone();
-            Ok(Value::builtin(field, move |_vm, args| {
-                if !args.is_empty() {
-                    return Err(RuntimeError::type_err("len takes no arguments"));
-                }
-                Ok(Value::Num(Num::Small(s.borrow().len() as i64)))
-            }))
-        }
         "add" => {
             let s = set.clone();
             Ok(Value::builtin(field, move |vm, args| {
@@ -2102,34 +2124,14 @@ pub fn get_set_method(set: &Shared<crate::value::SetMap>, field: &str) -> Result
     }
 }
 
-pub fn get_tuple_method(tuple: &Arc<[Value]>, field: &str) -> Result<Value> {
-    match field {
-        "len" => {
-            let t = tuple.clone();
-            Ok(Value::builtin(field, move |_vm, args| {
-                if !args.is_empty() {
-                    return Err(RuntimeError::type_err("len takes no arguments"));
-                }
-                Ok(Value::Num(Num::Small(t.len() as i64)))
-            }))
-        }
-        _ => Err(RuntimeError::attr_err(format!(
-            "tuple has no method {field}"
-        ))),
-    }
+pub fn get_tuple_method(_tuple: &Arc<[Value]>, field: &str) -> Result<Value> {
+    Err(RuntimeError::attr_err(format!(
+        "tuple has no method {field}"
+    )))
 }
 
 pub fn get_bytes_method(bytes: &Arc<Vec<u8>>, field: &str) -> Result<Value> {
     match field {
-        "len" => {
-            let b = bytes.clone();
-            Ok(Value::builtin(field, move |_vm, args| {
-                if !args.is_empty() {
-                    return Err(RuntimeError::type_err("len takes no arguments"));
-                }
-                Ok(Value::Num(Num::Small(b.len() as i64)))
-            }))
-        }
         "decode" => {
             let b = bytes.clone();
             Ok(Value::builtin(field, move |_vm, args| {
@@ -2138,7 +2140,7 @@ pub fn get_bytes_method(bytes: &Arc<Vec<u8>>, field: &str) -> Result<Value> {
                 }
                 String::from_utf8(b.as_ref().clone())
                     .map(Value::Text)
-                    .map_err(|_| RuntimeError::type_err("TypeError: bytes are not valid UTF-8"))
+                    .map_err(|_| RuntimeError::type_err("bytes are not valid UTF-8"))
             }))
         }
         "hex" => {
@@ -2188,7 +2190,7 @@ fn primitive_convert_handler(type_name: &'static str) -> BuiltinFn {
     Arc::new(move |vm, args| {
         if args.len() != 2 {
             return Err(RuntimeError::type_err(
-                "TypeError: convert handler requires 2 arguments",
+                "convert handler requires 2 arguments",
             ));
         }
         match call_primitive_convert(vm, type_name, &args[1]) {
@@ -2202,7 +2204,7 @@ fn dynamic_convert_handler(type_name: String) -> BuiltinFn {
     Arc::new(move |vm, args| {
         if args.len() != 2 {
             return Err(RuntimeError::type_err(
-                "TypeError: convert handler requires 2 arguments",
+                "convert handler requires 2 arguments",
             ));
         }
         match call_primitive_convert(vm, &type_name, &args[1]) {

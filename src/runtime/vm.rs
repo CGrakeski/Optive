@@ -151,7 +151,8 @@ pub(crate) struct TaskFiber {
     lw_slots: Vec<StackVal>,
     lw_bases: Vec<usize>,
     lw_base: usize,
-    lw_depth: usize,
+    /// 相对宿主 `stop_lw_depth` 的增量；重函数暂停脚本帧时可为负。
+    lw_depth: isize,
     lw_entry_pc: usize,
     lw_frame_slots: usize,
     /// 卸荷 FFI pending（随纤程迁移，不能只挂在 Vm 上）。
@@ -375,6 +376,11 @@ struct UserCallFrame {
     saved_column_map: Arc<Vec<usize>>,
     func: Arc<FunctionObject>,
     pushed_func_stack: bool,
+    /// 本帧是否压了 `locals_stack` / `name_to_slot`（轻量叶调用为 false）。
+    pushed_name_frame: bool,
+    /// 进入本帧前的轻量深度；重函数会把 `lw_depth` 置 0，返回时恢复。
+    saved_lw_depth: usize,
+    saved_lw_base: usize,
 }
 
 #[derive(Clone)]
@@ -446,6 +452,10 @@ pub struct Vm {
     user_call_deferred: bool,
     script_global_names: Vec<String>,
     script_globals: Vec<Value>,
+    /// 脚本顶层快局部槽数；0 表示未启用。
+    script_frame_slots: usize,
+    /// 脚本快局部 → `script_global_names` 下标。
+    script_local_to_global: Vec<(usize, usize)>,
     /// 本 OS 线程私有的全局函数 `Arc`（拷贝热字节码），避免跨核争用同一 `FunctionObject`。
     local_fn_hot: Vec<Option<Arc<FunctionObject>>>,
     /// 定义处绑定注解时优先从此模块环境取名（方法/导入后再绑定时用）。
@@ -595,6 +605,14 @@ pub(crate) struct EvalSnapshot {
     variant_defs: FxHashMap<String, Arc<crate::value::VariantDef>>,
     script_global_names: Vec<String>,
     script_globals: Vec<Value>,
+    script_frame_slots: usize,
+    script_local_to_global: Vec<(usize, usize)>,
+    lw_slots: Vec<StackVal>,
+    lw_bases: Vec<usize>,
+    lw_bases_sp: usize,
+    lw_sp: usize,
+    lw_base: usize,
+    lw_depth: usize,
 }
 
 pub(crate) struct ActiveIter {
@@ -666,6 +684,10 @@ enum StepAction {
     LoadFastAddImmStore {
         slot: usize,
         imm: i64,
+    },
+    LoadFastAddStore {
+        dst: usize,
+        src: usize,
     },
     LoadFastSqrGt {
         sqr_slot: usize,
@@ -777,7 +799,7 @@ enum StepAction {
     SelectNextIndex,
 }
 
-pub struct ModuleInitSnapshot {
+pub(crate) struct ModuleInitSnapshot {
     pub(crate) globals: SharedMap,
     pub(crate) functions: FxHashMap<String, Arc<FunctionObject>>,
     pub(crate) macros: FxHashMap<String, Arc<MacroObject>>,
@@ -789,6 +811,14 @@ pub struct ModuleInitSnapshot {
     pub(crate) pc: usize,
     pub(crate) script_global_names: Vec<String>,
     pub(crate) script_globals: Vec<Value>,
+    pub(crate) script_frame_slots: usize,
+    pub(crate) script_local_to_global: Vec<(usize, usize)>,
+    lw_slots: Vec<StackVal>,
+    lw_bases: Vec<usize>,
+    lw_bases_sp: usize,
+    lw_sp: usize,
+    lw_base: usize,
+    lw_depth: usize,
 }
 
 impl Vm {
@@ -908,6 +938,8 @@ impl Vm {
             user_call_deferred: false,
             script_global_names: Vec::new(),
             script_globals: Vec::new(),
+            script_frame_slots: 0,
+            script_local_to_global: Vec::new(),
             local_fn_hot: Vec::new(),
             annotation_bind_env: None,
             local_frame_pool: Vec::new(),
@@ -1416,6 +1448,14 @@ impl Vm {
             pc: self.pc,
             script_global_names: self.script_global_names.clone(),
             script_globals: self.script_globals.clone(),
+            script_frame_slots: self.script_frame_slots,
+            script_local_to_global: self.script_local_to_global.clone(),
+            lw_slots: self.lw_slots.clone(),
+            lw_bases: self.lw_bases.clone(),
+            lw_bases_sp: self.lw_bases_sp,
+            lw_sp: self.lw_sp,
+            lw_base: self.lw_base,
+            lw_depth: self.lw_depth,
         }
     }
 
@@ -1445,6 +1485,15 @@ impl Vm {
         type_registry::install_core_types(self);
         self.globals
             .insert("__package__".into(), Value::Text(package_name.to_string()));
+
+        // 勿把调用方脚本快帧 flush 进模块 SharedMap；load_program 会重建模块帧。
+        self.script_frame_slots = 0;
+        self.script_local_to_global.clear();
+        self.lw_bases_sp = 0;
+        self.lw_sp = 0;
+        self.lw_base = 0;
+        self.lw_depth = 0;
+        self.local_fn_hot.clear();
 
         let exports = Shared::new(HashMap::new());
         self.module_init_exports = Some(exports.clone());
@@ -1494,6 +1543,16 @@ impl Vm {
         self.overload_tables.extend(new_overloads);
         self.script_global_names = snap.script_global_names;
         self.script_globals = snap.script_globals;
+        self.script_frame_slots = snap.script_frame_slots;
+        self.script_local_to_global = snap.script_local_to_global;
+        self.lw_slots = snap.lw_slots;
+        self.lw_bases = snap.lw_bases;
+        self.lw_bases_sp = snap.lw_bases_sp;
+        self.lw_sp = snap.lw_sp;
+        self.lw_base = snap.lw_base;
+        self.lw_depth = snap.lw_depth;
+        // 模块 run 填过 local_fn_hot；必须按调用方平行槽重建，否则 CallGlobal 会打到未挂 env 的模块函数。
+        self.rebuild_local_fn_hot();
     }
 
     pub fn load_program(&mut self, program: CompiledProgram) -> Result<()> {
@@ -1554,7 +1613,10 @@ impl Vm {
         // REPL 多次 load：热 Store 可能只写平行槽；重建表前刷入 SharedMap，
         // 否则下一行读到 NewVar 的 none（如 `acc = acc + 5`）。
         self.flush_script_globals_to_map();
+        self.script_frame_slots = program.script_frame_slots;
+        self.script_local_to_global = program.script_local_to_global;
         self.init_script_globals(program.global_names);
+        self.prepare_script_fast_frame();
         type_registry::install_core_types(self);
         Ok(())
     }
@@ -1584,6 +1646,7 @@ impl Vm {
         self.hot_failed = false;
         self.hot_error = None;
         self.local_fn_hot.clear();
+        self.prepare_script_fast_frame();
     }
 
     /// 清掉顶层 `const` 绑定并回到入口，使同一已加载程序可再跑一遍。
@@ -1597,14 +1660,22 @@ impl Vm {
         self.has_pending_const = false;
     }
 
-    pub(crate) fn snapshot_module_global_env(&self) -> ModuleGlobalEnv {
+    pub(crate) fn snapshot_module_global_env(&mut self) -> ModuleGlobalEnv {
+        self.flush_script_fast_locals();
+        self.flush_script_globals_to_map();
         let mut map = self.globals.deep_clone();
-        // 顶层热路径可能只更新 script_globals；快照前合并，避免模块看到旧值。
+        // 顶层热路径可能只更新 script_globals；快照前合并。
+        // 槽为 none 时勿覆盖 SharedMap 里已有的非 none（NewVar 初值 none + Store 只写了 map）。
         for (idx, name) in self.script_global_names.iter().enumerate() {
             if name.is_empty() {
                 continue;
             }
             if let Some(v) = self.script_globals.get(idx) {
+                if matches!(v, Value::None) {
+                    if map.get(name).is_some_and(|x| !matches!(x, Value::None)) {
+                        continue;
+                    }
+                }
                 map.insert(name.clone(), v.clone());
             }
         }
@@ -1618,6 +1689,7 @@ impl Vm {
     /// 将平行槽刷回 SharedMap（M:1 热 `StoreGlobal` 可延迟同步；调度其它纤程前必须刷）。
     #[inline]
     fn flush_script_globals_to_map(&mut self) {
+        self.flush_script_fast_locals();
         if self.mn_parallel || !self.script_globals_map_dirty {
             return;
         }
@@ -1647,6 +1719,76 @@ impl Vm {
             .map(|name| self.globals.get(name).unwrap_or(Value::None))
             .collect();
         self.publish_script_globals();
+        self.rebuild_local_fn_hot();
+    }
+
+    fn prepare_script_fast_frame(&mut self) {
+        let n = self.script_frame_slots;
+        if n == 0 {
+            return;
+        }
+        if self.lw_slots.len() < n {
+            self.lw_slots.resize(n, StackVal::Empty);
+        }
+        for slot in self.lw_slots.iter_mut().take(n) {
+            *slot = StackVal::Empty;
+        }
+        self.lw_sp = n;
+        self.lw_base = 0;
+        self.lw_depth = 1;
+        self.lw_bases_sp = 0;
+        self.push_lw_base(0);
+    }
+
+    fn script_fast_slot(&self, local: usize) -> Option<&StackVal> {
+        if self.lw_bases_sp == 0 {
+            return None;
+        }
+        let base = self.lw_bases[0];
+        let idx = base + local;
+        if idx < self.lw_sp {
+            Some(&self.lw_slots[idx])
+        } else {
+            None
+        }
+    }
+
+    fn live_script_fast_local(&self, name: &str) -> Option<Value> {
+        let global = self.script_global_names.iter().position(|n| n == name)?;
+        let local = self
+            .script_local_to_global
+            .iter()
+            .find(|&&(_, g)| g == global)
+            .map(|&(l, _)| l)?;
+        match self.script_fast_slot(local)? {
+            StackVal::Empty => None,
+            other => Some(other.copy_imm().into_value()),
+        }
+    }
+
+    pub(crate) fn flush_script_fast_locals(&mut self) {
+        if self.script_local_to_global.is_empty() || self.lw_bases_sp == 0 {
+            return;
+        }
+        let pairs: Vec<(usize, usize)> = self.script_local_to_global.clone();
+        for (local, global) in pairs {
+            let Some(sv) = self.script_fast_slot(local).map(StackVal::copy_imm) else {
+                continue;
+            };
+            if global >= self.script_globals.len() {
+                continue;
+            }
+            let val = sv.into_value();
+            self.script_globals[global] = val.clone();
+            if let Some(name) = self.script_global_names.get(global) {
+                if !name.is_empty() {
+                    if !self.globals.set_inplace(name.as_str(), val.clone()) {
+                        self.globals.insert(name.clone(), val.clone());
+                    }
+                }
+            }
+            self.sync_local_fn_hot(global, &val);
+        }
     }
 
     fn publish_script_globals(&self) {
@@ -1659,6 +1801,27 @@ impl Vm {
         );
     }
 
+    /// M:N：各 worker 的 `script_globals` 互不共享；SharedMap 才是跨线程权威源。
+    fn overlay_script_globals_from_map(&mut self) {
+        for (i, name) in self.script_global_names.iter().enumerate() {
+            if name.is_empty() {
+                continue;
+            }
+            // 主线程未逃逸快槽（含尚未赋值的 Empty）以 lw 为准，勿被 map 盖掉。
+            if self.mn_primary
+                && self.lw_bases_sp > 0
+                && self.script_local_to_global.iter().any(|&(_, g)| g == i)
+            {
+                continue;
+            }
+            if let Some(v) = self.globals.get(name) {
+                if i < self.script_globals.len() {
+                    self.script_globals[i] = v;
+                }
+            }
+        }
+    }
+
     fn pull_script_globals_if_helper(&mut self) {
         if !self.mn_parallel || self.mn_primary {
             return;
@@ -1669,6 +1832,8 @@ impl Vm {
         }
         self.script_global_names = names;
         self.script_globals = vals;
+        // 发布快照可能早于 helper 上的 StoreGlobal；随后以 SharedMap 覆盖。
+        self.overlay_script_globals_from_map();
         self.rebuild_local_fn_hot();
     }
 
@@ -2191,8 +2356,8 @@ impl Vm {
     #[inline(always)]
     fn call_self_lightweight(&mut self, argc: usize, entry_pc: usize, frame_slots: usize) {
         if self.lw_depth >= self.cached_max_depth {
-            self.set_hot_error(RuntimeError::msg(
-                "RecursionError: maximum recursion depth exceeded",
+            self.set_hot_error(RuntimeError::recursion_err(
+                "maximum recursion depth exceeded",
             ));
             return;
         }
@@ -2575,10 +2740,11 @@ impl Vm {
         use crate::hot_code::{
             H_ADD_LIST, H_ADD_NUM, H_ADD_TEXT, H_CALL, H_CALL_GLOBAL, H_CALL_SELF, H_DIV_NUM, H_EQ,
             H_GE, H_GOTO, H_GOTO_IF, H_GOTO_IF_NOT, H_GT, H_LABEL, H_LE, H_LOAD_FAST,
-            H_LOAD_FAST_ADD_IMM_STORE, H_LOAD_FAST_EQ_IMM, H_LOAD_FAST_GT_IMM, H_LOAD_FAST_LE_IMM,
-            H_LOAD_FAST_LT_IMM, H_LOAD_FAST_MOD_EQ0, H_LOAD_FAST_SQR_GT, H_LOAD_FAST_SUB_IMM,
-            H_LOAD_GLOBAL, H_LOOP_COUNTDOWN, H_LT, H_MOD_NUM, H_MUL_NUM, H_NE, H_PUSH_BOOL,
-            H_PUSH_SMALL, H_RET, H_RET_FAST, H_RET_LEAVE, H_STORE_FAST, H_STORE_GLOBAL, H_SUB_NUM,
+            H_LOAD_FAST_ADD_IMM_STORE, H_LOAD_FAST_ADD_STORE, H_LOAD_FAST_EQ_IMM,
+            H_LOAD_FAST_GT_IMM, H_LOAD_FAST_LE_IMM, H_LOAD_FAST_LT_IMM, H_LOAD_FAST_MOD_EQ0,
+            H_LOAD_FAST_SQR_GT, H_LOAD_FAST_SUB_IMM, H_LOAD_GLOBAL, H_LOOP_COUNTDOWN, H_LT,
+            H_MOD_NUM, H_MUL_NUM, H_NE, H_PUSH_BOOL, H_PUSH_SMALL, H_RET, H_RET_FAST, H_RET_LEAVE,
+            H_STORE_FAST, H_STORE_GLOBAL, H_SUB_NUM,
         };
         // SAFETY（已由外层 `'hot` 循环 `if pc >= code_len { break }` 保证）：
         // 进入本函数时 `pc < ops.len()`，且 `HotCode::encode` 保证 `ops.len() == hot_args.len()`。
@@ -2720,6 +2886,22 @@ impl Vm {
                         }
                         self.pc = pc + 1;
                         self.store_fast_sv(slot, StackVal::Int(r));
+                        return HotFlow::Cont;
+                    }
+                }
+                HotFlow::Cold
+            }
+            H_LOAD_FAST_ADD_STORE => {
+                let (dst, src) = crate::hot_code::decode_two_slots(arg);
+                if let (Some(a), Some(b)) = (self.lw_slot_int(dst), self.lw_slot_int(src)) {
+                    let (r, ov) = a.overflowing_add(b);
+                    if !ov {
+                        if let Err(e) = self.reject_const_fast_store(dst) {
+                            self.set_hot_error(e);
+                            return HotFlow::Fail;
+                        }
+                        self.pc = pc + 1;
+                        self.store_fast_sv(dst, StackVal::Int(r));
                         return HotFlow::Cont;
                     }
                 }
@@ -2987,7 +3169,6 @@ impl Vm {
                             *n = n.wrapping_sub(1);
                             self.pc = pc + 1;
                         }
-                        self.tick_budget();
                         return HotFlow::Cont;
                     }
                 }
@@ -3172,6 +3353,7 @@ impl Vm {
                         if self.mn_parallel {
                             return self.dispatch_hot_store_global_mn(idx, n);
                         }
+                        self.sync_local_fn_hot(idx, &Value::Num(Num::Small(n)));
                         self.script_globals_map_dirty = true;
                         return HotFlow::Cont;
                     }
@@ -3289,9 +3471,9 @@ impl Vm {
     #[inline(never)]
     fn dispatch_hot_load_global_slow(&mut self, idx: usize) -> HotFlow {
         let aligned = self.user_call_frames.is_empty()
-            || self.active_module_global_env().map_or(true, |env| {
-                env.global_names.get(idx) == self.script_global_names.get(idx)
-            });
+            || self
+                .active_module_global_env()
+                .is_none_or(|env| env.global_names.get(idx) == self.script_global_names.get(idx));
         if aligned && idx < self.script_globals.len() {
             // SAFETY: idx < len
             let sv = match unsafe { self.script_globals.get_unchecked(idx) } {
@@ -3410,8 +3592,8 @@ impl Vm {
     #[inline(always)]
     fn call_self_lw1(&mut self, entry_pc: usize) {
         if self.lw_depth >= self.cached_max_depth {
-            self.set_hot_error(RuntimeError::msg(
-                "RecursionError: maximum recursion depth exceeded",
+            self.set_hot_error(RuntimeError::recursion_err(
+                "maximum recursion depth exceeded",
             ));
             return;
         }
@@ -3565,6 +3747,9 @@ impl Vm {
                         return self.finish_uncaught(e);
                     }
                     HotFlow::PendingRet => {
+                        if self.user_call_frames.is_empty() {
+                            self.flush_script_fast_locals();
+                        }
                         if self.lw_depth > 0 && self.fast_ret_sp == 0 {
                             self.pop_lightweight_frame();
                         }
@@ -3673,12 +3858,19 @@ impl Vm {
         }
     }
 
-    /// 未捕获脚本异常时，用异常种类与文案覆盖原始宿主错误。
+    /// 未捕获脚本异常：保留 `kind` + 正文。人读 `TypeName: msg` 只在 traceback 末行拼一次。
+    fn host_error_from_active(&self) -> RuntimeError {
+        let Some(exc) = self.active_exception.as_ref() else {
+            return RuntimeError::msg(String::new());
+        };
+        let kind = exceptions::kind_of_value(exc).unwrap_or(crate::error::ExceptionKind::Runtime);
+        let msg = exceptions::exception_message(exc).unwrap_or_default();
+        RuntimeError::typed(kind, msg)
+    }
+
     fn finalize_runtime_error(&self, fallback: RuntimeError) -> RuntimeError {
-        if let Some(exc) = self.active_exception.as_ref() {
-            let kind =
-                exceptions::kind_of_value(exc).unwrap_or(crate::error::ExceptionKind::Runtime);
-            RuntimeError::typed(kind, exceptions::format_uncaught(exc))
+        if self.active_exception.is_some() {
+            self.host_error_from_active()
         } else {
             fallback
         }
@@ -3743,14 +3935,7 @@ impl Vm {
         if self.dispatch_to_handler()? {
             return Ok(());
         }
-        let (kind, msg) = match self.active_exception.as_ref() {
-            Some(exc) => (
-                exceptions::kind_of_value(exc).unwrap_or(crate::error::ExceptionKind::Runtime),
-                exceptions::format_uncaught(exc),
-            ),
-            None => (crate::error::ExceptionKind::Runtime, String::new()),
-        };
-        Err(RuntimeError::typed(kind, msg))
+        Err(self.host_error_from_active())
     }
 
     fn decode_step_action(ins: &Instruction) -> StepAction {
@@ -3820,6 +4005,10 @@ impl Vm {
             I::LoadFastAddImmStore { slot, imm } => StepAction::LoadFastAddImmStore {
                 slot: *slot,
                 imm: *imm,
+            },
+            I::LoadFastAddStore { dst, src } => StepAction::LoadFastAddStore {
+                dst: *dst,
+                src: *src,
             },
             I::LoadFastSqrGt { sqr_slot, rhs_slot } => StepAction::LoadFastSqrGt {
                 sqr_slot: *sqr_slot,
@@ -4366,6 +4555,18 @@ impl Vm {
                 let v = self.pop_hot();
                 self.store_fast_sv(slot, v);
             }
+            StepAction::LoadFastAddStore { dst, src } => {
+                self.reject_const_fast_store(dst)?;
+                let a = self.load_fast_sv(dst);
+                let b = self.load_fast_sv(src);
+                self.op_push(a);
+                self.op_push(b);
+                let rhs = self.op_pop();
+                let lhs = self.op_pop();
+                self.exec_add_slow(lhs, rhs)?;
+                let v = self.pop_hot();
+                self.store_fast_sv(dst, v);
+            }
             StepAction::LoadFastSqrGt { sqr_slot, rhs_slot } => {
                 let d = self.load_fast_sv(sqr_slot);
                 self.op_push(d.copy_imm());
@@ -4866,12 +5067,7 @@ impl Vm {
                     if ok {
                         Ok(())
                     } else {
-                        let msg = self
-                            .active_exception
-                            .as_ref()
-                            .map(exceptions::format_uncaught)
-                            .unwrap_or_default();
-                        Err(RuntimeError::msg(msg))
+                        Err(self.host_error_from_active())
                     }
                 });
             }
@@ -5157,6 +5353,9 @@ impl Vm {
         }
         // 顶层热 Store 可能只写 script_globals；非 none 槽优先。
         // none 槽回退 SharedMap（friend Dispatch 等）；无键则 NameError（含 `del`）。
+        if let Some(v) = self.live_script_fast_local(name) {
+            return Ok(v);
+        }
         if let Some(idx) = self.script_global_names.iter().position(|n| n == name) {
             if let Some(v) = self.script_globals.get(idx) {
                 if !matches!(v, Value::None) {
@@ -5282,16 +5481,7 @@ impl Vm {
                 }
             }
         }
-        if let Some(Value::Cell(cell)) = self.globals.get(name) {
-            *cell.borrow_mut() = val.clone();
-        } else {
-            self.globals.insert(name.to_string(), val.clone());
-        }
-        if let Some(idx) = self.script_global_names.iter().position(|n| n == name) {
-            if idx < self.script_globals.len() {
-                self.script_globals[idx] = val;
-            }
-        }
+        self.store_global_by_name(name, val);
         self.finalize_const_init(name);
         Ok(())
     }
@@ -5324,6 +5514,7 @@ impl Vm {
                 if idx < self.script_globals.len() {
                     self.script_globals[idx] = Value::None;
                 }
+                self.sync_local_fn_hot(idx, &Value::None);
             }
             return Ok(());
         }
@@ -5540,7 +5731,7 @@ impl Vm {
                     return result;
                 }
                 Err(RuntimeError::type_err(format!(
-                    "TypeError: {type_name} is not callable with {n_args} argument(s)"
+                    "{type_name} is not callable with {n_args} argument(s)"
                 )))
             }
             Value::TypeSpec(spec) if self.variant_defs.contains_key(&spec.name) => {
@@ -6011,11 +6202,11 @@ impl Vm {
         if let Some(type_name) = table_name.strip_prefix("__convert__:") {
             let src = args.get(1).map_or("?", super::value::Value::type_name);
             return Err(RuntimeError::type_err(format!(
-                "TypeError: no matching __convert__ handler for {type_name} from {src}"
+                "no matching __convert__ handler for {type_name} from {src}"
             )));
         }
         Err(RuntimeError::type_err(format!(
-            "TypeError: no matching __dispatch__ for {table_name}"
+            "no matching __dispatch__ for {table_name}"
         )))
     }
 
@@ -6055,6 +6246,14 @@ impl Vm {
             variant_defs: self.variant_defs.snapshot_map(),
             script_global_names: self.script_global_names.clone(),
             script_globals: self.script_globals.clone(),
+            script_frame_slots: self.script_frame_slots,
+            script_local_to_global: self.script_local_to_global.clone(),
+            lw_slots: self.lw_slots.clone(),
+            lw_bases: self.lw_bases.clone(),
+            lw_bases_sp: self.lw_bases_sp,
+            lw_sp: self.lw_sp,
+            lw_base: self.lw_base,
+            lw_depth: self.lw_depth,
         }
     }
 
@@ -6077,6 +6276,14 @@ impl Vm {
         self.variant_defs.replace_with(snap.variant_defs);
         self.script_global_names = snap.script_global_names;
         self.script_globals = snap.script_globals;
+        self.script_frame_slots = snap.script_frame_slots;
+        self.script_local_to_global = snap.script_local_to_global;
+        self.lw_slots = snap.lw_slots;
+        self.lw_bases = snap.lw_bases;
+        self.lw_bases_sp = snap.lw_bases_sp;
+        self.lw_sp = snap.lw_sp;
+        self.lw_base = snap.lw_base;
+        self.lw_depth = snap.lw_depth;
     }
 
     pub(crate) fn run_snippet(&mut self, program: CompiledProgram) -> Result<()> {
@@ -6098,7 +6305,10 @@ impl Vm {
         // 顶层热 Store 可能只写平行槽；snippet 按 SharedMap 重建槽前必须先刷，
         // 否则 `eval(quote { a })` / 宏展开会读到 NewVar 的 none 或 NameError。
         self.flush_script_globals_to_map();
+        self.script_frame_slots = program.script_frame_slots;
+        self.script_local_to_global = program.script_local_to_global;
         self.init_script_globals(program.global_names);
+        self.prepare_script_fast_frame();
         self.code = Arc::new(program.code);
         self.hot_ops = program.hot.ops.clone();
         self.hot_args = program.hot.args.clone();
@@ -6356,8 +6566,8 @@ impl Vm {
         reenter: bool,
     ) -> Result<()> {
         if self.user_call_frames.len() >= self.cached_max_depth {
-            return Err(RuntimeError::msg(
-                "RecursionError: maximum recursion depth exceeded",
+            return Err(RuntimeError::recursion_err(
+                "maximum recursion depth exceeded",
             ));
         }
         let func = self.ensure_func_types_resolved(func)?;
@@ -6451,6 +6661,10 @@ impl Vm {
         }
         self.locals_stack.push(locals);
 
+        let saved_lw_depth = self.lw_depth;
+        let saved_lw_base = self.lw_base;
+        // 脚本未逃逸局部占用 lw 帧；重函数的 LoadFast 走 locals_stack，须暂时摘掉。
+        self.lw_depth = 0;
         self.user_call_frames.push(UserCallFrame {
             saved_code: self.code.clone(),
             saved_hot_ops: self.hot_ops.clone(),
@@ -6460,6 +6674,9 @@ impl Vm {
             saved_column_map: self.active_column_map.clone(),
             func: func.clone(),
             pushed_func_stack: !reenter,
+            pushed_name_frame: true,
+            saved_lw_depth,
+            saved_lw_base,
         });
         self.code = func.body.clone();
         validate_function_hot(&func)?;
@@ -6491,13 +6708,13 @@ impl Vm {
         argc: usize,
     ) -> Result<()> {
         if self.user_call_frames.len() >= self.cached_max_depth {
-            return Err(RuntimeError::msg(
-                "RecursionError: maximum recursion depth exceeded",
+            return Err(RuntimeError::recursion_err(
+                "maximum recursion depth exceeded",
             ));
         }
         if self.lw_depth >= self.cached_max_depth {
-            return Err(RuntimeError::msg(
-                "RecursionError: maximum recursion depth exceeded",
+            return Err(RuntimeError::recursion_err(
+                "maximum recursion depth exceeded",
             ));
         }
         if self.stack_sp < argc {
@@ -6505,13 +6722,12 @@ impl Vm {
         }
 
         self.func_stack.push(func.clone());
-        // 与 leave_scope 配对；轻量路径不使用名字表 / 堆局部帧。
-        self.name_to_slot.push(None);
-        self.locals_stack.push(Vec::new());
 
         let nslots = func.frame_slots.max(argc);
         let entry_pc = func.entry_pc;
         let frame_slots = func.frame_slots;
+        let saved_lw_depth = self.lw_depth;
+        let saved_lw_base = self.lw_base;
         self.user_call_frames.push(UserCallFrame {
             saved_code: std::mem::replace(&mut self.code, func.body.clone()),
             saved_hot_ops: std::mem::replace(&mut self.hot_ops, func.hot.ops.clone()),
@@ -6524,6 +6740,9 @@ impl Vm {
             ),
             func,
             pushed_func_stack: true,
+            pushed_name_frame: false,
+            saved_lw_depth,
+            saved_lw_base,
         });
         let base = self.lw_sp;
         self.push_lw_base(base);
@@ -6553,6 +6772,8 @@ impl Vm {
         self.pc = frame.saved_pc;
         self.active_line_map = frame.saved_line_map;
         self.active_column_map = frame.saved_column_map;
+        self.lw_depth = frame.saved_lw_depth;
+        self.lw_base = frame.saved_lw_base;
     }
 
     fn complete_user_return_instruction(
@@ -6570,11 +6791,17 @@ impl Vm {
             self.try_stack.pop();
         }
 
-        if leave_scope {
+        if leave_scope
+            && self
+                .user_call_frames
+                .last()
+                .is_some_and(|f| f.pushed_name_frame)
+        {
             self.leave_scope();
         }
 
         if self.user_call_frames.is_empty() {
+            self.flush_script_fast_locals();
             self.push_value(result);
             self.pc = self.code.len();
             return Ok(Some(self.stack_top()));
@@ -6589,7 +6816,9 @@ impl Vm {
             if let Some(ref ty) = func.return_type_value {
                 if let Some(detail) = types::type_check_error(self, &result, ty) {
                     let msg = format!("return: {detail}");
-                    self.leave_scope();
+                    if frame.pushed_name_frame {
+                        self.leave_scope();
+                    }
                     if frame.func.track_frames() {
                         self.func_frames.pop();
                     }
@@ -6605,7 +6834,9 @@ impl Vm {
             }
         }
 
-        self.leave_scope();
+        if frame.pushed_name_frame {
+            self.leave_scope();
+        }
         if frame.func.track_frames() {
             self.func_frames.pop();
         }
@@ -6628,7 +6859,11 @@ impl Vm {
             self.pop_lightweight_frame();
         }
         while let Some(frame) = self.user_call_frames.pop() {
-            self.leave_scope();
+            if frame.pushed_name_frame {
+                self.leave_scope();
+            } else if self.lw_depth > frame.saved_lw_depth {
+                self.pop_lightweight_frame();
+            }
             if frame.func.track_frames() {
                 self.func_frames.pop();
             }
@@ -6696,7 +6931,7 @@ impl Vm {
             if self.task_ctx.is_none() {
                 let mut st = dbg.borrow_mut();
                 if st.exception_uncaught {
-                    st.last_uncaught = Some(finalized.message().to_string());
+                    st.last_uncaught = Some(finalized.uncaught_line());
                     st.request_break(crate::debug::StopReason::Uncaught);
                     crate::debug::mark_stopped(self, &mut st);
                     return Ok(InterpResult::DebugBreak);
@@ -6725,6 +6960,54 @@ impl Vm {
             }
         }
         false
+    }
+
+    pub fn debug_list_globals(&self) -> Vec<(String, Value)> {
+        let unwrap = |v: &Value| match v {
+            Value::Cell(c) => c.borrow().clone(),
+            other => other.clone(),
+        };
+        let mut out = Vec::new();
+        let mut seen = FxHashSet::default();
+        for (idx, name) in self.script_global_names.iter().enumerate() {
+            if name.is_empty() {
+                continue;
+            }
+            if let Some(v) = self.script_globals.get(idx) {
+                // `del` 清掉 map 键并把槽写成 none：调试器不应再列出该名。
+                if matches!(v, Value::None) && !self.globals.contains_key(name.as_str()) {
+                    continue;
+                }
+                seen.insert(name.clone());
+                out.push((name.clone(), unwrap(v)));
+            }
+        }
+        for &(local, global) in &self.script_local_to_global {
+            let Some(name) = self.script_global_names.get(global) else {
+                continue;
+            };
+            if name.is_empty() {
+                continue;
+            }
+            if let Some(sv) = self.script_fast_slot(local) {
+                let val = sv.copy_imm().into_value();
+                if let Some(slot) = out.iter_mut().find(|(n, _)| n == name) {
+                    slot.1 = val;
+                } else {
+                    seen.insert(name.clone());
+                    out.push((name.clone(), val));
+                }
+            }
+        }
+        let mut rest = self.globals.keys();
+        rest.retain(|k| !seen.contains(k));
+        rest.sort();
+        for k in rest {
+            if let Some(v) = self.globals.get(&k) {
+                out.push((k, unwrap(&v)));
+            }
+        }
+        out
     }
 
     pub fn debug_list_locals(&self) -> Vec<(String, Value)> {
@@ -6958,7 +7241,10 @@ impl Vm {
             // 顶层热 Store 可能只写 script_globals；先刷到 SharedMap，再按 snippet
             // 的 global_names 重建槽，否则条件/日志断点求值会读到 none。
             self.flush_script_globals_to_map();
+            self.script_frame_slots = program.script_frame_slots;
+            self.script_local_to_global = program.script_local_to_global.clone();
             self.init_script_globals(program.global_names.clone());
+            self.prepare_script_fast_frame();
             self.code = Arc::new(program.code);
             self.hot_ops = program.hot.ops.clone();
             self.hot_args = program.hot.args.clone();
@@ -7380,6 +7666,9 @@ impl Vm {
             self.func_stack.push(func.clone());
             self.name_to_slot.push(name_map);
             self.locals_stack.push(locals);
+            let saved_lw_depth = self.lw_depth;
+            let saved_lw_base = self.lw_base;
+            self.lw_depth = 0;
             self.user_call_frames.push(UserCallFrame {
                 saved_code: self.code.clone(),
                 saved_hot_ops: self.hot_ops.clone(),
@@ -7389,6 +7678,9 @@ impl Vm {
                 saved_column_map: self.active_column_map.clone(),
                 func: func.clone(),
                 pushed_func_stack: true,
+                pushed_name_frame: true,
+                saved_lw_depth,
+                saved_lw_base,
             });
             self.code = func.body.clone();
             validate_function_hot(&func)?;
@@ -7615,6 +7907,8 @@ impl Vm {
             user_call_deferred: false,
             script_global_names: self.script_global_names.clone(),
             script_globals: self.script_globals.clone(),
+            script_frame_slots: self.script_frame_slots,
+            script_local_to_global: self.script_local_to_global.clone(),
             local_fn_hot: Vec::new(),
             annotation_bind_env: None,
             local_frame_pool: Vec::new(),
@@ -7725,7 +8019,9 @@ impl Vm {
     /// 阻塞等待时：
     /// - 已在任务纤程内（`sched_depth>0`）：**禁止再入** `scheduler_run_one`
     ///   （嵌套 capture 会破坏外层栈）；改为挂起本任务，让外层调度器继续；
-    /// - 否则抽干就绪队列（wait-as-worker）；M:N 下再短等。
+    /// - 否则 wait-as-worker：**一次只跑一个**就绪任务再回到等待条件。
+    ///   M:N 若在此把 injector 抽干，helper 还在 `wait_brief` 时主线程会把
+    ///   全部 CPU `go` 串行做完（Criterion `par/2` 会在 ~1× 与 ~2× 两档间跳）。
     pub(crate) fn wait_or_deadlock(&mut self, msg: &str) -> Result<()> {
         self.poll_gc_safepoint();
         if self.debug_break_requested {
@@ -7736,21 +8032,7 @@ impl Vm {
             self.block_suspend = true;
             return Ok(());
         }
-        if self.mn_parallel {
-            let mut ran = false;
-            while self.scheduler_run_one()? {
-                ran = true;
-                if self.debug_break_requested {
-                    return Ok(());
-                }
-            }
-            if self.debug_break_requested || ran {
-                return Ok(());
-            }
-        } else if self.scheduler_run_one()? {
-            return Ok(());
-        }
-        if self.debug_break_requested {
+        if self.scheduler_run_one()? || self.debug_break_requested {
             return Ok(());
         }
         if self.mn_parallel {
@@ -7970,7 +8252,7 @@ impl Vm {
             lw_slots,
             lw_bases,
             lw_base: self.lw_base.saturating_sub(ctx.stop_lw_sp),
-            lw_depth: self.lw_depth.saturating_sub(ctx.stop_lw_depth),
+            lw_depth: self.lw_depth as isize - ctx.stop_lw_depth as isize,
             lw_entry_pc: self.lw_entry_pc,
             lw_frame_slots: self.lw_frame_slots,
             ffi_wait: self.ffi_wait.take(),
@@ -8007,6 +8289,9 @@ impl Vm {
             frame.saved_pc = self.pc;
             frame.saved_line_map = self.active_line_map.clone();
             frame.saved_column_map = self.active_column_map.clone();
+            // 与 saved_code 相同：底帧的 lw 水位属于当前宿主，不是旧 worker。
+            frame.saved_lw_depth = self.lw_depth;
+            frame.saved_lw_base = self.lw_base;
         }
 
         self.code = fiber.code;
@@ -8060,7 +8345,16 @@ impl Vm {
             self.lw_sp += 1;
         }
         self.lw_base = ctx.stop_lw_sp + fiber.lw_base;
-        self.lw_depth = ctx.stop_lw_depth + fiber.lw_depth;
+        self.lw_depth = (ctx.stop_lw_depth as isize + fiber.lw_depth).max(0) as usize;
+        // `go` 入口走 `setup_user_call`，执行中 `lw_depth` 被置 0，LoadFast 走 locals_stack。
+        // helper 上 stop=0 时相对深度也是 0；迁到带脚本帧的宿主会变成 1，误读脚本槽。
+        if self
+            .user_call_frames
+            .last()
+            .is_some_and(|f| f.pushed_name_frame)
+        {
+            self.lw_depth = 0;
+        }
         self.lw_entry_pc = fiber.lw_entry_pc;
         self.lw_frame_slots = fiber.lw_frame_slots;
         self.ffi_wait = fiber.ffi_wait.take();
@@ -8111,8 +8405,12 @@ impl Vm {
             if !self.mn_primary {
                 self.mn.note_helper_run();
                 self.pull_script_globals_if_helper();
-            } else if self.local_fn_hot.is_empty() {
-                self.rebuild_local_fn_hot();
+            } else {
+                // 主线程不 pull 快照，但 helper 的 StoreGlobal 只写了 SharedMap / 对方槽。
+                self.overlay_script_globals_from_map();
+                if self.local_fn_hot.is_empty() {
+                    self.rebuild_local_fn_hot();
+                }
             }
         }
         let key = Self::task_ptr_key(&task);
@@ -9184,7 +9482,7 @@ fn index_value(vm: &mut Vm, obj: &Value, idx: &Value) -> Result<Value> {
             let i = num_to_isize(n)?;
             let borrowed = v
                 .try_borrow()
-                .ok_or_else(|| RuntimeError::msg("RuntimeError: list is already borrowed"))?;
+                .ok_or_else(|| RuntimeError::msg("list is already borrowed"))?;
             let len = borrowed.len() as isize;
             let idx = if i < 0 { len + i } else { i };
             if idx < 0 || idx >= len {
@@ -9470,18 +9768,18 @@ fn try_variant_case_convert(
     };
     if v.def.name != parent_variant.name && v.inst_name != parent_variant.name {
         return Some(Err(RuntimeError::type_err(format!(
-            "TypeError: cannot convert variant {} to {case_struct_name}",
+            "cannot convert variant {} to {case_struct_name}",
             v.inst_name
         ))));
     }
     let Value::Struct(s) = &v.payload else {
         return Some(Err(RuntimeError::type_err(format!(
-            "TypeError: variant payload is not a case struct for {case_struct_name}"
+            "variant payload is not a case struct for {case_struct_name}"
         ))));
     };
     if s.def.name != case_struct_name {
         return Some(Err(RuntimeError::type_err(format!(
-            "TypeError: variant case {} does not match {case_struct_name}",
+            "variant case {} does not match {case_struct_name}",
             s.def.name
         ))));
     }
@@ -9607,6 +9905,9 @@ fn resolve_type_ref_attr(vm: &mut Vm, type_name: &str, field: &str) -> Result<Va
 }
 
 fn get_attr(vm: &mut Vm, obj: &Value, field: &str) -> Result<Value> {
+    if let Some(v) = type_registry::bind_primitive_method(vm, obj, field) {
+        return Ok(v);
+    }
     match obj {
         Value::Module(m) => m
             .borrow()

@@ -71,6 +71,8 @@ pub struct Generator {
     current_return_wrapper: Option<Expr>,
     /// 正在编译生成器函数体（`yield` / `return expr` 语义不同）。
     yielding: bool,
+    /// 脚本 `{ }` 内已 `let`/`var` 的名字；这些名遮住未逃逸快局部。
+    block_shadows: Vec<HashSet<String>>,
 }
 
 struct CompileFnExtras<'a> {
@@ -106,6 +108,7 @@ impl Generator {
             captured_names: HashSet::new(),
             current_return_wrapper: None,
             yielding: false,
+            block_shadows: Vec::new(),
         }
     }
 
@@ -310,29 +313,50 @@ impl Generator {
     /// 外层作用域里可作为闭包捕获的词法局部（含已捕获进来的名字）。
     /// 模块级 / 全局绑定不应进 `__make_closure__`，应在内层用 `LoadGlobal` 解析。
     fn is_enclosing_local(&self, name: &str) -> bool {
-        self.local_slots
-            .as_ref()
-            .is_some_and(|m| m.contains_key(name))
-            || self.captured_names.contains(name)
+        // 脚本顶层未逃逸槽不是闭包词法局部：嵌套 func/do 必须走 LoadGlobal。
+        self.current_func.is_some()
+            && (self
+                .local_slots
+                .as_ref()
+                .is_some_and(|m| m.contains_key(name))
+                || self.captured_names.contains(name))
+    }
+
+    fn script_fast_slot(&self, name: &str) -> Option<usize> {
+        if self.current_func.is_some() {
+            return None;
+        }
+        if self.block_shadows.iter().any(|s| s.contains(name)) {
+            return None;
+        }
+        self.local_slots.as_ref().and_then(|m| m.get(name).copied())
+    }
+
+    fn is_fast_local(&self, name: &str) -> bool {
+        self.script_fast_slot(name).is_some()
     }
 
     fn emit_bind_name_flags(&mut self, name: &str, is_const: bool) {
-        if self.local_slots.is_some() {
+        if self.current_func.is_some() && self.local_slots.is_some() {
             let slot = self.ensure_local_slot(name);
             self.cg.emit(Instruction::BindFast {
                 slot,
                 name: name.to_string(),
                 is_const,
             });
-        } else {
-            self.cg.emit(Instruction::NewVar {
-                name: name.to_string(),
-                is_const,
-            });
-            // 须走 StoreGlobal，写入 module global 表；裸 Store 只写活动 globals，
-            // 模块 init 结束后跨模块调用会 NameError（如 `use ….{ C }`）。
-            self.emit_store_name(name);
+            return;
         }
+        if let Some(slot) = self.script_fast_slot(name) {
+            self.cg.emit(Instruction::StoreFast(slot));
+            return;
+        }
+        self.cg.emit(Instruction::NewVar {
+            name: name.to_string(),
+            is_const,
+        });
+        // 须走 StoreGlobal，写入 module global 表；裸 Store 只写活动 globals，
+        // 模块 init 结束后跨模块调用会 NameError（如 `use ….{ C }`）。
+        self.emit_store_name(name);
     }
 
     fn emit_store_temp(&mut self, name: &str) {
@@ -361,11 +385,32 @@ impl Generator {
     }
 
     fn emit_load_name(&mut self, name: &str) {
-        let local_binding = self
-            .local_slots
-            .as_ref()
-            .and_then(|slots| slots.get(name).copied());
-        if local_binding.is_none()
+        if self.current_func.is_some() {
+            let local_binding = self
+                .local_slots
+                .as_ref()
+                .and_then(|slots| slots.get(name).copied());
+            if local_binding.is_none()
+                && (self.program.struct_defs.contains_key(name)
+                    || crate::type_registry::is_registered_primitive(name))
+            {
+                self.cg
+                    .emit(Instruction::Push(Value::type_ref(name.to_string())));
+                return;
+            }
+            if let Some(slot) = local_binding {
+                self.cg.emit(Instruction::LoadFast(slot));
+                return;
+            }
+            if self.captured_names.contains(name) {
+                self.cg.emit(Instruction::Load(name.to_string()));
+                return;
+            }
+            let slot = self.global_slot(name);
+            self.cg.emit(Instruction::LoadGlobal(slot));
+            return;
+        }
+        if self.script_fast_slot(name).is_none()
             && (self.program.struct_defs.contains_key(name)
                 || crate::type_registry::is_registered_primitive(name))
         {
@@ -373,17 +418,8 @@ impl Generator {
                 .emit(Instruction::Push(Value::type_ref(name.to_string())));
             return;
         }
-        if let Some(slot) = local_binding {
+        if let Some(slot) = self.script_fast_slot(name) {
             self.cg.emit(Instruction::LoadFast(slot));
-            return;
-        }
-        if self.local_slots.is_some() {
-            if self.captured_names.contains(name) {
-                self.cg.emit(Instruction::Load(name.to_string()));
-                return;
-            }
-            let slot = self.global_slot(name);
-            self.cg.emit(Instruction::LoadGlobal(slot));
             return;
         }
         if self.macro_depth > 0 || self.block_depth > 0 {
@@ -395,18 +431,23 @@ impl Generator {
     }
 
     fn emit_store_name(&mut self, name: &str) {
-        if let Some(slots) = &self.local_slots {
-            if let Some(&slot) = slots.get(name) {
-                self.cg.emit(Instruction::StoreFast(slot));
-                return;
+        if self.current_func.is_some() {
+            if let Some(slots) = &self.local_slots {
+                if let Some(&slot) = slots.get(name) {
+                    self.cg.emit(Instruction::StoreFast(slot));
+                    return;
+                }
             }
-            // 与 emit_load_name 对称：捕获变量走名字 Store（Cell），勿写成 StoreGlobal。
             if self.captured_names.contains(name) {
                 self.cg.emit(Instruction::Store(name.to_string()));
                 return;
             }
             let slot = self.global_slot(name);
             self.cg.emit(Instruction::StoreGlobal(slot));
+            return;
+        }
+        if let Some(slot) = self.script_fast_slot(name) {
+            self.cg.emit(Instruction::StoreFast(slot));
             return;
         }
         if self.macro_depth > 0 || self.block_depth > 0 {
@@ -450,11 +491,39 @@ impl Generator {
     }
 
     pub fn compile(mut self, program: &Program) -> Result<CompiledProgram> {
+        // quote/snippet 用 block_depth 走名字 Load/Store，不要改成脚本快局部。
+        let unescaped = if self.block_depth == 0 {
+            free_vars::unescaped_script_var_names(program)
+        } else {
+            Vec::new()
+        };
+        if !unescaped.is_empty() {
+            let mut slots = HashMap::new();
+            for (i, name) in unescaped.iter().enumerate() {
+                slots.insert(name.clone(), i);
+            }
+            self.next_local_slot = unescaped.len();
+            self.local_slots = Some(slots);
+        }
         for stmt in &program.stmts {
             self.gen_stmt(stmt, true)?;
         }
         if let Some(err) = self.codegen_error.take() {
             return Err(err);
+        }
+        let mut flush = Vec::new();
+        if self.local_slots.is_some() {
+            for name in &unescaped {
+                let loc = self
+                    .local_slots
+                    .as_ref()
+                    .and_then(|m| m.get(name).copied())
+                    .expect("unescaped name has a fast slot");
+                let g = self.global_slot(name);
+                flush.push((loc, g));
+            }
+            self.program.script_frame_slots = self.next_local_slot;
+            self.program.script_local_to_global = flush;
         }
         self.cg.emit(Instruction::Ret);
         self.cg.patch_labels().map_err(RuntimeError::msg)?;
@@ -644,7 +713,7 @@ impl Generator {
                 visibility,
                 ..
             } => {
-                if self.local_slots.is_some() {
+                if self.current_func.is_some() && self.local_slots.is_some() {
                     let slot = self.ensure_local_slot(name);
                     if let Some(init) = init {
                         self.gen_expr(init)?;
@@ -661,6 +730,36 @@ impl Generator {
                         name: name.clone(),
                         is_const: *is_const,
                     });
+                } else if self.current_func.is_none() && self.block_depth > 0 {
+                    if let Some(set) = self.block_shadows.last_mut() {
+                        set.insert(name.clone());
+                    }
+                    self.cg.emit(Instruction::NewVar {
+                        name: name.clone(),
+                        is_const: *is_const,
+                    });
+                    if let Some(init) = init {
+                        self.gen_expr(init)?;
+                        if *type_strong {
+                            if let Some(ty) = type_expr {
+                                self.emit_type_check(ty)?;
+                            }
+                        }
+                        self.emit_store_name(name);
+                    }
+                } else if self.is_fast_local(name) {
+                    if let Some(init) = init {
+                        self.gen_expr(init)?;
+                        if *type_strong {
+                            if let Some(ty) = type_expr {
+                                self.emit_type_check(ty)?;
+                            }
+                        }
+                    } else {
+                        self.cg.emit(Instruction::Push(Value::None));
+                    }
+                    let slot = self.ensure_local_slot(name);
+                    self.cg.emit(Instruction::StoreFast(slot));
                 } else {
                     self.cg.emit(Instruction::NewVar {
                         name: name.clone(),
@@ -805,13 +904,9 @@ impl Generator {
                         .emit(Instruction::Push(Value::GenericFunction(template)));
                 }
                 self.gen_apply_decorators(decorators)?;
-                if self.local_slots.is_some() {
+                if self.is_fast_local(name) {
                     let slot = self.ensure_local_slot(name);
-                    self.cg.emit(Instruction::BindFast {
-                        slot,
-                        name: name.clone(),
-                        is_const: false,
-                    });
+                    self.cg.emit(Instruction::StoreFast(slot));
                 } else {
                     self.cg.emit(Instruction::NewVar {
                         name: name.clone(),
@@ -1046,7 +1141,9 @@ impl Generator {
             Stmt::Block(stmts) => {
                 self.cg.emit(Instruction::EnterScope);
                 self.block_depth += 1;
+                self.block_shadows.push(HashSet::new());
                 self.gen_block(stmts, top_level)?;
+                self.block_shadows.pop();
                 self.block_depth -= 1;
                 self.cg.emit(Instruction::LeaveScope);
             }
@@ -2055,6 +2152,7 @@ impl Generator {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn specialize_generic_template_in(
         mut gen: Self,
         template: &GenericFunctionTemplate,
@@ -2207,6 +2305,7 @@ impl Generator {
             captured_names,
             current_return_wrapper: return_wrapper,
             yielding: is_generator,
+            block_shadows: Vec::new(),
         };
         for p in params {
             if let (Some(ty), true) = (&p.type_expr, p.type_strong) {
@@ -2478,6 +2577,7 @@ impl Generator {
             captured_names: HashSet::new(),
             current_return_wrapper: None,
             yielding: false,
+            block_shadows: Vec::new(),
         };
         for s in body {
             sub.gen_stmt(s, false)?;

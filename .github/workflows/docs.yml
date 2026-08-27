@@ -34,6 +34,12 @@ jobs:
           mdbook-version: "0.4.40"
       - name: Build book
         run: mdbook build docs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: book
+          path: target/book
+          if-no-files-found: error
+          retention-days: 7
 
   pages:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -43,11 +49,10 @@ jobs:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: peaceiris/actions-mdbook@v2
+      - uses: actions/download-artifact@v4
         with:
-          mdbook-version: "0.4.40"
-      - run: mdbook build docs
+          name: book
+          path: target/book
       - uses: actions/upload-pages-artifact@v3
         with:
           path: target/book

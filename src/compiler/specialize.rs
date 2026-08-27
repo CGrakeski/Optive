@@ -104,6 +104,10 @@ pub(crate) fn specialize_with_entry(code: &mut [Instruction], entry_env: &[Optio
                 let t = env_get(&env, *slot);
                 env_set(&mut env, *slot, t.or(Some(Tag::Num)));
             }
+            Instruction::LoadFastAddStore { dst, src } => {
+                let t = env_get(&env, *src).or(env_get(&env, *dst));
+                env_set(&mut env, *dst, t.or(Some(Tag::Num)));
+            }
             Instruction::Load(_)
             | Instruction::LoadGlobal(_)
             | Instruction::LoadMacro(_)

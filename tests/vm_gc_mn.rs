@@ -155,7 +155,7 @@ func hold() {
     let a = []
     a.append(a)
     suspend
-    return a.len()
+    return len(a)
 }
 let t = go hold()
 let cleared = gc()

@@ -129,6 +129,8 @@ pub fn cmd_test(
             }
         });
     }
+    // `--jobs` 下各 worker 的 join 顺序不稳定；按相对路径排序，打印与 JUnit 可复现。
+    results.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut passed = 0usize;
     let mut failed = 0usize;

@@ -153,7 +153,7 @@ g.unlock()
 var total = 0
 var i = 0
 loop {
-  if (i >= rows.len()) { break }
+  if (i >= len(rows)) { break }
   total = total + rows[i]
   i = i + 1
 }

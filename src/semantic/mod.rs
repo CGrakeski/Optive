@@ -544,10 +544,8 @@ fn unreachable_in_block(stmts: &Block, diags: &mut Vec<Diagnostic>) {
             Stmt::FuncDecl { body, .. } | Stmt::MacroDecl { body, .. } => {
                 unreachable_in_block(body, diags);
             }
-            Stmt::FriendFuncDecl { body, .. } => {
-                if let Some(b) = body {
-                    unreachable_in_block(b, diags);
-                }
+            Stmt::FriendFuncDecl { body: Some(b), .. } => {
+                unreachable_in_block(b, diags);
             }
             Stmt::Try {
                 body,

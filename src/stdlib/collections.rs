@@ -97,6 +97,10 @@ fn coll_sum(vm: &mut Vm, args: &[Value]) -> Result<Value> {
                     ));
                 }
             }
+        } else {
+            return Err(crate::error::RuntimeError::type_err(
+                "sum requires integer values",
+            ));
         }
     }
     Ok(Value::Num(Num::from_bigint(total)))
@@ -152,13 +156,23 @@ fn coll_nth(vm: &mut Vm, args: &[Value]) -> Result<Value> {
             "nth requires 2 arguments",
         ));
     }
-    let n = expect_int("nth", args, 1)? as usize;
+    let n_i = expect_int("nth", args, 1)?;
+    if n_i < 0 {
+        return coll_index_err(vm, format!("nth index must be non-negative: {n_i}"));
+    }
+    let n = match usize::try_from(n_i) {
+        Ok(n) => n,
+        Err(_) => return coll_index_err(vm, format!("nth out of range: {n_i}")),
+    };
     let items = materialize_iter(vm, &args[0])?;
     if let Some(v) = items.into_iter().nth(n) {
         return Ok(v);
     }
-    let exc =
-        crate::exceptions::make_exception(vm, "IndexError", format!("nth out of range: {n}"))?;
+    coll_index_err(vm, format!("nth out of range: {n}"))
+}
+
+fn coll_index_err(vm: &mut Vm, msg: String) -> Result<Value> {
+    let exc = crate::exceptions::make_exception(vm, "IndexError", msg)?;
     match vm.throw_value(exc) {
         Ok(()) => Ok(Value::None),
         Err(e) => Err(e),

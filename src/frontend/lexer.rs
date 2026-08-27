@@ -368,11 +368,15 @@ impl Lexer {
             return Token::new(TokenKind::Placeholder, "_", line, col);
         }
 
-        if ch.is_ascii_digit() || (ch == '.' && self.peek_next_is_digit()) {
+        if ch.is_ascii_digit() {
+            return self.read_number(line, col);
+        }
+        // `.1` 只在表达式起点合法；`a.1` / `(x).1` 的点是成员访问，不能收成小数。
+        if ch == '.' && self.peek_next_is_digit() && !self.follows_complete_expr() {
             return self.read_number(line, col);
         }
 
-        if ch == '-' && self.peek_next_is_number_start() && !self.minus_follows_complete_expr() {
+        if ch == '-' && self.peek_next_is_number_start() && !self.follows_complete_expr() {
             return self.read_number(line, col);
         }
 
@@ -460,8 +464,8 @@ impl Lexer {
         rest.is_some_and(|c| c.is_ascii_digit())
     }
 
-    /// 在已完成的主表达式/后缀后，`-` 开启二元减法，而非负数字面量。
-    const fn minus_follows_complete_expr(&self) -> bool {
+    /// 已完成的主表达式/后缀之后：`-` 是减法而非负数字面量；`.1` 是成员访问而非小数。
+    const fn follows_complete_expr(&self) -> bool {
         matches!(
             self.last_kind,
             Some(

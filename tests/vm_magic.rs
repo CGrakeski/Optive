@@ -228,6 +228,16 @@ len(Box([1, 2, 3]))
 }
 
 #[test]
+fn builtin_len_calls_dunder() {
+    assert_num("len([1, 2, 3])", "3");
+    assert_num("[1, 2, 3].__len__()", "3");
+    assert_num(r#"len("ab")"#, "2");
+    assert_num(r#""ab".__len__()"#, "2");
+    run_err("[1].len()");
+    run_err("[1].len");
+}
+
+#[test]
 fn struct_iter_next_protocol() {
     assert_text(
         r#"

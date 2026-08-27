@@ -757,10 +757,10 @@ fn text_builder_new(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     });
 
     let buf_l = buf.clone();
-    let len = Value::builtin("len", move |_vm, call_args| {
+    let len = Value::builtin("__len__", move |_vm, call_args| {
         if !call_args.is_empty() {
             return Err(crate::error::RuntimeError::type_err(
-                "Builder.len requires 0 arguments",
+                "Builder.__len__ requires 0 arguments",
             ));
         }
         Ok(Value::Num(
@@ -791,7 +791,7 @@ fn text_builder_new(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let mut exports = HashMap::new();
     exports.insert("append".into(), append);
     exports.insert("clear".into(), clear);
-    exports.insert("len".into(), len);
+    exports.insert("__len__".into(), len);
     exports.insert("to_text".into(), to_text);
     exports.insert("to_bytes".into(), to_bytes);
 

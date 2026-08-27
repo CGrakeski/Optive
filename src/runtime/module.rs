@@ -240,7 +240,7 @@ impl Drop for ModuleContextGuard<'_> {
         self.vm.import_base = std::mem::take(&mut self.import_base);
         self.vm.current_package_id = std::mem::take(&mut self.package_id);
         self.vm.package_root = self.package_root.take();
-        self.vm.caps = std::mem::replace(&mut self.caps, crate::caps::Capabilities::full());
+        self.vm.caps = std::mem::take(&mut self.caps);
     }
 }
 

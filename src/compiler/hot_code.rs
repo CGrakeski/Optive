@@ -43,6 +43,7 @@ pub const H_LOAD_FAST_EQ_IMM: u8 = 34;
 pub const H_LOAD_FAST_ADD_IMM_STORE: u8 = 35;
 pub const H_LOAD_FAST_SQR_GT: u8 = 36;
 pub const H_LOAD_FAST_MOD_EQ0: u8 = 37;
+pub const H_LOAD_FAST_ADD_STORE: u8 = 38;
 pub const H_COLD: u8 = 255;
 
 #[derive(Clone, Default)]
@@ -109,6 +110,9 @@ impl HotCode {
                 }
                 Instruction::LoadFastAddImmStore { slot, imm } => {
                     (H_LOAD_FAST_ADD_IMM_STORE, encode_slot_imm(*slot, *imm))
+                }
+                Instruction::LoadFastAddStore { dst, src } => {
+                    (H_LOAD_FAST_ADD_STORE, encode_two_slots(*dst, *src))
                 }
                 Instruction::LoadFastSqrGt { sqr_slot, rhs_slot } => {
                     (H_LOAD_FAST_SQR_GT, encode_two_slots(*sqr_slot, *rhs_slot))

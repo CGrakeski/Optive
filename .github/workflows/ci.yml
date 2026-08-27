@@ -16,14 +16,22 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # CI 缓存 target/ 时增量产物又大又容易失效；关掉后依赖库命中缓存即可。
+  CARGO_INCREMENTAL: "0"
 
 # 取消同分支上被取代的旧运行，节省 CI 分钟。
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# 编译策略（避免「每个 job / 每个 step 全量重编」）：
+# - rust-cache 默认 key 含 job id，lint / test / release 的 ~/.cargo 与依赖 rlib 互不命中。
+#   同类 job 用 shared-key；clippy-driver 与 rustc 的 target/ 不兼容，禁止混用一把钥匙。
+# - clippy 后再 cargo build 会换编译器再编一遍依赖；二进制自检放到 test job。
+# - cargo test 会编 lib / bin / 集成测试；前面再 cargo build --bin Optive 是重复的。
+# - concurrent GC 只改运行时 env，与默认测试共用 debug 产物，不再单独起 runner。
+
 jobs:
-  # 单独的 fmt / clippy 门禁：快，且不依赖完整编译产物。
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -35,15 +43,49 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: clippy
+          cache-on-failure: true
       - name: rustfmt check
         run: cargo fmt --all -- --check
       - name: clippy (all targets and features, deny warnings)
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Stdlib documentation coverage
         run: python3 tools/check-stdlib-coverage.py
-      - name: Build Optive self-check binary
-        run: cargo build --locked --bin Optive
+
+  # 三平台构建 + 测试。集成测试会 spawn 已构建的 `Optive` 二进制，
+  # `cargo test` 默认会先编译 bin，故无需额外 `cargo build`。
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          cache-on-failure: true
+      - name: Test (default — 跳过被 ignore 的慢基准；含 vm_concurrency / vm_gc_mn / fuzz_frontend)
+        run: cargo test --locked --all-features
+      - name: Test (ignored 基准，仅作冒烟)
+        # 慢的 fib(30) 等；CI 上只验证能跑通，不读性能数据。产物已在上一步编好。
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test --locked --all-features -- --ignored
+      - name: GC correctness under concurrent mode
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          OPTIVE_GC_MODE: concurrent
+        run: |
+          cargo test --locked --test vm_gc_mn
+          cargo test --locked --test vm_gc_mode_compare -- --skip compare_stw_vs_concurrent
       - name: Optive check, test, and fmt self-check
+        if: matrix.os == 'ubuntu-latest'
         shell: bash
         env:
           OPTIVE_HOME: ${{ runner.temp }}/optive-home
@@ -64,31 +106,8 @@ jobs:
           cmp "$formatted" "$second_pass"
           "$optive" fmt --check "$fixture"
 
-  # 三平台构建 + 测试。集成测试会 spawn 已构建的 `Optive` 二进制，
-  # `cargo test` 默认会先编译 bin，故无需额外步骤。
-  build-test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build
-        run: cargo build --locked --bin Optive
-      - name: Test (default — 跳过被 ignore 的慢基准；含 vm_concurrency / vm_gc_mn / fuzz_frontend)
-        run: cargo test --locked --all-features
-      - name: Test (ignored 基准，仅作冒烟)
-        # 慢的 fib(30) 等；CI 上只验证能跑通，不读性能数据。
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo test --locked --all-features -- --ignored
-
   # release 构建冒烟：确保 release profile（LTO + overflow-checks）也能编译通过并运行。
+  # 与 debug 不同 profile，必须另编；shared-key 只复用同类 release 依赖缓存。
   build-release:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -98,6 +117,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+          cache-on-failure: true
       - name: Build (release)
         run: cargo build --locked --release --bin Optive
       - name: Smoke run
@@ -126,6 +148,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: metadata
+          cache-targets: false
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny,cargo-cyclonedx
@@ -146,21 +172,3 @@ jobs:
           path: optive.cdx.json
           if-no-files-found: error
           retention-days: 30
-
-  # concurrent GC 正确性进入 PR 门禁（默认运行时仍为 stw）。
-  gc-concurrent:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    env:
-      OPTIVE_GC_MODE: concurrent
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: GC correctness under concurrent mode
-        run: |
-          cargo test --locked --test vm_gc_mn
-          cargo test --locked --test vm_gc_mode_compare -- --skip compare_stw_vs_concurrent
-

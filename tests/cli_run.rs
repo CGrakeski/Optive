@@ -139,7 +139,7 @@ id = "dead"
     let (code, stdout, stderr) = run_optive_env(&["run"], &root, &[("OPTIVE_USE_LOCAL_DEPS", "1")]);
     assert_ne!(code, 0, "stdout={stdout}");
     assert!(
-        stderr.contains("expected 2")
+        stderr.contains("expected 1")
             || stderr.contains("delete")
             || stderr.contains("regenerate")
             || stderr.contains("out of date")

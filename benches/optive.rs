@@ -33,6 +33,36 @@ loop (100000) { sum = sum + 1 }
 sum
 ";
 
+const CALL_LOOP: &str = r"
+func id(x) { return x }
+let n = 0
+loop (50000) {
+    n = id(n + 1)
+}
+n
+";
+
+const CHANNEL_PING: &str = r"
+const let N = 20000
+let a = Channel(1)
+let b = Channel(1)
+go do {
+  var i = 0
+  loop (N) {
+    a.send(i)
+    let _ = b.recv()
+    i = i + 1
+  }
+}
+var i = 0
+loop (N) {
+  let x = a.recv()
+  b.send(x)
+  i = i + 1
+}
+N
+";
+
 const IS_PRIME: &str = r"
 func is_prime(n) {
   if (n < 2) { return false }
@@ -98,7 +128,7 @@ g.unlock()
 var total = 0
 var i = 0
 loop {{
-  if (i >= rows.len()) {{ break }}
+  if (i >= len(rows)) {{ break }}
   total = total + rows[i]
   i = i + 1
 }}
@@ -174,7 +204,7 @@ g.unlock()
 var total = 0
 var i = 0
 loop {{
-  if (i >= rows.len()) {{ break }}
+  if (i >= len(rows)) {{ break }}
   total = total + rows[i]
   i = i + 1
 }}
@@ -230,6 +260,63 @@ fn bench_arith_loop(c: &mut Criterion) {
     bench_run_source(c, "arith_loop(100_000)", ARITH_LOOP);
 }
 
+fn bench_function_call(c: &mut Criterion) {
+    c.bench_function("function_call_loop(50_000)", |b| {
+        b.iter(|| {
+            let v = run_source(CALL_LOOP).unwrap();
+            assert_eq!(v.display_string(), "50000");
+            black_box(v);
+        });
+    });
+}
+
+fn bench_channel_ping(c: &mut Criterion) {
+    let mut group = c.benchmark_group("channel_ping_20000");
+    group.sample_size(10);
+    for w in [1usize, 4] {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("workers={w}")),
+            &w,
+            |b, &workers| {
+                b.iter(|| {
+                    let mut vm = Vm::with_workers(workers);
+                    let v = run_source_in_vm(&mut vm, CHANNEL_PING, "<bench-ping>").unwrap();
+                    assert_eq!(v.display_string(), "20000");
+                    black_box(v);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+/// `[2, 50001]` 固定 8 个 `go` 切块。每次迭代新建 VM / 线程池。
+/// 测启动税 + 加 OS worker；不要当公平加速比。8 worker 可以慢于 4。
+fn bench_parallel_primes_50001(c: &mut Criterion) {
+    let src = parallel_primes_chunked_src(50_001);
+    let warm = {
+        let mut vm = Vm::with_workers(1);
+        run_source_in_vm(&mut vm, &src, "<bench>").unwrap()
+    };
+    assert_eq!(warm.display_string(), "5133");
+    black_box(warm);
+
+    let mut group = c.benchmark_group("parallel_primes_to_50001");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(2));
+    group.measurement_time(Duration::from_secs(8));
+    for w in [1usize, 2, 4, 8] {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("workers={w}")),
+            &w,
+            |b, &workers| {
+                b.iter(|| run_primes(workers, &src));
+            },
+        );
+    }
+    group.finish();
+}
+
 fn bench_parallel_primes(c: &mut Criterion) {
     let src = parallel_primes_chunked_src(10_001);
     let mut group = c.benchmark_group("parallel_primes_to_10001");
@@ -263,7 +350,10 @@ criterion_group!(
     bench_fib,
     bench_empty_loop,
     bench_arith_loop,
+    bench_function_call,
+    bench_channel_ping,
     bench_parallel_primes,
+    bench_parallel_primes_50001,
     bench_primes_speedup
 );
 criterion_main!(benches);

@@ -574,21 +574,26 @@ fn validate_identity(
     Ok(())
 }
 
+pub(crate) fn is_full_object_id(id: &str) -> bool {
+    matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 fn require_full_object_id(kind: &str, id: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if is_full_object_id(id) {
         Ok(())
     } else {
         Err(format!("{kind} must be a full 40- or 64-hex Git object id, got `{id}`").into())
     }
 }
 
-/// 对物化内容做稳定 SHA-256。忽略 VCS 元数据与 `.optive-id`；包含空目录与可执行位。
+/// 对物化内容做稳定 SHA-256。忽略 VCS 元数据、`.optive-id` 与文件系统可执行位
+///（Git `tree` 已记录 mode）。包含空目录。
 pub fn content_digest(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
     let mut files = Vec::new();
     collect_digest_entries(root, root, &mut files)?;
     files.sort_by(|a, b| a.0.cmp(&b.0));
     let mut hasher = Sha256::new();
-    hasher.update(b"optive-content-v2\0");
+    hasher.update(b"optive-content\0");
     for (relative, kind, path) in files {
         hash_field(&mut hasher, relative.as_bytes());
         hasher.update([kind]);
@@ -605,7 +610,6 @@ pub fn content_digest(root: &Path) -> Result<String, Box<dyn std::error::Error>>
             _ => {
                 let mut file = fs::File::open(&path)?;
                 let meta = file.metadata()?;
-                hasher.update([u8::from(file_is_executable(&meta))]);
                 hasher.update(meta.len().to_le_bytes());
                 let mut buffer = [0u8; 64 * 1024];
                 loop {
@@ -619,19 +623,6 @@ pub fn content_digest(root: &Path) -> Result<String, Box<dyn std::error::Error>>
         }
     }
     Ok(hex::encode(hasher.finalize()))
-}
-
-fn file_is_executable(meta: &fs::Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = meta;
-        false
-    }
 }
 
 fn collect_digest_entries(
@@ -687,6 +678,19 @@ mod tests {
     }
 
     #[test]
+    fn full_object_id_accepts_40_and_64_hex() {
+        assert!(is_full_object_id(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        assert!(is_full_object_id(&"ab".repeat(32)));
+        assert!(!is_full_object_id("abc"));
+        assert!(!is_full_object_id(
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+        ));
+        assert!(!is_full_object_id(&"a".repeat(41)));
+    }
+
+    #[test]
     fn content_digest_ignores_vcs_not_build_cache() {
         let root = std::env::temp_dir().join(format!(
             "optive-digest-{}-{}",
@@ -732,7 +736,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn content_digest_includes_executable_bit() {
+    fn content_digest_ignores_executable_bit() {
         use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!(
             "optive-digest-exec-{}-{}",
@@ -749,7 +753,7 @@ mod tests {
         let mut perms = fs::metadata(&file).unwrap().permissions();
         perms.set_mode(perms.mode() | 0o111);
         fs::set_permissions(&file, perms).unwrap();
-        assert_ne!(first, content_digest(&root).unwrap());
+        assert_eq!(first, content_digest(&root).unwrap());
         let _ = fs::remove_dir_all(&root);
     }
 }

@@ -174,6 +174,14 @@ fn lex_decimal_leading_dot() {
 }
 
 #[test]
+fn lex_leading_dot_after_complete_expr_is_member_dot() {
+    assert_kinds!("a.1", Identifier, Dot, NumLiteral);
+    assert_kinds!("a .1", Identifier, Dot, NumLiteral);
+    assert_kinds!("(x).1", LParen, Identifier, RParen, Dot, NumLiteral);
+    assert_kinds!("x+.1", Identifier, Plus, NumLiteral);
+}
+
+#[test]
 fn lex_scientific_notation() {
     assert_kinds!("1.5e1", NumLiteral);
     assert_kinds!("1e-3", NumLiteral);

@@ -15,7 +15,7 @@ use optive::run_source;
 fn set_literal_and_contains() {
     assert_bool("1 in {1, 2, 3}", true);
     assert_bool("4 in {1, 2, 3}", false);
-    assert_num("{1, 2, 3}.len()", "3");
+    assert_num("len({1, 2, 3})", "3");
 }
 
 #[test]
@@ -34,13 +34,13 @@ fn nested_dict_in_set_errors_consistently() {
 
 #[test]
 fn single_element_set_at_statement_level() {
-    assert_num("{1}.len()", "1");
+    assert_num("len({1})", "1");
     assert_bool("1 in {1}", true);
 }
 
 #[test]
 fn set_empty_via_ctor() {
-    assert_num("set().len()", "0");
+    assert_num("len(set())", "0");
 }
 
 #[test]
@@ -56,7 +56,7 @@ fn set_add_remove() {
 let s = {1, 2}
 s.add(3)
 s.remove(1)
-s.len()
+len(s)
 ",
         "2",
     );
@@ -70,8 +70,8 @@ fn set_eq_ignores_order() {
 #[test]
 fn tuple_literal_and_index() {
     assert_num("(10, 20, 30)[1]", "20");
-    assert_num("(42,).len()", "1");
-    assert_num("().len()", "0");
+    assert_num("len((42,))", "1");
+    assert_num("len(())", "0");
 }
 
 #[test]
@@ -87,13 +87,13 @@ fn tuple_from_list_convert() {
 
 #[test]
 fn bytes_literal() {
-    assert_num(r#"b"hi".len()"#, "2");
+    assert_num(r#"len(b"hi")"#, "2");
     assert_num(r#"b"hi"[0]"#, "104");
 }
 
 #[test]
 fn bytes_hex_escape() {
-    assert_num(r#"b"\x00\xff".len()"#, "2");
+    assert_num(r#"len(b"\x00\xff")"#, "2");
     assert_num(r#"b"\xff"[0]"#, "255");
 }
 
@@ -103,14 +103,14 @@ fn bytes_decode() {
 }
 
 #[test]
-fn bytes_ctor_from_list() {
-    assert_num("bytes([65, 66]).len()", "2");
-    assert_text(r"bytes([65, 66]).decode()", "AB");
+fn bytes_convert_from_list() {
+    assert_num("len(bytes.([65, 66]))", "2");
+    assert_text(r"bytes.([65, 66]).decode()", "AB");
 }
 
 #[test]
 fn list_set_tuple_roundtrip_convert() {
-    assert_bool("list.({1, 2}).len() == 2", true);
+    assert_bool("len(list.({1, 2})) == 2", true);
     assert_num("tuple.([7, 8])[1]", "8");
 }
 

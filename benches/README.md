@@ -2,9 +2,13 @@
 
 Criterion harness: `cargo bench --bench optive`.
 
-Tracked kernels: `fib(30)`, empty loop, arithmetic loop, parallel primes.
+Tracked kernels: `fib(30)`, empty loop, arithmetic loop, function-call loop,
+channel ping-pong, parallel primes.
 
+- `function_call_loop(50_000)`：`id(n+1)` 浅调用。
+- `channel_ping_20000`：`workers=1` / `workers=4`，容量 1 的 Channel 乒乓（调度税，不是算术）。
 - `parallel_primes_to_10001`：小核，固定 8 个 `go` 切块，每次迭代新建 VM。测启动税，**不要**用来谈加速比。
+- `parallel_primes_to_50001`：与文档第 2.1–2.3 节同核（`[2, 50001]`、固定 8 个 `go`，OS worker = 1/2/4/8）。每次迭代新建 VM / 线程池，测启动税；8 worker 可以慢于 4。
 - `primes_to_100001`：公平加速比。
   - `sequential`：无 `go`，只扫奇数（2 单独计入），`workers=1`
   - `par/2` `par/4` `par/8`：`go` 个数 = OS worker，奇数轮转 `n = 3+2*id; n += 2N`
@@ -14,14 +18,18 @@ Tracked kernels: `fib(30)`, empty loop, arithmetic loop, parallel primes.
 
 M:N 与这组核相关的运行时：独占 CPU `go` 不再每 8192 tick 切纤程；新任务进全局 injector；helper 在任务开始时拷贝脚本全局槽并本地化函数热码，避免热路径抢 `SharedMap` / 跨核 `Arc`；STW 只在预算耗尽时 poll，热回跳不再每条读 `stw_requested`。
 
-本机 `cargo bench --bench optive -- primes_to_100001` 一例（release，公平核，i7-11700K 8 物理核）：
+本机全量 `cargo bench --bench optive`（2026-08-26 稍后，release，i7-11700K 8 物理核；Criterion 点估计）：
+
+公平核 `primes_to_100001`（复用 VM）：
 
 | 配置 | 时间 | 加速比 |
 |---|---|---|
-| sequential | ~53.8 ms | 1.00× |
-| par/2 | ~29.8 ms | **1.80×** |
-| par/4 | ~17.5 ms | **3.07×** |
-| par/8 | ~12.0 ms | **4.49×** |
+| sequential | 34.8 ms | 1.00× |
+| par/2 | 17.6 ms | **1.98×** |
+| par/4 | 10.9 ms | **3.20×** |
+| par/8 | 7.08 ms | **4.91×** |
+
+切块 `parallel_primes_to_50001`（每次新建线程池；相对 1 worker）：21.7 / 14.1 / 10.6 / 29.5 ms → 1.00× / 1.53× / **2.04×** / 0.73×。
 
 ```bash
 cargo bench --bench optive -- primes_to_100001

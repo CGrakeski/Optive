@@ -73,6 +73,17 @@ del x
 }
 
 #[test]
+fn del_global_function_does_not_call_stale() {
+    run_err(
+        r"
+func f() { return 1 }
+del f
+f()
+",
+    );
+}
+
+#[test]
 fn del_list_negative_index() {
     assert_num(
         r"
