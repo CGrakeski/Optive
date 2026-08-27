@@ -618,11 +618,11 @@ fn locate_under_root(
         dir.push(part);
     }
     let file_candidate = dir.join(format!("{last}.tive"));
-    if caps.is_file("module lookup", &file_candidate)? {
+    if caps.lookup_is_file("module lookup", &file_candidate)? {
         return Ok(Some(file_candidate));
     }
     let package_candidate = dir.join(last).join("main.tive");
-    if caps.is_file("module lookup", &package_candidate)? {
+    if caps.lookup_is_file("module lookup", &package_candidate)? {
         return Ok(Some(package_candidate));
     }
     Ok(None)
@@ -654,11 +654,11 @@ fn locate_module_file(
             dir.push(part);
         }
         let file_candidate = dir.join(format!("{last}.tive"));
-        if caps.is_file("module lookup", &file_candidate)? {
+        if caps.lookup_is_file("module lookup", &file_candidate)? {
             return Ok(file_candidate);
         }
         let package_candidate = dir.join(last).join("main.tive");
-        if caps.is_file("module lookup", &package_candidate)? {
+        if caps.lookup_is_file("module lookup", &package_candidate)? {
             return Ok(package_candidate);
         }
     }
@@ -715,19 +715,18 @@ fn locate_string_module_with_caps(
     path: &str,
     base_dir: Option<&Path>,
 ) -> Result<PathBuf> {
-    let path_obj = Path::new(path);
-    if caps.is_file("module lookup", path_obj)? {
-        return Ok(path_obj.to_path_buf());
-    }
+    // 相对路径必须先相对 import_base / 搜索路径拼接，再交给沙箱。
+    // 若先用裸 `"foo.tive"` 做检查，会按进程 cwd 判定，沙箱根是临时目录时
+    // 会误报 outside roots，连 import_base 下的符号链接都检查不到。
     if let Some(base) = base_dir {
         let candidate = base.join(path);
-        if caps.is_file("module lookup", &candidate)? {
+        if caps.lookup_is_file("module lookup", &candidate)? {
             return Ok(candidate);
         }
     }
     for base in module_search_paths(base_dir) {
         let candidate = base.join(path);
-        if caps.is_file("module lookup", &candidate)? {
+        if caps.lookup_is_file("module lookup", &candidate)? {
             return Ok(candidate);
         }
     }

@@ -317,6 +317,29 @@ fn sandbox_tmp_dir_is_inside_writable_root() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[test]
+fn sandbox_string_import_resolves_under_import_base_not_cwd() {
+    // 进程 cwd 在沙箱外时，`import "foo.tive"` 必须相对 import_base 解析。
+    // 若先用裸相对路径做沙箱检查，会按 cwd 判定成 outside roots。
+    let root = fresh_sandbox_dir("import_base_not_cwd");
+    std::fs::write(root.join("hello.tive"), "export let value = 42\n").unwrap();
+    let caps = Capabilities::sandbox(vec![root.clone()]);
+    let mut vm = optive::vm::Vm::new();
+    vm.install_caps(caps);
+    vm.import_base = root.clone();
+    let v = optive::run_source_in_vm(
+        &mut vm,
+        "import \"hello.tive\" as hello\nhello.value",
+        "<test>",
+    )
+    .expect("module under import_base must be found even when cwd is outside the sandbox");
+    match v {
+        Value::Num(n) => assert_eq!(n.to_string(), "42"),
+        other => panic!("expected 42, got {}", other.display_string()),
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[cfg(unix)]
 #[test]
 fn sandbox_rejects_symlink_file_and_module_import() {

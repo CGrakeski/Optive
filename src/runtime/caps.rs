@@ -363,6 +363,15 @@ impl Capabilities {
         self.metadata_query(op, path, MetadataQuery::File)
     }
 
+    /// 模块搜索用：沙箱根外的候选视为未命中（继续找），符号链接等策略拒绝仍报错。
+    pub fn lookup_is_file(&self, op: &str, path: impl AsRef<Path>) -> Result<bool, RuntimeError> {
+        match self.is_file(op, path) {
+            Ok(found) => Ok(found),
+            Err(err) if is_outside_sandbox_root_error(&err) => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
     pub fn is_dir(&self, op: &str, path: impl AsRef<Path>) -> Result<bool, RuntimeError> {
         self.metadata_query(op, path, MetadataQuery::Dir)
     }
@@ -634,6 +643,11 @@ fn path_error(op: &str, path: &Path, reason: &str) -> RuntimeError {
     ))
 }
 
+fn is_outside_sandbox_root_error(err: &RuntimeError) -> bool {
+    err.message()
+        .ends_with("rejected by sandbox: path is outside sandbox roots")
+}
+
 fn absolute_lexical(path: &Path) -> Result<PathBuf, RuntimeError> {
     let joined = if path.is_absolute() {
         path.to_path_buf()
@@ -827,5 +841,47 @@ mod tests {
             .restrict_for_dependency(&root)
             .check_network("get")
             .is_ok());
+    }
+
+    #[test]
+    fn lookup_is_file_skips_outside_root_but_is_file_errors() {
+        let root =
+            std::env::temp_dir().join(format!("optive_lookup_outside_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&root);
+        std::fs::write(root.join("yes.tive"), "ok").unwrap();
+        let c = Capabilities::sandbox(vec![root.clone()]);
+        assert!(c.is_file("is_file", "nope.tive").is_err());
+        assert!(!c.lookup_is_file("module lookup", "nope.tive").unwrap());
+        assert!(c
+            .lookup_is_file("module lookup", root.join("yes.tive"))
+            .unwrap());
+        assert!(!c
+            .lookup_is_file("module lookup", root.join("missing.tive"))
+            .unwrap());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lookup_is_file_rejects_symlink_inside_root() {
+        use std::os::unix::fs::symlink;
+
+        let pid = std::process::id();
+        let root = std::env::temp_dir().join(format!("optive_lookup_link_{pid}"));
+        let outside = std::env::temp_dir().join(format!("optive_lookup_link_out_{pid}"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.tive"), "export let x = 1\n").unwrap();
+        let link = root.join("evil.tive");
+        symlink(outside.join("secret.tive"), &link).unwrap();
+        let c = Capabilities::sandbox(vec![root.clone()]);
+        let err = c
+            .lookup_is_file("module lookup", link)
+            .expect_err("symlink inside sandbox root must not look like a regular file");
+        assert!(err.message().contains("symbolic link"), "{}", err.message());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }
