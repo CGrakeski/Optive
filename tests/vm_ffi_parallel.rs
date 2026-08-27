@@ -13,7 +13,7 @@ mod common;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use optive::run_source_in_vm;
@@ -93,21 +93,42 @@ await t2
     )
 }
 
-fn run_dual_sleep(src: &str, serial: bool) -> std::time::Duration {
-    let mut vm = Vm::with_workers(4).with_ffi_serial(serial);
+/// 本文件墙钟测试共用进程级 FFI 卸荷池；并行跑会互相拉长 sleep。
+static FFI_WALL_CLOCK: Mutex<()> = Mutex::new(());
+
+fn lock_wall_clock() -> std::sync::MutexGuard<'static, ()> {
+    FFI_WALL_CLOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn dual_sleep_vm(serial: bool) -> Vm {
+    // 卸荷到独立线程：inline FFI 会占住 worker，CI 上 helper 来不及偷第二个
+    // `go` 时两段 sleep 几乎串行（macOS 上曾出现 ~346ms vs ~422ms）。
+    Vm::with_workers(4)
+        .with_ffi_serial(serial)
+        .with_ffi_threads(2)
+}
+
+fn run_dual_sleep_on(vm: &mut Vm, src: &str) -> std::time::Duration {
     let t0 = Instant::now();
-    let v = run_source_in_vm(&mut vm, src, "<ffi_overlap>").expect("run");
+    let v = run_source_in_vm(vm, src, "<ffi_overlap>").expect("run");
     assert!(matches!(v, Value::Num(_)), "got {v:?}");
     t0.elapsed()
 }
 
 #[test]
 fn parallel_distinct_symbols_overlap_wall_clock() {
+    let _timing = lock_wall_clock();
     let src = dual_sleep_source(200);
-    // 先付 dylib/编译成本，再比墙钟；CI 上绝对 320ms 会因调度抖 1ms 就挂。
-    let _ = run_dual_sleep(&src, false);
-    let parallel = run_dual_sleep(&src, false);
-    let serial = run_dual_sleep(&src, true);
+    let mut parallel_vm = dual_sleep_vm(false);
+    // 同一 VM 上预热：worker / 卸荷池 / dylib / 编译都先付掉。
+    let _ = run_dual_sleep_on(&mut parallel_vm, &src);
+    let parallel = run_dual_sleep_on(&mut parallel_vm, &src);
+
+    let mut serial_vm = dual_sleep_vm(true);
+    let _ = run_dual_sleep_on(&mut serial_vm, &src);
+    let serial = run_dual_sleep_on(&mut serial_vm, &src);
     assert!(
         serial.as_millis() >= 350,
         "serial baseline too fast ({}ms); cannot judge overlap",
@@ -124,6 +145,7 @@ fn parallel_distinct_symbols_overlap_wall_clock() {
 
 #[test]
 fn serial_mode_forces_no_overlap() {
+    let _timing = lock_wall_clock();
     let src = dual_sleep_source(150);
     let mut vm = Vm::with_workers(4).with_ffi_serial(true);
     let t0 = Instant::now();
@@ -140,6 +162,7 @@ fn serial_mode_forces_no_overlap() {
 
 #[test]
 fn offload_pool_lets_other_fibers_progress() {
+    let _timing = lock_wall_clock();
     let path = dll_path_literal();
     let src = format!(
         r#"

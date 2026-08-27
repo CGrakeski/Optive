@@ -157,6 +157,8 @@ pub(crate) struct TaskFiber {
     lw_frame_slots: usize,
     /// 卸荷 FFI pending（随纤程迁移，不能只挂在 Vm 上）。
     ffi_wait: Option<std::sync::Arc<crate::ffi_pool::FfiPending>>,
+    /// `go builtin(...)` 卸荷后：恢复时再 poll 同一 Builtin，勿跑宿主字节码。
+    retry_poll: Option<(Value, Vec<Value>)>,
     /// Barrier/Cond 挂起后重试：已登记等待，勿再次 +1。
     sync_wait_resume: Option<SyncWaitResume>,
 }
@@ -537,6 +539,8 @@ pub struct Vm {
     ffi_cfg: std::sync::Arc<crate::ffi::FfiRuntimeConfig>,
     /// 卸荷中的 pending（任务重试 Builtin 时取回）。
     ffi_wait: Option<std::sync::Arc<crate::ffi_pool::FfiPending>>,
+    /// `call_value_poll` 里 Builtin 卸荷后，随 `capture_fiber` 写入 `retry_poll`。
+    pending_poll_retry: Option<(Value, Vec<Value>)>,
     /// Barrier/Cond 挂起重试令牌（亦随 `TaskFiber` 迁移）。
     sync_wait_resume: Option<SyncWaitResume>,
     /// 当前调度任务上下文；`None` 表示主纤程。
@@ -986,6 +990,7 @@ impl Vm {
             call_retry_armed: false,
             ffi_cfg: crate::ffi::FfiRuntimeConfig::from_env(),
             ffi_wait: None,
+            pending_poll_retry: None,
             sync_wait_resume: None,
             task_ctx: None,
             suspend_budget: clamp_suspend_budget(suspend_budget_default()),
@@ -7950,6 +7955,7 @@ impl Vm {
             call_retry_armed: false,
             ffi_cfg: self.ffi_cfg.clone(),
             ffi_wait: None,
+            pending_poll_retry: None,
             sync_wait_resume: None,
             task_ctx: None,
             suspend_budget: clamp_suspend_budget(self.suspend_budget),
@@ -8254,6 +8260,7 @@ impl Vm {
             lw_entry_pc: self.lw_entry_pc,
             lw_frame_slots: self.lw_frame_slots,
             ffi_wait: self.ffi_wait.take(),
+            retry_poll: self.pending_poll_retry.take(),
             sync_wait_resume: self.sync_wait_resume.take(),
         };
 
@@ -8485,30 +8492,53 @@ impl Vm {
                     }
                 }
                 TaskState::Suspended => {
-                    let Some(fiber) = self.fiber_take(key) else {
+                    let Some(mut fiber) = self.fiber_take(key) else {
                         return Err(RuntimeError::msg(
                             "internal error: suspended task missing fiber",
                         ));
                     };
-                    self.install_fiber(task.clone(), fiber);
-                    let stop = self.task_ctx.as_ref().map_or(0, |c| c.stop_ucf);
-                    match self.run_interpreter(Some(stop))? {
-                        InterpResult::Value(v) => {
-                            if let Some(ctx) = self.task_ctx.take() {
-                                let _ = self.capture_fiber(&ctx);
+                    if let Some((callable, args)) = fiber.retry_poll.take() {
+                        self.install_fiber(task.clone(), fiber);
+                        match self.call_value_poll(callable, args)? {
+                            InterpResult::Value(v) => {
+                                if let Some(ctx) = self.task_ctx.take() {
+                                    let _ = self.capture_fiber(&ctx);
+                                }
+                                Ok(Some(v.unwrap_or(Value::None)))
                             }
-                            Ok(Some(v.unwrap_or(Value::None)))
-                        }
-                        InterpResult::Suspended => Ok(None),
-                        InterpResult::DebugBreak => {
-                            self.park_task_for_debug();
-                            Ok(None)
-                        }
-                        InterpResult::Yielded(v) => {
-                            if let Some(ctx) = self.task_ctx.take() {
-                                let _ = self.capture_fiber(&ctx);
+                            InterpResult::Suspended => Ok(None),
+                            InterpResult::DebugBreak => {
+                                self.park_task_for_debug();
+                                Ok(None)
                             }
-                            Ok(Some(v))
+                            InterpResult::Yielded(v) => {
+                                if let Some(ctx) = self.task_ctx.take() {
+                                    let _ = self.capture_fiber(&ctx);
+                                }
+                                Ok(Some(v))
+                            }
+                        }
+                    } else {
+                        self.install_fiber(task.clone(), fiber);
+                        let stop = self.task_ctx.as_ref().map_or(0, |c| c.stop_ucf);
+                        match self.run_interpreter(Some(stop))? {
+                            InterpResult::Value(v) => {
+                                if let Some(ctx) = self.task_ctx.take() {
+                                    let _ = self.capture_fiber(&ctx);
+                                }
+                                Ok(Some(v.unwrap_or(Value::None)))
+                            }
+                            InterpResult::Suspended => Ok(None),
+                            InterpResult::DebugBreak => {
+                                self.park_task_for_debug();
+                                Ok(None)
+                            }
+                            InterpResult::Yielded(v) => {
+                                if let Some(ctx) = self.task_ctx.take() {
+                                    let _ = self.capture_fiber(&ctx);
+                                }
+                                Ok(Some(v))
+                            }
                         }
                     }
                 }
@@ -8696,7 +8726,15 @@ impl Vm {
     fn call_value_poll(&mut self, callee: Value, args: Vec<Value>) -> Result<InterpResult> {
         match callee {
             Value::Function(f) => self.call_user_function_poll(f, args),
-            Value::Builtin(b) => Ok(InterpResult::Value(Some(b.call(self, &args)?))),
+            Value::Builtin(b) => {
+                let out = b.call(self, &args)?;
+                if self.block_suspend {
+                    self.block_suspend = false;
+                    self.pending_poll_retry = Some((Value::Builtin(b), args));
+                    return self.complete_task_suspend();
+                }
+                Ok(InterpResult::Value(Some(out)))
+            }
             other => {
                 let stop = self.user_call_frames.len();
                 let result = self.call_value(other, args)?;
