@@ -1,0 +1,16 @@
+id = "catgirl"
+format_version = 1
+description = "Demo overlay: Chinese catgirl messages (identity names stay English)"
+
+[layout.repl]
+prompt = "喵>>> "
+
+[layout.parse]
+label_error = "错误："
+
+[messages]
+"parse.expected_expression" = { text = "期望表达式喵~" }
+"runtime.zero_division" = { text = "除以零喵~" }
+
+[gloss]
+ZeroDivisionError = "零除错误"

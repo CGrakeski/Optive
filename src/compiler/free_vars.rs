@@ -540,17 +540,15 @@ pub fn unescaped_script_var_names(program: &Program) -> Vec<String> {
 }
 
 fn collect_top_level_var_names(stmt: &Stmt, out: &mut Vec<String>, seen: &mut HashSet<String>) {
-    match stmt {
-        Stmt::VarDecl {
-            is_const: false,
-            name,
-            ..
-        } => {
-            if seen.insert(name.clone()) {
-                out.push(name.clone());
-            }
+    if let Stmt::VarDecl {
+        is_const: false,
+        name,
+        ..
+    } = stmt
+    {
+        if seen.insert(name.clone()) {
+            out.push(name.clone());
         }
-        _ => {}
     }
 }
 

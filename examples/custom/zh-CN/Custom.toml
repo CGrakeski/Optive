@@ -1,0 +1,92 @@
+id = "zh-CN"
+description = "简体中文人读文案（CLI / REPL / 诊断排版）"
+format_version = 1
+
+# 覆盖当前全部 Diag 键（见 src/custom/keys.rs）。
+# 未键化的运行时英文原文仍走 Legacy，不会出现在本表。
+
+[messages]
+"parse.expected_expression" = { text = "期望表达式" }
+"runtime.zero_division" = { text = "除以零" }
+
+"cli.help.title" = { text = "Optive" }
+"cli.help.usage_header" = { text = "用法：" }
+"cli.help.repl" = { text = "  Optive                         启动交互式 REPL" }
+"cli.help.run_script" = { text = "  Optive <script.tive>           运行脚本" }
+"cli.help.run_code" = { text = "  Optive -c <code>               运行命令行代码（可多行）" }
+"cli.help.new" = { text = "  Optive new <ProjectName>       新建项目" }
+"cli.help.run" = { text = "  Optive run [path] [-- args…]   按 lock 确保依赖并运行入口" }
+"cli.help.up" = { text = "  Optive up [path] [-- args…]    update + run" }
+"cli.help.add" = { text = "  Optive add <git-url> […]       添加依赖（默认钉死 tip commit）" }
+"cli.help.remove" = { text = "  Optive remove <name>           移除依赖" }
+"cli.help.update" = { text = "  Optive update [name] [--dry-run] [-v]" }
+"cli.help.cache" = { text = "  Optive cache gc [--dry-run]    清理孤儿 pack" }
+"cli.help.deps" = { text = "  Optive deps [-v]               列出项目依赖" }
+"cli.help.deps_doctor" = { text = "  Optive deps doctor [-v]        诊断依赖 / lock / 孤儿 pack" }
+"cli.help.env" = { text = "  Optive env                     打印 OPTIVE_HOME 与各路径" }
+"cli.help.change" = { text = "  Optive change track_latest=…   切换是否跟随 tip（会告警）" }
+"cli.help.fmt" = { text = "  Optive fmt <file> [-o|--out]   格式化 .tive（默认写回）" }
+"cli.help.debug" = { text = "  Optive debug [file|path]       调试脚本或项目入口" }
+"cli.help.custom" = { text = "  Optive custom …                管理定制包" }
+"cli.help.caps_header" = { text = "运行时能力标志（适用于 run / up / debug / <script> / -c）：" }
+"cli.help.sandbox" = { text = "  --sandbox[=DIR]          无网络、无环境变量、无 FFI；文件系统限在 DIR（默认 cwd）" }
+"cli.help.no_network" = { text = "  --no-network            禁用 std.http" }
+"cli.help.no_ffi" = { text = "  --no-ffi                禁用 C.frompath / extern" }
+"cli.help.allow_ffi" = { text = "  --allow-ffi             允许原生 FFI（覆盖沙箱默认）" }
+"cli.help.allow_path" = { text = "  --allow-path DIR         允许访问 DIR 下文件系统（可重复；可与 --sandbox 组合）" }
+"cli.help.h" = { text = "  Optive -h, --help              显示帮助" }
+"cli.help.v" = { text = "  Optive -V, --version           显示版本" }
+"cli.help.env_header" = { text = "环境变量：" }
+"cli.help.optive_home" = { text = "  OPTIVE_HOME              全局 pack/ + index.db 根目录" }
+"cli.help.local_deps" = { text = "  OPTIVE_USE_LOCAL_DEPS=1  调试：依赖装进项目 deps/" }
+"cli.help.optive_custom_env" = { text = "  OPTIVE_CUSTOM=a,b        覆盖激活的定制包链" }
+"cli.help.files" = { text = "文件：Optive.toml（意图）、Optive.lock（复现）、Optive.cache（本机）、Custom.toml（定制包）" }
+"cli.custom.changing" = { text = "正在更改…" }
+"cli.custom.done" = { text = "完成。" }
+"cli.custom.added" = { text = "已添加定制包：" }
+"cli.custom.now" = { text = "当前定制：" }
+
+"repl.help.title" = { text = "Optive REPL" }
+"repl.help.help" = { text = "  :help              显示本帮助" }
+"repl.help.quit" = { text = "  :quit / :exit      退出（亦可用 quit / exit）" }
+"repl.help.ctrl_c" = { text = "  Ctrl-C             取消未完成的多行输入" }
+"repl.help.ctrl_d" = { text = "  Ctrl-D             退出" }
+
+[layout.repl]
+prompt = ">>> "
+continuation = "... "
+
+[layout.parse]
+label_error = "错误："
+arrow = " --> "
+
+[layout.traceback]
+header = "调用栈（最近调用在下）："
+frame = "  文件 \"{file}\"，第 {line} 行，在 {func}"
+direction = "top_down"
+
+[layout.exception]
+line = "{name}（{gloss}）：\n  {msg}"
+
+# gloss 仅影响人读展示；catch (e: ZeroDivisionError) 等身份名永不改。
+[gloss]
+BaseException = "基本异常"
+Exception = "异常"
+StopIteration = "迭代结束"
+ArithmeticError = "算术错误"
+LookupError = "查找错误"
+RuntimeError = "运行时错误"
+ValueError = "值错误"
+TypeError = "类型错误"
+SyntaxError = "语法错误"
+AttributeError = "属性错误"
+ZeroDivisionError = "零除错误"
+KeyError = "键错误"
+IndexError = "下标错误"
+NameError = "名称错误"
+IOError = "输入输出错误"
+AssertionError = "断言错误"
+NotImplementedError = "未实现"
+RecursionError = "递归错误"
+DeadlockError = "死锁错误"
+Cancelled = "已取消"

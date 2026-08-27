@@ -1671,10 +1671,10 @@ impl Vm {
                 continue;
             }
             if let Some(v) = self.script_globals.get(idx) {
-                if matches!(v, Value::None) {
-                    if map.get(name).is_some_and(|x| !matches!(x, Value::None)) {
-                        continue;
-                    }
+                if matches!(v, Value::None)
+                    && map.get(name).is_some_and(|x| !matches!(x, Value::None))
+                {
+                    continue;
                 }
                 map.insert(name.clone(), v.clone());
             }
@@ -1781,10 +1781,8 @@ impl Vm {
             let val = sv.into_value();
             self.script_globals[global] = val.clone();
             if let Some(name) = self.script_global_names.get(global) {
-                if !name.is_empty() {
-                    if !self.globals.set_inplace(name.as_str(), val.clone()) {
-                        self.globals.insert(name.clone(), val.clone());
-                    }
+                if !name.is_empty() && !self.globals.set_inplace(name.as_str(), val.clone()) {
+                    self.globals.insert(name.clone(), val.clone());
                 }
             }
             self.sync_local_fn_hot(global, &val);

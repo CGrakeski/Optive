@@ -23,7 +23,7 @@ use optive::{diagnostics, run_source};
 static HOME_LOCK: Mutex<()> = Mutex::new(());
 
 fn catgirl_src() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/custom/catgirl")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/custom/catgirl")
 }
 
 fn with_temp_home<T>(f: impl FnOnce(&PathBuf) -> T) -> T {
