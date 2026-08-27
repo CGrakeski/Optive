@@ -57,7 +57,9 @@ fn tempfile_dir() -> PathBuf {
 fn install_catgirl(home: &Path) {
     let dest = home.join("custom/catgirl");
     fs::create_dir_all(&dest).unwrap();
-    fs::copy(catgirl_src().join("Custom.toml"), dest.join("Custom.toml")).unwrap();
+    let src = catgirl_src().join("Custom.toml");
+    fs::copy(&src, dest.join("Custom.toml"))
+        .unwrap_or_else(|e| panic!("copy {}: {e}", src.display()));
 }
 
 #[test]
@@ -166,7 +168,9 @@ fn staging_load_allows_tmp_dir_name() {
     with_temp_home(|home| {
         let tmp = home.join("custom/.tmp-add");
         fs::create_dir_all(&tmp).unwrap();
-        fs::copy(catgirl_src().join("Custom.toml"), tmp.join("Custom.toml")).unwrap();
+        let src = catgirl_src().join("Custom.toml");
+        fs::copy(&src, tmp.join("Custom.toml"))
+            .unwrap_or_else(|e| panic!("copy {}: {e}", src.display()));
         let pack = load_pack_staging(&tmp).expect("staging should ignore dir name");
         assert_eq!(pack.id, "catgirl");
         assert!(load_pack_dir(&tmp).is_err(), "installed path must match id");
