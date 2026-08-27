@@ -93,19 +93,32 @@ await t2
     )
 }
 
+fn run_dual_sleep(src: &str, serial: bool) -> std::time::Duration {
+    let mut vm = Vm::with_workers(4).with_ffi_serial(serial);
+    let t0 = Instant::now();
+    let v = run_source_in_vm(&mut vm, src, "<ffi_overlap>").expect("run");
+    assert!(matches!(v, Value::Num(_)), "got {v:?}");
+    t0.elapsed()
+}
+
 #[test]
 fn parallel_distinct_symbols_overlap_wall_clock() {
     let src = dual_sleep_source(200);
-    let mut vm = Vm::with_workers(4).with_ffi_serial(false);
-    let t0 = Instant::now();
-    let v = run_source_in_vm(&mut vm, &src, "<ffi_parallel>").expect("run");
-    let elapsed = t0.elapsed();
-    assert!(matches!(v, Value::Num(_)), "got {v:?}");
-    // 并行：≈200ms；串行：≈400ms。松弛上界 320ms。
+    // 先付 dylib/编译成本，再比墙钟；CI 上绝对 320ms 会因调度抖 1ms 就挂。
+    let _ = run_dual_sleep(&src, false);
+    let parallel = run_dual_sleep(&src, false);
+    let serial = run_dual_sleep(&src, true);
     assert!(
-        elapsed.as_millis() < 320,
-        "expected overlap (~200ms), got {}ms (serial would be ~400ms)",
-        elapsed.as_millis()
+        serial.as_millis() >= 350,
+        "serial baseline too fast ({}ms); cannot judge overlap",
+        serial.as_millis()
+    );
+    // 重叠应明显短于两段相加。允许 CI 抖动：并行 < 0.8 × 串行。
+    assert!(
+        parallel.as_millis() * 5 < serial.as_millis() * 4,
+        "expected overlap: parallel {}ms vs serial {}ms (serial would be ~2× sleep)",
+        parallel.as_millis(),
+        serial.as_millis()
     );
 }
 
