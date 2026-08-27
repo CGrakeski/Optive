@@ -437,8 +437,8 @@ fn bind_extern_function(
     };
 
     let arg_ffi: Vec<FfiType> = arg_abis.iter().map(AbiType::ffi_type).collect();
-    let mut cif = Cif::new(arg_ffi, ret_abi.ffi_type());
-    apply_call_conv(&mut cif, conv)?;
+    let cif = Cif::new(arg_ffi, ret_abi.ffi_type());
+    apply_call_conv(conv)?;
     let ffi = Arc::new(FfiCallable {
         cif,
         code: code_ptr,
@@ -588,27 +588,19 @@ fn bind_extern_function(
 }
 
 #[cfg(not(target_os = "android"))]
-fn apply_call_conv(cif: &mut Cif, conv: CallConv) -> Result<()> {
-    use libffi::middle::ffi_abi_FFI_DEFAULT_ABI;
+fn apply_call_conv(conv: CallConv) -> Result<()> {
     match conv {
-        CallConv::C => {
-            cif.set_abi(ffi_abi_FFI_DEFAULT_ABI);
-            Ok(())
-        }
+        CallConv::C => Ok(()),
         CallConv::Stdcall => {
             // win64 上 stdcall 与默认 C 约定一致；32 位 Windows 尚未接 FFI_STDCALL。
             #[cfg(all(windows, target_arch = "x86"))]
             {
-                let _ = cif;
                 Err(crate::error::RuntimeError::msg(
                     "stdcall/winapi calling convention is not wired on 32-bit Windows; use 64-bit or C ABI",
                 ))
             }
             #[cfg(not(all(windows, target_arch = "x86")))]
-            {
-                cif.set_abi(ffi_abi_FFI_DEFAULT_ABI);
-                Ok(())
-            }
+            Ok(())
         }
     }
 }
@@ -643,7 +635,7 @@ pub(crate) fn invoke_native_call(
 ) -> Result<RetStorage> {
     let _guard = crate::gc::NativeCallGuard::enter();
     let result = (|| {
-        let ffi_args: Vec<Arg> = storage.iter_mut().map(ArgStorage::as_arg).collect();
+        let ffi_args: Vec<Arg<'_>> = storage.iter_mut().map(ArgStorage::as_arg).collect();
         let raw = if use_serial {
             let _guard = FFI_CALL_LOCK.lock();
             unsafe { call_cif(&ffi.cif, ffi.code, &ffi_args, &ret_abi) }?
@@ -667,7 +659,7 @@ pub(crate) fn invoke_native_call_sampled(
 ) -> Result<(RetStorage, i32)> {
     let _guard = crate::gc::NativeCallGuard::enter();
     let result = (|| {
-        let ffi_args: Vec<Arg> = storage.iter_mut().map(ArgStorage::as_arg).collect();
+        let ffi_args: Vec<Arg<'_>> = storage.iter_mut().map(ArgStorage::as_arg).collect();
         let raw = if use_serial {
             let _guard = FFI_CALL_LOCK.lock();
             unsafe { call_cif(&ffi.cif, ffi.code, &ffi_args, &ret_abi) }?
@@ -707,7 +699,7 @@ pub(crate) enum ArgStorage {
 
 impl ArgStorage {
     #[cfg(not(target_os = "android"))]
-    fn as_arg(&mut self) -> Arg {
+    fn as_arg(&mut self) -> Arg<'_> {
         match self {
             Self::I8(v) => Arg::new(v),
             Self::U8(v) => Arg::new(v),
@@ -858,7 +850,12 @@ pub(crate) enum RetStorage {
 }
 
 #[cfg(not(target_os = "android"))]
-unsafe fn call_cif(cif: &Cif, code: CodePtr, args: &[Arg], ret: &AbiType) -> Result<RetStorage> {
+unsafe fn call_cif(
+    cif: &Cif,
+    code: CodePtr,
+    args: &[Arg<'_>],
+    ret: &AbiType,
+) -> Result<RetStorage> {
     Ok(match ret {
         AbiType::Void => {
             cif.call::<()>(code, args);

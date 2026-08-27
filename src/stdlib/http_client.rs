@@ -131,6 +131,8 @@ fn response_to_dict(resp: reqwest::blocking::Response) -> Result<Value> {
 }
 
 fn build_client(opts: &Value) -> Result<reqwest::blocking::Client> {
+    // 与 std.net TLS 相同：先装 ring，避免 rustls 0.23 无默认 CryptoProvider。
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let mut builder = reqwest::blocking::Client::builder();
     if let Some(dur) = extract_timeout(opts) {
         builder = builder.timeout(dur);

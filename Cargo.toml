@@ -40,7 +40,7 @@ hex = "0.4"
 digest = "0.10"
 hmac = "0.12"
 gix = { version = "0.85", features = ["blocking-network-client", "worktree-mutation", "blocking-http-transport-reqwest-rust-tls", "merge"] }
-reqwest = { version = "0.11", default-features = false, features = ["rustls-tls-native-roots", "blocking"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "charset", "http2", "system-proxy"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 rustls-native-certs = "0.8"
 rustls-pemfile = "2"
@@ -67,7 +67,7 @@ cap-std = "4.0.3"
 ## Android 交叉编不拉 libffi-sys：其 build 在 Windows 宿主上走 MSVC/`cl.exe`，
 ## 无法为 `aarch64-linux-android` 编 libffi。该目标上 `extern`/`C.callback` 运行时报错。
 [target.'cfg(not(target_os = "android"))'.dependencies]
-libffi = "3.2"
+libffi = "5"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

@@ -12,6 +12,7 @@ env:
   CARGO_TERM_COLOR: always
   # 产物剥离符号，减小体积。
   CARGO_PROFILE_RELEASE_STRIP: symbols
+  MACOSX_DEPLOYMENT_TARGET: "14.0"
 
 # 同 tag 重复推送时不取消进行中的发布。
 concurrency:
@@ -50,6 +51,15 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/powershell \
+            /usr/share/swift /usr/local/.ghcup /usr/local/share/boost \
+            /usr/share/miniconda /opt/microsoft/msedge 2>/dev/null || true
+          sudo docker system prune -af --volumes >/dev/null 2>&1 || true
+          df -h /
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -57,7 +67,6 @@ jobs:
         with:
           # 默认 key 含 job id，同 target 的重跑也无法命中；按 triple 共享。
           shared-key: release-${{ matrix.target }}
-          cache-on-failure: true
       - name: Verify locked dependency input
         run: cargo metadata --locked --format-version 1 --no-deps
       - name: Build release

@@ -681,7 +681,8 @@ fn checkout_commit(
     use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
     use gix::refs::Target;
 
-    let repo = gix::open(repo_dir)?;
+    let mut repo = gix::open(repo_dir)?;
+    repo.committer_or_set_generic_fallback()?;
     let head = repo.head()?;
     let (ref_name, follow): (gix::refs::FullName, bool) = if head.is_unborn() {
         let name = head
@@ -1045,7 +1046,8 @@ pub fn checkout_rev(repo_dir: &std::path::Path, rev: &str) -> Result<(), Box<dyn
     use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
     use gix::refs::Target;
 
-    let repo = gix::open(repo_dir)?;
+    let mut repo = gix::open(repo_dir)?;
+    repo.committer_or_set_generic_fallback()?;
     let target = repo.rev_parse_single(rev)?;
     let target_id = target.detach();
 

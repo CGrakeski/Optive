@@ -18,6 +18,15 @@ env:
   RUSTFLAGS: "-D warnings"
   # CI 缓存 target/ 时增量产物又大又容易失效；关掉后依赖库命中缓存即可。
   CARGO_INCREMENTAL: "0"
+  # 缩小 debug 产物，避免 ubuntu-latest ~14GB 在 rust-cache 收尾时写满磁盘。
+  CARGO_PROFILE_DEV_DEBUG: "1"
+  # gix 写 reflog 需要身份；Windows runner 常未配 user.name。
+  GIT_AUTHOR_NAME: Optive CI
+  GIT_AUTHOR_EMAIL: ci@optive.invalid
+  GIT_COMMITTER_NAME: Optive CI
+  GIT_COMMITTER_EMAIL: ci@optive.invalid
+  # 避免 Xcode 把 min version 设成 runner 的 26.x，旧 libffi 汇编会编不过。
+  MACOSX_DEPLOYMENT_TARGET: "14.0"
 
 # 取消同分支上被取代的旧运行，节省 CI 分钟。
 concurrency:
@@ -27,6 +36,7 @@ concurrency:
 # 编译策略（避免「每个 job / 每个 step 全量重编」）：
 # - rust-cache 默认 key 含 job id，lint / test / release 的 ~/.cargo 与依赖 rlib 互不命中。
 #   同类 job 用 shared-key；clippy-driver 与 rustc 的 target/ 不兼容，禁止混用一把钥匙。
+# - 不要 cache-on-failure：失败后磁盘已紧，post 里 cargo metadata 再下 crate 会 ENOSPC。
 # - clippy 后再 cargo build 会换编译器再编一遍依赖；二进制自检放到 test job。
 # - cargo test 会编 lib / bin / 集成测试；前面再 cargo build --bin Optive 是重复的。
 # - concurrent GC 只改运行时 env，与默认测试共用 debug 产物，不再单独起 runner。
@@ -39,13 +49,20 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/powershell \
+            /usr/share/swift /usr/local/.ghcup /usr/local/share/boost \
+            /usr/share/miniconda /opt/microsoft/msedge 2>/dev/null || true
+          sudo docker system prune -af --volumes >/dev/null 2>&1 || true
+          df -h /
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: clippy
-          cache-on-failure: true
       - name: rustfmt check
         run: cargo fmt --all -- --check
       - name: clippy (all targets and features, deny warnings)
@@ -66,11 +83,21 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/powershell \
+            /usr/share/swift /usr/local/.ghcup /usr/local/share/boost \
+            /usr/share/miniconda /opt/microsoft/msedge 2>/dev/null || true
+          sudo docker system prune -af --volumes >/dev/null 2>&1 || true
+          df -h /
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test
-          cache-on-failure: true
+      - name: Fetch locked crates
+        run: cargo fetch --locked --all-features
       - name: Test (default — 跳过被 ignore 的慢基准；含 vm_concurrency / vm_gc_mn / fuzz_frontend)
         run: cargo test --locked --all-features
       - name: Test (ignored 基准，仅作冒烟)
@@ -115,11 +142,18 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/powershell \
+            /usr/share/swift /usr/local/.ghcup /usr/local/share/boost \
+            /usr/share/miniconda /opt/microsoft/msedge 2>/dev/null || true
+          sudo docker system prune -af --volumes >/dev/null 2>&1 || true
+          df -h /
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release
-          cache-on-failure: true
       - name: Build (release)
         run: cargo build --locked --release --bin Optive
       - name: Smoke run
