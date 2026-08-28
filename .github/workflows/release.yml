@@ -1,7 +1,7 @@
 name: Release
 
 # 打 tag `v*` 时：三平台构建 release 二进制，附到 GitHub Release。
-# 这是「CD」部分；CI 由 ci.yml 负责。
+# `workflow_dispatch` 只构建并上传 artifact，不发 Release（GitHub Release 必须绑 tag）。
 on:
   push:
     tags:
@@ -89,6 +89,7 @@ jobs:
           retention-days: 30
 
   publish:
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -111,8 +112,9 @@ jobs:
         with:
           subject-path: dist/*
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ github.ref_name }}
           files: |
             dist/optive-*
             dist/SHA256SUMS
