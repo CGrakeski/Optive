@@ -20,18 +20,27 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    outputs:
+      has_book: ${{ steps.book.outputs.has_book }}
     steps:
       - uses: actions/checkout@v5
+      - id: book
+        run: |
+          if [ -f docs/book.toml ]; then
+            echo "has_book=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_book=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: mdBook
-        if: hashFiles('docs/book.toml') != ''
+        if: steps.book.outputs.has_book == 'true'
         uses: peaceiris/actions-mdbook@v2
         with:
           mdbook-version: "0.4.40"
       - name: Build book
-        if: hashFiles('docs/book.toml') != ''
+        if: steps.book.outputs.has_book == 'true'
         run: mdbook build docs
       - uses: actions/upload-artifact@v7
-        if: hashFiles('docs/book.toml') != ''
+        if: steps.book.outputs.has_book == 'true'
         with:
           name: book
           path: target/book
@@ -39,7 +48,7 @@ jobs:
           retention-days: 7
 
   pages:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && hashFiles('docs/book.toml') != ''
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.check.outputs.has_book == 'true'
     needs: check
     runs-on: ubuntu-latest
     environment:
