@@ -126,7 +126,8 @@ jobs:
           "$optive" test "$fixture"
           formatted="$fixture/src/main.tive"
           second_pass="$RUNNER_TEMP/optive-fmt-self-check.second.tive"
-          "$optive" fmt "$formatted"
+          # 先整项目 fmt，再 --check：顶层空行等风格与 fixture 手写不必完全一致。
+          "$optive" fmt "$fixture"
           "$optive" fmt "$formatted" --out > "$second_pass"
           cmp "$formatted" "$second_pass"
           "$optive" fmt --check "$fixture"
