@@ -144,6 +144,13 @@ len(sha256("hello"))
 "#,
         "64",
     );
+    assert_text(
+        r#"
+use std.hash.{ md5 }
+md5(b"")
+"#,
+        "d41d8cd98f00b204e9800998ecf8427e",
+    );
 }
 
 #[test]

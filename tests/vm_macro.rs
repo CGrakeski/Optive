@@ -41,6 +41,19 @@ identity{6}
 }
 
 #[test]
+fn macro_identity_preserves_fstring() {
+    assert_text(
+        r#"
+macro identity(x) {
+    return x
+}
+identity{ f"n={1 + 1}" }
+"#,
+        "n=2",
+    );
+}
+
+#[test]
 fn quote_literal_eval() {
     assert_num(
         r"

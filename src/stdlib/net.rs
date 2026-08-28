@@ -423,6 +423,7 @@ fn wrap_listener(listener: TcpListener, tls: Option<Arc<ServerConfig>>) -> Value
         ]),
         children: HashMap::new(),
         is_user: false,
+        live_globals: None,
     }))
 }
 
@@ -503,6 +504,7 @@ fn wrap_conn(stream: ConnInner) -> Value {
         ]),
         children: HashMap::new(),
         is_user: false,
+        live_globals: None,
     });
     let key = module.as_ptr() as usize;
     registration.set_key(key);
@@ -605,6 +607,7 @@ fn wrap_udp(sock: UdpSocket) -> Value {
         ]),
         children: HashMap::new(),
         is_user: false,
+        live_globals: None,
     }))
 }
 
@@ -672,6 +675,7 @@ fn wrap_ws(ws: tungstenite::WebSocket<ConnInner>) -> Value {
         ]),
         children: HashMap::new(),
         is_user: false,
+        live_globals: None,
     }))
 }
 

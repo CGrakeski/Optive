@@ -291,6 +291,9 @@ pub struct ModuleObject {
     pub exports: HashMap<String, Value>,
     pub children: HashMap<String, Shared<Self>>,
     pub is_user: bool,
+    /// 用户模块：与 [`crate::opcode::ModuleGlobalEnv::globals`] 同一 `Arc` 格，
+    /// 使 `m.x` 看见 `export var` 的后续赋值（勿 `SyncCell::clone` 快照）。
+    pub live_globals: Option<Arc<SyncCell<HashMap<String, Value>>>>,
 }
 
 impl ModuleObject {
@@ -301,20 +304,36 @@ impl ModuleObject {
             exports: HashMap::new(),
             children: HashMap::new(),
             is_user: true,
+            live_globals: None,
         }
     }
 
     #[must_use]
     pub fn get_export(&self, name: &str) -> Option<Value> {
-        self.exports.get(name).cloned()
+        self.live_export(name).or_else(|| self.exports.get(name).cloned())
     }
 
     #[must_use]
     pub fn get_attr(&self, name: &str) -> Option<Value> {
+        if let Some(v) = self.live_export(name) {
+            return Some(v);
+        }
         if let Some(v) = self.exports.get(name) {
             return Some(v.clone());
         }
         self.children.get(name).map(|m| Value::Module(m.clone()))
+    }
+
+    fn live_export(&self, name: &str) -> Option<Value> {
+        if !self.exports.contains_key(name) {
+            return None;
+        }
+        let g = self.live_globals.as_ref()?;
+        let val = g.borrow().get(name)?.clone();
+        Some(match val {
+            Value::Cell(c) => c.borrow().clone(),
+            other => other,
+        })
     }
 }
 

@@ -210,6 +210,7 @@ impl Formatter {
                                 self.buf.push_str("func ");
                                 self.buf.push_str(name);
                                 self.emit_param_list(params, depth + 1);
+                                self.buf.push_str(" {}");
                             }
                             ProtocolMember::Field { name, mutable } => {
                                 self.buf.push_str(if *mutable { "var " } else { "let " });
@@ -576,22 +577,7 @@ impl Formatter {
                 self.buf.push('\n');
                 for c in cases {
                     self.indent(depth + 1);
-                    self.buf.push_str(&c.name);
-                    if !c.fields.is_empty() {
-                        self.buf.push('(');
-                        for (i, f) in c.fields.iter().enumerate() {
-                            if i > 0 {
-                                self.buf.push_str(", ");
-                            }
-                            self.buf.push_str(if f.mutable { "var " } else { "let " });
-                            self.buf.push_str(&f.name);
-                            if let Some(t) = &f.type_expr {
-                                self.buf.push_str(if f.type_strong { " :: " } else { ": " });
-                                self.emit_type(t);
-                            }
-                        }
-                        self.buf.push(')');
-                    }
+                    self.emit_variant_case(c, depth + 1);
                     self.buf.push('\n');
                 }
                 self.indent(depth);
@@ -691,15 +677,51 @@ impl Formatter {
         return_wrapper: Option<&Expr>,
         depth: usize,
     ) {
+        // 解析器认 `-> T` / `=> T`，可选再跟 `: wrap(_)`。
         if let Some(t) = return_type {
-            self.buf.push_str(if return_strong { " :: " } else { ": " });
+            self.buf.push_str(if return_strong { " => " } else { " -> " });
             self.emit_type(t);
         }
         if let Some(w) = return_wrapper {
-            self.buf.push_str(" -> ");
+            self.buf.push_str(" : ");
             // 包装器里的 `__ret_wrapper_val` 印回 `_`
             self.emit_expr_replacing(w, depth, RET_WRAPPER_VAL, "_");
         }
+    }
+
+    fn emit_variant_case(&mut self, c: &crate::ast::VariantCaseDecl, depth: usize) {
+        // AST 不区分 `typed Hit(x: T)` 与 `Hit = struct { let x }`；印成解析器能吃的两种合法形式。
+        self.buf.push_str(&c.name);
+        let typed = c.fields.iter().any(|f| f.type_expr.is_some());
+        if typed {
+            self.buf.push_str(" = typed struct {");
+        } else {
+            self.buf.push_str(" = struct {");
+        }
+        if c.fields.is_empty() {
+            self.buf.push('}');
+            return;
+        }
+        self.buf.push(' ');
+        for f in &c.fields {
+            if typed {
+                self.buf.push_str(&f.name);
+                if let Some(t) = &f.type_expr {
+                    self.buf.push_str(if f.type_strong { " :: " } else { ": " });
+                    self.emit_type(t);
+                }
+                self.buf.push(' ');
+            } else {
+                self.buf.push_str(if f.mutable { "var " } else { "let " });
+                self.buf.push_str(&f.name);
+                if let Some(d) = &f.default_expr {
+                    self.buf.push_str(" = ");
+                    self.emit_expr(d, depth);
+                }
+                self.buf.push(' ');
+            }
+        }
+        self.buf.push('}');
     }
 
     fn emit_type(&mut self, t: &Expr) {
@@ -1197,7 +1219,7 @@ impl Formatter {
                 body,
             } => {
                 self.buf.push_str("quote");
-                if !hygienic_names.is_empty() || !bindings.is_empty() {
+                if !hygienic_names.is_empty() {
                     self.buf.push('(');
                     for (i, n) in hygienic_names.iter().enumerate() {
                         if i > 0 {
@@ -1205,8 +1227,12 @@ impl Formatter {
                         }
                         self.buf.push_str(n);
                     }
+                    self.buf.push(')');
+                }
+                if !bindings.is_empty() {
+                    self.buf.push_str(" with (");
                     for (i, b) in bindings.iter().enumerate() {
-                        if i > 0 || !hygienic_names.is_empty() {
+                        if i > 0 {
                             self.buf.push_str(", ");
                         }
                         self.emit_expr_replacing(b, depth, replace_var, with);

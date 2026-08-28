@@ -356,7 +356,19 @@ pub(super) fn json_stringify_value(v: &Value, depth: usize) -> Result<String> {
                 .collect();
             format!("[{}]", parts?.join(","))
         }
-        other => json_escape_string(&other.print_string()),
+        Value::Tuple(t) => {
+            let parts: Result<Vec<_>> = t
+                .iter()
+                .map(|item| json_stringify_value(item, depth + 1))
+                .collect();
+            format!("[{}]", parts?.join(","))
+        }
+        other => {
+            return Err(crate::error::RuntimeError::type_err(format!(
+                "json.stringify: cannot encode {}",
+                other.type_name()
+            )));
+        }
     })
 }
 

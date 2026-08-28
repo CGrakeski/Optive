@@ -162,6 +162,111 @@ intern let x = 2
 }
 
 #[test]
+fn fmt_roundtrip_protocol_method_empty_body() {
+    let src = r"
+protocol Labeled {
+    func label(self) {}
+}
+";
+    let out = format_source(src).expect("fmt");
+    assert!(
+        out.contains("func label(self) {}"),
+        "protocol methods need empty braces to parse, got:\n{out}"
+    );
+    parse_ok(&out);
+}
+
+#[test]
+fn fmt_roundtrip_variant_cases() {
+    let src = r#"
+variant Probe {
+    Hit = struct { let rec }
+    Miss = struct { let path let reason }
+}
+
+variant Result {
+    typed Ok(value: num)
+    Err = typed struct { value: text }
+}
+"#;
+    let out = format_source(src).expect("fmt");
+    assert!(
+        out.contains("Hit = struct {"),
+        "untyped case must keep `= struct`, got:\n{out}"
+    );
+    assert!(
+        !out.contains("Hit(let"),
+        "must not print Hit(let rec), got:\n{out}"
+    );
+    parse_ok(&out);
+}
+
+#[test]
+fn fmt_roundtrip_quote_with_and_return_wrapper() {
+    let src = "\
+macro fail(msg) {
+    return quote with (msg) {
+        die(eval(msg))
+    }
+}
+
+func get_pid() -> num : num.(_) {
+    return 1
+}
+
+fail{\"hi\"}
+get_pid()
+";
+    let out = format_source(src).expect("fmt");
+    assert!(
+        out.contains("quote with (msg)"),
+        "quote with bindings, got:\n{out}"
+    );
+    assert!(
+        !out.contains("quote(msg)"),
+        "must not dump bindings into quote(), got:\n{out}"
+    );
+    assert!(
+        out.contains("-> num : num.(_)"),
+        "return sig -> T : wrap, got:\n{out}"
+    );
+    assert!(
+        !out.contains(": num ->"),
+        "must not print : T -> wrap, got:\n{out}"
+    );
+    parse_ok(&out);
+}
+
+#[test]
+fn fmt_roundtrip_macro_call_args_and_fstring() {
+    let src = r#"
+macro show(x) {
+    return quote with (x) {
+        eval(x)
+    }
+}
+
+func greet(name) {
+    return f"hi {name}"
+}
+
+var rest = [1, 2]
+show{len(rest)}
+"#;
+    let out = format_source(src).expect("fmt");
+    assert!(
+        out.contains("show{len(rest)}"),
+        "macro call args must survive fmt, got:\n{out}"
+    );
+    assert!(
+        out.contains("f\"hi {name}\""),
+        "f-string must survive fmt, got:\n{out}"
+    );
+    parse_ok(&out);
+    assert_eq!(value(&out).display_string(), "2");
+}
+
+#[test]
 fn fmt_roundtrip_still_runs() {
     let src = r"
 func fib(n) {

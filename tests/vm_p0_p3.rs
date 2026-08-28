@@ -9,7 +9,7 @@
 mod common;
 
 use common::{assert_bool, assert_list, assert_num, assert_text, run_err, value};
-use optive::{repl_needs_continuation, run_source_in_vm, vm::Vm};
+use optive::{repl_needs_continuation, run_source, run_source_in_vm, vm::Vm};
 
 #[test]
 fn p0_match_as_expression() {
@@ -216,6 +216,23 @@ use std.json.{ parse, stringify }
 stringify(parse("[1, 2]"))
 "#,
         "[1,2]",
+    );
+}
+
+#[test]
+fn p3_json_stringify_rejects_struct() {
+    let err = run_source(
+        r#"
+use std.json.{ stringify }
+struct Point { let x }
+stringify(Point(1))
+"#,
+    )
+    .expect_err("struct must not stringify");
+    assert!(
+        err.message().contains("cannot encode"),
+        "got: {}",
+        err.message()
     );
 }
 

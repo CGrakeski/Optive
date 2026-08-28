@@ -101,6 +101,8 @@ fn main() {
     let raw_args: Vec<String> = env::args().collect();
     let (color_choice, args) = color::take_color_args(&raw_args);
     color::init(color_choice);
+    let (quiet, args) = color::take_quiet_arg(&args);
+    color::set_quiet(quiet);
     let (custom_override, args) = take_custom_arg(&args);
     init_custom(custom_override.as_deref());
 
@@ -703,7 +705,7 @@ fn run_script_path_with_deps(
         .read_to_string("script entry", path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let file = path.to_string_lossy().to_string();
-    run_in_vm(&source, &file, caps, argv_override, |vm| {
+    run_in_vm(&source, &file, caps, argv_override, false, |vm| {
         inject_dep_map(vm, ensured, project_root);
     })
 }
@@ -720,19 +722,21 @@ fn run_script_path(path: &Path, caps: Capabilities) -> Result<(), Box<dyn std::e
         .read_to_string("script entry", path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let file = path.to_string_lossy().to_string();
-    run_in_vm(&source, &file, caps, None, |_| {})
+    run_in_vm(&source, &file, caps, None, false, |_| {})
 }
 
 fn run_inline_source(source: &str, caps: Capabilities) -> Result<(), Box<dyn std::error::Error>> {
-    run_in_vm(source, "<string>", caps, None, |_| {})
+    run_in_vm(source, "<string>", caps, None, true, |_| {})
 }
 
-/// 公共 VM 执行入口：创建 VM、设置能力、运行源码、打印非 None 结果。
+/// 公共 VM 执行入口：创建 VM、设置能力、运行源码。
+/// `print_result` 仅给 `-c`：脚本 / `run` 的 stdout 只应由 `print()` 写入。
 fn run_in_vm(
     source: &str,
     file: &str,
     caps: Capabilities,
     argv_override: Option<Vec<String>>,
+    print_result: bool,
     setup: impl FnOnce(&mut Vm),
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut vm = Vm::new();
@@ -741,7 +745,7 @@ fn run_in_vm(
     setup(&mut vm);
     match run_source_in_vm(&mut vm, source, file) {
         Ok(v) => {
-            if !matches!(v, optive::value::Value::None) {
+            if print_result && !matches!(v, optive::value::Value::None) {
                 println!("{}", v.display_string());
             }
             Ok(())
@@ -781,6 +785,7 @@ fn print_help() {
     println!("{}", t_cli(CliMsg::HelpCustom));
     println!();
     println!("{}", t_cli(CliMsg::HelpCapsHeader));
+    println!("{}", t_cli(CliMsg::HelpQuiet));
     println!("{}", t_cli(CliMsg::HelpSandbox));
     println!("{}", t_cli(CliMsg::HelpNoNetwork));
     println!("{}", t_cli(CliMsg::HelpNoFfi));

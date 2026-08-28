@@ -546,7 +546,7 @@ impl Generator {
     fn attach_compile_global_envs(&mut self) {
         let env = Arc::new(crate::opcode::ModuleGlobalEnv {
             global_names: self.program.global_names.clone(),
-            globals: crate::shared::SyncCell::new(HashMap::new()),
+            globals: std::sync::Arc::new(crate::shared::SyncCell::new(HashMap::new())),
             finalized: false,
         });
         let updated: HashMap<String, Arc<FunctionObject>> = self
@@ -1684,9 +1684,8 @@ impl Generator {
             return type_name.to_string();
         }
         if let Some((vname, cname)) = type_name.rsplit_once('.') {
-            if self.program.variant_defs.contains_key(vname) {
-                return crate::enum_variant::case_struct_name(vname, cname);
-            }
+            // 导入方 compile unit 没有 variant_defs，仍按内部 case-struct 名匹配。
+            return crate::enum_variant::case_struct_name(vname, cname);
         }
         type_name.to_string()
     }
@@ -1739,9 +1738,27 @@ impl Generator {
                     }
                 }
             }
-        } else if let Some(inner) = args.first() {
-            self.gen_match_pattern_test(temp, inner, path, fail_label)?;
+        } else {
+            for (i, arg) in args.iter().enumerate() {
+                match arg {
+                    Pattern::Bind(_) => {}
+                    other => {
+                        let field_temp = self.cg.fresh_temp("__match_slot");
+                        self.emit_load_match_slot(temp, path, i)?;
+                        self.emit_store_temp(&field_temp);
+                        self.gen_match_pattern_test(&field_temp, other, &[], fail_label)?;
+                    }
+                }
+            }
         }
+        Ok(())
+    }
+
+    fn emit_load_match_slot(&mut self, temp: &str, path: &[usize], index: usize) -> Result<()> {
+        self.emit_load_match_at(temp, path);
+        self.cg.emit(Instruction::PushSmall(index as i64));
+        self.cg.emit(Instruction::Load("__struct_slot__".into()));
+        self.cg.emit(Instruction::Call { argc: 2 });
         Ok(())
     }
 
@@ -1831,8 +1848,21 @@ impl Generator {
                             }
                         }
                     }
-                } else if let Some(inner) = args.first() {
-                    self.gen_match_pattern_bindings(temp, inner, path)?;
+                } else {
+                    for (i, arg) in args.iter().enumerate() {
+                        let field_temp = self.cg.fresh_temp("__match_slot");
+                        self.emit_load_match_slot(temp, path, i)?;
+                        self.emit_store_temp(&field_temp);
+                        match arg {
+                            Pattern::Bind(bind_name) => {
+                                self.emit_load_temp(&field_temp);
+                                self.emit_bind_name(bind_name);
+                            }
+                            other => {
+                                self.gen_match_pattern_bindings(&field_temp, other, &[])?;
+                            }
+                        }
+                    }
                 }
             }
             Pattern::Value(_) => {}
@@ -2404,7 +2434,7 @@ impl Generator {
         } else {
             Some(Arc::new(crate::opcode::ModuleGlobalEnv {
                 global_names: func_global_names,
-                globals: crate::shared::SyncCell::new(HashMap::new()),
+                globals: std::sync::Arc::new(crate::shared::SyncCell::new(HashMap::new())),
                 finalized: false,
             }))
         };

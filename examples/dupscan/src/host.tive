@@ -1,0 +1,63 @@
+// Host process id via libc / kernel32, plus a packed C.layout counter round-trip.
+use std.language.{ C }
+
+export typed struct ScanCounters {
+    let files: i32
+    let skipped: i32
+}: C.layout
+
+func pid_windows() {
+    let h = C.frompath("kernel32.dll")
+    extern(h, "GetCurrentProcessId")
+    func get_pid() -> C.types.unsigned_int : num.(u32.(_)) {}
+    return get_pid()
+}
+
+func pid_macos() {
+    let h = C.frompath("libSystem.B.dylib")
+    extern(h, "getpid")
+    func get_pid() -> C.types.int : num.(i32.(_)) {}
+    return get_pid()
+}
+
+func pid_linux() {
+    try {
+        let h = C.frompath("libc.so.6")
+        extern(h, "getpid")
+        func get_pid_glibc() -> C.types.int : num.(i32.(_)) {}
+        return get_pid_glibc()
+    } catch (e) {
+        let h = C.frompath("libc.so")
+        extern(h, "getpid")
+        func get_pid_libc() -> C.types.int : num.(i32.(_)) {}
+        return get_pid_libc()
+    }
+}
+
+export func host_pid() {
+    try {
+        let os = std.os.name()
+        if (os == "windows") {
+            return pid_windows()
+        }
+        if (os == "macos") {
+            return pid_macos()
+        }
+        return pid_linux()
+    } catch (e) {
+        return 0
+    }
+}
+
+export func pack_counts(files, skipped) {
+    try {
+        let buf = C.alloc(ScanCounters)
+        C.store(buf, ScanCounters(i32.(files), i32.(skipped)))
+        let c = C.load(ScanCounters, buf)
+        let out = { "files": num.(c.files), "skipped": num.(c.skipped) }
+        C.free(buf)
+        return out
+    } catch (e) {
+        return { "files": files, "skipped": skipped }
+    }
+}

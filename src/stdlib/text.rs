@@ -800,5 +800,6 @@ fn text_builder_new(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         exports,
         children: HashMap::new(),
         is_user: false,
+        live_globals: None,
     })))
 }

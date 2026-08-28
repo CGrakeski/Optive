@@ -1,0 +1,202 @@
+// dupscan — find duplicate files by content fingerprint.
+//
+//   Optive run examples/dupscan -- <dir> [--json] [--fail] [--min-bytes N]
+use "host.tive".{ host_pid, pack_counts }
+
+use "scan.tive".{ collect_files, try_probe, group_hits, partition_probes, labeled_paths }
+
+enum Mode {
+    Text
+    Json
+}
+
+enum Exit {
+    Ok = 0
+    Dup = 1
+    Usage = 2
+}
+
+struct Cli {
+    let root
+    let mode
+    let fail_on_dup
+    let min_bytes
+}
+
+func die(msg) {
+    print("dupscan:", msg)
+    print("usage: Optive run examples/dupscan -- <dir> [--json] [--fail] [--min-bytes N]")
+    std.os.exit(Exit.Usage.__value__)
+}
+
+macro fail(msg) {
+    return quote with (msg) {
+        die(eval(msg))
+    }
+}
+
+func print_help() {
+    print("dupscan — find duplicate files by content fingerprint")
+    print("")
+    print("Usage:")
+    print("  Optive run examples/dupscan -- <dir> [--json] [--fail] [--min-bytes N]")
+    print("")
+    print("Options:")
+    print("  --json          write a JSON report to stdout")
+    print("  --fail          exit 1 if any duplicate group is found")
+    print("  --min-bytes N   ignore files smaller than N bytes (default 1)")
+    print("  -h, --help      show this help")
+}
+
+func parse_cli(argv) {
+    let rest = argv[2:]
+    var root = none
+    var json = false
+    var fail_on_dup = false
+    var min_bytes = 1
+    var i = 0
+    while (i < len(rest)) {
+        let a = rest[i]
+        if (a == "-h" or a == "--help") {
+            return none
+        }
+        if (a == "--json") {
+            json = true
+            i = i + 1
+            continue
+        }
+        if (a == "--fail") {
+            fail_on_dup = true
+            i = i + 1
+            continue
+        }
+        if (a == "--min-bytes") {
+            i = i + 1
+            if (i >= len(rest)) {
+                fail{"--min-bytes needs a number"}
+            }
+            try {
+                min_bytes = int(rest[i])
+            } catch (e) {
+                die(std.concat("invalid --min-bytes: ", rest[i]))
+            }
+            i = i + 1
+            continue
+        }
+        if (std.text.startswith(a, "-")) {
+            die(std.concat("unknown flag: ", a))
+        }
+        if (root is not none) {
+            fail{"only one directory is allowed"}
+        }
+        root = a
+        i = i + 1
+    }
+    let mode = if json then Mode.Json else Mode.Text
+    return Cli(root, mode, fail_on_dup, min_bytes)
+}
+
+func duplicate_rows(groups) {
+    let rows = []
+    for (digest in std.collections.sorted(groups.keys())) {
+        let recs = groups[digest]
+        if (len(recs) < 2) {
+            continue
+        }
+        let paths = std.collections.sorted(labeled_paths(recs))
+        rows.append({ "digest": digest, "size": recs[0].size, "paths": paths, "copies": len(recs) })
+    }
+    return rows
+}
+
+func extra_copies(rows) {
+    var n = 0
+    for (row in rows) {
+        n = n + row["copies"] - 1
+    }
+    return n
+}
+
+func print_text(root, pid, workers, counts, elapsed, rows) {
+    let nfiles = counts["files"]
+    let nskip = counts["skipped"]
+    print(f"dupscan pid={pid} workers={workers} root={root}")
+    print(f"scanned {nfiles} files ({nskip} skipped) in {floatstring(elapsed)}s")
+    if (len(rows) == 0) {
+        print(f"no duplicates among {nfiles} files")
+        return
+    }
+    var i = 1
+    for (row in rows) {
+        let digest = row["digest"]
+        let size = row["size"]
+        let copies = row["copies"]
+        print("")
+        print(f"duplicate group {i}  digest={digest}  size={size}  copies={copies}")
+        for (p in row["paths"]) {
+            print(f"  {p}")
+        }
+        i = i + 1
+    }
+    let ngroups = len(rows)
+    let extra = extra_copies(rows)
+    print("")
+    print(f"{ngroups} duplicate group(s), {extra} extra copy(ies)")
+}
+
+let cli = parse_cli(std.os.args())
+
+if (cli is none) {
+    print_help()
+    std.os.exit(Exit.Ok.__value__)
+}
+
+if (cli.root is none) {
+    fail{"missing <dir>"}
+}
+
+if (not std.fs.is_dir(cli.root)) {
+    die(std.concat("not a directory: ", cli.root))
+}
+
+let scan_root = std.path.abspath(cli.root)
+
+let t0 = std.time.monotonic()
+
+let files = collect_files(scan_root)
+
+let probes = std.async.par_map(files, do(p) {
+    return try_probe(p, cli.min_bytes)
+})
+
+let parts = partition_probes(probes)
+
+let recs = parts[0]
+
+let skipped = parts[1]
+
+let groups = group_hits(recs)
+
+let rows = duplicate_rows(groups)
+
+let elapsed = std.time.monotonic() - t0
+
+let counts = pack_counts(len(recs), skipped)
+
+let pid = host_pid()
+
+let workers = std.async.workers()
+
+if (cli.mode == Mode.Json) {
+    print(
+        std.json.stringify(
+            { "root": scan_root, "pid": pid, "workers": workers, "elapsed_s": floatstring(elapsed), "files": counts["files"], "skipped": counts["skipped"], "duplicates": rows },
+        ),
+    )
+} else {
+    print_text(scan_root, pid, workers, counts, elapsed, rows)
+}
+
+let code = if cli.fail_on_dup and len(rows) > 0 then Exit.Dup.__value__ else Exit.Ok.__value__
+
+std.os.exit(code)

@@ -818,13 +818,14 @@ impl MacroObject {
 }
 
 /// 模块全局名表与绑定的快照；挂到该模块内编译的函数上，使导入后 `LoadGlobal`/`StoreGlobal` 仍可用。
-/// `globals` 用 `SyncCell`（`parking_lot）：导入后模块函数写入模块自己的绑定，且可跨线程共享`。
+/// `globals` 为 `Arc<SyncCell>`：与 [`crate::value::ModuleObject::live_globals`] 共享同一格，
+/// 使 `import m; m.x` 看见模块函数对 `export var` 的后续赋值。
 /// `finalized`：模块加载结束、live 快照挂上后为 true。编译期占位 env 为 false，
 /// 以便加载收尾可升级；已 finalized 的函数（含 `use` 引入的外模块函数）不得再被换绑。
 #[derive(Clone)]
 pub struct ModuleGlobalEnv {
     pub global_names: Vec<String>,
-    pub globals: SyncCell<HashMap<String, Value>>,
+    pub globals: Arc<SyncCell<HashMap<String, Value>>>,
     pub finalized: bool,
 }
 

@@ -258,7 +258,7 @@ cu.via_use("let")
     );
 }
 
-/// 导入后模块函数对模块全局的赋值必须留在 `module_env，不能污染调用方`。
+/// 导入后模块函数对模块全局的赋值必须留在 `module_env`，且 `m.counter` 读到活值。
 #[test]
 fn imported_module_mutates_own_global() {
     assert_num(
@@ -266,6 +266,19 @@ fn imported_module_mutates_own_global() {
 import "tests/import_fixtures/mutable_counter.tive" as c
 c.bump()
 c.bump()
+"#,
+        "2",
+    );
+}
+
+#[test]
+fn imported_export_var_visible_via_attr() {
+    assert_num(
+        r#"
+import "tests/import_fixtures/mutable_counter.tive" as c
+c.bump()
+c.bump()
+c.counter
 "#,
         "2",
     );

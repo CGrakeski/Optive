@@ -62,7 +62,9 @@ pub fn instance_is_a(vm: &Vm, val: &Value, type_name: &str) -> bool {
     if let Value::Struct(s) = val {
         type_registry::struct_name_is_a(vm, &s.def.name, type_name)
     } else if let Value::Variant(v) = val {
-        v.inst_name == type_name || v.def.name == type_name
+        v.inst_name == type_name
+            || v.def.name == type_name
+            || instance_is_a(vm, &v.payload, type_name)
     } else {
         false
     }

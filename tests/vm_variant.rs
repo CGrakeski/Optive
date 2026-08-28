@@ -125,3 +125,35 @@ match (o) {
         "ok",
     );
 }
+
+#[test]
+fn match_imported_variant_case_binds_field() {
+    assert_num(
+        r#"
+import "tests/import_fixtures/probe_variant.tive" as p
+let h = p.hit(41)
+match (h) {
+    case Probe.Hit(rec) { rec }
+} else {
+    0
+}
+"#,
+        "41",
+    );
+}
+
+#[test]
+fn match_imported_wrapped_variant_case() {
+    assert_num(
+        r#"
+import "tests/import_fixtures/probe_variant.tive" as p
+let w = p.wrap_hit(7)
+match (w) {
+    case Probe.Hit(rec) { rec }
+} else {
+    0
+}
+"#,
+        "7",
+    );
+}

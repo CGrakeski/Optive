@@ -262,7 +262,7 @@ fn read_func(r: &mut Cursor<&[u8]>) -> Result<(String, FunctionObject)> {
         let names = read_strs(r)?;
         Some(Arc::new(ModuleGlobalEnv {
             global_names: names,
-            globals: SyncCell::new(HashMap::new()),
+            globals: Arc::new(SyncCell::new(HashMap::new())),
             finalized: false,
         }))
     };

@@ -78,6 +78,14 @@ entry = "src/main.tive"
     let (code, stdout, stderr) = run_optive(&["run"], &root);
     assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
     assert!(stdout.contains("42"), "expected print 42, got: {stdout}");
+    assert!(
+        !stdout.contains("Project"),
+        "status lines must not pollute stdout: {stdout:?}"
+    );
+    assert!(
+        stderr.contains("Project") || stderr.contains("Running"),
+        "status lines belong on stderr, got: {stderr:?}"
+    );
     assert!(root.join("Optive.lock").is_file(), "should write lock");
 }
 
@@ -199,10 +207,14 @@ entry = "src/main.tive"
     let (code, stdout, stderr) = run_optive(&["--color", "run"], &root);
     assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
     assert!(
-        stdout.contains("\u{1b}[32m  Project demo_color"),
-        "expected green indented Project line, got: {stdout:?}"
+        stderr.contains("\u{1b}[32m  Project demo_color"),
+        "expected green indented Project line on stderr, got: {stderr:?}"
     );
-    assert!(stdout.contains("Running src"), "stdout={stdout}");
+    assert!(stderr.contains("Running src"), "stderr={stderr}");
+    assert!(
+        !stdout.contains("Project") && !stdout.contains("Running src"),
+        "status lines must not be on stdout: {stdout:?}"
+    );
 }
 
 #[test]
@@ -222,10 +234,76 @@ entry = "main.tive"
     let (code, stdout, stderr) = run_optive(&["--no-color", "run"], &root);
     assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
     assert!(
-        !stdout.contains('\u{1b}'),
-        "expected no ANSI, got: {stdout:?}"
+        !stderr.contains('\u{1b}'),
+        "expected no ANSI on stderr, got: {stderr:?}"
     );
-    assert!(stdout.contains("  Project demo_nocolor"), "stdout={stdout}");
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "expected no ANSI on stdout, got: {stdout:?}"
+    );
+    assert!(stderr.contains("  Project demo_nocolor"), "stderr={stderr}");
+    assert!(
+        !stdout.contains("Project"),
+        "status lines must not be on stdout: {stdout:?}"
+    );
+}
+
+#[test]
+fn quiet_hides_status_lines() {
+    let root = tempfile_project("demo_quiet");
+    fs::write(
+        root.join("Optive.toml"),
+        r#"
+[package]
+name = "demo_quiet"
+entry = "src/main.tive"
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/main.tive"), "print(9)\n").unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["--quiet", "--no-color", "run"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(stdout.contains('9'), "expected print 9, got: {stdout}");
+    assert!(
+        !stderr.contains("Project") && !stderr.contains("Running"),
+        "expected no status lines with --quiet, stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn run_does_not_print_last_expression() {
+    let root = tempfile_project("demo_no_last");
+    fs::write(
+        root.join("Optive.toml"),
+        r#"
+[package]
+name = "demo_no_last"
+entry = "src/main.tive"
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/main.tive"), "41 + 1\n").unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["--no-color", "run"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(
+        !stdout.contains("42"),
+        "Optive run must not print last expression, stdout={stdout:?}"
+    );
+}
+
+#[test]
+fn inline_code_prints_last_expression() {
+    let root = tempfile_project("inline_last");
+    let (code, stdout, stderr) = run_optive(&["-c", "41 + 1"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(
+        stdout.contains("42"),
+        "Optive -c should print last value, got: {stdout}"
+    );
 }
 
 #[test]
@@ -545,6 +623,10 @@ fn help_lists_test_and_index_sync() {
     assert!(
         stdout.contains("--trust-deps"),
         "help should mention --trust-deps:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("--quiet"),
+        "help should mention --quiet:\n{stdout}"
     );
 }
 

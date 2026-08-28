@@ -74,7 +74,7 @@ pub fn install_std(vm: &mut Vm) {
 /// 编译嵌入的 `macros.tive`，挂到 `std.macros`。
 fn install_std_macros(vm: &mut Vm, std_mod: &Shared<ModuleObject>) -> Result<()> {
     let source = include_str!("../stdlib/macros.tive");
-    let exports = run_module_source(
+    let (exports, live_globals) = run_module_source(
         vm,
         source,
         "<std.macros>",
@@ -88,6 +88,7 @@ fn install_std_macros(vm: &mut Vm, std_mod: &Shared<ModuleObject>) -> Result<()>
         exports,
         children: HashMap::new(),
         is_user: false,
+        live_globals: Some(live_globals),
     });
     std_mod
         .borrow_mut()
@@ -252,7 +253,10 @@ fn run_module_source(
     import_base: PathBuf,
     package_id: String,
     package_root: Option<PathBuf>,
-) -> Result<HashMap<String, Value>> {
+) -> Result<(
+    HashMap<String, Value>,
+    Arc<crate::shared::SyncCell<HashMap<String, Value>>>,
+)> {
     let mut context = ModuleContextGuard::new(
         vm,
         source,
@@ -355,7 +359,7 @@ fn run_module_source(
         new_struct_defs,
         new_overloads,
     );
-    Ok(export_map)
+    Ok((export_map, module_env.globals.clone()))
 }
 
 /// 将 `StructDef.methods` / `overloads` 里的函数重绑到模块全局 env。
@@ -509,8 +513,12 @@ fn load_file_as_module(
         package_id,
         package_root,
     ) {
-        Ok(exports) => {
-            placeholder.borrow_mut().exports = exports;
+        Ok((exports, live_globals)) => {
+            {
+                let mut m = placeholder.borrow_mut();
+                m.exports = exports;
+                m.live_globals = Some(live_globals);
+            }
             Ok(Value::Module(placeholder))
         }
         Err(e) => {
@@ -792,7 +800,7 @@ pub fn load_string_module(vm: &mut Vm, path: &str) -> Result<Value> {
     let import_base = file_path
         .parent()
         .map_or_else(|| vm.import_base.clone(), std::path::Path::to_path_buf);
-    let exports = run_module_source(
+    let (exports, live_globals) = run_module_source(
         vm,
         &source,
         &file_path.to_string_lossy(),
@@ -806,6 +814,7 @@ pub fn load_string_module(vm: &mut Vm, path: &str) -> Result<Value> {
         exports,
         children: HashMap::new(),
         is_user: true,
+        live_globals: Some(live_globals),
     });
     vm.module_cache.insert(canonical, module.clone());
     Ok(Value::Module(module))

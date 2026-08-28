@@ -124,6 +124,7 @@ fn wrap_db(conn: Connection) -> Value {
         ]),
         children: HashMap::new(),
         is_user: false,
+        live_globals: None,
     }))
 }
 

@@ -1,0 +1,119 @@
+use std.decos.{ memoize }
+
+use std.hash.{ sha256 }
+
+use std.encoding.{ hex_encode }
+
+protocol Labeled {
+    func label(self) {}
+}
+
+export struct FileRec {
+    let path
+    let size
+    let digest
+    func label(self) {
+        return self.path
+    }
+}
+
+FileRec.__convert__.__dispatch__.append(
+    do(t, v) {
+        if (type(v) != "list") {
+            throw TypeError("FileRec convert expects [path, size, digest]")
+        }
+        if (len(v) != 3) {
+            throw TypeError("FileRec convert expects [path, size, digest]")
+        }
+        return FileRec(v[0], v[1], v[2])
+    },
+)
+
+export variant Probe {
+    Hit = struct { let rec }
+    Miss = struct { let path let reason }
+}
+
+export func label_of[T: Labeled](x: T) {
+    return x.label()
+}
+
+export func labeled_paths(recs) {
+    return [label_of[FileRec](r) for (r in recs)]
+}
+
+friend func rec_line(r :: FileRec) {
+    return std.concat(str(r.size), " ", r.digest, " ", r.path)
+}
+
+const let SKIP_DIRS = {".git", "target", "node_modules", ".optive", "__pycache__", "dist", "build"}
+
+memoize
+func skip_name(name) {
+    return name in SKIP_DIRS
+}
+
+export func collect_files(root) {
+    let out = []
+    let stack = [root]
+    var i = 0
+    while (i < len(stack)) {
+        let folder = stack[i]
+        i = i + 1
+        let names = std.fs.list_dir(folder)
+        for (name in names) {
+            if (skip_name(name)) {
+                continue
+            }
+            let p = std.path.join(folder, name)
+            if (std.fs.is_dir(p)) {
+                if (std.text.startswith(name, ".")) {
+                    continue
+                }
+                stack.append(p)
+            } elif (std.fs.is_file(p)) {
+                out.append(p)
+            }
+        }
+    }
+    return out
+}
+
+export func try_probe(path, min_bytes) {
+    try {
+        let data = std.fs.read_bytes(path)
+        let size = len(data)
+        if (size < min_bytes) {
+            return Probe.Miss(path, "too small")
+        }
+        let rec = FileRec.([path, size, sha256(hex_encode(data))])
+        return Probe.Hit(rec)
+    } catch (e) {
+        return Probe.Miss(path, str(e.message))
+    }
+}
+
+export func partition_probes(probes) {
+    let recs = []
+    var skipped = 0
+    for (p in probes) {
+        match (p) {
+            case Probe.Hit(rec) {
+                recs.append(rec)
+            }
+            case Probe.Miss(path, reason) {
+                skipped = skipped + 1
+            }
+            else {
+                skipped = skipped + 1
+            }
+        }
+    }
+    return [recs, skipped]
+}
+
+export func group_hits(recs) {
+    return std.collections.group_by(recs, do(r) {
+        return r.digest
+    })
+}

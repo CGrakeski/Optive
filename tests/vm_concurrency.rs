@@ -530,6 +530,41 @@ ys[0] + ys[1] + ys[2]
     );
 }
 
+/// memoize 走 `call_user_function`；任务里 IO 让出不得报 `task suspended outside scheduler`。
+#[test]
+fn par_map_memoize_list_dir_does_not_abort() {
+    assert_bool(
+        r#"
+use std.decos.{ memoize }
+use std.fs.{ list_dir }
+use std.path.{ abspath }
+memoize func listing(p) {
+    return list_dir(p)
+}
+let root = abspath("tests")
+let ys = std.async.par_map([root, root], listing)
+len(ys[0]) > 0 and len(ys[1]) > 0
+"#,
+        true,
+    );
+}
+
+#[test]
+fn par_map_memoize_sleep_returns_values() {
+    assert_num(
+        r#"
+use std.decos.{ memoize }
+memoize func nap(x) {
+    std.time.sleep(0.01)
+    return x * 2
+}
+let ys = std.async.par_map([1, 2, 3], nap)
+ys[0] + ys[1] + ys[2]
+"#,
+        "12",
+    );
+}
+
 #[test]
 fn atomic_add() {
     assert_num(

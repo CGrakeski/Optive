@@ -1,0 +1,12 @@
+export variant Probe {
+    Hit = struct { let rec }
+    Miss = struct { let path let reason }
+}
+
+export func hit(n) {
+    return Probe.Hit(n)
+}
+
+export func wrap_hit(n) {
+    return Probe(Probe.Hit(n))
+}

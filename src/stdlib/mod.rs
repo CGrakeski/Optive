@@ -238,6 +238,7 @@ pub fn build_std_module() -> Shared<ModuleObject> {
         exports: exports(&[("concat", builtin(std_concat))]),
         children: std_children,
         is_user: false,
+        live_globals: None,
     })
 }
 
@@ -271,6 +272,7 @@ pub(crate) fn submodule(name: &str, entries: &[(&str, Value)]) -> Shared<ModuleO
         exports: exports(entries),
         children: HashMap::new(),
         is_user: false,
+        live_globals: None,
     })
 }
 
@@ -475,6 +477,9 @@ fn decos_once(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
                 .ok_or_else(|| crate::error::RuntimeError::msg("once: empty cache"));
         }
         let result = vm.call_user_function(inner.clone(), call_args.to_vec())?;
+        if vm.nested_user_call_suspended {
+            return Ok(result);
+        }
         *cached.borrow_mut() = Some(result.clone());
         *called.borrow_mut() = true;
         Ok(result)
@@ -494,6 +499,9 @@ fn decos_memoize(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
             return Ok(hit.clone());
         }
         let result = vm.call_user_function(inner.clone(), call_args.to_vec())?;
+        if vm.nested_user_call_suspended {
+            return Ok(result);
+        }
         cache.borrow_mut().insert(key, result.clone());
         Ok(result)
     }))
@@ -692,6 +700,7 @@ fn build_sync_module() -> Shared<ModuleObject> {
         ]),
         children: HashMap::new(),
         is_user: false,
+        live_globals: None,
     })
 }
 
@@ -1621,6 +1630,7 @@ fn re_compile(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         ]),
         children: HashMap::new(),
         is_user: false,
+        live_globals: None,
     })))
 }
 
@@ -1714,22 +1724,22 @@ fn re_split(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 fn hash_md5(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     use digest::Digest;
     use md5::Md5;
-    let text = expect_text("md5", args, 0)?;
-    let digest = Md5::digest(text.as_bytes());
+    let bytes = expect_text_or_bytes("md5", args, 0)?;
+    let digest = Md5::digest(&bytes);
     Ok(Value::Text(hex::encode(digest)))
 }
 
 fn hash_sha256(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     use sha2::{Digest, Sha256};
-    let text = expect_text("sha256", args, 0)?;
-    let digest = Sha256::digest(text.as_bytes());
+    let bytes = expect_text_or_bytes("sha256", args, 0)?;
+    let digest = Sha256::digest(&bytes);
     Ok(Value::Text(hex::encode(digest)))
 }
 
 fn hash_sha512(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     use sha2::{Digest, Sha512};
-    let text = expect_text("sha512", args, 0)?;
-    let digest = Sha512::digest(text.as_bytes());
+    let bytes = expect_text_or_bytes("sha512", args, 0)?;
+    let digest = Sha512::digest(&bytes);
     Ok(Value::Text(hex::encode(digest)))
 }
 
@@ -1741,22 +1751,22 @@ fn hash_hmac(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
             "hmac requires (key, msg, algo)",
         ));
     }
-    let key = expect_text("hmac", args, 0)?;
-    let msg = expect_text("hmac", args, 1)?;
+    let key = expect_text_or_bytes("hmac", args, 0)?;
+    let msg = expect_text_or_bytes("hmac", args, 1)?;
     let algo = expect_text("hmac", args, 2)?;
     match algo.as_str() {
         "sha256" => {
             type H = Hmac<Sha256>;
-            let mut mac = H::new_from_slice(key.as_bytes())
+            let mut mac = H::new_from_slice(&key)
                 .map_err(|e| crate::error::RuntimeError::msg(format!("hmac key error: {e}")))?;
-            mac.update(msg.as_bytes());
+            mac.update(&msg);
             Ok(Value::Text(hex::encode(mac.finalize().into_bytes())))
         }
         "sha512" => {
             type H = Hmac<Sha512>;
-            let mut mac = H::new_from_slice(key.as_bytes())
+            let mut mac = H::new_from_slice(&key)
                 .map_err(|e| crate::error::RuntimeError::msg(format!("hmac key error: {e}")))?;
-            mac.update(msg.as_bytes());
+            mac.update(&msg);
             Ok(Value::Text(hex::encode(mac.finalize().into_bytes())))
         }
         other => Err(crate::error::RuntimeError::value_err(format!(

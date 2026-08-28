@@ -1107,6 +1107,7 @@ pub fn build_c_language_module() -> Shared<ModuleObject> {
         exports,
         children,
         is_user: false,
+        live_globals: None,
     })
 }
 
@@ -1125,6 +1126,7 @@ fn build_c_types_module() -> Shared<ModuleObject> {
         exports,
         children: HashMap::new(),
         is_user: false,
+        live_globals: None,
     })
 }
 
@@ -1140,5 +1142,6 @@ pub fn build_language_module() -> Shared<ModuleObject> {
         exports,
         children,
         is_user: false,
+        live_globals: None,
     })
 }

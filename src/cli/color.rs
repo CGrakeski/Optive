@@ -5,6 +5,7 @@ use std::io::{self, IsTerminal};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static COLOR_ENABLED: AtomicBool = AtomicBool::new(false);
+static STATUS_QUIET: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorChoice {
@@ -94,9 +95,33 @@ pub fn dim(text: &str) -> String {
     paint(DIM, text)
 }
 
-/// 状态行：两格缩进 + 绿色（如 Project / Running）。
+/// 状态行：两格缩进 + 绿色（如 Project / Running）。写到 stderr，避免污染脚本 stdout。
 pub fn status_line(text: &str) {
-    println!("{}", green(&format!("  {text}")));
+    if STATUS_QUIET.load(Ordering::Relaxed) {
+        return;
+    }
+    eprintln!("{}", green(&format!("  {text}")));
+}
+
+pub fn set_quiet(quiet: bool) {
+    STATUS_QUIET.store(quiet, Ordering::Relaxed);
+}
+
+/// 从 argv 抽出 `--quiet`，返回 (quiet, 剩余参数含 program name)。
+pub fn take_quiet_arg(args: &[String]) -> (bool, Vec<String>) {
+    let mut quiet = false;
+    let mut out = Vec::with_capacity(args.len());
+    if let Some(first) = args.first() {
+        out.push(first.clone());
+    }
+    for a in args.iter().skip(1) {
+        if a == "--quiet" {
+            quiet = true;
+        } else {
+            out.push(a.clone());
+        }
+    }
+    (quiet, out)
 }
 
 pub fn eprint_error(msg: impl AsRef<str>) {

@@ -452,6 +452,8 @@ pub struct Vm {
     pub(crate) primitive_methods: FxHashMap<String, FxHashMap<String, BuiltinFn>>,
     user_call_frames: Vec<UserCallFrame>,
     user_call_deferred: bool,
+    /// 嵌套 `call_user_function` 已把任务纤程挂起；外层 Call 不得把 dummy None 当返回值。
+    pub(crate) nested_user_call_suspended: bool,
     script_global_names: Vec<String>,
     script_globals: Vec<Value>,
     /// 脚本顶层快局部槽数；0 表示未启用。
@@ -940,6 +942,7 @@ impl Vm {
             primitive_methods: FxHashMap::default(),
             user_call_frames: Vec::new(),
             user_call_deferred: false,
+            nested_user_call_suspended: false,
             script_global_names: Vec::new(),
             script_globals: Vec::new(),
             script_frame_slots: 0,
@@ -1686,7 +1689,7 @@ impl Vm {
         }
         ModuleGlobalEnv {
             global_names: self.script_global_names.clone(),
-            globals: crate::shared::SyncCell::new(map.into_iter().collect()),
+            globals: std::sync::Arc::new(crate::shared::SyncCell::new(map.into_iter().collect())),
             finalized: true,
         }
     }
@@ -3718,8 +3721,8 @@ impl Vm {
                 if self.cover_active {
                     crate::coverage::record_hit(self);
                 }
-                if self.pending_suspend {
-                    return self.complete_task_suspend();
+                if self.pending_suspend || self.nested_user_call_suspended {
+                    return self.take_task_suspend();
                 }
                 let pc = self.pc;
                 if pc >= code_len {
@@ -3770,8 +3773,8 @@ impl Vm {
                     }
                     HotFlow::Switched => {
                         self.tick_budget();
-                        if self.pending_suspend {
-                            return self.complete_task_suspend();
+                        if self.pending_suspend || self.nested_user_call_suspended {
+                            return self.take_task_suspend();
                         }
                         if self.pending_main_yield {
                             self.pending_main_yield = false;
@@ -3798,8 +3801,8 @@ impl Vm {
                             return self.finish_uncaught(e);
                         }
                         self.tick_budget();
-                        if self.pending_suspend {
-                            return self.complete_task_suspend();
+                        if self.pending_suspend || self.nested_user_call_suspended {
+                            return self.take_task_suspend();
                         }
                         if self.pending_main_yield {
                             self.pending_main_yield = false;
@@ -4647,18 +4650,7 @@ impl Vm {
                 self.call_args_buf.reverse();
                 let args = std::mem::take(&mut self.call_args_buf);
                 let result = self.call_value(callee, args)?;
-                if self.call_retry_armed {
-                    // arm_call_retry：栈上已是 callee/args，PC 已回绕；勿压返回值。
-                    self.call_retry_armed = false;
-                    return Ok(());
-                }
-                if !self.user_call_deferred && self.active_exception.is_none() {
-                    self.push_value(result);
-                }
-                // 协作让出：返回值已入栈，随后挂起纤程。
-                if self.pending_suspend {
-                    return Ok(());
-                }
+                self.finish_value_call(result)?;
             }
             StepAction::CallGlobal { global_idx, argc } => {
                 let callee = self.load_script_global(global_idx)?;
@@ -4670,16 +4662,7 @@ impl Vm {
                 self.call_args_buf.reverse();
                 let args = std::mem::take(&mut self.call_args_buf);
                 let result = self.call_value(callee, args)?;
-                if self.call_retry_armed {
-                    self.call_retry_armed = false;
-                    return Ok(());
-                }
-                if !self.user_call_deferred && self.active_exception.is_none() {
-                    self.push_value(result);
-                }
-                if self.pending_suspend {
-                    return Ok(());
-                }
+                self.finish_value_call(result)?;
             }
             StepAction::CallSelf { argc } => {
                 let func = self
@@ -4710,16 +4693,7 @@ impl Vm {
                     _ => return Err(RuntimeError::type_err("CallList requires arg list")),
                 };
                 let result = self.call_value(callee, args)?;
-                if self.call_retry_armed {
-                    self.call_retry_armed = false;
-                    return Ok(());
-                }
-                if !self.user_call_deferred && self.active_exception.is_none() {
-                    self.push_value(result);
-                }
-                if self.pending_suspend {
-                    return Ok(());
-                }
+                self.finish_value_call(result)?;
             }
             StepAction::CallEx => {
                 let callee = self.pop()?;
@@ -4734,16 +4708,7 @@ impl Vm {
                     _ => return Err(RuntimeError::type_err("CallEx requires kwargs dict")),
                 };
                 let result = self.call_value_ex(callee, positional, kwargs)?;
-                if self.call_retry_armed {
-                    self.call_retry_armed = false;
-                    return Ok(());
-                }
-                if !self.user_call_deferred && self.active_exception.is_none() {
-                    self.push_value(result);
-                }
-                if self.pending_suspend {
-                    return Ok(());
-                }
+                self.finish_value_call(result)?;
             }
             StepAction::MacroCall { argc } => {
                 let callee = self.pop()?;
@@ -6189,7 +6154,15 @@ impl Vm {
         }
         if let Some((_, _, target)) = best {
             return match target {
-                DispatchTarget::Function(func) => self.call_user_function(func, args),
+                DispatchTarget::Function(func) => {
+                    let bound = self.bind_call_arguments(&func, args, DictMap::new())?;
+                    if func.is_generator() {
+                        return self.make_generator_iterator(func, bound);
+                    }
+                    self.setup_user_call(func, bound, false)?;
+                    self.user_call_deferred = true;
+                    Ok(Value::None)
+                }
                 DispatchTarget::Builtin(b) => {
                     let out = b.call(self, &args)?;
                     if self.block_suspend {
@@ -6525,9 +6498,10 @@ impl Vm {
     ) -> Result<Value> {
         match self.call_user_function_poll(func, args)? {
             InterpResult::Value(v) => Ok(v.unwrap_or(Value::None)),
-            InterpResult::Suspended => Err(RuntimeError::msg(
-                "internal error: task suspended outside scheduler",
-            )),
+            InterpResult::Suspended => {
+                self.nested_user_call_suspended = true;
+                Ok(Value::None)
+            }
             InterpResult::DebugBreak => Err(RuntimeError::msg(
                 "internal error: debug break outside debugger session",
             )),
@@ -6535,6 +6509,36 @@ impl Vm {
                 "internal error: generator yield outside iterator",
             )),
         }
+    }
+
+    /// opcode Call 之后：处理重试、延迟调用、以及嵌套用户函数挂起。
+    fn finish_value_call(&mut self, result: Value) -> Result<()> {
+        if self.nested_user_call_suspended {
+            if self.task_ctx.is_none() {
+                self.pending_suspend = true;
+            }
+            return Ok(());
+        }
+        if self.call_retry_armed {
+            self.call_retry_armed = false;
+            return Ok(());
+        }
+        if !self.user_call_deferred && self.active_exception.is_none() {
+            self.push_value(result);
+        }
+        Ok(())
+    }
+
+    fn take_task_suspend(&mut self) -> Result<InterpResult> {
+        if self.task_ctx.is_some() {
+            return self.complete_task_suspend();
+        }
+        if self.nested_user_call_suspended {
+            self.nested_user_call_suspended = false;
+            self.pending_suspend = false;
+            return Ok(InterpResult::Suspended);
+        }
+        self.complete_task_suspend()
     }
 
     fn call_user_function_poll(
@@ -7908,6 +7912,7 @@ impl Vm {
             primitive_methods: self.primitive_methods.clone(),
             user_call_frames: Vec::new(),
             user_call_deferred: false,
+            nested_user_call_suspended: false,
             script_global_names: self.script_global_names.clone(),
             script_globals: self.script_globals.clone(),
             script_frame_slots: self.script_frame_slots,
@@ -8454,6 +8459,7 @@ impl Vm {
         let saved_block_suspend = self.block_suspend;
         let saved_call_retry = self.call_retry_armed;
         let saved_ucd = self.user_call_deferred;
+        let saved_nested_suspend = self.nested_user_call_suspended;
         self.pending_suspend = false;
         // 任务内阻塞挂起不得泄漏到调用方（主 fiber 的 Channel.recv 等），
         // 否则调用方会误走 arm_call_retry / 把栈上残留的 Task 当成 recv 结果。
@@ -8463,6 +8469,7 @@ impl Vm {
         // 跳过压栈返回值（如 `ch.recv()` 结果），栈顶残留值被误绑定。
         self.call_retry_armed = false;
         self.user_call_deferred = false;
+        self.nested_user_call_suspended = false;
         self.sched_depth = self.sched_depth.saturating_add(1);
 
         let run_result = (|| -> Result<Option<Value>> {
@@ -8578,6 +8585,7 @@ impl Vm {
         self.block_suspend = saved_block_suspend;
         self.call_retry_armed = saved_call_retry;
         self.user_call_deferred = saved_ucd;
+        self.nested_user_call_suspended = saved_nested_suspend;
         self.mn.notify_all();
         Ok(true)
     }
@@ -8732,6 +8740,9 @@ impl Vm {
                     self.block_suspend = false;
                     self.pending_poll_retry = Some((Value::Builtin(b), args));
                     return self.complete_task_suspend();
+                }
+                if self.nested_user_call_suspended {
+                    return Ok(InterpResult::Suspended);
                 }
                 Ok(InterpResult::Value(Some(out)))
             }

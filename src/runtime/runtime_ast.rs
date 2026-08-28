@@ -20,6 +20,7 @@ pub enum AstNodeKind {
     Unknown,
     Number,
     String,
+    FString,
     Bool,
     NoneLit,
     VarRef,
@@ -62,6 +63,7 @@ impl AstNodeKind {
         match self {
             Self::Number => Some("AstNumber"),
             Self::String => Some("AstString"),
+            Self::FString => Some("AstFString"),
             Self::Bool => Some("AstBool"),
             Self::VarRef => Some("AstVarRef"),
             Self::Unary => Some("AstUnary"),
@@ -85,6 +87,7 @@ pub fn annotation_to_kind(name: &str) -> Option<AstNodeKind> {
         "VarRefNode" | "AstVarRef" => Some(AstNodeKind::VarRef),
         "NumberNode" | "AstNumber" => Some(AstNodeKind::Number),
         "StringNode" | "AstString" => Some(AstNodeKind::String),
+        "FStringNode" | "AstFString" => Some(AstNodeKind::FString),
         "BoolNode" | "AstBool" => Some(AstNodeKind::Bool),
         "UnaryNode" | "AstUnary" => Some(AstNodeKind::Unary),
         "BinaryNode" | "AstBinary" => Some(AstNodeKind::Binary),
@@ -166,16 +169,20 @@ pub fn ast_from_expr(expr: &Expr) -> RuntimeAstNode {
             ..default_node()
         },
         ExprKind::FString(parts) => {
-            let mut text = String::new();
+            let mut children = Vec::new();
             for part in parts {
                 match part {
-                    crate::ast::FStringPart::Text(s) => text.push_str(s),
-                    crate::ast::FStringPart::Expr(_) => text.push_str("{...}"),
+                    crate::ast::FStringPart::Text(s) => children.push(RuntimeAstNode {
+                        kind: AstNodeKind::String,
+                        text: s.clone(),
+                        ..default_node()
+                    }),
+                    crate::ast::FStringPart::Expr(e) => children.push(ast_from_expr(e)),
                 }
             }
             RuntimeAstNode {
-                kind: AstNodeKind::String,
-                text,
+                kind: AstNodeKind::FString,
+                children,
                 ..default_node()
             }
         }
@@ -826,9 +833,84 @@ pub fn quote_binding_to_value(node: &RuntimeAstNode) -> Result<Value> {
     }
 }
 
+fn source_string_lit(s: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn source_fstring(node: &RuntimeAstNode) -> String {
+    let mut out = String::from("f\"");
+    for child in &node.children {
+        if child.kind == AstNodeKind::String {
+            for ch in child.text.chars() {
+                match ch {
+                    '\\' => out.push_str("\\\\"),
+                    '"' => out.push_str("\\\""),
+                    '{' => out.push_str("{{"),
+                    '}' => out.push_str("}}"),
+                    '\n' => out.push_str("\\n"),
+                    c => out.push(c),
+                }
+            }
+        } else {
+            out.push('{');
+            out.push_str(&ast_to_source(child));
+            out.push('}');
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn source_call_arg(arg: &AstCallArg) -> String {
+    let mut out = String::new();
+    if arg.is_splat {
+        out.push('*');
+    }
+    if !arg.kw_name.is_empty() {
+        out.push_str(&arg.kw_name);
+        out.push_str(": ");
+    }
+    out.push_str(&ast_to_source(&arg.value));
+    out
+}
+
+fn source_quote(node: &RuntimeAstNode) -> String {
+    let mut out = String::from("quote");
+    if !node.hygienic_names.is_empty() {
+        out.push('(');
+        out.push_str(&node.hygienic_names.join(", "));
+        out.push(')');
+    }
+    if !node.bindings.is_empty() {
+        out.push_str(" with (");
+        let binds: Vec<String> = node.bindings.iter().map(ast_to_source).collect();
+        out.push_str(&binds.join(", "));
+        out.push(')');
+    }
+    out.push_str(" { ");
+    out.push_str(&slot_str(node.slot_a.as_deref()));
+    out.push_str(" }");
+    out
+}
+
 pub fn ast_to_source(node: &RuntimeAstNode) -> String {
     match node.kind {
-        AstNodeKind::Number | AstNodeKind::String => node.text.clone(),
+        AstNodeKind::Number => node.text.clone(),
+        AstNodeKind::String => source_string_lit(&node.text),
+        AstNodeKind::FString => source_fstring(node),
         AstNodeKind::Bool => node.bool_val.to_string(),
         AstNodeKind::NoneLit => "none".into(),
         AstNodeKind::VarRef => node.text.clone(),
@@ -842,9 +924,9 @@ pub fn ast_to_source(node: &RuntimeAstNode) -> String {
         AstNodeKind::FuncCall | AstNodeKind::MacroCall => {
             let callee = slot_str(node.slot_a.as_deref());
             let args = node
-                .children
+                .call_args
                 .iter()
-                .map(ast_to_source)
+                .map(source_call_arg)
                 .collect::<Vec<_>>()
                 .join(", ");
             if node.kind == AstNodeKind::MacroCall {
@@ -872,9 +954,7 @@ pub fn ast_to_source(node: &RuntimeAstNode) -> String {
                 .join(", ");
             format!("[{items}]")
         }
-        AstNodeKind::QuoteExpr => {
-            format!("quote({})", slot_str(node.slot_a.as_deref()))
-        }
+        AstNodeKind::QuoteExpr => source_quote(node),
         AstNodeKind::BlockStmt => node
             .stmts
             .iter()
@@ -1277,6 +1357,17 @@ fn ast_to_expr(node: &RuntimeAstNode) -> Result<Expr> {
     match node.kind {
         AstNodeKind::Number => Ok(Expr::at(0, 1, ExprKind::Number(node.text.clone()))),
         AstNodeKind::String => Ok(Expr::at(0, 1, ExprKind::String(node.text.clone()))),
+        AstNodeKind::FString => {
+            let mut parts = Vec::new();
+            for child in &node.children {
+                if child.kind == AstNodeKind::String {
+                    parts.push(crate::ast::FStringPart::Text(child.text.clone()));
+                } else {
+                    parts.push(crate::ast::FStringPart::Expr(Box::new(ast_to_expr(child)?)));
+                }
+            }
+            Ok(Expr::at(0, 1, ExprKind::FString(parts)))
+        }
         AstNodeKind::Bool => Ok(Expr::at(0, 1, ExprKind::Bool(node.bool_val))),
         AstNodeKind::NoneLit => Ok(Expr::at(0, 1, ExprKind::None)),
         AstNodeKind::VarRef => Ok(Expr::at(0, 1, ExprKind::Var(node.text.clone()))),

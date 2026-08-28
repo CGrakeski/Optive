@@ -63,6 +63,7 @@ pub fn install_globals(vm: &mut Vm) {
         ("__merge_kwargs__", builtin_merge_kwargs),
         ("__variant_is__", builtin_variant_is),
         ("__variant_payload__", builtin_variant_payload),
+        ("__struct_slot__", builtin_struct_slot),
         ("__finalize_enum__", builtin_finalize_enum),
     ];
     for (name, f) in builtins {
@@ -835,6 +836,40 @@ fn builtin_variant_payload(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         Value::Variant(v) => Ok(v.payload.clone()),
         other => Err(crate::error::RuntimeError::type_err(format!(
             "__variant_payload__ expects variant, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+fn builtin_struct_slot(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(crate::error::RuntimeError::type_err(
+            "__struct_slot__ expects (value, index)",
+        ));
+    }
+    let idx = crate::value::expect_i64("__struct_slot__", &args[1])?;
+    if idx < 0 {
+        return Err(crate::error::RuntimeError::value_err(
+            "__struct_slot__: index must be >= 0",
+        ));
+    }
+    let payload = match &args[0] {
+        Value::Variant(v) => &v.payload,
+        other => other,
+    };
+    match payload {
+        Value::Struct(s) => s
+            .slots
+            .borrow()
+            .get(idx as usize)
+            .cloned()
+            .ok_or_else(|| {
+                crate::error::RuntimeError::value_err(format!(
+                    "__struct_slot__: index {idx} out of range"
+                ))
+            }),
+        other => Err(crate::error::RuntimeError::type_err(format!(
+            "__struct_slot__ expects struct (or variant wrapping one), got {}",
             other.type_name()
         ))),
     }

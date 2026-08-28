@@ -53,6 +53,7 @@ pub enum CliMsg {
     HelpIndexChange,
     HelpCustom,
     HelpCapsHeader,
+    HelpQuiet,
     HelpSandbox,
     HelpNoNetwork,
     HelpNoFfi,
@@ -144,6 +145,7 @@ impl CliMsg {
             Self::HelpIndexChange => "cli.help.index_change",
             Self::HelpCustom => "cli.help.custom",
             Self::HelpCapsHeader => "cli.help.caps_header",
+            Self::HelpQuiet => "cli.help.quiet",
             Self::HelpSandbox => "cli.help.sandbox",
             Self::HelpNoNetwork => "cli.help.no_network",
             Self::HelpNoFfi => "cli.help.no_ffi",
@@ -206,6 +208,7 @@ impl CliMsg {
             Self::HelpIndexChange => "  Optive index change <url>      Set index git remote + sync",
             Self::HelpCustom => "  Optive custom ...                Manage customization packs",
             Self::HelpCapsHeader => "Runtime capability flags (apply to run / up / debug / test / <script> / -c):",
+            Self::HelpQuiet => "  --quiet                  Silence Project / Running status lines (stderr)",
             Self::HelpSandbox => "  --sandbox[=DIR]          No network, no env, no FFI; fs limited to DIR (default: cwd)",
             Self::HelpNoNetwork => "  --no-network            Disable std.http / std.net",
             Self::HelpNoFfi => {
