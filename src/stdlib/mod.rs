@@ -239,6 +239,7 @@ pub fn build_std_module() -> Shared<ModuleObject> {
         children: std_children,
         is_user: false,
         live_globals: None,
+        ..Default::default()
     })
 }
 
@@ -273,6 +274,7 @@ pub(crate) fn submodule(name: &str, entries: &[(&str, Value)]) -> Shared<ModuleO
         children: HashMap::new(),
         is_user: false,
         live_globals: None,
+        ..Default::default()
     })
 }
 
@@ -701,6 +703,7 @@ fn build_sync_module() -> Shared<ModuleObject> {
         children: HashMap::new(),
         is_user: false,
         live_globals: None,
+        ..Default::default()
     })
 }
 
@@ -1631,6 +1634,7 @@ fn re_compile(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         children: HashMap::new(),
         is_user: false,
         live_globals: None,
+        ..Default::default()
     })))
 }
 

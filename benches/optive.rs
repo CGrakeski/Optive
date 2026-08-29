@@ -19,7 +19,7 @@ func fib(n) {
     if (n <= 1) { return n }
     return fib(n - 1) + fib(n - 2)
 }
-fib(30)
+fib(35)
 ";
 
 const EMPTY_LOOP: &str = r"
@@ -249,7 +249,7 @@ fn bench_run_source(c: &mut Criterion, name: &str, src: &'static str) {
 }
 
 fn bench_fib(c: &mut Criterion) {
-    bench_run_source(c, "fib(30)", FIB);
+    bench_run_source(c, "fib(35)", FIB);
 }
 
 fn bench_empty_loop(c: &mut Criterion) {

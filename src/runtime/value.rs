@@ -11,7 +11,7 @@ use crate::opcode::FunctionObject;
 use crate::opcode::MacroObject;
 use crate::runtime_ast::RuntimeAstNode;
 use crate::shared::{Shared, SyncCell};
-use crate::Result;
+use crate::{error, Result};
 
 /// `Num::{floor,ceil,trunc,round}_num`：整数原样，有理数走 `BigRational` 对应方法。
 macro_rules! num_rat_round {
@@ -285,10 +285,11 @@ pub fn builtin_repr(name: &str) -> String {
     format!("<builtin {name}>")
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ModuleObject {
     pub name: String,
     pub exports: HashMap<String, Value>,
+    pub all_attrs: HashMap<String, Value>,
     pub children: HashMap<String, Shared<Self>>,
     pub is_user: bool,
     /// 用户模块：与 [`crate::opcode::ModuleGlobalEnv::globals`] 同一 `Arc` 格，
@@ -302,6 +303,7 @@ impl ModuleObject {
         Self {
             name,
             exports: HashMap::new(),
+            all_attrs: HashMap::new(),
             children: HashMap::new(),
             is_user: true,
             live_globals: None,
@@ -335,6 +337,16 @@ impl ModuleObject {
             Value::Cell(c) => c.borrow().clone(),
             other => other,
         })
+    }
+
+    fn make_visible(&self, name: &str) -> Result<Value> {
+        if self.all_attrs.contains_key(name) {
+            Ok(self.all_attrs.get(name).unwrap().clone())
+        } else {
+            Err(error::RuntimeError::attr_err(
+                format!("No attr named `{}` found in `{}`", name, self.name)
+            ))
+        }
     }
 }
 

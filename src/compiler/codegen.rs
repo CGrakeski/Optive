@@ -45,7 +45,7 @@ enum OpenHandler {
 }
 
 pub struct Generator {
-    cg: Codegen,
+    codegen: Codegen,
     program: CompiledProgram,
     loop_break_labels: Vec<usize>,
     loop_continue_labels: Vec<usize>,
@@ -87,7 +87,7 @@ impl Generator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            cg: Codegen::new(),
+            codegen: Codegen::new(),
             program: CompiledProgram::new(),
             loop_break_labels: Vec::new(),
             loop_continue_labels: Vec::new(),
@@ -215,21 +215,21 @@ impl Generator {
             .filter_map(|p| p.default_expr.as_ref())
             .collect();
         if default_exprs.is_empty() {
-            self.cg
+            self.codegen
                 .emit(Instruction::Push(Value::Function(Arc::new(func))));
         } else {
             for expr in &default_exprs {
                 self.gen_expr(expr)?;
             }
-            self.cg.emit(Instruction::VecNew(default_exprs.len()));
-            self.cg
+            self.codegen.emit(Instruction::VecNew(default_exprs.len()));
+            self.codegen
                 .emit(Instruction::Push(Value::Function(Arc::new(func))));
-            self.cg
+            self.codegen
                 .emit(Instruction::Load("__attach_defaults__".into()));
-            self.cg.emit(Instruction::Call { argc: 2 });
+            self.codegen.emit(Instruction::Call { argc: 2 });
         }
         // 定义处绑定类型注解（须为类型；未绑定名在此失败）。
-        self.cg.emit(Instruction::ResolveFuncTypes);
+        self.codegen.emit(Instruction::ResolveFuncTypes);
         Ok(())
     }
 
@@ -240,8 +240,8 @@ impl Generator {
         mutate_args: bool,
         f: impl FnOnce(&mut Self) -> Result<()>,
     ) -> Result<()> {
-        let args_tmp = self.cg.fresh_temp("__call_args");
-        let kw_tmp = self.cg.fresh_temp("__call_kwargs");
+        let args_tmp = self.codegen.fresh_temp("__call_args");
+        let kw_tmp = self.codegen.fresh_temp("__call_kwargs");
         self.emit_store_temp(&kw_tmp);
         self.emit_store_temp(&args_tmp);
         if mutate_args {
@@ -262,32 +262,32 @@ impl Generator {
 
     /// `生成位置参数列表与关键字参数字典（栈：args_list`, `kwargs_dict`）。
     fn gen_call_args_and_kwargs(&mut self, args: &[CallArg]) -> Result<()> {
-        self.cg.emit(Instruction::VecNew(0));
-        self.cg.emit(Instruction::DictNew(0));
+        self.codegen.emit(Instruction::VecNew(0));
+        self.codegen.emit(Instruction::DictNew(0));
         for a in args {
             if a.is_kwsplat {
                 // kwargs = update(kwargs, dict) — 合并关键字参数字典
                 self.gen_expr(&a.value)?;
-                self.cg.emit(Instruction::Load("__merge_kwargs__".into()));
-                self.cg.emit(Instruction::Call { argc: 2 });
+                self.codegen.emit(Instruction::Load("__merge_kwargs__".into()));
+                self.codegen.emit(Instruction::Call { argc: 2 });
             } else if let Some(name) = &a.name {
                 // kwargs[name] = value；保留 kwargs 在栈上
                 self.with_call_arg_temps(false, |this| {
-                    this.cg.emit(Instruction::Push(Value::Text(name.clone())));
+                    this.codegen.emit(Instruction::Push(Value::Text(name.clone())));
                     this.gen_expr(&a.value)?;
-                    this.cg.emit(Instruction::DictSet);
+                    this.codegen.emit(Instruction::DictSet);
                     Ok(())
                 })?;
             } else if a.is_splat {
                 self.with_call_arg_temps(true, |this| {
                     this.gen_expr(&a.value)?;
-                    this.cg.emit(Instruction::ListExtend);
+                    this.codegen.emit(Instruction::ListExtend);
                     Ok(())
                 })?;
             } else {
                 self.with_call_arg_temps(true, |this| {
                     this.gen_expr(&a.value)?;
-                    this.cg.emit(Instruction::ListAppend);
+                    this.codegen.emit(Instruction::ListAppend);
                     Ok(())
                 })?;
             }
@@ -339,7 +339,7 @@ impl Generator {
     fn emit_bind_name_flags(&mut self, name: &str, is_const: bool) {
         if self.current_func.is_some() && self.local_slots.is_some() {
             let slot = self.ensure_local_slot(name);
-            self.cg.emit(Instruction::BindFast {
+            self.codegen.emit(Instruction::BindFast {
                 slot,
                 name: name.to_string(),
                 is_const,
@@ -347,10 +347,10 @@ impl Generator {
             return;
         }
         if let Some(slot) = self.script_fast_slot(name) {
-            self.cg.emit(Instruction::StoreFast(slot));
+            self.codegen.emit(Instruction::StoreFast(slot));
             return;
         }
-        self.cg.emit(Instruction::NewVar {
+        self.codegen.emit(Instruction::NewVar {
             name: name.to_string(),
             is_const,
         });
@@ -362,26 +362,26 @@ impl Generator {
     fn emit_store_temp(&mut self, name: &str) {
         if self.local_slots.is_some() {
             let slot = self.ensure_local_slot(name);
-            self.cg.emit(Instruction::StoreFast(slot));
+            self.codegen.emit(Instruction::StoreFast(slot));
         } else {
             if self.declared_temps.insert(name.to_string()) {
-                self.cg.emit(Instruction::NewVar {
+                self.codegen.emit(Instruction::NewVar {
                     name: name.to_string(),
                     is_const: false,
                 });
             }
-            self.cg.emit(Instruction::Store(name.to_string()));
+            self.codegen.emit(Instruction::Store(name.to_string()));
         }
     }
 
     fn emit_load_temp(&mut self, name: &str) {
         if let Some(slots) = &self.local_slots {
             if let Some(&slot) = slots.get(name) {
-                self.cg.emit(Instruction::LoadFast(slot));
+                self.codegen.emit(Instruction::LoadFast(slot));
                 return;
             }
         }
-        self.cg.emit(Instruction::Load(name.to_string()));
+        self.codegen.emit(Instruction::Load(name.to_string()));
     }
 
     fn emit_load_name(&mut self, name: &str) {
@@ -394,68 +394,68 @@ impl Generator {
                 && (self.program.struct_defs.contains_key(name)
                     || crate::type_registry::is_registered_primitive(name))
             {
-                self.cg
+                self.codegen
                     .emit(Instruction::Push(Value::type_ref(name.to_string())));
                 return;
             }
             if let Some(slot) = local_binding {
-                self.cg.emit(Instruction::LoadFast(slot));
+                self.codegen.emit(Instruction::LoadFast(slot));
                 return;
             }
             if self.captured_names.contains(name) {
-                self.cg.emit(Instruction::Load(name.to_string()));
+                self.codegen.emit(Instruction::Load(name.to_string()));
                 return;
             }
             let slot = self.global_slot(name);
-            self.cg.emit(Instruction::LoadGlobal(slot));
+            self.codegen.emit(Instruction::LoadGlobal(slot));
             return;
         }
         if self.script_fast_slot(name).is_none()
             && (self.program.struct_defs.contains_key(name)
                 || crate::type_registry::is_registered_primitive(name))
         {
-            self.cg
+            self.codegen
                 .emit(Instruction::Push(Value::type_ref(name.to_string())));
             return;
         }
         if let Some(slot) = self.script_fast_slot(name) {
-            self.cg.emit(Instruction::LoadFast(slot));
+            self.codegen.emit(Instruction::LoadFast(slot));
             return;
         }
         if self.macro_depth > 0 || self.block_depth > 0 {
-            self.cg.emit(Instruction::Load(name.to_string()));
+            self.codegen.emit(Instruction::Load(name.to_string()));
             return;
         }
         let slot = self.global_slot(name);
-        self.cg.emit(Instruction::LoadGlobal(slot));
+        self.codegen.emit(Instruction::LoadGlobal(slot));
     }
 
     fn emit_store_name(&mut self, name: &str) {
         if self.current_func.is_some() {
             if let Some(slots) = &self.local_slots {
                 if let Some(&slot) = slots.get(name) {
-                    self.cg.emit(Instruction::StoreFast(slot));
+                    self.codegen.emit(Instruction::StoreFast(slot));
                     return;
                 }
             }
             if self.captured_names.contains(name) {
-                self.cg.emit(Instruction::Store(name.to_string()));
+                self.codegen.emit(Instruction::Store(name.to_string()));
                 return;
             }
             let slot = self.global_slot(name);
-            self.cg.emit(Instruction::StoreGlobal(slot));
+            self.codegen.emit(Instruction::StoreGlobal(slot));
             return;
         }
         if let Some(slot) = self.script_fast_slot(name) {
-            self.cg.emit(Instruction::StoreFast(slot));
+            self.codegen.emit(Instruction::StoreFast(slot));
             return;
         }
         if self.macro_depth > 0 || self.block_depth > 0 {
-            self.cg.emit(Instruction::Store(name.to_string()));
+            self.codegen.emit(Instruction::Store(name.to_string()));
             return;
         }
         let slot = self.global_slot(name);
-        self.cg.emit(Instruction::StoreGlobal(slot));
+        self.codegen.emit(Instruction::StoreGlobal(slot));
     }
 
     fn expr_is_generic_type_formable(&self, expr: &Expr) -> bool {
@@ -471,19 +471,19 @@ impl Generator {
     fn gen_type_index_operand(&mut self, expr: &Expr) -> Result<()> {
         match &expr.kind {
             ExprKind::Var(name) => {
-                self.cg
+                self.codegen
                     .emit(Instruction::Push(Value::type_ref(name.clone())));
             }
             ExprKind::Index { object, index } => {
                 self.gen_type_index_operand(object)?;
                 self.gen_type_index_operand(index)?;
-                self.cg.emit(Instruction::Index);
+                self.codegen.emit(Instruction::Index);
             }
             ExprKind::List(elems) => {
                 for e in elems {
                     self.gen_type_index_operand(e)?;
                 }
-                self.cg.emit(Instruction::VecNew(elems.len()));
+                self.codegen.emit(Instruction::VecNew(elems.len()));
             }
             _ => self.gen_expr(expr)?,
         }
@@ -525,18 +525,18 @@ impl Generator {
             self.program.script_frame_slots = self.next_local_slot;
             self.program.script_local_to_global = flush;
         }
-        self.cg.emit(Instruction::Ret);
-        self.cg.patch_labels().map_err(RuntimeError::msg)?;
-        crate::specialize::specialize_instructions(&mut self.cg.code);
-        let (compacted, remap) = crate::opcode::compact_bytecode(std::mem::take(&mut self.cg.code));
+        self.codegen.emit(Instruction::Ret);
+        self.codegen.patch_labels().map_err(RuntimeError::msg)?;
+        crate::specialize::specialize_instructions(&mut self.codegen.code);
+        let (compacted, remap) = crate::opcode::compact_bytecode(std::mem::take(&mut self.codegen.code));
         let (fused, remap2) = crate::opcode::peephole_fuse(compacted);
-        self.cg.code = fused;
-        crate::stack_effect::verify_compiled("script", &self.cg.code)?;
-        self.program.code = std::mem::take(&mut self.cg.code);
+        self.codegen.code = fused;
+        crate::stack_effect::verify_compiled("script", &self.codegen.code)?;
+        self.program.code = std::mem::take(&mut self.codegen.code);
         self.program.hot = crate::hot_code::HotCode::encode(&self.program.code);
-        let lm = crate::opcode::compact_parallel(&self.cg.line_map, &remap);
+        let lm = crate::opcode::compact_parallel(&self.codegen.line_map, &remap);
         self.program.line_map = crate::opcode::compact_parallel(&lm, &remap2);
-        let cm = crate::opcode::compact_parallel(&self.cg.column_map, &remap);
+        let cm = crate::opcode::compact_parallel(&self.codegen.column_map, &remap);
         self.program.column_map = crate::opcode::compact_parallel(&cm, &remap2);
         self.attach_compile_global_envs();
         Ok(self.program)
@@ -686,7 +686,7 @@ impl Generator {
 
     fn emit_type_check(&mut self, ty: &Expr) -> Result<()> {
         self.gen_expr(ty)?;
-        self.cg.emit(Instruction::TypeCheck);
+        self.codegen.emit(Instruction::TypeCheck);
         Ok(())
     }
 
@@ -697,12 +697,12 @@ impl Generator {
     fn maybe_register_export(&mut self, visibility: Visibility, name: &str, top_level: bool) {
         // 历史语义：无修饰符与 `export` 均注册为导出；仅 `intern` 不导出。
         if top_level && visibility != Visibility::Internal {
-            self.cg.emit(Instruction::RegisterExport(name.to_string()));
+            self.codegen.emit(Instruction::RegisterExport(name.to_string()));
         }
     }
 
     fn gen_stmt(&mut self, located: &LocatedStmt, top_level: bool) -> Result<()> {
-        self.cg.set_loc(located.line, located.column);
+        self.codegen.set_loc(located.line, located.column);
         let stmt = &located.stmt;
         match stmt {
             Stmt::VarDecl {
@@ -724,9 +724,9 @@ impl Generator {
                             }
                         }
                     } else {
-                        self.cg.emit(Instruction::Push(Value::None));
+                        self.codegen.emit(Instruction::Push(Value::None));
                     }
-                    self.cg.emit(Instruction::BindFast {
+                    self.codegen.emit(Instruction::BindFast {
                         slot,
                         name: name.clone(),
                         is_const: *is_const,
@@ -735,7 +735,7 @@ impl Generator {
                     if let Some(set) = self.block_shadows.last_mut() {
                         set.insert(name.clone());
                     }
-                    self.cg.emit(Instruction::NewVar {
+                    self.codegen.emit(Instruction::NewVar {
                         name: name.clone(),
                         is_const: *is_const,
                     });
@@ -757,12 +757,12 @@ impl Generator {
                             }
                         }
                     } else {
-                        self.cg.emit(Instruction::Push(Value::None));
+                        self.codegen.emit(Instruction::Push(Value::None));
                     }
                     let slot = self.ensure_local_slot(name);
-                    self.cg.emit(Instruction::StoreFast(slot));
+                    self.codegen.emit(Instruction::StoreFast(slot));
                 } else {
-                    self.cg.emit(Instruction::NewVar {
+                    self.codegen.emit(Instruction::NewVar {
                         name: name.clone(),
                         is_const: *is_const,
                     });
@@ -806,13 +806,13 @@ impl Generator {
                 LValue::Member { object, field } => {
                     self.gen_expr(object)?;
                     self.gen_expr(value)?;
-                    self.cg.emit(Instruction::SetField(field.clone()));
+                    self.codegen.emit(Instruction::SetField(field.clone()));
                 }
                 LValue::Index { object, index } => {
                     self.gen_expr(object)?;
                     self.gen_expr(index)?;
                     self.gen_expr(value)?;
-                    self.cg.emit(Instruction::IndexSet);
+                    self.codegen.emit(Instruction::IndexSet);
                 }
                 LValue::Slice {
                     object,
@@ -825,7 +825,7 @@ impl Generator {
                     self.gen_slice_bound(end.as_deref())?;
                     self.gen_slice_bound(step.as_deref())?;
                     self.gen_expr(value)?;
-                    self.cg.emit(Instruction::SliceSet);
+                    self.codegen.emit(Instruction::SliceSet);
                 }
                 LValue::Name(name) => {
                     self.gen_expr(value)?;
@@ -878,12 +878,12 @@ impl Generator {
                     self.emit_function_value_with_defaults(params, func)?;
                     if !free.is_empty() {
                         for fname in &free {
-                            self.cg.emit(Instruction::Push(Value::Text(fname.clone())));
+                            self.codegen.emit(Instruction::Push(Value::Text(fname.clone())));
                             self.emit_load_name(fname);
                         }
-                        self.cg.emit(Instruction::DictNew(free.len()));
-                        self.cg.emit(Instruction::Load("__make_closure__".into()));
-                        self.cg.emit(Instruction::Call { argc: 2 });
+                        self.codegen.emit(Instruction::DictNew(free.len()));
+                        self.codegen.emit(Instruction::Load("__make_closure__".into()));
+                        self.codegen.emit(Instruction::Call { argc: 2 });
                     }
                 } else {
                     let template = Arc::new(GenericFunctionTemplate {
@@ -901,15 +901,15 @@ impl Generator {
                     self.program
                         .generic_functions
                         .insert(name.clone(), template.clone());
-                    self.cg
+                    self.codegen
                         .emit(Instruction::Push(Value::GenericFunction(template)));
                 }
                 self.gen_apply_decorators(decorators)?;
                 if self.is_fast_local(name) {
                     let slot = self.ensure_local_slot(name);
-                    self.cg.emit(Instruction::StoreFast(slot));
+                    self.codegen.emit(Instruction::StoreFast(slot));
                 } else {
-                    self.cg.emit(Instruction::NewVar {
+                    self.codegen.emit(Instruction::NewVar {
                         name: name.clone(),
                         is_const: false,
                     });
@@ -927,9 +927,9 @@ impl Generator {
                     members.clone(),
                 ));
                 self.program.protocols.insert(name.clone(), def);
-                self.cg
+                self.codegen
                     .emit(Instruction::Push(Value::type_ref(name.clone())));
-                self.cg.emit(Instruction::NewVar {
+                self.codegen.emit(Instruction::NewVar {
                     name: name.clone(),
                     is_const: true,
                 });
@@ -946,12 +946,12 @@ impl Generator {
                 self.program
                     .macros
                     .insert(name.clone(), Arc::new(mac.clone()));
-                self.cg.emit(Instruction::Push(Value::Macro(Arc::new(mac))));
-                self.cg.emit(Instruction::NewVar {
+                self.codegen.emit(Instruction::Push(Value::Macro(Arc::new(mac))));
+                self.codegen.emit(Instruction::NewVar {
                     name: name.clone(),
                     is_const: false,
                 });
-                self.cg.emit(Instruction::Store(name.clone()));
+                self.codegen.emit(Instruction::Store(name.clone()));
                 self.maybe_register_export(*visibility, name, top_level);
             }
             Stmt::FriendFuncDecl {
@@ -976,18 +976,18 @@ impl Generator {
                             is_generator: false,
                         },
                     )?;
-                    self.cg.emit(Instruction::Push(Value::Text(name.clone())));
-                    self.cg
+                    self.codegen.emit(Instruction::Push(Value::Text(name.clone())));
+                    self.codegen
                         .emit(Instruction::Push(Value::Function(Arc::new(handler))));
-                    self.cg.emit(Instruction::ResolveFuncTypes);
-                    self.cg
+                    self.codegen.emit(Instruction::ResolveFuncTypes);
+                    self.codegen
                         .emit(Instruction::Load("__register_dispatch_handler__".into()));
-                    self.cg.emit(Instruction::Call { argc: 2 });
+                    self.codegen.emit(Instruction::Call { argc: 2 });
                 } else {
-                    self.cg.emit(Instruction::Push(Value::Text(name.clone())));
-                    self.cg
+                    self.codegen.emit(Instruction::Push(Value::Text(name.clone())));
+                    self.codegen
                         .emit(Instruction::Load("__ensure_dispatch__".into()));
-                    self.cg.emit(Instruction::Call { argc: 1 });
+                    self.codegen.emit(Instruction::Call { argc: 1 });
                 }
                 self.maybe_register_export(*visibility, name, top_level);
             }
@@ -996,9 +996,9 @@ impl Generator {
                     // 8B：`return expr` ≡ 再 yield 一次后结束；裸 return 直接结束。
                     if let Some(e) = expr {
                         self.gen_expr(e)?;
-                        self.cg.emit(Instruction::Yield);
+                        self.codegen.emit(Instruction::Yield);
                     }
-                    self.cg.emit(Instruction::Push(Value::None));
+                    self.codegen.emit(Instruction::Push(Value::None));
                     self.gen_return_from_tos()?;
                 } else {
                     self.gen_return_expr(expr.as_ref())?;
@@ -1013,9 +1013,9 @@ impl Generator {
                 if let Some(e) = expr {
                     self.gen_expr(e)?;
                 } else {
-                    self.cg.emit(Instruction::Push(Value::None));
+                    self.codegen.emit(Instruction::Push(Value::None));
                 }
-                self.cg.emit(Instruction::Yield);
+                self.codegen.emit(Instruction::Yield);
             }
             Stmt::YieldFrom(expr) => {
                 if !self.yielding {
@@ -1024,14 +1024,14 @@ impl Generator {
                     ));
                 }
                 self.gen_expr(expr)?;
-                self.cg.emit(Instruction::YieldFrom);
+                self.codegen.emit(Instruction::YieldFrom);
             }
             Stmt::Expr(e) => {
                 self.gen_expr(e)?;
                 if top_level {
                     // 顶层保留栈顶值供 REPL / 最后结果
                 } else {
-                    self.cg.emit(Instruction::Pop);
+                    self.codegen.emit(Instruction::Pop);
                 }
             }
             Stmt::If {
@@ -1043,11 +1043,11 @@ impl Generator {
                 self.gen_if(cond, then_block, elifs, else_block.as_ref(), top_level)?;
             }
             Stmt::While { cond, body } => {
-                let start = self.cg.fresh_label();
-                let end = self.cg.fresh_label();
-                self.cg.mark_label(start);
+                let start = self.codegen.fresh_label();
+                let end = self.codegen.fresh_label();
+                self.codegen.mark_label(start);
                 self.gen_expr(cond)?;
-                let jmp = self.cg.emit(Instruction::GotoIfNot(end));
+                let jmp = self.codegen.emit(Instruction::GotoIfNot(end));
                 self.loop_break_labels.push(end);
                 self.loop_continue_labels.push(start);
                 self.loop_handler_depths.push(self.handler_stack.len());
@@ -1059,21 +1059,21 @@ impl Generator {
                 self.loop_continue_labels.pop();
                 self.loop_handler_depths.pop();
                 self.loop_owns_stack_counter.pop();
-                self.cg.emit(Instruction::Goto(start));
-                self.cg.mark_label(end);
+                self.codegen.emit(Instruction::Goto(start));
+                self.codegen.mark_label(end);
                 let _ = jmp;
             }
             Stmt::Loop { count, body } => {
-                let start = self.cg.fresh_label();
-                let end = self.cg.fresh_label();
+                let start = self.codegen.fresh_label();
+                let end = self.codegen.fresh_label();
                 let owns_counter = count.is_some();
                 if let Some(c) = count {
                     self.gen_expr(c)?;
                 }
-                self.cg.mark_label(start);
+                self.codegen.mark_label(start);
                 if owns_counter {
-                    let done = self.cg.fresh_label();
-                    self.cg.emit(Instruction::LoopCountdown(done));
+                    let done = self.codegen.fresh_label();
+                    self.codegen.emit(Instruction::LoopCountdown(done));
                     self.loop_break_labels.push(end);
                     self.loop_continue_labels.push(start);
                     self.loop_handler_depths.push(self.handler_stack.len());
@@ -1085,10 +1085,10 @@ impl Generator {
                     self.loop_continue_labels.pop();
                     self.loop_handler_depths.pop();
                     self.loop_owns_stack_counter.pop();
-                    self.cg.emit(Instruction::Goto(start));
-                    self.cg.mark_label(done);
+                    self.codegen.emit(Instruction::Goto(start));
+                    self.codegen.mark_label(done);
                     // break 跳向 `end`；与 `done` 同 PC，否则 patch_labels 报 undefined label。
-                    self.cg.mark_label(end);
+                    self.codegen.mark_label(end);
                 } else {
                     self.loop_break_labels.push(end);
                     self.loop_continue_labels.push(start);
@@ -1101,8 +1101,8 @@ impl Generator {
                     self.loop_continue_labels.pop();
                     self.loop_handler_depths.pop();
                     self.loop_owns_stack_counter.pop();
-                    self.cg.emit(Instruction::Goto(start));
-                    self.cg.mark_label(end);
+                    self.codegen.emit(Instruction::Goto(start));
+                    self.codegen.mark_label(end);
                 }
             }
             Stmt::For { items, body } => {
@@ -1123,9 +1123,9 @@ impl Generator {
                     .ok_or_else(|| RuntimeError::msg("break outside loop"))?;
                 self.emit_handler_exit_cleanups(depth);
                 if owns_counter {
-                    self.cg.emit(Instruction::Pop);
+                    self.codegen.emit(Instruction::Pop);
                 }
-                self.cg.emit(Instruction::Goto(lbl));
+                self.codegen.emit(Instruction::Goto(lbl));
             }
             Stmt::Continue => {
                 let lbl = *self
@@ -1137,16 +1137,16 @@ impl Generator {
                     .last()
                     .ok_or_else(|| RuntimeError::msg("continue outside loop"))?;
                 self.emit_handler_exit_cleanups(depth);
-                self.cg.emit(Instruction::Goto(lbl));
+                self.codegen.emit(Instruction::Goto(lbl));
             }
             Stmt::Block(stmts) => {
-                self.cg.emit(Instruction::EnterScope);
+                self.codegen.emit(Instruction::EnterScope);
                 self.block_depth += 1;
                 self.block_shadows.push(HashSet::new());
                 self.gen_block(stmts, top_level)?;
                 self.block_shadows.pop();
                 self.block_depth -= 1;
-                self.cg.emit(Instruction::LeaveScope);
+                self.codegen.emit(Instruction::LeaveScope);
             }
             Stmt::StructDecl {
                 visibility,
@@ -1271,9 +1271,9 @@ impl Generator {
                 let def = Arc::make_mut(def);
                 def.methods = def_methods;
                 def.overloads = def_overloads;
-                self.cg
+                self.codegen
                     .emit(Instruction::Push(Value::type_ref(name.clone())));
-                self.cg.emit(Instruction::NewVar {
+                self.codegen.emit(Instruction::NewVar {
                     name: name.clone(),
                     is_const: false,
                 });
@@ -1309,31 +1309,31 @@ impl Generator {
                             .unwrap_or("module")
                             .to_string()
                     });
-                    self.cg.emit(Instruction::FindModFile(path.clone()));
+                    self.codegen.emit(Instruction::FindModFile(path.clone()));
                     self.emit_bind_name(&bind);
                 } else {
                     let parts: Vec<String> = path.split('.').map(str::to_string).collect();
                     let bind = alias
                         .clone()
                         .unwrap_or_else(|| parts.last().cloned().unwrap_or_default());
-                    self.cg.emit(Instruction::FindMod(parts));
+                    self.codegen.emit(Instruction::FindMod(parts));
                     self.emit_bind_name(&bind);
                 }
             }
             Stmt::Use { module, items } => {
-                let temp = self.cg.fresh_temp("__use_mod");
+                let temp = self.codegen.fresh_temp("__use_mod");
                 self.emit_load_module_ref(module);
                 self.emit_store_temp(&temp);
                 for item in items {
                     self.emit_load_temp(&temp);
-                    self.cg.emit(Instruction::GetAttr(item.name.clone()));
+                    self.codegen.emit(Instruction::GetAttr(item.name.clone()));
                     let bind = item.alias.clone().unwrap_or_else(|| item.name.clone());
                     self.emit_bind_name(&bind);
                 }
             }
             Stmt::Throw(e) => {
                 self.gen_expr(e)?;
-                self.cg.emit(Instruction::Throw);
+                self.codegen.emit(Instruction::Throw);
             }
             Stmt::Try {
                 body,
@@ -1351,16 +1351,16 @@ impl Generator {
             }
             Stmt::Del(target) => match target {
                 DelTarget::Name(name) => {
-                    self.cg.emit(Instruction::DelName(name.clone()));
+                    self.codegen.emit(Instruction::DelName(name.clone()));
                 }
                 DelTarget::Index { object, index } => {
                     self.gen_expr(object)?;
                     self.gen_expr(index)?;
-                    self.cg.emit(Instruction::DelIndex);
+                    self.codegen.emit(Instruction::DelIndex);
                 }
                 DelTarget::Member { object, field } => {
                     self.gen_expr(object)?;
-                    self.cg.emit(Instruction::DelAttr(field.clone()));
+                    self.codegen.emit(Instruction::DelAttr(field.clone()));
                 }
             },
             Stmt::With {
@@ -1380,7 +1380,7 @@ impl Generator {
     fn gen_apply_decorators(&mut self, decorators: &[Expr]) -> Result<()> {
         for deco in decorators.iter().rev() {
             self.gen_expr(deco)?;
-            self.cg.emit(Instruction::Call { argc: 1 });
+            self.codegen.emit(Instruction::Call { argc: 1 });
         }
         Ok(())
     }
@@ -1392,24 +1392,24 @@ impl Generator {
         body: &Block,
         as_value: bool,
     ) -> Result<()> {
-        let ctx = self.cg.fresh_temp("__with_ctx");
-        let exc = self.cg.fresh_temp("__with_exc");
+        let ctx = self.codegen.fresh_temp("__with_ctx");
+        let exc = self.codegen.fresh_temp("__with_exc");
         self.gen_expr(context)?;
         self.emit_store_temp(&ctx);
         self.emit_load_temp(&ctx);
-        self.cg.emit(Instruction::GetAttr("__enter__".into()));
-        self.cg.emit(Instruction::Call { argc: 0 });
+        self.codegen.emit(Instruction::GetAttr("__enter__".into()));
+        self.codegen.emit(Instruction::Call { argc: 0 });
         if let Some(name) = alias {
             self.emit_bind_name(name);
         } else {
-            self.cg.emit(Instruction::Pop);
+            self.codegen.emit(Instruction::Pop);
         }
 
-        let catch_dispatch = self.cg.fresh_label();
-        let success_cleanup = self.cg.fresh_label();
-        let try_end = self.cg.fresh_label();
+        let catch_dispatch = self.codegen.fresh_label();
+        let success_cleanup = self.codegen.fresh_label();
+        let try_end = self.codegen.fresh_label();
         // else_label → 成功清理；EndTry 会 PopTry 后再跳过来。
-        self.cg.emit(Instruction::EnterTry {
+        self.codegen.emit(Instruction::EnterTry {
             catch_label: catch_dispatch,
             else_label: success_cleanup,
             end_label: try_end,
@@ -1417,31 +1417,31 @@ impl Generator {
         self.handler_stack
             .push(OpenHandler::With { ctx: ctx.clone() });
         self.gen_block(body, as_value)?;
-        self.cg.emit(Instruction::EndTry);
+        self.codegen.emit(Instruction::EndTry);
         self.handler_stack.pop();
 
-        self.cg.mark_label(success_cleanup);
+        self.codegen.mark_label(success_cleanup);
         self.emit_load_temp(&ctx);
-        self.cg.emit(Instruction::Push(Value::None));
-        self.cg.emit(Instruction::Load("__with_exit__".into()));
-        self.cg.emit(Instruction::Call { argc: 2 });
-        self.cg.emit(Instruction::Pop);
-        self.cg.emit(Instruction::Goto(try_end));
+        self.codegen.emit(Instruction::Push(Value::None));
+        self.codegen.emit(Instruction::Load("__with_exit__".into()));
+        self.codegen.emit(Instruction::Call { argc: 2 });
+        self.codegen.emit(Instruction::Pop);
+        self.codegen.emit(Instruction::Goto(try_end));
 
-        self.cg.mark_label(catch_dispatch);
-        self.cg.emit(Instruction::PushExc);
+        self.codegen.mark_label(catch_dispatch);
+        self.codegen.emit(Instruction::PushExc);
         self.emit_store_temp(&exc);
         // 先弹出本层 try，再调 __exit__ / 重抛，避免重抛再次落入同一 catch 死循环。
-        self.cg.emit(Instruction::PopTry);
+        self.codegen.emit(Instruction::PopTry);
         self.emit_load_temp(&ctx);
         self.emit_load_temp(&exc);
-        self.cg.emit(Instruction::Load("__with_exit__".into()));
-        self.cg.emit(Instruction::Call { argc: 2 });
-        self.cg.emit(Instruction::Pop);
+        self.codegen.emit(Instruction::Load("__with_exit__".into()));
+        self.codegen.emit(Instruction::Call { argc: 2 });
+        self.codegen.emit(Instruction::Pop);
         self.emit_load_temp(&exc);
-        self.cg.emit(Instruction::Throw);
+        self.codegen.emit(Instruction::Throw);
 
-        self.cg.mark_label(try_end);
+        self.codegen.mark_label(try_end);
         Ok(())
     }
 
@@ -1453,27 +1453,27 @@ impl Generator {
         else_block: Option<&Block>,
         as_value: bool,
     ) -> Result<()> {
-        let end = self.cg.fresh_label();
-        let mut next = self.cg.fresh_label();
+        let end = self.codegen.fresh_label();
+        let mut next = self.codegen.fresh_label();
         self.gen_expr(cond)?;
-        self.cg.emit(Instruction::GotoIfNot(next));
+        self.codegen.emit(Instruction::GotoIfNot(next));
         self.gen_block(then_block, as_value)?;
-        self.cg.emit(Instruction::Goto(end));
+        self.codegen.emit(Instruction::Goto(end));
         for (elif_cond, elif_body) in elifs {
-            self.cg.mark_label(next);
-            next = self.cg.fresh_label();
+            self.codegen.mark_label(next);
+            next = self.codegen.fresh_label();
             self.gen_expr(elif_cond)?;
-            self.cg.emit(Instruction::GotoIfNot(next));
+            self.codegen.emit(Instruction::GotoIfNot(next));
             self.gen_block(elif_body, as_value)?;
-            self.cg.emit(Instruction::Goto(end));
+            self.codegen.emit(Instruction::Goto(end));
         }
-        self.cg.mark_label(next);
+        self.codegen.mark_label(next);
         if let Some(else_b) = else_block {
             self.gen_block(else_b, as_value)?;
         } else if as_value {
-            self.cg.emit(Instruction::Push(Value::None));
+            self.codegen.emit(Instruction::Push(Value::None));
         }
-        self.cg.mark_label(end);
+        self.codegen.mark_label(end);
         Ok(())
     }
 
@@ -1484,15 +1484,15 @@ impl Generator {
         else_block: Option<&Block>,
         as_value: bool,
     ) -> Result<()> {
-        let catch_dispatch = self.cg.fresh_label();
+        let catch_dispatch = self.codegen.fresh_label();
         let else_label = if else_block.is_some() {
-            self.cg.fresh_label()
+            self.codegen.fresh_label()
         } else {
             0
         };
-        let try_end = self.cg.fresh_label();
+        let try_end = self.codegen.fresh_label();
 
-        self.cg.emit(Instruction::EnterTry {
+        self.codegen.emit(Instruction::EnterTry {
             catch_label: catch_dispatch,
             else_label,
             end_label: try_end,
@@ -1500,17 +1500,17 @@ impl Generator {
         self.handler_stack.push(OpenHandler::Try);
         // 无 else 且作值时保留 body 结果；有 else 时成功路径走 else（与 Python 语义一致），body 不留值。
         self.gen_block(body, as_value && else_block.is_none())?;
-        self.cg.emit(Instruction::EndTry);
+        self.codegen.emit(Instruction::EndTry);
         // EndTry 已在运行时弹帧；catch 会在 body 前 PopTry。编译期栈在此收起。
         self.handler_stack.pop();
 
-        self.cg.mark_label(catch_dispatch);
+        self.codegen.mark_label(catch_dispatch);
 
         let mut body_labels = Vec::new();
         let mut first_wildcard: Option<usize> = None;
 
         for clause in catches {
-            let body_lbl = self.cg.fresh_label();
+            let body_lbl = self.codegen.fresh_label();
             body_labels.push(body_lbl);
             match &clause.pattern {
                 CatchPattern::Wildcard => {
@@ -1521,8 +1521,8 @@ impl Generator {
                 CatchPattern::Bind {
                     type_name: Some(t), ..
                 } => {
-                    self.cg.emit(Instruction::ExcMatch(t.clone()));
-                    self.cg.emit(Instruction::GotoIf(body_lbl));
+                    self.codegen.emit(Instruction::ExcMatch(t.clone()));
+                    self.codegen.emit(Instruction::GotoIf(body_lbl));
                 }
                 CatchPattern::Bind {
                     type_name: None, ..
@@ -1535,32 +1535,32 @@ impl Generator {
         }
 
         if let Some(wc) = first_wildcard {
-            self.cg.emit(Instruction::Goto(wc));
+            self.codegen.emit(Instruction::Goto(wc));
         } else {
-            self.cg.emit(Instruction::Rethrow);
+            self.codegen.emit(Instruction::Rethrow);
         }
 
         for (clause, body_lbl) in catches.iter().zip(body_labels.iter()) {
-            self.cg.mark_label(*body_lbl);
+            self.codegen.mark_label(*body_lbl);
             if let CatchPattern::Bind { name, .. } = &clause.pattern {
-                self.cg.emit(Instruction::PushExc);
+                self.codegen.emit(Instruction::PushExc);
                 self.emit_bind_name(name);
             }
             // 先弹出本层 try，再跑 catch 体，避免 catch 内再抛落入同一 handler 死循环。
-            self.cg.emit(Instruction::PopTry);
+            self.codegen.emit(Instruction::PopTry);
             self.gen_block(&clause.body, as_value)?;
-            self.cg.emit(Instruction::Goto(try_end));
+            self.codegen.emit(Instruction::Goto(try_end));
         }
 
         if else_label != 0 {
-            self.cg.mark_label(else_label);
+            self.codegen.mark_label(else_label);
             // EndTry 已 PopTry，else 不再被本层 handler 覆盖。
             if let Some(else_b) = else_block {
                 self.gen_block(else_b, as_value)?;
             }
         }
 
-        self.cg.mark_label(try_end);
+        self.codegen.mark_label(try_end);
         Ok(())
     }
 
@@ -1571,26 +1571,26 @@ impl Generator {
         else_block: Option<&Block>,
         as_value: bool,
     ) -> Result<()> {
-        let temp = self.cg.fresh_temp("__match");
+        let temp = self.codegen.fresh_temp("__match");
         self.gen_expr(subject)?;
         self.emit_store_temp(&temp);
 
-        let end = self.cg.fresh_label();
-        let mut next_case = self.cg.fresh_label();
+        let end = self.codegen.fresh_label();
+        let mut next_case = self.codegen.fresh_label();
 
         for case in cases {
-            self.cg.mark_label(next_case);
-            next_case = self.cg.fresh_label();
+            self.codegen.mark_label(next_case);
+            next_case = self.codegen.fresh_label();
             self.gen_match_case(&temp, &case.pattern, &case.body, next_case, end, as_value)?;
         }
-        self.cg.mark_label(next_case);
+        self.codegen.mark_label(next_case);
 
         if let Some(else_b) = else_block {
             self.gen_block(else_b, as_value)?;
         } else if as_value {
-            self.cg.emit(Instruction::Push(Value::None));
+            self.codegen.emit(Instruction::Push(Value::None));
         }
-        self.cg.mark_label(end);
+        self.codegen.mark_label(end);
         Ok(())
     }
 
@@ -1606,30 +1606,30 @@ impl Generator {
         if let Pattern::Or(alts) = pattern {
             let mut body_labels = Vec::new();
             for alt in alts {
-                let body_lbl = self.cg.fresh_label();
+                let body_lbl = self.codegen.fresh_label();
                 body_labels.push(body_lbl);
-                let alt_fail = self.cg.fresh_label();
+                let alt_fail = self.codegen.fresh_label();
                 self.gen_match_pattern_test(temp, alt, &[], alt_fail)?;
-                self.cg.emit(Instruction::Goto(body_lbl));
-                self.cg.mark_label(alt_fail);
+                self.codegen.emit(Instruction::Goto(body_lbl));
+                self.codegen.mark_label(alt_fail);
             }
-            self.cg.emit(Instruction::Goto(fail_label));
+            self.codegen.emit(Instruction::Goto(fail_label));
             for (alt, body_lbl) in alts.iter().zip(body_labels.iter()) {
-                self.cg.mark_label(*body_lbl);
+                self.codegen.mark_label(*body_lbl);
                 self.gen_match_pattern_bindings(temp, alt, &[])?;
                 self.gen_block(body, as_value)?;
-                self.cg.emit(Instruction::Goto(end_label));
+                self.codegen.emit(Instruction::Goto(end_label));
             }
             return Ok(());
         }
 
-        let body_lbl = self.cg.fresh_label();
+        let body_lbl = self.codegen.fresh_label();
         self.gen_match_pattern_test(temp, pattern, &[], fail_label)?;
-        self.cg.emit(Instruction::Goto(body_lbl));
-        self.cg.mark_label(body_lbl);
+        self.codegen.emit(Instruction::Goto(body_lbl));
+        self.codegen.mark_label(body_lbl);
         self.gen_match_pattern_bindings(temp, pattern, &[])?;
         self.gen_block(body, as_value)?;
-        self.cg.emit(Instruction::Goto(end_label));
+        self.codegen.emit(Instruction::Goto(end_label));
         Ok(())
     }
 
@@ -1644,19 +1644,19 @@ impl Generator {
             Pattern::Value(expr) => {
                 self.emit_load_match_at(temp, path);
                 self.gen_expr(expr)?;
-                self.cg.emit(Instruction::MatchEq);
-                self.cg.emit(Instruction::GotoIfNot(fail_label));
+                self.codegen.emit(Instruction::MatchEq);
+                self.codegen.emit(Instruction::GotoIfNot(fail_label));
             }
             Pattern::Bind(_) => {}
             Pattern::List(elems) | Pattern::Tuple(elems) => {
                 self.emit_load_match_at(temp, path);
-                self.cg.emit(Instruction::IsList);
-                self.cg.emit(Instruction::GotoIfNot(fail_label));
+                self.codegen.emit(Instruction::IsList);
+                self.codegen.emit(Instruction::GotoIfNot(fail_label));
                 self.emit_load_match_at(temp, path);
-                self.cg.emit(Instruction::ListLen);
-                self.cg.emit(Instruction::PushSmall(elems.len() as i64));
-                self.cg.emit(Instruction::Eq);
-                self.cg.emit(Instruction::GotoIfNot(fail_label));
+                self.codegen.emit(Instruction::ListLen);
+                self.codegen.emit(Instruction::PushSmall(elems.len() as i64));
+                self.codegen.emit(Instruction::Eq);
+                self.codegen.emit(Instruction::GotoIfNot(fail_label));
                 for (i, elem) in elems.iter().enumerate() {
                     let mut child_path = path.to_vec();
                     child_path.push(i);
@@ -1665,8 +1665,8 @@ impl Generator {
             }
             Pattern::Struct { type_name, .. } => {
                 self.emit_load_match_at(temp, path);
-                self.cg.emit(Instruction::IsInstance(type_name.clone()));
-                self.cg.emit(Instruction::GotoIfNot(fail_label));
+                self.codegen.emit(Instruction::IsInstance(type_name.clone()));
+                self.codegen.emit(Instruction::GotoIfNot(fail_label));
             }
             Pattern::Or(_) => {
                 return Err(RuntimeError::msg("or pattern in test"));
@@ -1701,17 +1701,17 @@ impl Generator {
     ) -> Result<()> {
         if self.program.variant_defs.contains_key(type_name) {
             self.emit_load_match_at(temp, path);
-            self.cg
+            self.codegen
                 .emit(Instruction::Push(Value::type_ref(type_name.to_string())));
-            self.cg.emit(Instruction::Load("__variant_is__".into()));
-            self.cg.emit(Instruction::Call { argc: 2 });
-            self.cg.emit(Instruction::GotoIfNot(fail_label));
+            self.codegen.emit(Instruction::Load("__variant_is__".into()));
+            self.codegen.emit(Instruction::Call { argc: 2 });
+            self.codegen.emit(Instruction::GotoIfNot(fail_label));
             if let Some(inner) = args.first() {
-                let payload_temp = self.cg.fresh_temp("__variant_payload");
+                let payload_temp = self.codegen.fresh_temp("__variant_payload");
                 self.emit_load_match_at(temp, path);
-                self.cg
+                self.codegen
                     .emit(Instruction::Load("__variant_payload__".into()));
-                self.cg.emit(Instruction::Call { argc: 1 });
+                self.codegen.emit(Instruction::Call { argc: 1 });
                 self.emit_store_temp(&payload_temp);
                 self.gen_match_pattern_test(&payload_temp, inner, &[], fail_label)?;
             }
@@ -1719,8 +1719,8 @@ impl Generator {
         }
         let resolved = self.resolve_match_type_name(type_name);
         self.emit_load_match_at(temp, path);
-        self.cg.emit(Instruction::IsInstance(resolved.clone()));
-        self.cg.emit(Instruction::GotoIfNot(fail_label));
+        self.codegen.emit(Instruction::IsInstance(resolved.clone()));
+        self.codegen.emit(Instruction::GotoIfNot(fail_label));
         if let Some(sdef) = self.program.struct_defs.get(&resolved).cloned() {
             let field_names = sdef.fields.clone();
             if args.len() != field_names.len() {
@@ -1731,9 +1731,9 @@ impl Generator {
                     Pattern::Bind(_) => {}
                     other => {
                         let fname = &field_names[i];
-                        let field_temp = self.cg.fresh_temp("__match_field");
+                        let field_temp = self.codegen.fresh_temp("__match_field");
                         self.emit_load_match_at(temp, path);
-                        self.cg.emit(Instruction::GetAttr(fname.clone()));
+                        self.codegen.emit(Instruction::GetAttr(fname.clone()));
                         self.emit_store_temp(&field_temp);
                         self.gen_match_pattern_test(&field_temp, other, &[], fail_label)?;
                     }
@@ -1744,7 +1744,7 @@ impl Generator {
                 match arg {
                     Pattern::Bind(_) => {}
                     other => {
-                        let field_temp = self.cg.fresh_temp("__match_slot");
+                        let field_temp = self.codegen.fresh_temp("__match_slot");
                         self.emit_load_match_slot(temp, path, i)?;
                         self.emit_store_temp(&field_temp);
                         self.gen_match_pattern_test(&field_temp, other, &[], fail_label)?;
@@ -1757,9 +1757,9 @@ impl Generator {
 
     fn emit_load_match_slot(&mut self, temp: &str, path: &[usize], index: usize) -> Result<()> {
         self.emit_load_match_at(temp, path);
-        self.cg.emit(Instruction::PushSmall(index as i64));
-        self.cg.emit(Instruction::Load("__struct_slot__".into()));
-        self.cg.emit(Instruction::Call { argc: 2 });
+        self.codegen.emit(Instruction::PushSmall(index as i64));
+        self.codegen.emit(Instruction::Load("__struct_slot__".into()));
+        self.codegen.emit(Instruction::Call { argc: 2 });
         Ok(())
     }
 
@@ -1776,8 +1776,8 @@ impl Generator {
             PatternElem::Value(expr) => {
                 self.emit_load_match_at(temp, path);
                 self.gen_expr(expr)?;
-                self.cg.emit(Instruction::MatchEq);
-                self.cg.emit(Instruction::GotoIfNot(fail_label));
+                self.codegen.emit(Instruction::MatchEq);
+                self.codegen.emit(Instruction::GotoIfNot(fail_label));
                 Ok(())
             }
         }
@@ -1804,7 +1804,7 @@ impl Generator {
             Pattern::Struct { fields, .. } => {
                 for field in fields {
                     self.emit_load_match_at(temp, path);
-                    self.cg.emit(Instruction::GetAttr(field.clone()));
+                    self.codegen.emit(Instruction::GetAttr(field.clone()));
                     self.emit_bind_name(field);
                 }
             }
@@ -1814,11 +1814,11 @@ impl Generator {
             Pattern::Call { type_name, args } => {
                 if self.program.variant_defs.contains_key(type_name) {
                     if let Some(inner) = args.first() {
-                        let payload_temp = self.cg.fresh_temp("__variant_payload");
+                        let payload_temp = self.codegen.fresh_temp("__variant_payload");
                         self.emit_load_match_at(temp, path);
-                        self.cg
+                        self.codegen
                             .emit(Instruction::Load("__variant_payload__".into()));
-                        self.cg.emit(Instruction::Call { argc: 1 });
+                        self.codegen.emit(Instruction::Call { argc: 1 });
                         self.emit_store_temp(&payload_temp);
                         self.gen_match_pattern_bindings(&payload_temp, inner, &[])?;
                     }
@@ -1837,13 +1837,13 @@ impl Generator {
                         match arg {
                             Pattern::Bind(bind_name) => {
                                 self.emit_load_match_at(temp, path);
-                                self.cg.emit(Instruction::GetAttr(fname.clone()));
+                                self.codegen.emit(Instruction::GetAttr(fname.clone()));
                                 self.emit_bind_name(bind_name);
                             }
                             other => {
-                                let field_temp = self.cg.fresh_temp("__match_field");
+                                let field_temp = self.codegen.fresh_temp("__match_field");
                                 self.emit_load_match_at(temp, path);
-                                self.cg.emit(Instruction::GetAttr(fname.clone()));
+                                self.codegen.emit(Instruction::GetAttr(fname.clone()));
                                 self.emit_store_temp(&field_temp);
                                 self.gen_match_pattern_bindings(&field_temp, other, &[])?;
                             }
@@ -1851,7 +1851,7 @@ impl Generator {
                     }
                 } else {
                     for (i, arg) in args.iter().enumerate() {
-                        let field_temp = self.cg.fresh_temp("__match_slot");
+                        let field_temp = self.codegen.fresh_temp("__match_slot");
                         self.emit_load_match_slot(temp, path, i)?;
                         self.emit_store_temp(&field_temp);
                         match arg {
@@ -1906,19 +1906,19 @@ impl Generator {
 
         if let Some(gen_func) = generate_func {
             self.emit_enum_all_dict(members)?;
-            self.cg.emit(Instruction::Push(Value::Function(gen_func)));
-            self.cg.emit(Instruction::Call { argc: 1 });
-            let values_temp = self.cg.fresh_temp("__enum_values");
+            self.codegen.emit(Instruction::Push(Value::Function(gen_func)));
+            self.codegen.emit(Instruction::Call { argc: 1 });
+            let values_temp = self.codegen.fresh_temp("__enum_values");
             self.emit_store_temp(&values_temp);
-            self.cg
+            self.codegen
                 .emit(Instruction::Push(Value::type_ref(name.to_string())));
             for m in members {
-                self.cg.emit(Instruction::Push(Value::Text(m.name.clone())));
+                self.codegen.emit(Instruction::Push(Value::Text(m.name.clone())));
             }
-            self.cg.emit(Instruction::VecNew(members.len()));
+            self.codegen.emit(Instruction::VecNew(members.len()));
             self.emit_load_temp(&values_temp);
-            self.cg.emit(Instruction::Load("__finalize_enum__".into()));
-            self.cg.emit(Instruction::Call { argc: 3 });
+            self.codegen.emit(Instruction::Load("__finalize_enum__".into()));
+            self.codegen.emit(Instruction::Call { argc: 3 });
         } else {
             let member_infos = crate::enum_variant::default_enum_values(members)?;
             let mut def = crate::value::EnumDef {
@@ -1936,9 +1936,9 @@ impl Generator {
                 .insert(name.to_string(), Arc::new(def));
         }
 
-        self.cg
+        self.codegen
             .emit(Instruction::Push(Value::type_ref(name.to_string())));
-        self.cg.emit(Instruction::NewVar {
+        self.codegen.emit(Instruction::NewVar {
             name: name.to_string(),
             is_const: false,
         });
@@ -1949,27 +1949,27 @@ impl Generator {
 
     fn emit_enum_all_dict(&mut self, members: &[EnumMemberDecl]) -> Result<()> {
         for m in members.iter().rev() {
-            self.cg.emit(Instruction::Push(Value::Text(m.name.clone())));
+            self.codegen.emit(Instruction::Push(Value::Text(m.name.clone())));
             if let Some(expr) = &m.value {
                 let num = crate::enum_variant::eval_const_num(expr)?;
-                self.cg.emit(Instruction::Push(Value::Num(num)));
+                self.codegen.emit(Instruction::Push(Value::Num(num)));
             } else {
-                self.cg.emit(Instruction::Push(Value::None));
+                self.codegen.emit(Instruction::Push(Value::None));
             }
         }
-        self.cg.emit(Instruction::DictNew(members.len()));
+        self.codegen.emit(Instruction::DictNew(members.len()));
         Ok(())
     }
 
     fn emit_load_module_ref(&mut self, module: &ModuleRef) {
         match module {
             ModuleRef::Qualified(parts) => {
-                self.cg.emit(Instruction::FindMod(parts.clone()));
+                self.codegen.emit(Instruction::FindMod(parts.clone()));
             }
             ModuleRef::FilePath { path, attrs } => {
-                self.cg.emit(Instruction::FindModFile(path.clone()));
+                self.codegen.emit(Instruction::FindModFile(path.clone()));
                 for attr in attrs {
-                    self.cg.emit(Instruction::GetAttr(attr.clone()));
+                    self.codegen.emit(Instruction::GetAttr(attr.clone()));
                 }
             }
         }
@@ -1977,25 +1977,25 @@ impl Generator {
 
     fn gen_fstring(&mut self, parts: &[FStringPart]) -> Result<()> {
         if parts.is_empty() {
-            self.cg.emit(Instruction::Push(Value::Text(String::new())));
+            self.codegen.emit(Instruction::Push(Value::Text(String::new())));
             return Ok(());
         }
         let mut first = true;
         for part in parts {
             match part {
                 FStringPart::Text(s) => {
-                    self.cg.emit(Instruction::Push(Value::Text(s.clone())));
+                    self.codegen.emit(Instruction::Push(Value::Text(s.clone())));
                 }
                 FStringPart::Expr(expr) => {
                     self.gen_expr(expr)?;
-                    self.cg.emit(Instruction::Load("str".into()));
-                    self.cg.emit(Instruction::Call { argc: 1 });
+                    self.codegen.emit(Instruction::Load("str".into()));
+                    self.codegen.emit(Instruction::Call { argc: 1 });
                 }
             }
             if first {
                 first = false;
             } else {
-                self.cg.emit(Instruction::Add);
+                self.codegen.emit(Instruction::Add);
             }
         }
         Ok(())
@@ -2015,9 +2015,9 @@ impl Generator {
         for (sname, sdef) in struct_defs {
             self.program.struct_defs.insert(sname, sdef);
         }
-        self.cg
+        self.codegen
             .emit(Instruction::Push(Value::type_ref(name.to_string())));
-        self.cg.emit(Instruction::NewVar {
+        self.codegen.emit(Instruction::NewVar {
             name: name.to_string(),
             is_const: false,
         });
@@ -2045,8 +2045,8 @@ impl Generator {
     fn emit_load_match_at(&mut self, temp: &str, path: &[usize]) {
         self.emit_load_temp(temp);
         for &idx in path {
-            self.cg.emit(Instruction::PushSmall(idx as i64));
-            self.cg.emit(Instruction::Index);
+            self.codegen.emit(Instruction::PushSmall(idx as i64));
+            self.codegen.emit(Instruction::Index);
         }
     }
 
@@ -2062,7 +2062,7 @@ impl Generator {
             for located in block {
                 self.gen_stmt(located, false)?;
             }
-            self.cg.emit(Instruction::Push(Value::None));
+            self.codegen.emit(Instruction::Push(Value::None));
         } else {
             for (i, located) in block.iter().enumerate() {
                 let keep = keep_last_value && Some(i) == last_value_idx;
@@ -2247,9 +2247,9 @@ impl Generator {
         for a in args {
             self.gen_expr(&a.value)?;
         }
-        self.cg.emit(Instruction::Push(Value::Function(func)));
-        self.cg.emit(Instruction::ResolveFuncTypes);
-        self.cg.emit(Instruction::Call { argc: args.len() });
+        self.codegen.emit(Instruction::Push(Value::Function(func)));
+        self.codegen.emit(Instruction::ResolveFuncTypes);
+        self.codegen.emit(Instruction::Call { argc: args.len() });
         Ok(true)
     }
 
@@ -2315,7 +2315,7 @@ impl Generator {
         }
         let wrapper_for_func = return_wrapper.clone();
         let mut sub = Self {
-            cg: Codegen::new(),
+            codegen: Codegen::new(),
             program: self.fresh_subprogram(),
             loop_break_labels: Vec::new(),
             loop_continue_labels: Vec::new(),
@@ -2376,8 +2376,8 @@ impl Generator {
         if let Some(err) = sub.codegen_error.take() {
             return Err(err);
         }
-        sub.cg.patch_labels().map_err(RuntimeError::msg)?;
-        let mut body = std::mem::take(&mut sub.cg.code);
+        sub.codegen.patch_labels().map_err(RuntimeError::msg)?;
+        let mut body = std::mem::take(&mut sub.codegen.code);
         let entry_env: Vec<Option<crate::specialize::Tag>> = params
             .iter()
             .map(|p| match (&p.type_expr, p.type_strong) {
@@ -2390,9 +2390,9 @@ impl Generator {
         let (fused_body, body_remap2) = crate::opcode::peephole_fuse(compacted_body);
         body = fused_body;
         crate::stack_effect::verify_compiled(name, &body)?;
-        let lm = crate::opcode::compact_parallel(&sub.cg.line_map, &body_remap);
+        let lm = crate::opcode::compact_parallel(&sub.codegen.line_map, &body_remap);
         let func_line_map = crate::opcode::compact_parallel(&lm, &body_remap2);
-        let cm = crate::opcode::compact_parallel(&sub.cg.column_map, &body_remap);
+        let cm = crate::opcode::compact_parallel(&sub.codegen.column_map, &body_remap);
         let func_column_map = crate::opcode::compact_parallel(&cm, &body_remap2);
         // 子编译器的 `global_names` 可能含空洞：struct/原始类型经 `Push(type_ref)`
         // 不写入名字表，而 `len` 等仍占后续 `LoadGlobal` 下标 → `["", "len", …]`。
@@ -2495,15 +2495,15 @@ impl Generator {
         for h in handlers.into_iter().rev() {
             match h {
                 OpenHandler::Try => {
-                    self.cg.emit(Instruction::PopTry);
+                    self.codegen.emit(Instruction::PopTry);
                 }
                 OpenHandler::With { ctx } => {
-                    self.cg.emit(Instruction::PopTry);
+                    self.codegen.emit(Instruction::PopTry);
                     self.emit_load_temp(&ctx);
-                    self.cg.emit(Instruction::Push(Value::None));
-                    self.cg.emit(Instruction::Load("__with_exit__".into()));
-                    self.cg.emit(Instruction::Call { argc: 2 });
-                    self.cg.emit(Instruction::Pop);
+                    self.codegen.emit(Instruction::Push(Value::None));
+                    self.codegen.emit(Instruction::Load("__with_exit__".into()));
+                    self.codegen.emit(Instruction::Call { argc: 2 });
+                    self.codegen.emit(Instruction::Pop);
                 }
             }
         }
@@ -2521,15 +2521,15 @@ impl Generator {
             return;
         }
         if keep_tos {
-            let tmp = self.cg.fresh_temp("__ret_keep");
+            let tmp = self.codegen.fresh_temp("__ret_keep");
             self.emit_store_temp(&tmp);
             for _ in 0..n {
-                self.cg.emit(Instruction::Pop);
+                self.codegen.emit(Instruction::Pop);
             }
             self.emit_load_temp(&tmp);
         } else {
             for _ in 0..n {
-                self.cg.emit(Instruction::Pop);
+                self.codegen.emit(Instruction::Pop);
             }
         }
     }
@@ -2542,12 +2542,12 @@ impl Generator {
                         if let Some(end) = self.match_expr_ends.last().copied() {
                             self.emit_handler_exit_cleanups(0);
                             self.emit_discard_loop_stack_counters(false);
-                            self.cg.emit(Instruction::LoadFast(slot));
-                            self.cg.emit(Instruction::Goto(end));
+                            self.codegen.emit(Instruction::LoadFast(slot));
+                            self.codegen.emit(Instruction::Goto(end));
                         } else {
                             self.emit_handler_exit_cleanups(0);
                             self.emit_discard_loop_stack_counters(false);
-                            self.cg.emit(Instruction::RetFast(slot));
+                            self.codegen.emit(Instruction::RetFast(slot));
                         }
                         return Ok(());
                     }
@@ -2557,7 +2557,7 @@ impl Generator {
         if let Some(e) = expr {
             self.gen_expr(e)?;
         } else {
-            self.cg.emit(Instruction::Push(Value::None));
+            self.codegen.emit(Instruction::Push(Value::None));
         }
         self.gen_return_from_tos()
     }
@@ -2567,17 +2567,17 @@ impl Generator {
         if let Some(wrapper) = self.current_return_wrapper.clone() {
             // 解析期已将包装器中的 `_` 替换为 `__ret_wrapper_val`。
             let slot = self.ensure_local_slot(RET_WRAPPER_VAL);
-            self.cg.emit(Instruction::StoreFast(slot));
+            self.codegen.emit(Instruction::StoreFast(slot));
             self.gen_expr(&wrapper)?;
         }
         if let Some(end) = self.match_expr_ends.last().copied() {
             self.emit_handler_exit_cleanups(0);
             self.emit_discard_loop_stack_counters(true);
-            self.cg.emit(Instruction::Goto(end));
+            self.codegen.emit(Instruction::Goto(end));
         } else {
             self.emit_handler_exit_cleanups(0);
             self.emit_discard_loop_stack_counters(true);
-            self.cg.emit(Instruction::Ret);
+            self.codegen.emit(Instruction::Ret);
         }
         Ok(())
     }
@@ -2589,7 +2589,7 @@ impl Generator {
         body: &Block,
     ) -> Result<MacroObject> {
         let mut sub = Self {
-            cg: Codegen::new(),
+            codegen: Codegen::new(),
             program: self.fresh_subprogram(),
             loop_break_labels: Vec::new(),
             loop_continue_labels: Vec::new(),
@@ -2618,17 +2618,17 @@ impl Generator {
         if let Some(err) = sub.codegen_error.take() {
             return Err(err);
         }
-        sub.cg.emit(Instruction::Push(Value::None));
-        sub.cg.emit(Instruction::Ret);
-        sub.cg.patch_labels().map_err(RuntimeError::msg)?;
+        sub.codegen.emit(Instruction::Push(Value::None));
+        sub.codegen.emit(Instruction::Ret);
+        sub.codegen.patch_labels().map_err(RuntimeError::msg)?;
 
-        Ok(MacroObject::new(name, params.to_vec(), sub.cg.code))
+        Ok(MacroObject::new(name, params.to_vec(), sub.codegen.code))
     }
 
     fn gen_macro_callee(&mut self, callee: &Expr) -> Result<()> {
         match &callee.kind {
             ExprKind::Var(name) => {
-                self.cg.emit(Instruction::LoadMacro(name.clone()));
+                self.codegen.emit(Instruction::LoadMacro(name.clone()));
             }
             _ => self.gen_expr(callee)?,
         }
@@ -2641,28 +2641,28 @@ impl Generator {
         use crate::runtime_ast::AstNodeKind;
         match node.kind {
             AstNodeKind::VarRef => {
-                self.cg.emit(Instruction::Load(node.text.clone()));
-                self.cg.emit(Instruction::Load("__ast_clone__".into()));
-                self.cg.emit(Instruction::Call { argc: 1 });
+                self.codegen.emit(Instruction::Load(node.text.clone()));
+                self.codegen.emit(Instruction::Load("__ast_clone__".into()));
+                self.codegen.emit(Instruction::Call { argc: 1 });
             }
             AstNodeKind::MacroCall => {
-                self.cg.emit(Instruction::VecNew(0));
+                self.codegen.emit(Instruction::VecNew(0));
                 for call_arg in &node.call_args {
                     self.gen_materialize_frozen_ast_arg(&call_arg.value)?;
-                    self.cg.emit(Instruction::ListAppend);
+                    self.codegen.emit(Instruction::ListAppend);
                 }
                 let callee = node
                     .slot_a
                     .as_ref()
                     .ok_or_else(|| RuntimeError::msg("macro call AST missing callee"))?;
-                self.cg.emit(Instruction::Push(Value::RuntimeAst(Arc::new(
+                self.codegen.emit(Instruction::Push(Value::RuntimeAst(Arc::new(
                     (**callee).clone(),
                 ))));
-                self.cg.emit(Instruction::Load("__ast_macro_call__".into()));
-                self.cg.emit(Instruction::Call { argc: 2 });
+                self.codegen.emit(Instruction::Load("__ast_macro_call__".into()));
+                self.codegen.emit(Instruction::Call { argc: 2 });
             }
             _ => {
-                self.cg
+                self.codegen
                     .emit(Instruction::Push(Value::RuntimeAst(Arc::new(node.clone()))));
             }
         }
@@ -2677,13 +2677,13 @@ impl Generator {
                     "macro splat argument must be a simple identifier",
                 ));
             }
-            self.cg.emit(Instruction::Load(arg.node.text.clone()));
-            self.cg.emit(Instruction::Load("__ast_clone__".into()));
-            self.cg.emit(Instruction::Call { argc: 1 });
+            self.codegen.emit(Instruction::Load(arg.node.text.clone()));
+            self.codegen.emit(Instruction::Load("__ast_clone__".into()));
+            self.codegen.emit(Instruction::Call { argc: 1 });
         } else if self.macro_depth > 0 {
             self.gen_materialize_frozen_ast_arg(&arg.node)?;
         } else {
-            self.cg
+            self.codegen
                 .emit(Instruction::Push(Value::RuntimeAst(arg.node.clone())));
         }
         Ok(())
@@ -2692,7 +2692,7 @@ impl Generator {
     /// 压入表达式的编译期冻结 AST（宏被调名、quote 体等）。
     fn gen_frozen_ast_expr(&mut self, expr: &Expr) {
         let ast = runtime_ast::ast_from_expr(expr);
-        self.cg
+        self.codegen
             .emit(Instruction::Push(Value::RuntimeAst(Arc::new(ast))));
     }
 
@@ -2700,9 +2700,9 @@ impl Generator {
     fn gen_materialized_ast_expr(&mut self, expr: &Expr) -> Result<()> {
         if self.macro_depth > 0 {
             if let ExprKind::Var(name) = &expr.kind {
-                self.cg.emit(Instruction::Load(name.clone()));
-                self.cg.emit(Instruction::Load("__ast_clone__".into()));
-                self.cg.emit(Instruction::Call { argc: 1 });
+                self.codegen.emit(Instruction::Load(name.clone()));
+                self.codegen.emit(Instruction::Load("__ast_clone__".into()));
+                self.codegen.emit(Instruction::Call { argc: 1 });
                 return Ok(());
             }
         }
@@ -2711,31 +2711,31 @@ impl Generator {
     }
 
     fn gen_expr(&mut self, expr: &Expr) -> Result<()> {
-        self.cg.set_loc(expr.loc.line, expr.loc.column);
+        self.codegen.set_loc(expr.loc.line, expr.loc.column);
         match &expr.kind {
             ExprKind::Number(n) => {
                 if let Ok(sized) = crate::sized::SizedNum::from_literal(n) {
-                    self.cg.emit(Instruction::Push(Value::Sized(sized)));
+                    self.codegen.emit(Instruction::Push(Value::Sized(sized)));
                 } else {
                     let num = Num::from_literal(n)?;
                     if let Num::Small(v) = num {
-                        self.cg.emit(Instruction::PushSmall(v));
+                        self.codegen.emit(Instruction::PushSmall(v));
                     } else {
-                        self.cg.emit(Instruction::Push(Value::Num(num)));
+                        self.codegen.emit(Instruction::Push(Value::Num(num)));
                     }
                 }
             }
             ExprKind::String(s) => {
-                self.cg.emit(Instruction::Push(Value::Text(s.clone())));
+                self.codegen.emit(Instruction::Push(Value::Text(s.clone())));
             }
             ExprKind::FString(parts) => {
                 self.gen_fstring(parts)?;
             }
             ExprKind::Bool(b) => {
-                self.cg.emit(Instruction::Push(Value::Bool(*b)));
+                self.codegen.emit(Instruction::Push(Value::Bool(*b)));
             }
             ExprKind::None => {
-                self.cg.emit(Instruction::Push(Value::None));
+                self.codegen.emit(Instruction::Push(Value::None));
             }
             ExprKind::Var(name) => {
                 self.emit_load_name(name);
@@ -2749,48 +2749,48 @@ impl Generator {
                 self.gen_expr(operand)?;
                 match op {
                     UnaryOp::Neg => {
-                        self.cg.emit(Instruction::Neg);
+                        self.codegen.emit(Instruction::Neg);
                     }
                     UnaryOp::Not => {
-                        self.cg.emit(Instruction::Not);
+                        self.codegen.emit(Instruction::Not);
                     }
                     UnaryOp::TruthyNot => {
-                        self.cg.emit(Instruction::TruthyNot);
+                        self.codegen.emit(Instruction::TruthyNot);
                     }
                     UnaryOp::Invert => {
-                        self.cg.emit(Instruction::Invert);
+                        self.codegen.emit(Instruction::Invert);
                     }
                 }
             }
             ExprKind::Binary { op, left, right } => {
                 match op {
                     BinaryOp::And => {
-                        let end = self.cg.fresh_label();
-                        let rest = self.cg.fresh_label();
-                        let temp = self.cg.fresh_temp("__sc_and");
+                        let end = self.codegen.fresh_label();
+                        let rest = self.codegen.fresh_label();
+                        let temp = self.codegen.fresh_temp("__sc_and");
                         self.gen_expr(left)?;
                         self.emit_store_temp(&temp);
                         self.emit_load_temp(&temp);
-                        self.cg.emit(Instruction::GotoIfNot(end));
+                        self.codegen.emit(Instruction::GotoIfNot(end));
                         self.gen_expr(right)?;
-                        self.cg.emit(Instruction::Goto(rest));
-                        self.cg.mark_label(end);
+                        self.codegen.emit(Instruction::Goto(rest));
+                        self.codegen.mark_label(end);
                         self.emit_load_temp(&temp);
-                        self.cg.mark_label(rest);
+                        self.codegen.mark_label(rest);
                     }
                     BinaryOp::Or => {
-                        let use_left = self.cg.fresh_label();
-                        let end = self.cg.fresh_label();
-                        let temp = self.cg.fresh_temp("__sc_or");
+                        let use_left = self.codegen.fresh_label();
+                        let end = self.codegen.fresh_label();
+                        let temp = self.codegen.fresh_temp("__sc_or");
                         self.gen_expr(left)?;
                         self.emit_store_temp(&temp);
                         self.emit_load_temp(&temp);
-                        self.cg.emit(Instruction::GotoIf(use_left));
+                        self.codegen.emit(Instruction::GotoIf(use_left));
                         self.gen_expr(right)?;
-                        self.cg.emit(Instruction::Goto(end));
-                        self.cg.mark_label(use_left);
+                        self.codegen.emit(Instruction::Goto(end));
+                        self.codegen.mark_label(use_left);
                         self.emit_load_temp(&temp);
-                        self.cg.mark_label(end);
+                        self.codegen.mark_label(end);
                     }
                     _ => {
                         self.gen_expr(left)?;
@@ -2823,7 +2823,7 @@ impl Generator {
                                 ));
                             }
                         };
-                        self.cg.emit(instr);
+                        self.codegen.emit(instr);
                     }
                 }
             }
@@ -2834,37 +2834,37 @@ impl Generator {
                 if has_named || has_kwsplat {
                     self.gen_call_args_and_kwargs(args)?;
                     self.gen_expr(callee)?;
-                    self.cg.emit(Instruction::CallEx);
+                    self.codegen.emit(Instruction::CallEx);
                 } else if has_splat {
-                    self.cg.emit(Instruction::VecNew(0));
+                    self.codegen.emit(Instruction::VecNew(0));
                     for a in args {
                         if a.is_splat {
                             self.gen_expr(&a.value)?;
-                            self.cg.emit(Instruction::ListExtend);
+                            self.codegen.emit(Instruction::ListExtend);
                         } else {
                             self.gen_expr(&a.value)?;
-                            self.cg.emit(Instruction::ListAppend);
+                            self.codegen.emit(Instruction::ListAppend);
                         }
                     }
                     self.gen_expr(callee)?;
-                    self.cg.emit(Instruction::CallList);
+                    self.codegen.emit(Instruction::CallList);
                 } else if self.try_emit_generic_call(callee, args)? {
                 } else if self.is_self_call(callee) && !self.current_func_has_flexible_params() {
                     for a in args {
                         self.gen_expr(&a.value)?;
                     }
-                    self.cg.emit(Instruction::CallSelf { argc: args.len() });
+                    self.codegen.emit(Instruction::CallSelf { argc: args.len() });
                 } else {
                     for a in args {
                         self.gen_expr(&a.value)?;
                     }
                     self.gen_expr(callee)?;
-                    self.cg.emit(Instruction::Call { argc: args.len() });
+                    self.codegen.emit(Instruction::Call { argc: args.len() });
                 }
             }
             ExprKind::Member { object, field } => {
                 self.gen_expr(object)?;
-                self.cg.emit(Instruction::GetAttr(field.clone()));
+                self.codegen.emit(Instruction::GetAttr(field.clone()));
             }
             ExprKind::Index { object, index } => {
                 if let ExprKind::Var(name) = &object.kind {
@@ -2872,8 +2872,8 @@ impl Generator {
                         let type_args = monomorph::type_args_from_index_expr(index)
                             .map_err(RuntimeError::msg)?;
                         let func = self.instantiate_generic(name, type_args)?;
-                        self.cg.emit(Instruction::Push(Value::Function(func)));
-                        self.cg.emit(Instruction::ResolveFuncTypes);
+                        self.codegen.emit(Instruction::Push(Value::Function(func)));
+                        self.codegen.emit(Instruction::ResolveFuncTypes);
                         return Ok(());
                     }
                 }
@@ -2883,13 +2883,13 @@ impl Generator {
                 } else {
                     self.gen_expr(index)?;
                 }
-                self.cg.emit(Instruction::Index);
+                self.codegen.emit(Instruction::Index);
             }
             ExprKind::List(elems) => {
                 for e in elems {
                     self.gen_expr(e)?;
                 }
-                self.cg.emit(Instruction::VecNew(elems.len()));
+                self.codegen.emit(Instruction::VecNew(elems.len()));
             }
             ExprKind::ListComp {
                 elem,
@@ -2925,22 +2925,22 @@ impl Generator {
                     self.gen_expr(k)?;
                     self.gen_expr(v)?;
                 }
-                self.cg.emit(Instruction::DictNew(entries.len()));
+                self.codegen.emit(Instruction::DictNew(entries.len()));
             }
             ExprKind::Set(elems) => {
                 for e in elems {
                     self.gen_expr(e)?;
                 }
-                self.cg.emit(Instruction::SetNew(elems.len()));
+                self.codegen.emit(Instruction::SetNew(elems.len()));
             }
             ExprKind::Tuple(elems) => {
                 for e in elems {
                     self.gen_expr(e)?;
                 }
-                self.cg.emit(Instruction::TupleNew(elems.len()));
+                self.codegen.emit(Instruction::TupleNew(elems.len()));
             }
             ExprKind::Bytes(bytes) => {
-                self.cg
+                self.codegen
                     .emit(Instruction::Push(Value::Bytes(Arc::new(bytes.clone()))));
             }
             ExprKind::DoFunc {
@@ -2974,12 +2974,12 @@ impl Generator {
                 self.emit_function_value_with_defaults(params, func)?;
                 if !free.is_empty() {
                     for name in &free {
-                        self.cg.emit(Instruction::Push(Value::Text(name.clone())));
+                        self.codegen.emit(Instruction::Push(Value::Text(name.clone())));
                         self.emit_load_name(name);
                     }
-                    self.cg.emit(Instruction::DictNew(free.len()));
-                    self.cg.emit(Instruction::Load("__make_closure__".into()));
-                    self.cg.emit(Instruction::Call { argc: 2 });
+                    self.codegen.emit(Instruction::DictNew(free.len()));
+                    self.codegen.emit(Instruction::Load("__make_closure__".into()));
+                    self.codegen.emit(Instruction::Call { argc: 2 });
                 }
             }
             ExprKind::Pipeline {
@@ -3001,40 +3001,40 @@ impl Generator {
                 self.gen_slice_bound(start.as_deref())?;
                 self.gen_slice_bound(end.as_deref())?;
                 self.gen_slice_bound(step.as_deref())?;
-                self.cg.emit(Instruction::SliceGet);
+                self.codegen.emit(Instruction::SliceGet);
             }
             ExprKind::TypeConvert { type_expr, value } => {
                 if self.macro_depth > 0 {
                     self.gen_materialized_ast_expr(value)?;
                     self.gen_materialized_ast_expr(type_expr)?;
-                    self.cg
+                    self.codegen
                         .emit(Instruction::Load("__ast_type_convert__".into()));
-                    self.cg.emit(Instruction::Call { argc: 2 });
+                    self.codegen.emit(Instruction::Call { argc: 2 });
                 } else {
                     // 类型侧按普通表达式求值（getattr），不拼点分 TypeRef 路径。
                     self.gen_expr(type_expr)?;
                     self.gen_expr(value)?;
-                    self.cg.emit(Instruction::Load("convert".into()));
-                    self.cg.emit(Instruction::Call { argc: 2 });
+                    self.codegen.emit(Instruction::Load("convert".into()));
+                    self.codegen.emit(Instruction::Call { argc: 2 });
                 }
             }
             ExprKind::MacroCall { callee, args } => {
                 if self.macro_depth > 0 {
                     // 宏体内嵌套宏调用只组合 AST，此处不展开。
-                    self.cg.emit(Instruction::VecNew(0));
+                    self.codegen.emit(Instruction::VecNew(0));
                     for arg in args {
                         self.gen_push_macro_call_arg(arg)?;
-                        self.cg.emit(Instruction::ListAppend);
+                        self.codegen.emit(Instruction::ListAppend);
                     }
                     self.gen_frozen_ast_expr(callee);
-                    self.cg.emit(Instruction::Load("__ast_macro_call__".into()));
-                    self.cg.emit(Instruction::Call { argc: 2 });
+                    self.codegen.emit(Instruction::Load("__ast_macro_call__".into()));
+                    self.codegen.emit(Instruction::Call { argc: 2 });
                 } else {
                     for arg in args {
                         self.gen_push_macro_call_arg(arg)?;
                     }
                     self.gen_macro_callee(callee)?;
-                    self.cg.emit(Instruction::MacroCall { argc: args.len() });
+                    self.codegen.emit(Instruction::MacroCall { argc: args.len() });
                 }
             }
             ExprKind::Quote {
@@ -3046,40 +3046,40 @@ impl Generator {
                 for name in hygienic_names {
                     hyg_vals.push(Value::Text(name.clone()));
                 }
-                self.cg
+                self.codegen
                     .emit(Instruction::Push(Value::List(Shared::new(hyg_vals))));
                 let mut bind_vals = Vec::new();
                 for binding in bindings {
                     let ast = runtime_ast::ast_from_expr(binding);
                     bind_vals.push(Value::RuntimeAst(Arc::new(ast)));
                 }
-                self.cg
+                self.codegen
                     .emit(Instruction::Push(Value::List(Shared::new(bind_vals))));
                 let body_ast = runtime_ast::ast_from_block(body);
-                self.cg
+                self.codegen
                     .emit(Instruction::Push(Value::RuntimeAst(Arc::new(body_ast))));
-                self.cg.emit(Instruction::Load("quote".into()));
-                self.cg.emit(Instruction::Call { argc: 3 });
+                self.codegen.emit(Instruction::Load("quote".into()));
+                self.codegen.emit(Instruction::Call { argc: 3 });
             }
             ExprKind::IfThenElse {
                 cond,
                 then_expr,
                 else_expr,
             } => {
-                let else_label = self.cg.fresh_label();
-                let end = self.cg.fresh_label();
+                let else_label = self.codegen.fresh_label();
+                let end = self.codegen.fresh_label();
                 self.gen_expr(cond)?;
-                self.cg.emit(Instruction::GotoIfNot(else_label));
+                self.codegen.emit(Instruction::GotoIfNot(else_label));
                 self.gen_expr(then_expr)?;
-                self.cg.emit(Instruction::Goto(end));
-                self.cg.mark_label(else_label);
+                self.codegen.emit(Instruction::Goto(end));
+                self.codegen.mark_label(else_label);
                 self.gen_expr(else_expr)?;
-                self.cg.mark_label(end);
+                self.codegen.mark_label(end);
             }
             ExprKind::Handle { operand } => {
-                let catch_label = self.cg.fresh_label();
-                let end_label = self.cg.fresh_label();
-                self.cg.emit(Instruction::EnterTry {
+                let catch_label = self.codegen.fresh_label();
+                let end_label = self.codegen.fresh_label();
+                self.codegen.emit(Instruction::EnterTry {
                     catch_label,
                     else_label: 0,
                     end_label,
@@ -3087,12 +3087,12 @@ impl Generator {
                 // 与 try 一样入栈，使 loop 内 break/continue 能补发 PopTry。
                 self.handler_stack.push(OpenHandler::Try);
                 self.gen_expr(operand)?;
-                self.cg.emit(Instruction::Goto(end_label));
-                self.cg.mark_label(catch_label);
-                self.cg.emit(Instruction::Push(Value::None));
-                self.cg.mark_label(end_label);
+                self.codegen.emit(Instruction::Goto(end_label));
+                self.codegen.mark_label(catch_label);
+                self.codegen.emit(Instruction::Push(Value::None));
+                self.codegen.mark_label(end_label);
                 self.handler_stack.pop();
-                self.cg.emit(Instruction::PopTry);
+                self.codegen.emit(Instruction::PopTry);
             }
             ExprKind::Go { operand } => {
                 self.gen_go_operand(operand)?;
@@ -3105,7 +3105,7 @@ impl Generator {
             }
             ExprKind::Snap { operand } => {
                 self.gen_expr(operand)?;
-                self.cg.emit(Instruction::Snap);
+                self.codegen.emit(Instruction::Snap);
             }
             ExprKind::Await { operand } => {
                 if let ExprKind::Call { callee, args } = &operand.kind {
@@ -3117,15 +3117,15 @@ impl Generator {
                             self.gen_expr(&a.value)?;
                         }
                         self.gen_expr(callee)?;
-                        self.cg.emit(Instruction::GoCall(args.len()));
-                        self.cg.emit(Instruction::Await);
+                        self.codegen.emit(Instruction::GoCall(args.len()));
+                        self.codegen.emit(Instruction::Await);
                     } else {
                         self.gen_expr(operand)?;
-                        self.cg.emit(Instruction::Await);
+                        self.codegen.emit(Instruction::Await);
                     }
                 } else {
                     self.gen_expr(operand)?;
-                    self.cg.emit(Instruction::Await);
+                    self.codegen.emit(Instruction::Await);
                 }
             }
             ExprKind::Suspend => {
@@ -3144,11 +3144,11 @@ impl Generator {
                 cases,
                 else_block,
             } => {
-                let end = self.cg.fresh_label();
+                let end = self.codegen.fresh_label();
                 self.match_expr_ends.push(end);
                 self.gen_match(subject, cases, else_block.as_ref(), true)?;
                 self.match_expr_ends.pop();
-                self.cg.mark_label(end);
+                self.codegen.mark_label(end);
             }
         }
         Ok(())
@@ -3164,13 +3164,13 @@ impl Generator {
                     self.gen_expr(&a.value)?;
                 }
                 self.gen_expr(callee)?;
-                self.cg.emit(Instruction::GoCall(args.len()));
+                self.codegen.emit(Instruction::GoCall(args.len()));
                 return Ok(());
             }
         }
         // 非调用：求值后包装为已完成 Task。
         self.gen_expr(operand)?;
-        self.cg.emit(Instruction::GoValue);
+        self.codegen.emit(Instruction::GoValue);
         Ok(())
     }
 
@@ -3347,17 +3347,17 @@ impl Generator {
     }
 
     fn gen_select(&mut self, cases: &[SelectCase], else_block: Option<&Block>) -> Result<()> {
-        let end = self.cg.fresh_label();
-        let start = self.cg.fresh_label();
-        let idx_tmp = self.cg.fresh_temp("__sel_idx");
+        let end = self.codegen.fresh_label();
+        let start = self.codegen.fresh_label();
+        let idx_tmp = self.codegen.fresh_temp("__sel_idx");
 
         // 预处理 sleep 截止时间。
         let mut sleep_temps: Vec<Option<String>> = Vec::with_capacity(cases.len());
         for case in cases {
             if let Some(secs) = select_sleep_seconds_expr(&case.event) {
-                let tmp = self.cg.fresh_temp("__sel_deadline");
+                let tmp = self.codegen.fresh_temp("__sel_deadline");
                 self.gen_expr(secs)?;
-                self.cg.emit(Instruction::MakeDeadline);
+                self.codegen.emit(Instruction::MakeDeadline);
                 self.emit_store_temp(&tmp);
                 sleep_temps.push(Some(tmp));
             } else {
@@ -3366,44 +3366,44 @@ impl Generator {
         }
 
         // 每轮打乱 case 次序再 poll（多就绪公平）。
-        self.cg.mark_label(start);
-        self.cg.emit(Instruction::SelectBegin(cases.len()));
-        let attempt = self.cg.fresh_label();
-        self.cg.mark_label(attempt);
-        self.cg.emit(Instruction::SelectNextIndex);
+        self.codegen.mark_label(start);
+        self.codegen.emit(Instruction::SelectBegin(cases.len()));
+        let attempt = self.codegen.fresh_label();
+        self.codegen.mark_label(attempt);
+        self.codegen.emit(Instruction::SelectNextIndex);
         self.emit_store_temp(&idx_tmp);
         self.emit_load_temp(&idx_tmp);
-        self.cg.emit(Instruction::Push(Value::Num(Num::Small(-1))));
-        self.cg.emit(Instruction::Eq);
-        let have_case = self.cg.fresh_label();
-        self.cg.emit(Instruction::GotoIfNot(have_case));
+        self.codegen.emit(Instruction::Push(Value::Num(Num::Small(-1))));
+        self.codegen.emit(Instruction::Eq);
+        let have_case = self.codegen.fresh_label();
+        self.codegen.emit(Instruction::GotoIfNot(have_case));
 
         // 本轮次序已耗尽且无一就绪。
         if let Some(else_b) = else_block {
             self.emit_select_idle(&sleep_temps);
             // 再公平 poll 一轮；仍无则 else
-            self.cg.emit(Instruction::SelectBegin(cases.len()));
-            let attempt2 = self.cg.fresh_label();
-            self.cg.mark_label(attempt2);
-            self.cg.emit(Instruction::SelectNextIndex);
+            self.codegen.emit(Instruction::SelectBegin(cases.len()));
+            let attempt2 = self.codegen.fresh_label();
+            self.codegen.mark_label(attempt2);
+            self.codegen.emit(Instruction::SelectNextIndex);
             self.emit_store_temp(&idx_tmp);
             self.emit_load_temp(&idx_tmp);
-            self.cg.emit(Instruction::Push(Value::Num(Num::Small(-1))));
-            self.cg.emit(Instruction::Eq);
-            let have_case2 = self.cg.fresh_label();
-            self.cg.emit(Instruction::GotoIfNot(have_case2));
+            self.codegen.emit(Instruction::Push(Value::Num(Num::Small(-1))));
+            self.codegen.emit(Instruction::Eq);
+            let have_case2 = self.codegen.fresh_label();
+            self.codegen.emit(Instruction::GotoIfNot(have_case2));
             self.gen_block(else_b, true)?;
-            self.cg.emit(Instruction::Goto(end));
-            self.cg.mark_label(have_case2);
+            self.codegen.emit(Instruction::Goto(end));
+            self.codegen.mark_label(have_case2);
             self.gen_select_dispatch_cases(cases, &sleep_temps, &idx_tmp, attempt2, end)?;
         } else {
             self.emit_select_idle(&sleep_temps);
-            self.cg.emit(Instruction::Goto(start));
+            self.codegen.emit(Instruction::Goto(start));
         }
 
-        self.cg.mark_label(have_case);
+        self.codegen.mark_label(have_case);
         self.gen_select_dispatch_cases(cases, &sleep_temps, &idx_tmp, attempt, end)?;
-        self.cg.mark_label(end);
+        self.codegen.mark_label(end);
         Ok(())
     }
 
@@ -3417,41 +3417,41 @@ impl Generator {
         end: usize,
     ) -> Result<()> {
         for (i, case) in cases.iter().enumerate() {
-            let next = self.cg.fresh_label();
+            let next = self.codegen.fresh_label();
             self.emit_load_temp(idx_tmp);
-            self.cg
+            self.codegen
                 .emit(Instruction::Push(Value::Num(Num::Small(i as i64))));
-            self.cg.emit(Instruction::Eq);
-            self.cg.emit(Instruction::GotoIfNot(next));
+            self.codegen.emit(Instruction::Eq);
+            self.codegen.emit(Instruction::GotoIfNot(next));
             self.gen_select_poll(&case.event, sleep_temps[i].as_deref())?;
-            self.cg.emit(Instruction::GotoIfNot(attempt));
+            self.codegen.emit(Instruction::GotoIfNot(attempt));
             if let Some(name) = &case.bind {
                 if name == "_" {
-                    self.cg.emit(Instruction::Pop);
+                    self.codegen.emit(Instruction::Pop);
                 } else {
                     self.emit_bind_name(name);
                 }
             } else {
-                self.cg.emit(Instruction::Pop);
+                self.codegen.emit(Instruction::Pop);
             }
             self.gen_block(&case.body, true)?;
-            self.cg.emit(Instruction::Goto(end));
-            self.cg.mark_label(next);
+            self.codegen.emit(Instruction::Goto(end));
+            self.codegen.mark_label(next);
         }
-        self.cg.emit(Instruction::Goto(attempt));
+        self.codegen.emit(Instruction::Goto(attempt));
         Ok(())
     }
 
     /// 表达式位置的 `suspend`：指令本身不压值，补 `none` 满足「expr 留 1 值」契约，
     /// 供语句层 `Pop` / 表达式位消费。勿用于 select 空转让步。
     fn emit_suspend_expr(&mut self) {
-        self.cg.emit(Instruction::Suspend);
-        self.cg.emit(Instruction::Push(Value::None));
+        self.codegen.emit(Instruction::Suspend);
+        self.codegen.emit(Instruction::Push(Value::None));
     }
 
     /// 控制流位置的裸挂起（select idle 等）：不压值，后继不得假定栈顶有结果。
     fn emit_suspend_idle(&mut self) {
-        self.cg.emit(Instruction::Suspend);
+        self.codegen.emit(Instruction::Suspend);
     }
 
     /// 有 sleep case 时用 SelectIdle（睡到最近截止 + 调度让出），避免 task 上 Suspend 永久挂起饿死 tick。
@@ -3465,32 +3465,32 @@ impl Generator {
         for tmp in &deadlines {
             self.emit_load_temp(tmp);
         }
-        self.cg.emit(Instruction::SelectIdle(deadlines.len()));
+        self.codegen.emit(Instruction::SelectIdle(deadlines.len()));
     }
 
     fn gen_select_poll(&mut self, event: &Expr, sleep_tmp: Option<&str>) -> Result<()> {
         if let Some(tmp) = sleep_tmp {
             self.emit_load_temp(tmp);
-            self.cg.emit(Instruction::SelectPollDeadline);
+            self.codegen.emit(Instruction::SelectPollDeadline);
             return Ok(());
         }
         match &event.kind {
             ExprKind::Await { operand } => {
                 self.gen_expr(operand)?;
-                self.cg.emit(Instruction::SelectPollTask);
+                self.codegen.emit(Instruction::SelectPollTask);
                 Ok(())
             }
             ExprKind::Call { callee, args } => {
                 if let ExprKind::Member { object, field } = &callee.kind {
                     if field == "recv" && args.is_empty() {
                         self.gen_expr(object)?;
-                        self.cg.emit(Instruction::SelectTryRecv);
+                        self.codegen.emit(Instruction::SelectTryRecv);
                         return Ok(());
                     }
                     if field == "send" && args.len() == 1 {
                         self.gen_expr(object)?;
                         self.gen_expr(&args[0].value)?;
-                        self.cg.emit(Instruction::SelectTrySend);
+                        self.codegen.emit(Instruction::SelectTrySend);
                         return Ok(());
                     }
                 }
@@ -3534,30 +3534,30 @@ impl Generator {
         if items.is_empty() {
             return Err(RuntimeError::type_err("comprehension requires for clause"));
         }
-        let result_name = self.cg.fresh_temp(match kind {
+        let result_name = self.codegen.fresh_temp(match kind {
             CompKind::List => "__list_comp_result",
             CompKind::Set => "__set_comp_result",
             CompKind::Dict => "__dict_comp_result",
         });
 
         match kind {
-            CompKind::List => self.cg.emit(Instruction::VecNew(0)),
-            CompKind::Set => self.cg.emit(Instruction::SetNew(0)),
-            CompKind::Dict => self.cg.emit(Instruction::DictNew(0)),
+            CompKind::List => self.codegen.emit(Instruction::VecNew(0)),
+            CompKind::Set => self.codegen.emit(Instruction::SetNew(0)),
+            CompKind::Dict => self.codegen.emit(Instruction::DictNew(0)),
         };
         self.emit_store_temp(&result_name);
 
         self.gen_for_iter_setup(items)?;
-        let start = self.cg.fresh_label();
-        let end = self.cg.fresh_label();
-        self.cg.mark_label(start);
-        self.cg.emit(Instruction::IterNext);
-        self.cg.emit(Instruction::GotoIfNot(end));
+        let start = self.codegen.fresh_label();
+        let end = self.codegen.fresh_label();
+        self.codegen.mark_label(start);
+        self.codegen.emit(Instruction::IterNext);
+        self.codegen.emit(Instruction::GotoIfNot(end));
         self.gen_for_iter_bind(items);
 
         for guard in guards {
             self.gen_expr(guard)?;
-            self.cg.emit(Instruction::GotoIfNot(start));
+            self.codegen.emit(Instruction::GotoIfNot(start));
         }
 
         self.emit_load_temp(&result_name);
@@ -3567,14 +3567,14 @@ impl Generator {
                     RuntimeError::msg("internal: list comprehension missing element")
                 })?;
                 self.gen_expr(e)?;
-                self.cg.emit(Instruction::ListAppend);
+                self.codegen.emit(Instruction::ListAppend);
             }
             CompKind::Set => {
                 let e = elem.ok_or_else(|| {
                     RuntimeError::msg("internal: set comprehension missing element")
                 })?;
                 self.gen_expr(e)?;
-                self.cg.emit(Instruction::SetAdd);
+                self.codegen.emit(Instruction::SetAdd);
             }
             CompKind::Dict => {
                 let k = key
@@ -3584,14 +3584,14 @@ impl Generator {
                 })?;
                 self.gen_expr(k)?;
                 self.gen_expr(v)?;
-                self.cg.emit(Instruction::DictSet);
+                self.codegen.emit(Instruction::DictSet);
             }
         }
         self.emit_store_temp(&result_name);
 
-        self.cg.emit(Instruction::Goto(start));
-        self.cg.mark_label(end);
-        self.cg.emit(Instruction::IterEnd);
+        self.codegen.emit(Instruction::Goto(start));
+        self.codegen.mark_label(end);
+        self.codegen.emit(Instruction::IterEnd);
         self.emit_load_temp(&result_name);
         Ok(())
     }
@@ -3610,8 +3610,8 @@ impl Generator {
             for item in items {
                 self.gen_expr(&item.iterable)?;
             }
-            self.cg.emit(Instruction::Load("__zip_iter__".into()));
-            self.cg.emit(Instruction::Call { argc: items.len() });
+            self.codegen.emit(Instruction::Load("__zip_iter__".into()));
+            self.codegen.emit(Instruction::Call { argc: items.len() });
         }
 
         let params: Vec<FuncParam> = items
@@ -3650,16 +3650,16 @@ impl Generator {
                 is_generator: false,
             },
         )?;
-        self.cg
+        self.codegen
             .emit(Instruction::Push(Value::Function(Arc::new(elem_fn))));
         if !elem_free.is_empty() {
             for name in &elem_free {
-                self.cg.emit(Instruction::Push(Value::Text(name.clone())));
+                self.codegen.emit(Instruction::Push(Value::Text(name.clone())));
                 self.emit_load_name(name);
             }
-            self.cg.emit(Instruction::DictNew(elem_free.len()));
-            self.cg.emit(Instruction::Load("__make_closure__".into()));
-            self.cg.emit(Instruction::Call { argc: 2 });
+            self.codegen.emit(Instruction::DictNew(elem_free.len()));
+            self.codegen.emit(Instruction::Load("__make_closure__".into()));
+            self.codegen.emit(Instruction::Call { argc: 2 });
         }
 
         for guard in guards {
@@ -3684,22 +3684,22 @@ impl Generator {
                     is_generator: false,
                 },
             )?;
-            self.cg
+            self.codegen
                 .emit(Instruction::Push(Value::Function(Arc::new(g_fn))));
             if !g_free.is_empty() {
                 for name in &g_free {
-                    self.cg.emit(Instruction::Push(Value::Text(name.clone())));
+                    self.codegen.emit(Instruction::Push(Value::Text(name.clone())));
                     self.emit_load_name(name);
                 }
-                self.cg.emit(Instruction::DictNew(g_free.len()));
-                self.cg.emit(Instruction::Load("__make_closure__".into()));
-                self.cg.emit(Instruction::Call { argc: 2 });
+                self.codegen.emit(Instruction::DictNew(g_free.len()));
+                self.codegen.emit(Instruction::Load("__make_closure__".into()));
+                self.codegen.emit(Instruction::Call { argc: 2 });
             }
         }
-        self.cg.emit(Instruction::VecNew(guards.len()));
+        self.codegen.emit(Instruction::VecNew(guards.len()));
 
-        self.cg.emit(Instruction::Load("__make_genexpr__".into()));
-        self.cg.emit(Instruction::Call { argc: 3 });
+        self.codegen.emit(Instruction::Load("__make_genexpr__".into()));
+        self.codegen.emit(Instruction::Call { argc: 3 });
         Ok(())
     }
 
@@ -3708,11 +3708,11 @@ impl Generator {
             return Err(RuntimeError::type_err("for requires at least one iterator"));
         }
         self.gen_for_iter_setup(items)?;
-        let start = self.cg.fresh_label();
-        let end = self.cg.fresh_label();
-        self.cg.mark_label(start);
-        self.cg.emit(Instruction::IterNext);
-        self.cg.emit(Instruction::GotoIfNot(end));
+        let start = self.codegen.fresh_label();
+        let end = self.codegen.fresh_label();
+        self.codegen.mark_label(start);
+        self.codegen.emit(Instruction::IterNext);
+        self.codegen.emit(Instruction::GotoIfNot(end));
         self.gen_for_iter_bind(items);
         self.loop_break_labels.push(end);
         self.loop_continue_labels.push(start);
@@ -3725,44 +3725,44 @@ impl Generator {
         self.loop_continue_labels.pop();
         self.loop_handler_depths.pop();
         self.loop_owns_stack_counter.pop();
-        self.cg.emit(Instruction::Goto(start));
-        self.cg.mark_label(end);
-        self.cg.emit(Instruction::IterEnd);
+        self.codegen.emit(Instruction::Goto(start));
+        self.codegen.mark_label(end);
+        self.codegen.emit(Instruction::IterEnd);
         Ok(())
     }
 
     fn gen_for_iter_setup(&mut self, items: &[ForItem]) -> Result<()> {
         if items.len() == 1 {
             self.gen_expr(&items[0].iterable)?;
-            self.cg.emit(Instruction::IterNew);
+            self.codegen.emit(Instruction::IterNew);
             return Ok(());
         }
         for item in items {
             self.gen_expr(&item.iterable)?;
         }
-        self.cg.emit(Instruction::Load("__zip_iter__".into()));
-        self.cg.emit(Instruction::Call { argc: items.len() });
-        self.cg.emit(Instruction::IterNew);
+        self.codegen.emit(Instruction::Load("__zip_iter__".into()));
+        self.codegen.emit(Instruction::Call { argc: items.len() });
+        self.codegen.emit(Instruction::IterNew);
         Ok(())
     }
 
     fn gen_for_iter_bind(&mut self, items: &[ForItem]) {
         if items.len() == 1 {
             if items[0].name == "_" {
-                self.cg.emit(Instruction::Pop);
+                self.codegen.emit(Instruction::Pop);
             } else {
                 self.emit_bind_name(&items[0].name);
             }
             return;
         }
-        let tuple_name = self.cg.fresh_temp("__zip_tuple");
+        let tuple_name = self.codegen.fresh_temp("__zip_tuple");
         self.emit_store_temp(&tuple_name);
         for (i, item) in items.iter().enumerate() {
             self.emit_load_temp(&tuple_name);
-            self.cg.emit(Instruction::PushSmall(i as i64));
-            self.cg.emit(Instruction::Index);
+            self.codegen.emit(Instruction::PushSmall(i as i64));
+            self.codegen.emit(Instruction::Index);
             if item.name == "_" {
-                self.cg.emit(Instruction::Pop);
+                self.codegen.emit(Instruction::Pop);
             } else {
                 self.emit_bind_name(&item.name);
             }
@@ -3773,7 +3773,7 @@ impl Generator {
         if let Some(expr) = bound {
             self.gen_expr(expr)?;
         } else {
-            self.cg.emit(Instruction::Push(Value::None));
+            self.codegen.emit(Instruction::Push(Value::None));
         }
         Ok(())
     }
@@ -3794,12 +3794,12 @@ impl Generator {
                 }
             }
             DestructPattern::Discard => {
-                self.cg.emit(Instruction::Pop);
+                self.codegen.emit(Instruction::Pop);
             }
             DestructPattern::Tuple(elems) | DestructPattern::List(elems) => {
                 let (before, rest, after) = split_destruct_elems(elems)?;
                 if let Some(rest_elem) = rest {
-                    self.cg.emit(Instruction::UnpackRest {
+                    self.codegen.emit(Instruction::UnpackRest {
                         before: before.len(),
                         after: after.len(),
                     });
@@ -3815,7 +3815,7 @@ impl Generator {
                             }
                         }
                         DestructElem::RestDiscard => {
-                            self.cg.emit(Instruction::Pop);
+                            self.codegen.emit(Instruction::Pop);
                         }
                         DestructElem::Pat(_) => {
                             return Err(RuntimeError::msg("internal: rest slot is not Rest"));
@@ -3826,7 +3826,7 @@ impl Generator {
                     }
                 } else {
                     let n = before.len();
-                    self.cg.emit(Instruction::UnpackExact(n));
+                    self.codegen.emit(Instruction::UnpackExact(n));
                     for pat in before.iter().rev() {
                         self.gen_destruct_bind(pat, is_const, declaring)?;
                     }

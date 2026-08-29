@@ -94,7 +94,7 @@ enum HotFlow {
 }
 
 /// `run_interpreter` 出口：正常值、任务已挂起、或调试器请求暂停。
-enum InterpResult {
+enum InterpreterResult {
     Value(Option<Value>),
     Suspended,
     DebugBreak,
@@ -3646,15 +3646,15 @@ impl Vm {
     pub fn run(&mut self) -> Result<Value> {
         self.fail_if_host_cancelled()?;
         match self.run_interpreter(None)? {
-            InterpResult::Value(Some(v)) => Ok(v),
-            InterpResult::Value(None) => Ok(self.stack_top()),
-            InterpResult::Suspended => Err(RuntimeError::msg(
+            InterpreterResult::Value(Some(v)) => Ok(v),
+            InterpreterResult::Value(None) => Ok(self.stack_top()),
+            InterpreterResult::Suspended => Err(RuntimeError::msg(
                 "internal error: main fiber suspended unexpectedly",
             )),
-            InterpResult::DebugBreak => Err(RuntimeError::msg(
+            InterpreterResult::DebugBreak => Err(RuntimeError::msg(
                 "internal error: debug break without debugger session",
             )),
-            InterpResult::Yielded(_) => Err(RuntimeError::msg(
+            InterpreterResult::Yielded(_) => Err(RuntimeError::msg(
                 "internal error: generator yield outside iterator",
             )),
         }
@@ -3664,13 +3664,13 @@ impl Vm {
     pub fn run_until_debug_break(&mut self) -> Result<Option<Value>> {
         self.resume_debug_paused_tasks();
         match self.run_interpreter(None)? {
-            InterpResult::Value(Some(v)) => Ok(Some(v)),
-            InterpResult::Value(None) => Ok(Some(self.stack_top())),
-            InterpResult::DebugBreak => Ok(None),
-            InterpResult::Suspended => Err(RuntimeError::msg(
+            InterpreterResult::Value(Some(v)) => Ok(Some(v)),
+            InterpreterResult::Value(None) => Ok(Some(self.stack_top())),
+            InterpreterResult::DebugBreak => Ok(None),
+            InterpreterResult::Suspended => Err(RuntimeError::msg(
                 "internal error: main fiber suspended unexpectedly",
             )),
-            InterpResult::Yielded(_) => Err(RuntimeError::msg(
+            InterpreterResult::Yielded(_) => Err(RuntimeError::msg(
                 "internal error: generator yield outside iterator",
             )),
         }
@@ -3714,17 +3714,17 @@ impl Vm {
     }
 
     #[inline]
-    fn check_debug_pause(&mut self) -> Option<InterpResult> {
+    fn check_debug_pause(&mut self) -> Option<InterpreterResult> {
         let dbg = self.debug.clone()?;
         let mut state = dbg.borrow_mut();
         if crate::debug::should_pause(self, &mut state) {
             crate::debug::mark_stopped(self, &mut state);
-            return Some(InterpResult::DebugBreak);
+            return Some(InterpreterResult::DebugBreak);
         }
         None
     }
 
-    fn run_interpreter(&mut self, until_depth: Option<usize>) -> Result<InterpResult> {
+    fn run_interpreter(&mut self, until_depth: Option<usize>) -> Result<InterpreterResult> {
         self.ensure_op_stack(256);
         'outer: loop {
             // 仅在外层刷新切片；CallSelf/Cont 热路径不碰 Rc / ptr_eq。
@@ -3739,7 +3739,7 @@ impl Vm {
                 if self.debug_active {
                     if self.debug_break_requested && self.task_ctx.is_none() {
                         self.debug_break_requested = false;
-                        return Ok(InterpResult::DebugBreak);
+                        return Ok(InterpreterResult::DebugBreak);
                     }
                     if let Some(r) = self.check_debug_pause() {
                         return Ok(r);
@@ -3791,10 +3791,10 @@ impl Vm {
                         );
                         let result = result_sv.into_value();
                         if let Some(ret) = self.complete_user_return_instruction(leave, result)? {
-                            return Ok(InterpResult::Value(Some(ret)));
+                            return Ok(InterpreterResult::Value(Some(ret)));
                         }
                         if until_depth.is_some_and(|d| self.user_call_frames.len() == d) {
-                            return Ok(InterpResult::Value(self.op_last_value()));
+                            return Ok(InterpreterResult::Value(self.op_last_value()));
                         }
                         continue 'outer;
                     }
@@ -3843,7 +3843,7 @@ impl Vm {
                             }
                         }
                         if let Some(v) = self.pending_gen_yield.take() {
-                            return Ok(InterpResult::Yielded(v));
+                            return Ok(InterpreterResult::Yielded(v));
                         }
                         if std::ptr::eq(Arc::as_ptr(&self.hot_ops).cast::<u8>(), ops_ptr)
                             && std::ptr::eq(Arc::as_ptr(&self.hot_args).cast::<i64>(), args_ptr)
@@ -3857,20 +3857,20 @@ impl Vm {
 
             // pc 已越界（pc >= code_len）
             if until_depth.is_none() && self.user_call_frames.is_empty() {
-                return Ok(InterpResult::Value(self.op_last_value()));
+                return Ok(InterpreterResult::Value(self.op_last_value()));
             }
             if until_depth.is_some_and(|d| self.user_call_frames.len() <= d) {
-                return Ok(InterpResult::Value(self.op_last_value()));
+                return Ok(InterpreterResult::Value(self.op_last_value()));
             }
             if !self.user_call_frames.is_empty() {
                 if let Some(ret) = self.complete_user_return_instruction(false, Value::None)? {
-                    return Ok(InterpResult::Value(Some(ret)));
+                    return Ok(InterpreterResult::Value(Some(ret)));
                 }
                 continue 'outer;
             }
             break;
         }
-        Ok(InterpResult::Value(None))
+        Ok(InterpreterResult::Value(None))
     }
 
     /// 若已有脚本异常则分发；否则把**任意**宿主错误提升为语言异常再 `throw`。
@@ -5961,8 +5961,8 @@ impl Vm {
         self.pc = 0;
 
         let result = match self.run_interpreter(None) {
-            Ok(InterpResult::Value(v)) => v.unwrap_or_else(|| self.stack_top()),
-            Ok(InterpResult::Suspended) => {
+            Ok(InterpreterResult::Value(v)) => v.unwrap_or_else(|| self.stack_top()),
+            Ok(InterpreterResult::Suspended) => {
                 self.leave_scope();
                 self.code = saved_code;
                 self.hot_ops = saved_hot_ops;
@@ -5972,7 +5972,7 @@ impl Vm {
                     "internal error: task suspended inside macro expansion",
                 ));
             }
-            Ok(InterpResult::DebugBreak) => {
+            Ok(InterpreterResult::DebugBreak) => {
                 self.leave_scope();
                 self.code = saved_code;
                 self.hot_ops = saved_hot_ops;
@@ -5982,7 +5982,7 @@ impl Vm {
                     "internal error: debug break inside macro expansion",
                 ));
             }
-            Ok(InterpResult::Yielded(_)) => {
+            Ok(InterpreterResult::Yielded(_)) => {
                 self.leave_scope();
                 self.code = saved_code;
                 self.hot_ops = saved_hot_ops;
@@ -6532,15 +6532,15 @@ impl Vm {
         args: Vec<Value>,
     ) -> Result<Value> {
         match self.call_user_function_poll(func, args)? {
-            InterpResult::Value(v) => Ok(v.unwrap_or(Value::None)),
-            InterpResult::Suspended => {
+            InterpreterResult::Value(v) => Ok(v.unwrap_or(Value::None)),
+            InterpreterResult::Suspended => {
                 self.nested_user_call_suspended = true;
                 Ok(Value::None)
             }
-            InterpResult::DebugBreak => Err(RuntimeError::msg(
+            InterpreterResult::DebugBreak => Err(RuntimeError::msg(
                 "internal error: debug break outside debugger session",
             )),
-            InterpResult::Yielded(_) => Err(RuntimeError::msg(
+            InterpreterResult::Yielded(_) => Err(RuntimeError::msg(
                 "internal error: generator yield outside iterator",
             )),
         }
@@ -6564,14 +6564,14 @@ impl Vm {
         Ok(())
     }
 
-    fn take_task_suspend(&mut self) -> Result<InterpResult> {
+    fn take_task_suspend(&mut self) -> Result<InterpreterResult> {
         if self.task_ctx.is_some() {
             return self.complete_task_suspend();
         }
         if self.nested_user_call_suspended {
             self.nested_user_call_suspended = false;
             self.pending_suspend = false;
-            return Ok(InterpResult::Suspended);
+            return Ok(InterpreterResult::Suspended);
         }
         self.complete_task_suspend()
     }
@@ -6580,10 +6580,10 @@ impl Vm {
         &mut self,
         func: Arc<FunctionObject>,
         args: Vec<Value>,
-    ) -> Result<InterpResult> {
+    ) -> Result<InterpreterResult> {
         let bound = self.bind_call_arguments(&func, args, DictMap::new())?;
         if func.is_generator() {
-            return Ok(InterpResult::Value(Some(
+            return Ok(InterpreterResult::Value(Some(
                 self.make_generator_iterator(func, bound)?,
             )));
         }
@@ -6591,13 +6591,13 @@ impl Vm {
         let stop_depth = self.user_call_frames.len();
         self.setup_user_call(func, bound, false)?;
         match self.run_interpreter(Some(stop_depth))? {
-            InterpResult::Value(v) => {
+            InterpreterResult::Value(v) => {
                 self.op_truncate(stack_base);
-                Ok(InterpResult::Value(Some(v.unwrap_or(Value::None))))
+                Ok(InterpreterResult::Value(Some(v.unwrap_or(Value::None))))
             }
-            InterpResult::Suspended => Ok(InterpResult::Suspended),
-            InterpResult::DebugBreak => Ok(InterpResult::DebugBreak),
-            InterpResult::Yielded(v) => Ok(InterpResult::Yielded(v)),
+            InterpreterResult::Suspended => Ok(InterpreterResult::Suspended),
+            InterpreterResult::DebugBreak => Ok(InterpreterResult::DebugBreak),
+            InterpreterResult::Yielded(v) => Ok(InterpreterResult::Yielded(v)),
         }
     }
 
@@ -6971,7 +6971,7 @@ impl Vm {
         std::mem::take(&mut self.last_error_stack)
     }
 
-    fn finish_uncaught(&mut self, e: RuntimeError) -> Result<InterpResult> {
+    fn finish_uncaught(&mut self, e: RuntimeError) -> Result<InterpreterResult> {
         let finalized = self.finalize_runtime_error(e);
         if let Some(dbg) = &self.debug {
             if self.task_ctx.is_none() {
@@ -6980,7 +6980,7 @@ impl Vm {
                     st.last_uncaught = Some(finalized.uncaught_line());
                     st.request_break(crate::debug::StopReason::Uncaught);
                     crate::debug::mark_stopped(self, &mut st);
-                    return Ok(InterpResult::DebugBreak);
+                    return Ok(InterpreterResult::DebugBreak);
                 }
             }
         }
@@ -7767,11 +7767,11 @@ impl Vm {
             };
 
             match result {
-                InterpResult::Yielded(v) => {
+                InterpreterResult::Yielded(v) => {
                     self.op_truncate(stack_base);
                     return Ok(Some(v));
                 }
-                InterpResult::Value(_) => {
+                InterpreterResult::Value(_) => {
                     let _ = self.generator_run.pop();
                     if let IteratorKind::Generator { exhausted, .. } = &mut state.borrow_mut().kind
                     {
@@ -7780,13 +7780,13 @@ impl Vm {
                     self.op_truncate(stack_base);
                     return Ok(None);
                 }
-                InterpResult::Suspended => {
+                InterpreterResult::Suspended => {
                     let _ = self.generator_run.pop();
                     return Err(RuntimeError::msg(
                         "internal error: generator suspended via task scheduler",
                     ));
                 }
-                InterpResult::DebugBreak => {
+                InterpreterResult::DebugBreak => {
                     let _ = self.generator_run.pop();
                     return Err(RuntimeError::msg(
                         "internal error: debug break inside generator",
@@ -8539,7 +8539,7 @@ impl Vm {
         self.pending_suspend = false;
     }
 
-    fn complete_task_suspend(&mut self) -> Result<InterpResult> {
+    fn complete_task_suspend(&mut self) -> Result<InterpreterResult> {
         self.pending_suspend = false;
         let Some(ctx) = self.task_ctx.take() else {
             return Err(RuntimeError::msg(
@@ -8551,7 +8551,7 @@ impl Vm {
         self.fiber_insert(key, fiber);
         ctx.task.borrow_mut().state = TaskState::Suspended;
         self.enqueue_task(ctx.task);
-        Ok(InterpResult::Suspended)
+        Ok(InterpreterResult::Suspended)
     }
 
     pub(crate) fn scheduler_run_one(&mut self) -> Result<bool> {
@@ -8642,19 +8642,19 @@ impl Vm {
                     self.task_ctx = Some(Self::snapshot_task_ctx(task.clone(), self));
                     self.budget_left = self.suspend_budget;
                     match self.call_value_poll(callable, args)? {
-                        InterpResult::Value(v) => {
+                        InterpreterResult::Value(v) => {
                             // 丢弃任务帧，保证不污染调用方（主 fiber / 外层任务）栈。
                             if let Some(ctx) = self.task_ctx.take() {
                                 let _ = self.capture_fiber(&ctx);
                             }
                             Ok(Some(v.unwrap_or(Value::None)))
                         }
-                        InterpResult::Suspended => Ok(None),
-                        InterpResult::DebugBreak => {
+                        InterpreterResult::Suspended => Ok(None),
+                        InterpreterResult::DebugBreak => {
                             self.park_task_for_debug();
                             Ok(None)
                         }
-                        InterpResult::Yielded(v) => {
+                        InterpreterResult::Yielded(v) => {
                             if let Some(ctx) = self.task_ctx.take() {
                                 let _ = self.capture_fiber(&ctx);
                             }
@@ -8671,18 +8671,18 @@ impl Vm {
                     if let Some((callable, args)) = fiber.retry_poll.take() {
                         self.install_fiber(task.clone(), fiber);
                         match self.call_value_poll(callable, args)? {
-                            InterpResult::Value(v) => {
+                            InterpreterResult::Value(v) => {
                                 if let Some(ctx) = self.task_ctx.take() {
                                     let _ = self.capture_fiber(&ctx);
                                 }
                                 Ok(Some(v.unwrap_or(Value::None)))
                             }
-                            InterpResult::Suspended => Ok(None),
-                            InterpResult::DebugBreak => {
+                            InterpreterResult::Suspended => Ok(None),
+                            InterpreterResult::DebugBreak => {
                                 self.park_task_for_debug();
                                 Ok(None)
                             }
-                            InterpResult::Yielded(v) => {
+                            InterpreterResult::Yielded(v) => {
                                 if let Some(ctx) = self.task_ctx.take() {
                                     let _ = self.capture_fiber(&ctx);
                                 }
@@ -8693,18 +8693,18 @@ impl Vm {
                         self.install_fiber(task.clone(), fiber);
                         let stop = self.task_ctx.as_ref().map_or(0, |c| c.stop_ucf);
                         match self.run_interpreter(Some(stop))? {
-                            InterpResult::Value(v) => {
+                            InterpreterResult::Value(v) => {
                                 if let Some(ctx) = self.task_ctx.take() {
                                     let _ = self.capture_fiber(&ctx);
                                 }
                                 Ok(Some(v.unwrap_or(Value::None)))
                             }
-                            InterpResult::Suspended => Ok(None),
-                            InterpResult::DebugBreak => {
+                            InterpreterResult::Suspended => Ok(None),
+                            InterpreterResult::DebugBreak => {
                                 self.park_task_for_debug();
                                 Ok(None)
                             }
-                            InterpResult::Yielded(v) => {
+                            InterpreterResult::Yielded(v) => {
                                 if let Some(ctx) = self.task_ctx.take() {
                                     let _ = self.capture_fiber(&ctx);
                                 }
@@ -8895,7 +8895,7 @@ impl Vm {
         }
     }
 
-    fn call_value_poll(&mut self, callee: Value, args: Vec<Value>) -> Result<InterpResult> {
+    fn call_value_poll(&mut self, callee: Value, args: Vec<Value>) -> Result<InterpreterResult> {
         match callee {
             Value::Function(f) => self.call_user_function_poll(f, args),
             Value::Builtin(b) => {
@@ -8906,24 +8906,24 @@ impl Vm {
                     return self.complete_task_suspend();
                 }
                 if self.nested_user_call_suspended {
-                    return Ok(InterpResult::Suspended);
+                    return Ok(InterpreterResult::Suspended);
                 }
-                Ok(InterpResult::Value(Some(out)))
+                Ok(InterpreterResult::Value(Some(out)))
             }
             other => {
                 let stop = self.user_call_frames.len();
                 let result = self.call_value(other, args)?;
                 if self.user_call_deferred {
                     match self.run_interpreter(Some(stop))? {
-                        InterpResult::Value(v) => {
-                            Ok(InterpResult::Value(Some(v.unwrap_or(Value::None))))
+                        InterpreterResult::Value(v) => {
+                            Ok(InterpreterResult::Value(Some(v.unwrap_or(Value::None))))
                         }
-                        InterpResult::Suspended => Ok(InterpResult::Suspended),
-                        InterpResult::DebugBreak => Ok(InterpResult::DebugBreak),
-                        InterpResult::Yielded(v) => Ok(InterpResult::Yielded(v)),
+                        InterpreterResult::Suspended => Ok(InterpreterResult::Suspended),
+                        InterpreterResult::DebugBreak => Ok(InterpreterResult::DebugBreak),
+                        InterpreterResult::Yielded(v) => Ok(InterpreterResult::Yielded(v)),
                     }
                 } else {
-                    Ok(InterpResult::Value(Some(result)))
+                    Ok(InterpreterResult::Value(Some(result)))
                 }
             }
         }
@@ -9354,8 +9354,8 @@ impl Vm {
             }
         }
         let result = match self.call_value_poll(callable, vec![]) {
-            Ok(InterpResult::Value(v)) => v.unwrap_or(Value::None),
-            Ok(InterpResult::Suspended) => {
+            Ok(InterpreterResult::Value(v)) => v.unwrap_or(Value::None),
+            Ok(InterpreterResult::Suspended) => {
                 if let SyncInner::Once { phase, value } = &mut *s.borrow_mut() {
                     *phase = OncePhase::Idle;
                     *value = Value::None;
@@ -9365,7 +9365,7 @@ impl Vm {
                     "Once.run: callable suspended; use a non-suspending function",
                 ));
             }
-            Ok(InterpResult::DebugBreak) => {
+            Ok(InterpreterResult::DebugBreak) => {
                 if let SyncInner::Once { phase, value } = &mut *s.borrow_mut() {
                     *phase = OncePhase::Idle;
                     *value = Value::None;
@@ -9373,7 +9373,7 @@ impl Vm {
                 self.mn.notify_all();
                 return Err(RuntimeError::msg("Once.run interrupted by debugger"));
             }
-            Ok(InterpResult::Yielded(_)) => {
+            Ok(InterpreterResult::Yielded(_)) => {
                 if let SyncInner::Once { phase, value } = &mut *s.borrow_mut() {
                     *phase = OncePhase::Idle;
                     *value = Value::None;

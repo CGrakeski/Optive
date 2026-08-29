@@ -31,7 +31,7 @@ thread_local! {
 
 pub fn sample_error_codes() {
     let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-    LAST_ERRNO.with(|c| c.set(code));
+    LAST_ERRNO.set(code);
 }
 
 /// 采样并返回 errno（卸荷线程把值带回调用方）。
@@ -42,7 +42,7 @@ pub fn sample_error_codes_value() -> i32 {
 }
 
 pub fn set_last_errno(code: i32) {
-    LAST_ERRNO.with(|c| c.set(code));
+    LAST_ERRNO.set(code);
 }
 
 pub fn with_active_vm<R>(vm: &mut Vm, f: impl FnOnce() -> R) -> R {
@@ -54,10 +54,10 @@ pub fn with_active_vm<R>(vm: &mut Vm, f: impl FnOnce() -> R) -> R {
     }
     impl Drop for TlsGuard {
         fn drop(&mut self) {
-            FFI_ACTIVE_VM.with(|c| c.set(self.prev));
+            FFI_ACTIVE_VM.set(self.prev);
         }
     }
-    let prev = FFI_ACTIVE_VM.with(|c| c.replace(ptr));
+    let prev = FFI_ACTIVE_VM.replace(ptr);
     let _guard = TlsGuard { prev };
     f()
 }
@@ -750,6 +750,7 @@ pub fn builtin_struct(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         children: HashMap::new(),
         is_user: false,
         live_globals: None,
+        ..Default::default()
     })))
 }
 
@@ -1368,13 +1369,10 @@ pub fn builtin_callback(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
             call_args.push(unsafe { decode_cb_arg(p.cast_mut(), abi.clone()) });
         }
         let result = vm.call_value(userdata.callable.clone(), call_args);
-        let val = match result {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("optive FFI callback error: {}", e.message());
-                Value::None
-            }
-        };
+        let val = result.unwrap_or_else(|e| {
+            eprintln!("optive FFI callback error: {}", e.message());
+            Value::None
+        });
         *ret = encode_cb_ret_u64(&val, userdata.ret_abi.clone());
     }
 

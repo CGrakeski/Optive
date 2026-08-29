@@ -91,9 +91,9 @@ fn sync_from(url: &str) -> Result<(), Box<dyn Error>> {
     println!("  -> {}", index_path.display());
     if git_ops::should_replace_checkout(&index_path, url)? {
         if let Some(old) = git_ops::origin_fetch_url(&index_path) {
-            println!("Local index origin is {old}; replacing checkout…");
+            println!("Local index origin is {old}; replacing checkout...");
         } else {
-            println!("Local index is not the configured remote; replacing checkout…");
+            println!("Local index is not the configured remote; replacing checkout...");
         }
         git_ops::remove_checkout(&index_path)?;
     }

@@ -89,6 +89,7 @@ fn install_std_macros(vm: &mut Vm, std_mod: &Shared<ModuleObject>) -> Result<()>
         children: HashMap::new(),
         is_user: false,
         live_globals: Some(live_globals),
+        ..Default::default()
     });
     std_mod
         .borrow_mut()
@@ -817,6 +818,7 @@ pub fn load_string_module(vm: &mut Vm, path: &str) -> Result<Value> {
         children: HashMap::new(),
         is_user: true,
         live_globals: Some(live_globals),
+        ..Default::default()
     });
     vm.module_cache.insert(canonical, module.clone());
     Ok(Value::Module(module))
