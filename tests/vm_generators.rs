@@ -197,3 +197,48 @@ func outer() {
 fn yield_at_module_level_errors() {
     run_err("yield 1");
 }
+
+#[test]
+fn yield_inside_try_does_not_catch_caller_throw() {
+    assert_num(
+        r#"
+gen g() {
+  try {
+    yield 1
+    10
+  } catch (e: Exception) {
+    20
+  }
+}
+let it = g()
+next(it)
+try {
+  throw ValueError("from caller")
+} catch (e: ValueError) {
+  7
+}
+"#,
+        "7",
+    );
+}
+
+#[test]
+fn yield_inside_for_does_not_steal_caller_iterator() {
+    assert_num(
+        r#"
+gen g() {
+  for (x in [1, 2, 3]) {
+    yield x
+  }
+}
+let it = g()
+next(it)
+var s = 0
+for (y in [10, 20]) {
+  s = s + y
+}
+s + next(it)
+"#,
+        "32",
+    );
+}

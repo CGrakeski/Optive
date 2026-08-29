@@ -679,7 +679,8 @@ impl Formatter {
     ) {
         // 解析器认 `-> T` / `=> T`，可选再跟 `: wrap(_)`。
         if let Some(t) = return_type {
-            self.buf.push_str(if return_strong { " => " } else { " -> " });
+            self.buf
+                .push_str(if return_strong { " => " } else { " -> " });
             self.emit_type(t);
         }
         if let Some(w) = return_wrapper {

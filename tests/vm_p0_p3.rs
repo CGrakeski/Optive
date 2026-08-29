@@ -26,6 +26,22 @@ s
 }
 
 #[test]
+fn match_expr_return_fast_local() {
+    assert_text(
+        r#"
+func label(n) {
+  let word = "alpha"
+  match (n) {
+    case (1) { return word }
+  } else { return "other" }
+}
+label(1)
+"#,
+        "alpha",
+    );
+}
+
+#[test]
 fn p0_range_returns_iterator() {
     let v = value("type(std.math.range(3))");
     assert_eq!(v.display_string(), "iterator");

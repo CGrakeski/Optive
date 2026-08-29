@@ -225,6 +225,18 @@ impl Capabilities {
         }
     }
 
+    /// 环境读取网关：`getenv`。沙箱默认关闭，避免泄漏宿主密钥。
+    pub fn check_env_read(&self, op: &str) -> Result<(), RuntimeError> {
+        if self.env {
+            Ok(())
+        } else {
+            Err(RuntimeError::io_err(format!(
+                "{}: environment read disabled (sandbox)",
+                crate::value::builtin_repr(op)
+            )))
+        }
+    }
+
     /// 子进程网关：`std.os.run` / `capture`。依赖默认关闭。
     pub fn check_process(&self, op: &str) -> Result<(), RuntimeError> {
         if self.process {

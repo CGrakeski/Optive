@@ -419,7 +419,14 @@ pub fn ensure_local_pack(
             )
             .into());
         } else {
-            // 无 .git、无 marker 的本地 fixture（测试/手摆 deps/）：盖章后复用。
+            // 无 .git、无 marker 的本地目录：默认拒绝盖章，避免把任意 deps/ 当成已验证 pack。
+            if !super::home::allow_unverified_fixture() {
+                return Err(format!(
+                    "deps/{name} exists without .optive-id; set OPTIVE_ALLOW_UNVERIFIED_FIXTURE=1 \
+                     to stamp a test fixture, or clone a matching checkout"
+                )
+                .into());
+            }
             fs::write(&marker, &id)?;
             let identity = inspect_fixture(&target, &source, &commit)?;
             validate_identity(&identity, expected, None)?;

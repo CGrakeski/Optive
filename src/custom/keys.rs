@@ -229,7 +229,7 @@ impl CliMsg {
             Self::HelpV => "  Optive -V, --version           Show version",
             Self::HelpEnvHeader => "Env:",
             Self::HelpOptiveHome => "  OPTIVE_HOME              Global pack/ + index.db + index.url root",
-            Self::HelpLocalDeps => "  OPTIVE_USE_LOCAL_DEPS=1  Debug: install into project deps/",
+            Self::HelpLocalDeps => "  OPTIVE_USE_LOCAL_DEPS=1  Debug: install into project deps/ (unmarked dirs need OPTIVE_ALLOW_UNVERIFIED_FIXTURE=1)",
             Self::HelpOptiveCustomEnv => "  OPTIVE_CUSTOM=a,b        Override active customization packs",
             Self::HelpOptiveIndexUrl => "  OPTIVE_INDEX_URL         Override package index git remote (default: gitee.com/CGrakeski/optindex)",
             Self::HelpOptiveIndexPin => "  OPTIVE_INDEX_PIN         Require index HEAD to equal this full commit id",

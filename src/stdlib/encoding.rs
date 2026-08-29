@@ -9,6 +9,8 @@ use crate::Result;
 
 use super::{builtin, expect_arity, expect_text, io_map, submodule};
 
+const MAX_GZIP_OUT: u64 = 32 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // std.encoding —— base64 / hex / url / gzip 编解码
 // ---------------------------------------------------------------------------
@@ -132,10 +134,15 @@ pub(super) fn enc_gzip_decode(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let data = enc_input_bytes(&args[0])?;
     use flate2::read::GzDecoder;
     use std::io::Read;
-    let mut dec = GzDecoder::new(&data[..]);
+    let mut dec = GzDecoder::new(&data[..]).take(MAX_GZIP_OUT + 1);
     let mut out = Vec::new();
     dec.read_to_end(&mut out)
         .map_err(|e| io_map("gzip_decode", e))?;
+    if out.len() as u64 > MAX_GZIP_OUT {
+        return Err(crate::error::RuntimeError::value_err(
+            "gzip_decode: decompressed output exceeds 32 MiB",
+        ));
+    }
     Ok(Value::Bytes(Arc::new(out)))
 }
 

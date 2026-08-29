@@ -1,7 +1,8 @@
 //! 包索引轻量信任链：可选 pin 与 signed-commit 策略。
 //!
 //! 默认 `off`，本地 `index.json` 与未签名 checkout 仍可开发。
-//! 官方默认远程可用 `OPTIVE_INDEX_POLICY=strict` 要求 HEAD 带签名头；
+//! `OPTIVE_INDEX_POLICY=signed` / `strict` 先检查 commit 是否带签名头，
+//! 再调用 `git verify-commit` 做密码学校验；git 不可用时失败关闭。
 //! `OPTIVE_INDEX_PIN` 一旦设置即强制 HEAD 等于该完整 object id。
 
 use std::error::Error;
@@ -117,7 +118,37 @@ fn verify_index_dir_with(
     }
     let head = head.expect("git HEAD inspected");
     check_index_head(&head, policy, pin, official_default)?;
+    if requires_signature(policy, pin, official_default) {
+        verify_git_commit_signature(path, &head.commit)?;
+    }
     Ok(Some(head))
+}
+
+fn requires_signature(policy: IndexPolicy, pin: Option<&str>, official_default: bool) -> bool {
+    match policy {
+        IndexPolicy::Off => false,
+        IndexPolicy::Signed => true,
+        IndexPolicy::Strict => official_default || pin.is_none(),
+    }
+}
+
+fn verify_git_commit_signature(repo: &Path, commit: &str) -> Result<(), Box<dyn Error>> {
+    let out = std::process::Command::new("git")
+        .args(["verify-commit", commit])
+        .current_dir(repo)
+        .output()
+        .map_err(|e| {
+            format!("OPTIVE_INDEX_POLICY requires git verify-commit, but launching git failed: {e}")
+        })?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        Err(format!(
+            "index HEAD {commit} signature verification failed (missing, untrusted, or invalid key): {stderr}"
+        )
+        .into())
+    }
 }
 
 fn check_index_head(
@@ -134,11 +165,7 @@ fn check_index_head(
             ));
         }
     }
-    let require_signed = match policy {
-        IndexPolicy::Off => false,
-        IndexPolicy::Signed => true,
-        IndexPolicy::Strict => official_default || pin.is_none(),
-    };
+    let require_signed = requires_signature(policy, pin, official_default);
     if require_signed && !head.signed {
         return Err(format!(
             "index HEAD {} is unsigned; official/strict policy requires a gpgsig or SSH signature header on the commit",
@@ -292,5 +319,48 @@ msg mentions -----BEGIN PGP SIGNATURE-----\n";
             signed: false,
         };
         assert!(check_index_head(&head, IndexPolicy::Off, None, true).is_ok());
+    }
+
+    #[test]
+    fn signed_policy_verify_commit_fails_on_unsigned_repo() {
+        let tmp = std::env::temp_dir().join(format!(
+            "optive_idx_verify_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let status = std::process::Command::new("git")
+            .current_dir(&tmp)
+            .args(["init"])
+            .status()
+            .expect("git init");
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .current_dir(&tmp)
+            .args([
+                "-c",
+                "user.email=t@e.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "unsigned",
+            ])
+            .status()
+            .expect("git commit");
+        assert!(status.success());
+        let err = verify_index_dir_with(&tmp, IndexPolicy::Signed, None, false, "test")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unsigned") || err.contains("verify-commit") || err.contains("signature"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

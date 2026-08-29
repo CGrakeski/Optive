@@ -264,14 +264,24 @@ pub fn looks_like_git_url(url: &str) -> bool {
 }
 
 pub(crate) fn validate_git_url(url: &str) -> Result<(), Box<dyn Error>> {
-    if looks_like_git_url(url) {
-        Ok(())
-    } else {
-        Err(format!(
-            "unsupported git URL scheme (allow https://, http://, ssh://, git://, file:///, git@host:path): {url}"
+    let u = url.trim();
+    if !looks_like_git_url(u) {
+        return Err(format!(
+            "unsupported git URL scheme (allow https://, ssh://, file:///, git@host:path): {url}"
         )
-        .into())
+        .into());
     }
+    if u.starts_with("git://") {
+        return Err("insecure git:// URLs are not allowed; use https:// or ssh".into());
+    }
+    if u.starts_with("http://") && std::env::var("OPTIVE_ALLOW_INSECURE_GIT").as_deref() != Ok("1")
+    {
+        return Err(
+            "insecure http:// git URLs are not allowed; use https:// or set OPTIVE_ALLOW_INSECURE_GIT=1"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// 将 `file://` / `file:///` URL 转成文件系统路径。
@@ -1105,6 +1115,21 @@ fn checkout_git_worktree(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn looks_like_git_url_recognizes_http_but_validate_rejects() {
+        assert!(looks_like_git_url("http://example.com/repo.git"));
+        assert!(looks_like_git_url("git://example.com/repo.git"));
+        let err = validate_git_url("http://example.com/repo.git")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("http://"), "{err}");
+        let err = validate_git_url("git://example.com/repo.git")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("git://"), "{err}");
+        assert!(validate_git_url("https://example.com/repo.git").is_ok());
+    }
 
     #[test]
     fn file_url_windows_drive_keeps_third_slash_semantics() {

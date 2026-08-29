@@ -531,6 +531,7 @@ impl Generator {
         let (compacted, remap) = crate::opcode::compact_bytecode(std::mem::take(&mut self.cg.code));
         let (fused, remap2) = crate::opcode::peephole_fuse(compacted);
         self.cg.code = fused;
+        crate::stack_effect::verify_compiled("script", &self.cg.code)?;
         self.program.code = std::mem::take(&mut self.cg.code);
         self.program.hot = crate::hot_code::HotCode::encode(&self.program.code);
         let lm = crate::opcode::compact_parallel(&self.cg.line_map, &remap);
@@ -2388,6 +2389,7 @@ impl Generator {
         let (compacted_body, body_remap) = crate::opcode::compact_bytecode(body);
         let (fused_body, body_remap2) = crate::opcode::peephole_fuse(compacted_body);
         body = fused_body;
+        crate::stack_effect::verify_compiled(name, &body)?;
         let lm = crate::opcode::compact_parallel(&sub.cg.line_map, &body_remap);
         let func_line_map = crate::opcode::compact_parallel(&lm, &body_remap2);
         let cm = crate::opcode::compact_parallel(&sub.cg.column_map, &body_remap);
@@ -2540,6 +2542,7 @@ impl Generator {
                         if let Some(end) = self.match_expr_ends.last().copied() {
                             self.emit_handler_exit_cleanups(0);
                             self.emit_discard_loop_stack_counters(false);
+                            self.cg.emit(Instruction::LoadFast(slot));
                             self.cg.emit(Instruction::Goto(end));
                         } else {
                             self.emit_handler_exit_cleanups(0);
@@ -3469,16 +3472,6 @@ impl Generator {
         if let Some(tmp) = sleep_tmp {
             self.emit_load_temp(tmp);
             self.cg.emit(Instruction::SelectPollDeadline);
-            // ready 时补一个 none 作为绑定值
-            let not_ready = self.cg.fresh_label();
-            let done = self.cg.fresh_label();
-            self.cg.emit(Instruction::GotoIfNot(not_ready));
-            self.cg.emit(Instruction::Push(Value::None));
-            self.cg.emit(Instruction::Push(Value::Bool(true)));
-            self.cg.emit(Instruction::Goto(done));
-            self.cg.mark_label(not_ready);
-            self.cg.emit(Instruction::Push(Value::Bool(false)));
-            self.cg.mark_label(done);
             return Ok(());
         }
         match &event.kind {
@@ -3498,16 +3491,6 @@ impl Generator {
                         self.gen_expr(object)?;
                         self.gen_expr(&args[0].value)?;
                         self.cg.emit(Instruction::SelectTrySend);
-                        // send ready → 绑定值用 none
-                        let not_ready = self.cg.fresh_label();
-                        let done = self.cg.fresh_label();
-                        self.cg.emit(Instruction::GotoIfNot(not_ready));
-                        self.cg.emit(Instruction::Push(Value::None));
-                        self.cg.emit(Instruction::Push(Value::Bool(true)));
-                        self.cg.emit(Instruction::Goto(done));
-                        self.cg.mark_label(not_ready);
-                        self.cg.emit(Instruction::Push(Value::Bool(false)));
-                        self.cg.mark_label(done);
                         return Ok(());
                     }
                 }

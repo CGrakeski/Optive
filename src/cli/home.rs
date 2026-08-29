@@ -59,6 +59,14 @@ pub fn use_local_deps() -> bool {
     )
 }
 
+/// 允许把无 `.optive-id` 的本地 `deps/<name>/` 盖章复用（测试 fixture）。
+pub fn allow_unverified_fixture() -> bool {
+    matches!(
+        env::var("OPTIVE_ALLOW_UNVERIFIED_FIXTURE").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

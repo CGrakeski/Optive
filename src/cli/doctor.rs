@@ -68,6 +68,14 @@ pub fn print_env() {
         if home::use_local_deps() { "1" } else { "0" }
     );
     println!(
+        "unverified fixtures:     {}",
+        if home::allow_unverified_fixture() {
+            "allowed"
+        } else {
+            "blocked"
+        }
+    );
+    println!(
         "bytecode cache:          {}",
         optive::bc_cache::cache_dir().display()
     );

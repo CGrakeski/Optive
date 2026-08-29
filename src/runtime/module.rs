@@ -245,6 +245,11 @@ impl Drop for ModuleContextGuard<'_> {
     }
 }
 
+type ModuleRunResult = (
+    HashMap<String, Value>,
+    Arc<crate::shared::SyncCell<HashMap<String, Value>>>,
+);
+
 fn run_module_source(
     vm: &mut Vm,
     source: &str,
@@ -253,10 +258,7 @@ fn run_module_source(
     import_base: PathBuf,
     package_id: String,
     package_root: Option<PathBuf>,
-) -> Result<(
-    HashMap<String, Value>,
-    Arc<crate::shared::SyncCell<HashMap<String, Value>>>,
-)> {
+) -> Result<ModuleRunResult> {
     let mut context = ModuleContextGuard::new(
         vm,
         source,

@@ -13,8 +13,9 @@ use crate::traceback;
 use crate::type_registry;
 use crate::types::{self, type_value_display};
 use crate::value::{
-    values_identical, BuiltinFn, ChannelInner, DictMap, DispatchTable, IteratorKind, IteratorState,
-    ModuleObject, MutexInner, Num, TaskInner, TaskState, Value, ValueKey,
+    values_identical, BuiltinFn, ChannelInner, DictMap, DispatchTable, GeneratorTryFrame,
+    IteratorKind, IteratorState, ModuleObject, MutexInner, Num, TaskInner, TaskState, Value,
+    ValueKey,
 };
 use crate::Result;
 
@@ -368,6 +369,15 @@ pub(crate) struct TryFrame {
     fast_ret_sp: usize,
 }
 
+/// 一次 `resume_generator` 的宿主水位，yield 时按此裁剪 try/iterators。
+struct GeneratorRunFrame {
+    stop_try: usize,
+    stop_iters: usize,
+    stop_fast_ret: usize,
+    stop_ucf: usize,
+    stop_stack: usize,
+}
+
 #[derive(Clone)]
 struct UserCallFrame {
     saved_code: Arc<Vec<Instruction>>,
@@ -561,6 +571,8 @@ pub struct Vm {
     generator_resuming: bool,
     /// 当前恢复的生成器状态（供 Yield/YieldFrom 写回）。
     active_generator: Option<Shared<IteratorState>>,
+    /// 嵌套 resume 的入口深度（对齐 `capture_fiber` 的 stop_*）。
+    generator_run: Vec<GeneratorRunFrame>,
     /// Yield 刚产出的值，由 `run_interpreter` 转为 `InterpResult::Yielded`。
     pending_gen_yield: Option<Value>,
     /// 调试会话状态；`None` 时热路径仅多一次空检查。
@@ -1003,6 +1015,7 @@ impl Vm {
             script_globals_map_dirty: false,
             generator_resuming: false,
             active_generator: None,
+            generator_run: Vec::new(),
             pending_gen_yield: None,
             debug: None,
             debug_active: false,
@@ -1087,11 +1100,13 @@ impl Vm {
     pub(crate) fn take_ready_ffi_wait(
         &mut self,
     ) -> Option<std::result::Result<(crate::ffi::RetStorage, i32), String>> {
-        let Some(p) = &self.ffi_wait else {
-            return None;
-        };
+        let p = self.ffi_wait.as_ref()?.clone();
+        let gc_pins = p.pin_count();
         let ready = p.try_take()?;
         self.ffi_wait = None;
+        for _ in 0..gc_pins {
+            self.gc.ffi_unpin_last();
+        }
         Some(ready)
     }
 
@@ -2143,6 +2158,18 @@ impl Vm {
     #[inline]
     const fn jump_to_pc(&mut self, pc: usize) {
         self.pc = pc;
+    }
+
+    /// `target == code.len()` 视为隐式返回；越界则失败关闭。
+    fn jump_or_halt(&mut self, target: usize) -> Result<()> {
+        if target > self.code.len() {
+            return Err(RuntimeError::msg(format!(
+                "internal: goto target {target} out of range (code len {})",
+                self.code.len()
+            )));
+        }
+        self.jump_to_pc(target);
+        Ok(())
     }
 
     /// 返回栈顶元素为 [Value]；空栈时返回 None。
@@ -4142,9 +4169,10 @@ impl Vm {
             StepAction::Push(v) => self.push_value(v),
             StepAction::PushSmall(n) => self.push_int(n),
             StepAction::Pop => {
-                if self.stack_sp > 0 {
-                    self.op_pop();
+                if self.stack_sp == 0 {
+                    return Err(RuntimeError::msg("internal: stack underflow (Pop)"));
                 }
+                self.op_pop();
             }
             StepAction::Add => {
                 let b = self.pop()?;
@@ -4603,18 +4631,18 @@ impl Vm {
             }
             StepAction::Label => {}
             StepAction::Goto(target) => {
-                self.jump_to_pc(target);
+                self.jump_or_halt(target)?;
             }
             StepAction::GotoIf(target) => {
                 let cond = self.pop()?;
                 if self.value_is_truthy_fast(&cond) {
-                    self.jump_to_pc(target);
+                    self.jump_or_halt(target)?;
                 }
             }
             StepAction::GotoIfNot(target) => {
                 let cond = self.pop()?;
                 if !self.value_is_truthy_fast(&cond) {
-                    self.jump_to_pc(target);
+                    self.jump_or_halt(target)?;
                 }
             }
             StepAction::LoopCountdown(target) => {
@@ -4629,7 +4657,7 @@ impl Vm {
                             let a = self.pop_hot();
                             self.exec_sub_slow(a, b)?;
                         } else {
-                            self.jump_to_pc(target);
+                            self.jump_or_halt(target)?;
                         }
                     }
                     other => {
@@ -5199,9 +5227,11 @@ impl Vm {
                 };
                 let outcome = inner.borrow_mut().try_send(val);
                 match outcome {
-                    Some(Ok(())) => self.push_value(Value::Bool(true)),
-                    Some(Err(())) => self.push_value(Value::Bool(false)),
-                    None => self.push_value(Value::Bool(false)),
+                    Some(Ok(())) => {
+                        self.push_value(Value::None);
+                        self.push_value(Value::Bool(true));
+                    }
+                    Some(Err(())) | None => self.push_value(Value::Bool(false)),
                 }
             }
             StepAction::SelectPollTask => {
@@ -5234,7 +5264,12 @@ impl Vm {
             StepAction::SelectPollDeadline => {
                 let dl = self.pop()?;
                 let ready = crate::concurrency::poll_deadline_ready(&dl)?;
-                self.push_value(Value::Bool(ready));
+                if ready {
+                    self.push_value(Value::None);
+                    self.push_value(Value::Bool(true));
+                } else {
+                    self.push_value(Value::Bool(false));
+                }
             }
             StepAction::SelectIdle(n) => {
                 let mut deadlines = Vec::with_capacity(n);
@@ -6879,6 +6914,10 @@ impl Vm {
             }
             self.restore_user_call_frame(frame);
         }
+        if self.generator_run.is_empty() {
+            self.try_stack.clear();
+            self.iterators.clear();
+        }
         Ok(())
     }
 
@@ -7611,6 +7650,9 @@ impl Vm {
                 pc: 0,
                 exhausted: false,
                 yield_from: None,
+                paused_try: Vec::new(),
+                paused_iters: Vec::new(),
+                paused_fast_ret: Vec::new(),
             },
         }
         .into_value())
@@ -7629,6 +7671,7 @@ impl Vm {
                     pc,
                     exhausted,
                     yield_from,
+                    ..
                 } = &st.kind
                 else {
                     return Err(RuntimeError::msg(
@@ -7659,6 +7702,14 @@ impl Vm {
 
             let stack_base = self.stack_sp;
             let stop_depth = self.user_call_frames.len();
+            self.generator_run.push(GeneratorRunFrame {
+                stop_try: self.try_stack.len(),
+                stop_iters: self.iterators.len(),
+                stop_fast_ret: self.fast_ret_sp,
+                stop_ucf: self.user_call_frames.len(),
+                stop_stack: self.stack_sp,
+            });
+            self.restore_generator_pause(state);
             self.active_generator = Some(state.clone());
             self.generator_resuming = true;
 
@@ -7701,12 +7752,27 @@ impl Vm {
             self.generator_resuming = false;
             self.active_generator = None;
 
-            match result? {
+            let result = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    if let Some(ctx) = self.generator_run.pop() {
+                        self.try_stack.truncate(ctx.stop_try);
+                        self.iterators.truncate(ctx.stop_iters);
+                        if self.fast_ret_sp > ctx.stop_fast_ret {
+                            self.fast_ret_sp = ctx.stop_fast_ret;
+                        }
+                    }
+                    return Err(e);
+                }
+            };
+
+            match result {
                 InterpResult::Yielded(v) => {
                     self.op_truncate(stack_base);
                     return Ok(Some(v));
                 }
                 InterpResult::Value(_) => {
+                    let _ = self.generator_run.pop();
                     if let IteratorKind::Generator { exhausted, .. } = &mut state.borrow_mut().kind
                     {
                         *exhausted = true;
@@ -7715,17 +7781,155 @@ impl Vm {
                     return Ok(None);
                 }
                 InterpResult::Suspended => {
+                    let _ = self.generator_run.pop();
                     return Err(RuntimeError::msg(
                         "internal error: generator suspended via task scheduler",
                     ));
                 }
                 InterpResult::DebugBreak => {
+                    let _ = self.generator_run.pop();
                     return Err(RuntimeError::msg(
                         "internal error: debug break inside generator",
                     ));
                 }
             }
         }
+    }
+
+    fn restore_generator_pause(&mut self, state: &Shared<IteratorState>) {
+        let Some(ctx) = self.generator_run.last() else {
+            return;
+        };
+        let stop_try = ctx.stop_try;
+        let stop_iters = ctx.stop_iters;
+        let stop_fast_ret = ctx.stop_fast_ret;
+        let stop_ucf = ctx.stop_ucf;
+        let stop_stack = ctx.stop_stack;
+        let (tries, iters, fast) = {
+            let mut st = state.borrow_mut();
+            let IteratorKind::Generator {
+                paused_try,
+                paused_iters,
+                paused_fast_ret,
+                ..
+            } = &mut st.kind
+            else {
+                return;
+            };
+            (
+                std::mem::take(paused_try),
+                std::mem::take(paused_iters),
+                std::mem::take(paused_fast_ret),
+            )
+        };
+        debug_assert_eq!(self.try_stack.len(), stop_try);
+        debug_assert_eq!(self.iterators.len(), stop_iters);
+        for f in tries {
+            self.try_stack.push(TryFrame {
+                catch_pc: f.catch_pc,
+                else_pc: f.else_pc,
+                end_pc: f.end_pc,
+                user_call_depth: f.user_call_depth.saturating_add(stop_ucf),
+                stack_sp: f.stack_sp.saturating_add(stop_stack),
+                iterators_len: f.iterators_len.saturating_add(stop_iters),
+                fast_ret_sp: f.fast_ret_sp.saturating_add(stop_fast_ret),
+            });
+        }
+        for it in iters {
+            self.iterators.push(ActiveIter { state: it });
+        }
+        for pc in fast {
+            if self.fast_ret_sp >= self.fast_ret_pcs.len() {
+                self.fast_ret_pcs.push(pc);
+            } else {
+                self.fast_ret_pcs[self.fast_ret_sp] = pc;
+            }
+            self.fast_ret_sp += 1;
+        }
+    }
+
+    fn capture_generator_pause(&mut self) -> Result<()> {
+        let Some(state) = self.active_generator.clone() else {
+            return Err(RuntimeError::msg(
+                "internal: yield without active generator",
+            ));
+        };
+        let ctx = self
+            .generator_run
+            .pop()
+            .ok_or_else(|| RuntimeError::msg("internal: generator pause without resume frame"))?;
+        let locals = self
+            .locals_stack
+            .last()
+            .cloned()
+            .ok_or_else(|| RuntimeError::msg("internal: generator missing locals"))?;
+        let name_map = self.name_to_slot.last().cloned().flatten();
+        let pc = self.pc;
+
+        let mut paused_try = Vec::new();
+        if self.try_stack.len() > ctx.stop_try {
+            let mut ts = self.try_stack.split_off(ctx.stop_try);
+            for f in &mut ts {
+                paused_try.push(GeneratorTryFrame {
+                    catch_pc: f.catch_pc,
+                    else_pc: f.else_pc,
+                    end_pc: f.end_pc,
+                    user_call_depth: f.user_call_depth.saturating_sub(ctx.stop_ucf),
+                    stack_sp: f.stack_sp.saturating_sub(ctx.stop_stack),
+                    iterators_len: f.iterators_len.saturating_sub(ctx.stop_iters),
+                    fast_ret_sp: f.fast_ret_sp.saturating_sub(ctx.stop_fast_ret),
+                });
+            }
+        }
+        let paused_iters = if self.iterators.len() > ctx.stop_iters {
+            self.iterators
+                .split_off(ctx.stop_iters)
+                .into_iter()
+                .map(|a| a.state)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let paused_fast_ret = if self.fast_ret_sp > ctx.stop_fast_ret {
+            let pcs = self.fast_ret_pcs[ctx.stop_fast_ret..self.fast_ret_sp].to_vec();
+            self.fast_ret_sp = ctx.stop_fast_ret;
+            pcs
+        } else {
+            Vec::new()
+        };
+
+        if let IteratorKind::Generator {
+            locals: l,
+            name_map: nm,
+            pc: p,
+            paused_try: pt,
+            paused_iters: pi,
+            paused_fast_ret: pf,
+            ..
+        } = &mut state.borrow_mut().kind
+        {
+            *l = locals;
+            *nm = name_map;
+            *p = pc;
+            *pt = paused_try;
+            *pi = paused_iters;
+            *pf = paused_fast_ret;
+        }
+
+        let frame = self
+            .user_call_frames
+            .pop()
+            .ok_or_else(|| RuntimeError::msg("internal: generator missing call frame"))?;
+        self.locals_stack.pop();
+        self.name_to_slot.pop();
+        if frame.pushed_func_stack {
+            self.func_stack.pop();
+        }
+        if frame.func.track_frames() {
+            self.func_frames.pop();
+        }
+        self.restore_user_call_frame(frame);
+        Ok(())
     }
 
     fn generator_yield_value(&mut self, v: Value) -> Result<()> {
@@ -7764,47 +7968,6 @@ impl Vm {
             self.generator_resuming = saved_resuming;
             // 空可迭代：继续执行下一条指令。
         }
-        Ok(())
-    }
-
-    fn capture_generator_pause(&mut self) -> Result<()> {
-        let Some(state) = self.active_generator.clone() else {
-            return Err(RuntimeError::msg(
-                "internal: yield without active generator",
-            ));
-        };
-        let locals = self
-            .locals_stack
-            .last()
-            .cloned()
-            .ok_or_else(|| RuntimeError::msg("internal: generator missing locals"))?;
-        let name_map = self.name_to_slot.last().cloned().flatten();
-        let pc = self.pc;
-        if let IteratorKind::Generator {
-            locals: l,
-            name_map: nm,
-            pc: p,
-            ..
-        } = &mut state.borrow_mut().kind
-        {
-            *l = locals;
-            *nm = name_map;
-            *p = pc;
-        }
-
-        let frame = self
-            .user_call_frames
-            .pop()
-            .ok_or_else(|| RuntimeError::msg("internal: generator missing call frame"))?;
-        self.locals_stack.pop();
-        self.name_to_slot.pop();
-        if frame.pushed_func_stack {
-            self.func_stack.pop();
-        }
-        if frame.func.track_frames() {
-            self.func_frames.pop();
-        }
-        self.restore_user_call_frame(frame);
         Ok(())
     }
 
@@ -7970,6 +8133,7 @@ impl Vm {
             script_globals_map_dirty: false,
             generator_resuming: false,
             active_generator: None,
+            generator_run: Vec::new(),
             pending_gen_yield: None,
             debug: self.debug.clone(),
             debug_active: self.debug_active,

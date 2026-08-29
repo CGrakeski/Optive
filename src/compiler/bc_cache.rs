@@ -21,6 +21,11 @@ use crate::Result;
 
 const MAGIC: &[u8; 4] = b"TIVC";
 const FORMAT: u16 = crate::versions::BYTECODE_FORMAT_VERSION;
+/// 单段缓存字符串 / 字节常量上限，防止畸形 `.tivc` 申请超大缓冲。
+const MAX_CACHE_BLOB: u32 = 16 * 1024 * 1024;
+/// 整文件上限。
+const MAX_CACHE_FILE: usize = 32 * 1024 * 1024;
+const MAX_CACHE_ITEMS: u32 = 1_000_000;
 
 static STORES: AtomicU64 = AtomicU64::new(0);
 static HITS: AtomicU64 = AtomicU64::new(0);
@@ -84,6 +89,9 @@ pub fn key(version: &str, file: &str, source: &str, dep_ids: &str) -> String {
 
 pub fn load(path: &Path) -> Option<CompiledProgram> {
     let bytes = fs::read(path).ok()?;
+    if bytes.len() > MAX_CACHE_FILE {
+        return None;
+    }
     decode(&bytes).ok()
 }
 
@@ -159,7 +167,7 @@ fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
     let column_map = read_usizes(&mut r)?;
     let global_names = read_strs(&mut r)?;
     let script_frame_slots = read_u32(&mut r)? as usize;
-    let nflush = read_u32(&mut r)? as usize;
+    let nflush = read_counted_len(&mut r, MAX_CACHE_ITEMS)?;
     let mut script_local_to_global = Vec::with_capacity(nflush);
     for _ in 0..nflush {
         let loc = read_u32(&mut r)? as usize;
@@ -167,7 +175,7 @@ fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
         script_local_to_global.push((loc, glob));
     }
     let code = read_ins_vec(&mut r)?;
-    let nfunc = read_u32(&mut r)? as usize;
+    let nfunc = read_counted_len(&mut r, MAX_CACHE_ITEMS)?;
     let mut functions = HashMap::new();
     for _ in 0..nfunc {
         let (name, f) = read_func(&mut r)?;
@@ -236,7 +244,7 @@ fn read_func(r: &mut Cursor<&[u8]>) -> Result<(String, FunctionObject)> {
     r.read_exact(&mut argc_buf)
         .map_err(|_| crate::error::RuntimeError::msg("truncated function"))?;
     let hot_call_argc = u16::from_le_bytes(argc_buf);
-    let nparams = read_u32(r)? as usize;
+    let nparams = read_counted_len(r, MAX_CACHE_ITEMS)?;
     let mut params = Vec::with_capacity(nparams);
     for _ in 0..nparams {
         params.push(FuncParam {
@@ -308,11 +316,11 @@ fn write_hot(w: &mut Vec<u8>, hot: &HotCode) -> Result<()> {
 }
 
 fn read_hot(r: &mut Cursor<&[u8]>) -> Result<HotCode> {
-    let n = read_u32(r)? as usize;
+    let n = read_counted_len(r, MAX_CACHE_BLOB)?;
     let mut ops = vec![0u8; n];
     r.read_exact(&mut ops)
         .map_err(|_| crate::error::RuntimeError::msg("truncated hot ops"))?;
-    let m = read_u32(r)? as usize;
+    let m = read_counted_len(r, MAX_CACHE_ITEMS)?;
     let mut args = Vec::with_capacity(m);
     for _ in 0..m {
         args.push(read_i64(r)?);
@@ -332,7 +340,7 @@ fn write_ins_slice(w: &mut Vec<u8>, code: &[Instruction]) -> Result<()> {
 }
 
 fn read_ins_vec(r: &mut Cursor<&[u8]>) -> Result<Vec<Instruction>> {
-    let n = read_u32(r)? as usize;
+    let n = read_counted_len(r, MAX_CACHE_ITEMS)?;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         out.push(decode_ins(r)?);
@@ -385,7 +393,7 @@ fn decode_value(r: &mut Cursor<&[u8]>) -> Result<Value> {
         3 => Ok(Value::Text(read_str(r)?)),
         4 => Ok(Value::TypeRef(read_str(r)?)),
         5 => {
-            let n = read_u32(r)? as usize;
+            let n = read_counted_len(r, MAX_CACHE_BLOB)?;
             let mut b = vec![0u8; n];
             r.read_exact(&mut b)
                 .map_err(|_| crate::error::RuntimeError::msg("truncated bytes const"))?;
@@ -951,15 +959,29 @@ fn read_i64(r: &mut Cursor<&[u8]>) -> Result<i64> {
         .map_err(|_| crate::error::RuntimeError::msg("truncated cache"))?;
     Ok(i64::from_le_bytes(b))
 }
+fn remaining_bytes(r: &Cursor<&[u8]>) -> u64 {
+    (r.get_ref().len() as u64).saturating_sub(r.position())
+}
+
+fn read_counted_len(r: &mut Cursor<&[u8]>, max: u32) -> Result<usize> {
+    let n = read_u32(r)?;
+    if n > max || u64::from(n) > remaining_bytes(r) {
+        return Err(crate::error::RuntimeError::msg(
+            "bytecode cache blob too large",
+        ));
+    }
+    Ok(n as usize)
+}
+
 fn read_str(r: &mut Cursor<&[u8]>) -> Result<String> {
-    let n = read_u32(r)? as usize;
+    let n = read_counted_len(r, MAX_CACHE_BLOB)?;
     let mut b = vec![0u8; n];
     r.read_exact(&mut b)
         .map_err(|_| crate::error::RuntimeError::msg("truncated string"))?;
     String::from_utf8(b).map_err(|_| crate::error::RuntimeError::msg("cached string not utf-8"))
 }
 fn read_strs(r: &mut Cursor<&[u8]>) -> Result<Vec<String>> {
-    let n = read_u32(r)? as usize;
+    let n = read_counted_len(r, MAX_CACHE_ITEMS)?;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         out.push(read_str(r)?);
@@ -967,7 +989,7 @@ fn read_strs(r: &mut Cursor<&[u8]>) -> Result<Vec<String>> {
     Ok(out)
 }
 fn read_usizes(r: &mut Cursor<&[u8]>) -> Result<Vec<usize>> {
-    let n = read_u32(r)? as usize;
+    let n = read_counted_len(r, MAX_CACHE_ITEMS)?;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         out.push(read_u32(r)? as usize);

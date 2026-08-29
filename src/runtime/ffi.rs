@@ -545,23 +545,53 @@ fn bind_extern_function(
         let use_serial = vm.ffi_serial();
         let offload = vm.ffi_threads() > 0 && vm.can_offload_ffi();
 
+        let pin_addrs: Vec<usize> = storage
+            .iter()
+            .filter_map(|s| match s {
+                ArgStorage::Ptr(p) if *p != 0 => Some(*p),
+                _ => None,
+            })
+            .collect();
+        for p in &pin_addrs {
+            vm.gc.ffi_pin(Value::Ptr(*p));
+        }
+        let gc_pins = pin_addrs.len();
         let raw = if offload {
-            // 卸荷路径：不设 active_vm → 同步回调会失败（首版故意禁止）。
-            let pending = crate::ffi_pool::submit_call(
+            for p in &pin_addrs {
+                crate::ptr_registry::pin(*p);
+            }
+            let pending = match crate::ffi_pool::submit_call(
                 ffi.clone(),
                 storage,
                 ret_abi.clone(),
                 use_serial,
                 vm.ffi_threads(),
                 vm.gc.clone(),
-            )?;
+                pin_addrs.clone(),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    for p in &pin_addrs {
+                        crate::ptr_registry::unpin(*p);
+                    }
+                    for _ in 0..gc_pins {
+                        vm.gc.ffi_unpin_last();
+                    }
+                    return Err(e);
+                }
+            };
             vm.set_ffi_wait(pending);
             vm.block_suspend = true;
             return Ok(Value::None);
         } else {
-            super::ffi_extra::with_active_vm(vm, || {
+            let _ptr_pins = crate::ptr_registry::PtrPinGuard::pin_addrs(pin_addrs);
+            let result = super::ffi_extra::with_active_vm(vm, || {
                 invoke_native_call(&ffi, &mut storage, ret_abi.clone(), use_serial)
-            })?
+            });
+            for _ in 0..gc_pins {
+                vm.gc.ffi_unpin_last();
+            }
+            result?
         };
 
         let mut out = abi_to_value(vm, raw, &ret_abi)?;

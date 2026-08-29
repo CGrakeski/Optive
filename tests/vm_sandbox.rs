@@ -124,6 +124,19 @@ chdir("..")
 }
 
 #[test]
+fn sandbox_blocks_getenv() {
+    let caps = Capabilities::sandbox(cwd_root());
+    assert_caps_err(
+        r#"
+use std.os.{ getenv }
+getenv("PATH")
+"#,
+        caps,
+        "environment read disabled",
+    );
+}
+
+#[test]
 fn empty_roots_blocks_all_fs() {
     let caps = Capabilities::sandbox(vec![]);
     assert_caps_err(
@@ -275,9 +288,34 @@ fn json_sqlite_and_abspath_use_path_gate() {
     }
     assert_caps_err(
         r#"std.sqlite.open("inside.db")"#,
-        caps,
+        caps.clone(),
         "file databases are disabled",
     );
+    for source in [
+        r#"
+let db = std.sqlite.open(":memory:")
+db.execute("ATTACH DATABASE 'escape.db' AS x")
+"#,
+        r#"
+let db = std.sqlite.open(":memory:")
+db.execute("CREATE TABLE t(x)")
+db.execute("VACUUM INTO 'escape.db'")
+"#,
+    ] {
+        match run_with_caps(source, caps.clone()) {
+            Ok(v) => panic!("expected sqlite sandbox denial, got {}", v.display_string()),
+            Err(e) => {
+                let msg = e.message().to_ascii_lowercase();
+                assert!(
+                    msg.contains("authoriz")
+                        || msg.contains("denied")
+                        || msg.contains("not authorized")
+                        || msg.contains("auth"),
+                    "unexpected sqlite error: {msg}"
+                );
+            }
+        }
+    }
     let _ = std::fs::remove_dir_all(root);
 }
 

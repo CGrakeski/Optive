@@ -25,8 +25,9 @@ pub(super) fn build_os_module() -> Shared<ModuleObject> {
     )
 }
 
-pub(super) fn os_getenv(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+pub(super) fn os_getenv(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let key = expect_text("getenv", args, 0)?;
+    vm.caps.check_env_read("getenv")?;
     Ok(std::env::var(&key).map_or(Value::None, Value::Text))
 }
 
@@ -65,7 +66,12 @@ pub(super) fn os_cwd(_vm: &mut Vm, _args: &[Value]) -> Result<Value> {
 pub(super) fn os_chdir(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let p = expect_text("chdir", args, 0)?;
     vm.caps.check_env("chdir")?;
-    std::env::set_current_dir(&p).map_err(|e| io_map("chdir failed", e))?;
+    let target = vm.caps.resolve_fs_path(
+        "chdir",
+        std::path::Path::new(&p),
+        crate::caps::FsAccess::Read,
+    )?;
+    std::env::set_current_dir(&target).map_err(|e| io_map("chdir failed", e))?;
     Ok(Value::None)
 }
 

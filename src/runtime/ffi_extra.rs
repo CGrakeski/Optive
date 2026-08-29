@@ -46,11 +46,20 @@ pub fn set_last_errno(code: i32) {
 }
 
 pub fn with_active_vm<R>(vm: &mut Vm, f: impl FnOnce() -> R) -> R {
+    // 调用方在 `f` 返回前不得再使用 `vm`。同步回调经 `active_vm` 取得本窗口内
+    // 唯一的 `&mut Vm`（同线程可重入回调串行发生）。
     let ptr = std::ptr::from_mut::<Vm>(vm);
+    struct TlsGuard {
+        prev: *mut Vm,
+    }
+    impl Drop for TlsGuard {
+        fn drop(&mut self) {
+            FFI_ACTIVE_VM.with(|c| c.set(self.prev));
+        }
+    }
     let prev = FFI_ACTIVE_VM.with(|c| c.replace(ptr));
-    let out = f();
-    FFI_ACTIVE_VM.with(|c| c.set(prev));
-    out
+    let _guard = TlsGuard { prev };
+    f()
 }
 
 fn active_vm<'a>() -> Result<&'a mut Vm> {
@@ -487,9 +496,23 @@ pub fn builtin_cstring_to_text(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         )));
     }
     // 拷贝到 Optive 托管 `text`；调用方仍须按所有权释放 C 侧缓冲。
-    let s = unsafe { std::ffi::CStr::from_ptr(p as *const std::ffi::c_char) };
-    let text = s
-        .to_str()
+    let mut bytes = Vec::new();
+    let mut i = 0usize;
+    loop {
+        let b = unsafe { std::ptr::read_unaligned((p as *const u8).add(i)) };
+        if b == 0 {
+            break;
+        }
+        bytes.push(b);
+        i += 1;
+        if i > 10_000_000 {
+            return Err(RuntimeError::value_err(format!(
+                "{}: string too long",
+                builtin_repr("cstring_to_text")
+            )));
+        }
+    }
+    let text = std::str::from_utf8(&bytes)
         .map_err(|e| {
             RuntimeError::value_err(format!(
                 "{}: invalid UTF-8: {e}",
@@ -1250,6 +1273,7 @@ struct CallbackData {
     callable: Value,
     arg_abis: Vec<AbiType>,
     ret_abi: AbiType,
+    live: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(not(target_os = "android"))]
@@ -1301,6 +1325,14 @@ pub fn builtin_callback(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
             )))
         }
     };
+    for abi in arg_abis.iter().chain(std::iter::once(&ret_abi)) {
+        if matches!(abi, AbiType::CStruct { .. }) {
+            return Err(RuntimeError::type_err(format!(
+                "{}: C struct arguments/returns are not supported for callbacks",
+                builtin_repr("callback")
+            )));
+        }
+    }
 
     let arg_ffi: Vec<FfiType> = arg_abis.iter().map(AbiType::ffi_type).collect();
     let cif = Cif::new(arg_ffi, ret_abi.ffi_type());
@@ -1309,6 +1341,7 @@ pub fn builtin_callback(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         callable,
         arg_abis,
         ret_abi,
+        live: std::sync::atomic::AtomicBool::new(true),
     });
     let data_ptr = Box::into_raw(data);
 
@@ -1318,6 +1351,11 @@ pub fn builtin_callback(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         args: *const *const c_void,
         userdata: &mut CallbackData,
     ) {
+        if !userdata.live.load(Ordering::Acquire) {
+            eprintln!("optive FFI callback: invoked after callback_free; returning 0");
+            *ret = 0;
+            return;
+        }
         let Ok(vm) = active_vm() else {
             // 无活动 VM：无法安全回调；返回零并尽量不静默到不可观测。
             eprintln!("optive FFI callback: no active VM; returning 0");
@@ -1378,10 +1416,10 @@ pub fn builtin_callback_free(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         )));
     }
     let id = expect_usize("callback_free", &args[0])?;
-    if let Some(owned) = CALLBACKS.lock().remove(&id) {
+    if let Some(owned) = CALLBACKS.lock().get(&id) {
+        // 失效 trampoline，但不释放可执行闭包：原生侧可能仍持有函数指针。
         unsafe {
-            drop(Box::from_raw(owned._keep.0));
-            drop(Box::from_raw(owned._keep.1));
+            (*owned._keep.1).live.store(false, Ordering::Release);
         }
     }
     Ok(Value::None)

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::{params_from_iter, types::ValueRef, Connection};
 
 use crate::error::RuntimeError;
@@ -33,7 +34,48 @@ fn sqlite_open(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     };
     let conn = Connection::open(&checked)
         .map_err(|e| RuntimeError::io_err(format!("sqlite.open {}: {e}", checked.display())))?;
+    if vm.caps.fs_restricted() {
+        let _ = conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true);
+        install_sandbox_authorizer(&conn);
+    }
     Ok(wrap_db(conn))
+}
+
+/// 沙箱里 SQLite 仍可能经 ATTACH / VACUUM INTO / 危险 PRAGMA 自己打开文件。
+fn install_sandbox_authorizer(conn: &Connection) {
+    conn.authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+        AuthAction::Attach { .. } | AuthAction::Detach { .. } => Authorization::Deny,
+        AuthAction::CreateVtable { .. } | AuthAction::DropVtable { .. } => Authorization::Deny,
+        AuthAction::Function { function_name } => {
+            if function_name.eq_ignore_ascii_case("load_extension") {
+                Authorization::Deny
+            } else {
+                Authorization::Allow
+            }
+        }
+        AuthAction::Pragma {
+            pragma_name,
+            pragma_value,
+        } => sandbox_pragma_auth(pragma_name, pragma_value),
+        // SQLITE_COPY (0)：部分版本的 VACUUM INTO 走此码而非 Attach。
+        AuthAction::Unknown { code: 0, .. } => Authorization::Deny,
+        _ => Authorization::Allow,
+    }));
+}
+
+fn sandbox_pragma_auth(pragma_name: &str, pragma_value: Option<&str>) -> Authorization {
+    let name = pragma_name.to_ascii_lowercase();
+    match name.as_str() {
+        "temp_store_directory" | "key" | "rekey" | "hexkey" | "textkey" | "activate_extensions" => {
+            Authorization::Deny
+        }
+        "journal_mode" => match pragma_value.map(str::to_ascii_lowercase) {
+            None => Authorization::Allow,
+            Some(v) if matches!(v.as_str(), "memory" | "off" | "delete") => Authorization::Allow,
+            Some(_) => Authorization::Deny,
+        },
+        _ => Authorization::Allow,
+    }
 }
 
 fn wrap_db(conn: Connection) -> Value {

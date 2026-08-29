@@ -19,17 +19,27 @@ pub(crate) type FfiPendingResult = std::result::Result<(RetStorage, i32), String
 
 pub struct FfiPending {
     pub(crate) result: Mutex<Option<FfiPendingResult>>,
+    pinned: Vec<usize>,
 }
 
 impl FfiPending {
-    fn new() -> Arc<Self> {
+    fn new(pinned: Vec<usize>) -> Arc<Self> {
         Arc::new(Self {
             result: Mutex::new(None),
+            pinned,
         })
     }
 
     pub(crate) fn try_take(&self) -> Option<FfiPendingResult> {
-        self.result.lock().take()
+        let ready = self.result.lock().take()?;
+        for p in &self.pinned {
+            crate::ptr_registry::unpin(*p);
+        }
+        Some(ready)
+    }
+
+    pub(crate) fn pin_count(&self) -> usize {
+        self.pinned.len()
     }
 
     pub(crate) fn is_ready(&self) -> bool {
@@ -134,6 +144,7 @@ pub(crate) fn submit_call(
     use_serial: bool,
     threads: usize,
     gc: Arc<SharedGc>,
+    pinned: Vec<usize>,
 ) -> Result<Arc<FfiPending>> {
     if threads == 0 {
         return Err(RuntimeError::msg(
@@ -141,7 +152,7 @@ pub(crate) fn submit_call(
         ));
     }
     ensure_workers(threads)?;
-    let pending = FfiPending::new();
+    let pending = FfiPending::new(pinned);
     let job = Job {
         ffi,
         storage,

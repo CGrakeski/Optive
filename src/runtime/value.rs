@@ -310,7 +310,8 @@ impl ModuleObject {
 
     #[must_use]
     pub fn get_export(&self, name: &str) -> Option<Value> {
-        self.live_export(name).or_else(|| self.exports.get(name).cloned())
+        self.live_export(name)
+            .or_else(|| self.exports.get(name).cloned())
     }
 
     #[must_use]
@@ -418,7 +419,23 @@ pub enum IteratorKind {
         pc: usize,
         exhausted: bool,
         yield_from: Option<Shared<IteratorState>>,
+        /// yield 时从 VM 拆下的 try 帧（相对生成器入口深度）。
+        paused_try: Vec<GeneratorTryFrame>,
+        paused_iters: Vec<Shared<IteratorState>>,
+        paused_fast_ret: Vec<usize>,
     },
+}
+
+/// 与 VM `TryFrame` 对齐，存在生成器暂停状态里以免 `value`/`vm` 循环依赖。
+#[derive(Clone)]
+pub struct GeneratorTryFrame {
+    pub catch_pc: usize,
+    pub else_pc: usize,
+    pub end_pc: usize,
+    pub user_call_depth: usize,
+    pub stack_sp: usize,
+    pub iterators_len: usize,
+    pub fast_ret_sp: usize,
 }
 
 #[derive(Clone)]

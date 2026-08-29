@@ -319,8 +319,23 @@ fn main() {
                 return;
             }
             path => {
+                if path.starts_with("--") {
+                    let (caps, rest) = parse_caps_from(&args[1..]);
+                    if rest.is_empty() {
+                        repl(caps);
+                        return;
+                    }
+                    let script = &rest[0];
+                    if script.ends_with(".tive") || Path::new(script).is_file() {
+                        run_script_file(script, caps);
+                        return;
+                    }
+                    color::eprint_error(format!("unknown command or file: {script}"));
+                    color::eprint_error("try: Optive --help");
+                    process::exit(2);
+                }
                 if path.ends_with(".tive") || Path::new(path).is_file() {
-                    let (caps, _rest) = parse_caps_or_exit(&args);
+                    let (caps, _rest) = parse_caps_from(&args[2..]);
                     run_script_file(path, caps);
                     return;
                 }
@@ -331,7 +346,7 @@ fn main() {
         }
     }
 
-    repl();
+    repl(Capabilities::full());
 }
 
 fn parse_project_path_and_script_args(rest: &[String]) -> (Option<PathBuf>, Vec<String>) {
@@ -345,15 +360,18 @@ fn parse_project_path_and_script_args(rest: &[String]) -> (Option<PathBuf>, Vec<
     (path, script_args)
 }
 
-fn parse_caps_or_exit(args: &[String]) -> (Capabilities, Vec<String>) {
-    let (caps, rest) = match cli::caps::parse_caps(&args[2..]) {
+fn parse_caps_from(args: &[String]) -> (Capabilities, Vec<String>) {
+    match cli::caps::parse_caps(args) {
         Ok(v) => v,
         Err(e) => {
             color::eprint_error(format!("Error: {e}"));
             process::exit(2);
         }
-    };
-    (caps, rest)
+    }
+}
+
+fn parse_caps_or_exit(args: &[String]) -> (Capabilities, Vec<String>) {
+    parse_caps_from(&args[2..])
 }
 
 fn cmd_new(name: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -828,7 +846,7 @@ fn print_repl_help() {
     println!("{}", t_repl(ReplMsg::HelpCtrlD));
 }
 
-fn repl() {
+fn repl(caps: Capabilities) {
     let mut rl: Editor<ReplHelper, DefaultHistory> = match Editor::new() {
         Ok(mut e) => {
             e.set_helper(Some(ReplHelper {
@@ -846,6 +864,7 @@ fn repl() {
     let _ = rl.load_history(&hist);
 
     let mut vm = Vm::new();
+    vm.install_caps(caps);
     let mut accumulator = String::new();
     let pack = custom::active_pack();
     let primary = pack.repl_prompt().to_string();

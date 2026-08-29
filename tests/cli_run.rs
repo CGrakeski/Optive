@@ -12,6 +12,11 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+const LOCAL_DEPS_ENV: &[(&str, &str)] = &[
+    ("OPTIVE_USE_LOCAL_DEPS", "1"),
+    ("OPTIVE_ALLOW_UNVERIFIED_FIXTURE", "1"),
+];
+
 fn optive_bin() -> PathBuf {
     let target = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -108,9 +113,38 @@ fake_lib = { git = "https://github.com/example/fake_lib.git", rev = "aaaaaaaaaaa
     fs::create_dir_all(root.join("deps/fake_lib")).unwrap();
     fs::write(root.join("deps/fake_lib/main.tive"), "export let x = 1\n").unwrap();
 
-    let (code, stdout, stderr) = run_optive_env(&["run"], &root, &[("OPTIVE_USE_LOCAL_DEPS", "1")]);
+    let (code, stdout, stderr) = run_optive_env(&["run"], &root, LOCAL_DEPS_ENV);
     assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
     assert!(stdout.contains("ok"), "stdout={stdout}");
+}
+
+#[test]
+fn local_deps_unmarked_dir_requires_fixture_flag() {
+    let root = tempfile_project("demo_unmarked_dep");
+    fs::write(
+        root.join("Optive.toml"),
+        r#"
+[package]
+name = "demo_unmarked_dep"
+entry = "main.tive"
+
+[dependencies]
+fake_lib = { git = "https://github.com/example/fake_lib.git", rev = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+"#,
+    )
+    .unwrap();
+    fs::write(root.join("main.tive"), "print(\"ok\")\n").unwrap();
+    fs::create_dir_all(root.join("deps/fake_lib")).unwrap();
+    fs::write(root.join("deps/fake_lib/main.tive"), "export let x = 1\n").unwrap();
+
+    let (code, stdout, stderr) = run_optive_env(&["run"], &root, &[("OPTIVE_USE_LOCAL_DEPS", "1")]);
+    assert_ne!(code, 0, "stdout={stdout}");
+    assert!(
+        stderr.contains(".optive-id")
+            || stderr.contains("UNVERIFIED")
+            || stderr.contains("fixture"),
+        "stderr={stderr}"
+    );
 }
 
 #[test]
@@ -144,7 +178,7 @@ id = "dead"
     )
     .unwrap();
 
-    let (code, stdout, stderr) = run_optive_env(&["run"], &root, &[("OPTIVE_USE_LOCAL_DEPS", "1")]);
+    let (code, stdout, stderr) = run_optive_env(&["run"], &root, LOCAL_DEPS_ENV);
     assert_ne!(code, 0, "stdout={stdout}");
     assert!(
         stderr.contains("expected 1")
@@ -363,7 +397,7 @@ greeter = { git = "https://github.com/example/greeter.git", rev = "ccccccccccccc
     )
     .unwrap();
 
-    let (code, stdout, stderr) = run_optive_env(&["run"], &root, &[("OPTIVE_USE_LOCAL_DEPS", "1")]);
+    let (code, stdout, stderr) = run_optive_env(&["run"], &root, LOCAL_DEPS_ENV);
     assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
     assert!(stdout.contains("hello"), "stdout={stdout}");
 }
@@ -396,8 +430,7 @@ greeter = { git = "https://github.com/example/greeter.git", rev = "ababababababa
     )
     .unwrap();
 
-    let env = [("OPTIVE_USE_LOCAL_DEPS", "1")];
-    let (code, stdout, stderr) = run_optive_env(&["run", "--sandbox"], &root, &env);
+    let (code, stdout, stderr) = run_optive_env(&["run", "--sandbox"], &root, LOCAL_DEPS_ENV);
     assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
     assert!(stdout.contains("hello from src"), "stdout={stdout}");
 
@@ -406,7 +439,7 @@ greeter = { git = "https://github.com/example/greeter.git", rev = "ababababababa
         "std.fs.write_text(\"deps/greeter/hack.txt\", \"no\")\n",
     )
     .unwrap();
-    let (code, stdout, stderr) = run_optive_env(&["run", "--sandbox"], &root, &env);
+    let (code, stdout, stderr) = run_optive_env(&["run", "--sandbox"], &root, LOCAL_DEPS_ENV);
     assert_ne!(code, 0, "stdout={stdout}");
     assert!(stderr.contains("read-only dependency root"), "{stderr}");
     assert!(!root.join("deps/greeter/hack.txt").exists());
@@ -444,7 +477,7 @@ logging = { git = "https://github.com/example/logging.git", rev = "eeeeeeeeeeeee
     fs::create_dir_all(root.join("deps/logging")).unwrap();
     fs::write(root.join("deps/logging/main.tive"), "export let y = 2\n").unwrap();
 
-    let (code, stdout, stderr) = run_optive_env(&["run"], &root, &[("OPTIVE_USE_LOCAL_DEPS", "1")]);
+    let (code, stdout, stderr) = run_optive_env(&["run"], &root, LOCAL_DEPS_ENV);
     // LOCAL_DEPS 同名冲突：greeter 会装 logging 到 deps/logging，根也会…
     // 根 import logging 未声明 → 应失败
     assert_ne!(code, 0, "stdout={stdout}");

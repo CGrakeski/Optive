@@ -31,6 +31,56 @@ pub struct PtrEntry {
 
 static REGISTRY: LazyLock<Mutex<HashMap<usize, PtrEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static PINS: LazyLock<Mutex<HashMap<usize, usize>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub fn pin(addr: usize) {
+    if addr == 0 {
+        return;
+    }
+    *PINS.lock().entry(addr).or_insert(0) += 1;
+}
+
+pub fn unpin(addr: usize) {
+    if addr == 0 {
+        return;
+    }
+    let mut g = PINS.lock();
+    if let Some(c) = g.get_mut(&addr) {
+        *c = c.saturating_sub(1);
+        if *c == 0 {
+            g.remove(&addr);
+        }
+    }
+}
+
+pub fn is_pinned(addr: usize) -> bool {
+    PINS.lock().get(&addr).copied().unwrap_or(0) > 0
+}
+
+/// RAII：in-flight FFI 参数指针钉住，Drop 时 unpin。
+pub struct PtrPinGuard {
+    addrs: Vec<usize>,
+}
+
+impl PtrPinGuard {
+    pub fn pin_addrs(addrs: impl IntoIterator<Item = usize>) -> Self {
+        let mut addrs: Vec<usize> = addrs.into_iter().filter(|&a| a != 0).collect();
+        addrs.sort_unstable();
+        addrs.dedup();
+        for a in &addrs {
+            pin(*a);
+        }
+        Self { addrs }
+    }
+}
+
+impl Drop for PtrPinGuard {
+    fn drop(&mut self) {
+        for a in self.addrs.drain(..) {
+            unpin(a);
+        }
+    }
+}
 
 pub fn register(entry: PtrEntry) {
     if entry.addr == 0 {
@@ -173,6 +223,12 @@ pub fn alloc_owned(nbytes: usize, align: usize, elem: Option<String>) -> Result<
 pub fn free_owned(addr: usize) -> Result<()> {
     if addr == 0 {
         return Ok(());
+    }
+    if is_pinned(addr) {
+        return Err(RuntimeError::value_err(format!(
+            "{}: pointer is in use by an in-flight FFI call",
+            builtin_repr("free")
+        )));
     }
     let Some(e) = unregister(addr) else {
         return Err(RuntimeError::value_err(format!(

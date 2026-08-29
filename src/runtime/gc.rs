@@ -989,13 +989,19 @@ fn mark_iterator_children(state: &IteratorState, worklist: &mut Vec<Value>) {
             worklist.push(Value::Channel(channel.clone()));
         }
         IteratorKind::Generator {
-            locals, yield_from, ..
+            locals,
+            yield_from,
+            paused_iters,
+            ..
         } => {
             for v in locals {
                 worklist.push(v.clone());
             }
             if let Some(yf) = yield_from {
                 worklist.push(Value::Iterator(yf.clone()));
+            }
+            for it in paused_iters {
+                worklist.push(Value::Iterator(it.clone()));
             }
         }
     }

@@ -858,16 +858,11 @@ fn builtin_struct_slot(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         other => other,
     };
     match payload {
-        Value::Struct(s) => s
-            .slots
-            .borrow()
-            .get(idx as usize)
-            .cloned()
-            .ok_or_else(|| {
-                crate::error::RuntimeError::value_err(format!(
-                    "__struct_slot__: index {idx} out of range"
-                ))
-            }),
+        Value::Struct(s) => s.slots.borrow().get(idx as usize).cloned().ok_or_else(|| {
+            crate::error::RuntimeError::value_err(format!(
+                "__struct_slot__: index {idx} out of range"
+            ))
+        }),
         other => Err(crate::error::RuntimeError::type_err(format!(
             "__struct_slot__ expects struct (or variant wrapping one), got {}",
             other.type_name()

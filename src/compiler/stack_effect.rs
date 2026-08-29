@@ -1,7 +1,7 @@
 //! 指令栈效应表与测试期平衡检查（零运行时开销）。
 //!
 //! - `Instruction::stack_effect`：纯数据，供 verifier / 文档使用，不进解释器热循环。
-//! - `verify_stack_balance`：CFG 工作表分析，仅在测试或显式调用时运行。
+//! - `verify_stack_balance`：CFG 工作表分析；编译器在 peephole 之后调用 [`verify_compiled`]。
 //!
 //! Call 族按「同步调用」近似（pop args+callee, push 1），与 specialize 一致；
 //! 用户函数的延迟返回不改变调用方净效应。
@@ -101,7 +101,7 @@ impl Instruction {
             Self::SelectTrySend => Adjust {
                 pop: 2,
                 push: 1,
-                alt_push: None,
+                alt_push: Some(2),
             },
             Self::Neg
             | Self::Invert
@@ -114,8 +114,7 @@ impl Instruction {
             | Self::GoValue
             | Self::Await
             | Self::Snap
-            | Self::MakeDeadline
-            | Self::SelectPollDeadline => Adjust {
+            | Self::MakeDeadline => Adjust {
                 pop: 1,
                 push: 1,
                 alt_push: None,
@@ -144,11 +143,15 @@ impl Instruction {
             | Self::StoreGlobal(_)
             | Self::StoreFast(_)
             | Self::BindFast { .. }
-            | Self::DelName(_)
             | Self::DelAttr(_)
             | Self::Yield
             | Self::YieldFrom => Adjust {
                 pop: 1,
+                push: 0,
+                alt_push: None,
+            },
+            Self::DelName(_) => Adjust {
+                pop: 0,
                 push: 0,
                 alt_push: None,
             },
@@ -172,13 +175,13 @@ impl Instruction {
                 alt_push: None,
             },
             Self::PopTry => PopTry,
-            Self::Call { argc } | Self::CallSelf { argc } | Self::MacroCall { argc } => Adjust {
+            Self::Call { argc } | Self::MacroCall { argc } => Adjust {
                 pop: (*argc as u16).saturating_add(1),
                 push: 1,
                 alt_push: None,
             },
-            // callee 已编码在指令里，只弹参数。
-            Self::CallGlobal { argc, .. } => Adjust {
+            // callee 已是当前函数 / 全局槽，只弹参数。
+            Self::CallSelf { argc } | Self::CallGlobal { argc, .. } => Adjust {
                 pop: *argc as u16,
                 push: 1,
                 alt_push: None,
@@ -256,7 +259,7 @@ impl Instruction {
                 alt_push: None,
             },
             // ready: value+bool；not ready: 仅 bool
-            Self::SelectTryRecv | Self::SelectPollTask => Adjust {
+            Self::SelectTryRecv | Self::SelectPollTask | Self::SelectPollDeadline => Adjust {
                 pop: 1,
                 push: 1,
                 alt_push: Some(2),
@@ -314,14 +317,19 @@ impl Instruction {
 
 /// 检查字节码操作数栈深度永不下溢，且控制流汇合点深度一致。
 ///
-/// 供测试使用；不在解释器热路径调用。
-///
-/// 可变效应指令（`SelectTryRecv` / `SelectPollTask` / `IterNext`）须紧跟
+/// 可变效应指令（`SelectTryRecv` / `SelectPollTask` / `SelectPollDeadline` / `SelectTrySend` / `IterNext`）须紧跟
 /// `GotoIf`/`GotoIfNot`：ready 路径多压一个值，由条件跳转分流，不能对同一
 /// 后继合并两个深度。
 ///
 /// `EnterTry` 沿控制流路径压栈；`PopTry`/`EndTry` 弹出。Handle 表达式用
 /// `Goto`+`PopTry` 关闭而无 `EndTry`，不得被后续 `EndTry` 误匹配。
+pub fn verify_compiled(what: &str, code: &[Instruction]) -> crate::Result<()> {
+    verify_stack_balance(code).map_err(|e| {
+        crate::error::RuntimeError::msg(format!("internal: stack imbalance in {what}: {e}"))
+    })
+}
+
+/// 见 [`verify_compiled`]。测试也可直接调用。
 pub fn verify_stack_balance(code: &[Instruction]) -> Result<(), String> {
     let n = code.len();
     if n == 0 {
@@ -339,6 +347,10 @@ pub fn verify_stack_balance(code: &[Instruction]) -> Result<(), String> {
             continue;
         }
         if let Some((prev_d, prev_ts)) = &state_at[pc] {
+            // Ret/Throw 是路径终点：不同深度汇入同一条 Ret 合法（栈顶即返回值；空栈 VM 补 none）。
+            if matches!(code[pc].stack_effect(), StackEffect::Exit { .. }) {
+                continue;
+            }
             if *prev_d != depth || *prev_ts != try_stack {
                 return Err(format!(
                     "stack/try-stack mismatch at pc={pc}: depth {prev_d}/{depth}, try_stack {prev_ts:?}/{try_stack:?} (ins={:?})",

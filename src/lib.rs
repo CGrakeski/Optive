@@ -61,7 +61,7 @@ pub fn compile_with_context(
     source: &str,
     file: &str,
 ) -> Result<opcode::CompiledProgram> {
-    let mut compiled = if crate::bc_cache::should_use(file) {
+    let mut compiled = if crate::bc_cache::should_use(file) && !vm.caps.fs_restricted() {
         let mut dep_ids: Vec<String> = vm.dep_map.values().map(|d| d.id.clone()).collect();
         dep_ids.sort();
         let key = crate::bc_cache::key(

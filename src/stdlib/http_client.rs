@@ -87,6 +87,9 @@ fn opt_num(opts: &Value, key: &str) -> Option<i64> {
     None
 }
 
+const DEFAULT_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_HTTP_BODY: u64 = 8 * 1024 * 1024;
+
 fn extract_timeout(opts: &Value) -> Option<std::time::Duration> {
     if let Value::Dict(d) = opts {
         if let Some(Value::Num(n)) = d.borrow().get(&ValueKey::Text("timeout".into())) {
@@ -99,6 +102,7 @@ fn extract_timeout(opts: &Value) -> Option<std::time::Duration> {
 }
 
 fn response_to_dict(resp: reqwest::blocking::Response) -> Result<Value> {
+    use std::io::Read;
     let status = resp.status().as_u16();
     let url = resp.url().to_string();
     let mut header_map = DictMap::new();
@@ -109,9 +113,17 @@ fn response_to_dict(resp: reqwest::blocking::Response) -> Result<Value> {
             Value::Text(val.to_string()),
         );
     }
-    let body = resp.text().map_err(|e| {
+    let mut limited = resp.take(MAX_HTTP_BODY + 1);
+    let mut raw = Vec::new();
+    limited.read_to_end(&mut raw).map_err(|e| {
         crate::error::RuntimeError::io_err(format!("http: failed to read body: {e}"))
     })?;
+    if raw.len() as u64 > MAX_HTTP_BODY {
+        return Err(crate::error::RuntimeError::io_err(format!(
+            "http: response body exceeds {MAX_HTTP_BODY} bytes"
+        )));
+    }
+    let body = String::from_utf8_lossy(&raw).into_owned();
     let mut out = DictMap::new();
     out.insert(
         ValueKey::Text("status".into()),
@@ -133,10 +145,8 @@ fn response_to_dict(resp: reqwest::blocking::Response) -> Result<Value> {
 fn build_client(opts: &Value) -> Result<reqwest::blocking::Client> {
     // 与 std.net TLS 相同：先装 ring，避免 rustls 0.23 无默认 CryptoProvider。
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let mut builder = reqwest::blocking::Client::builder();
-    if let Some(dur) = extract_timeout(opts) {
-        builder = builder.timeout(dur);
-    }
+    let mut builder = reqwest::blocking::Client::builder()
+        .timeout(extract_timeout(opts).unwrap_or(DEFAULT_HTTP_TIMEOUT));
     if let Some(p) = opt_str(opts, "proxy") {
         let proxy = reqwest::Proxy::all(&p).map_err(|e| {
             crate::error::RuntimeError::value_err(format!("http: invalid proxy '{p}': {e}"))
