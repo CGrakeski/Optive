@@ -1,7 +1,7 @@
 //! REPL 语法高亮：Lexer span + ANSI，热路径只 tokenize、带行缓存。
 
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::env;
 
 use optive::lexer::Lexer;
@@ -19,7 +19,7 @@ const LIT_STR: &str = "\x1b[92m"; // bright green
 const COMMENT: &str = "\x1b[90m"; // bright black / gray
 const OP: &str = "\x1b[37m"; // white/gray
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Style {
     None,
     Kw,
@@ -76,18 +76,34 @@ const fn ansi_prefix(style: Style) -> &'static str {
     }
 }
 
-/// 是否启用输入行高亮（尊重 `--color` / `NO_COLOR`，可用 `OPTIVE_REPL_HIGHLIGHT=0` 关掉）。
+fn highlight_setting(value: Option<&str>) -> bool {
+    match value {
+        Some(value) => {
+            let value = value.to_ascii_lowercase();
+            !matches!(value.as_str(), "0" | "false" | "off" | "no")
+        }
+        None => true,
+    }
+}
+
+/// 是否启用输入行高亮（尊重 `--color` / `NO_COLOR`）。
+///
+/// 默认开启，所有平台都可用 `OPTIVE_REPL_HIGHLIGHT=0` 关闭。
 pub fn highlight_enabled() -> bool {
     if !color::enabled() {
         return false;
     }
-    match env::var("OPTIVE_REPL_HIGHLIGHT") {
-        Ok(s) => {
-            let s = s.to_ascii_lowercase();
-            !matches!(s.as_str(), "0" | "false" | "off" | "no")
-        }
-        Err(_) => true,
-    }
+    let configured = env::var("OPTIVE_REPL_HIGHLIGHT").ok();
+    highlight_setting(configured.as_deref())
+}
+
+fn trailing_style(line: &str) -> Style {
+    Lexer::new(line)
+        .tokenize_spans()
+        .into_iter()
+        .rev()
+        .find_map(|(_, end, kind)| (end == line.len()).then(|| style_for(kind)))
+        .unwrap_or(Style::None)
 }
 
 /// 单行高亮（不查缓存）。`line` 为字节串；span 来自 Lexer。
@@ -122,27 +138,87 @@ pub fn highlight_tive_line(line: &str) -> String {
 }
 
 /// 行级缓存：rustyline 的 `highlight` 只有 `&self`。
-#[derive(Default)]
 pub struct LineHighlightCache {
     inner: RefCell<Option<(String, String)>>,
+    terminal_style: Cell<Style>,
+    preserve_trailing_style: Cell<bool>,
+}
+
+impl Default for LineHighlightCache {
+    fn default() -> Self {
+        Self {
+            inner: RefCell::new(None),
+            terminal_style: Cell::new(Style::None),
+            preserve_trailing_style: Cell::new(true),
+        }
+    }
 }
 
 impl LineHighlightCache {
+    /// rustyline 在 Windows 上通过清空并重画整行来更新高亮。只在行尾 token 的
+    /// 样式发生变化时请求重画；同一 token 内的普通输入沿用当前终端样式。
+    pub fn should_refresh(
+        &self,
+        line: &str,
+        at: usize,
+        kind: rustyline::highlight::CmdKind,
+    ) -> bool {
+        if !highlight_enabled() {
+            self.terminal_style.set(Style::None);
+            return false;
+        }
+        self.should_refresh_when_enabled(line, at, kind)
+    }
+
+    fn should_refresh_when_enabled(
+        &self,
+        line: &str,
+        at: usize,
+        kind: rustyline::highlight::CmdKind,
+    ) -> bool {
+        if kind == rustyline::highlight::CmdKind::ForcedRefresh {
+            // Enter/最终刷新必须恢复默认终端样式，避免后续输出继承输入颜色。
+            self.preserve_trailing_style.set(false);
+            self.terminal_style.set(Style::None);
+            return false;
+        }
+        self.preserve_trailing_style.set(true);
+        if at != line.len() {
+            return false;
+        }
+        trailing_style(line) != self.terminal_style.get()
+    }
+
     pub fn get_or_highlight<'l>(&self, line: &'l str) -> Cow<'l, str> {
         if !highlight_enabled() {
             return Cow::Borrowed(line);
         }
+        let trailing = if self.preserve_trailing_style.get() {
+            trailing_style(line)
+        } else {
+            Style::None
+        };
         {
             let guard = self.inner.borrow();
             if let Some((src, painted)) = guard.as_ref() {
                 if src == line {
-                    return Cow::Owned(painted.clone());
+                    let mut painted = painted.clone();
+                    if trailing != Style::None {
+                        painted.push_str(ansi_prefix(trailing));
+                    }
+                    self.terminal_style.set(trailing);
+                    return Cow::Owned(painted);
                 }
             }
         }
         let painted = highlight_tive_line(line);
         *self.inner.borrow_mut() = Some((line.to_string(), painted.clone()));
-        Cow::Owned(painted)
+        let mut output = painted;
+        if trailing != Style::None {
+            output.push_str(ansi_prefix(trailing));
+        }
+        self.terminal_style.set(trailing);
+        Cow::Owned(output)
     }
 }
 
@@ -181,5 +257,45 @@ mod tests {
         let b = highlight_tive_line("func f() { 1 }");
         assert_eq!(a, b);
         let _ = c;
+    }
+
+    #[test]
+    fn highlighting_is_enabled_by_default() {
+        assert!(highlight_setting(None));
+    }
+
+    #[test]
+    fn explicit_highlight_setting_overrides_platform_default() {
+        assert!(highlight_setting(Some("1")));
+        assert!(highlight_setting(Some("true")));
+        assert!(!highlight_setting(Some("0")));
+        assert!(!highlight_setting(Some("OFF")));
+    }
+
+    #[test]
+    fn repaint_is_requested_only_when_trailing_style_changes() {
+        use rustyline::highlight::CmdKind;
+
+        let cache = LineHighlightCache::default();
+        assert!(!cache.should_refresh_when_enabled("l", 1, CmdKind::Other));
+        assert!(!cache.should_refresh_when_enabled("le", 2, CmdKind::Other));
+        assert!(cache.should_refresh_when_enabled("let", 3, CmdKind::Other));
+        cache.terminal_style.set(Style::Kw);
+        assert!(cache.should_refresh_when_enabled("letx", 4, CmdKind::Other));
+        cache.terminal_style.set(Style::None);
+        assert!(!cache.should_refresh_when_enabled("letxy", 5, CmdKind::Other));
+    }
+
+    #[test]
+    fn forced_refresh_restores_default_terminal_style() {
+        use rustyline::highlight::CmdKind;
+
+        let cache = LineHighlightCache::default();
+        assert!(cache.should_refresh_when_enabled("42", 2, CmdKind::Other));
+        cache.terminal_style.set(Style::Num);
+        cache.preserve_trailing_style.set(true);
+        assert!(!cache.should_refresh_when_enabled("42", 2, CmdKind::ForcedRefresh));
+        assert_eq!(cache.terminal_style.get(), Style::None);
+        assert!(!cache.preserve_trailing_style.get());
     }
 }

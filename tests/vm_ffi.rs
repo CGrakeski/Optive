@@ -209,7 +209,7 @@ fn extern_missing_symbol_errors() {
     let src = format!(
         r#"
 use std.language.{{ C }}
-let h = C.frompath({path})
+var h = C.frompath({path})
 extern(h, "no_such_symbol") func missing(a: C.types.int) -> C.types.int ...
 "#
     );
@@ -304,7 +304,7 @@ fn extern_survives_handle_drop() {
     let src = format!(
         r"
 use std.language.{{ C }}
-let h = C.frompath({path})
+var h = C.frompath({path})
 extern(h) func add(
     implicit a: C.types.int,
     implicit b: C.types.int
@@ -570,24 +570,24 @@ fn mn_ffi_parallel_add_stress() {
     let src = format!(
         r"
 use std.language.{{ C }}
-let h = C.frompath({path})
+var h = C.frompath({path})
 extern(h) func add(
     implicit a: C.types.int,
     implicit b: C.types.int
 ) -> C.types.int : num.(i32.(_)) ...
-let m = Mutex(0)
-let wg = WaitGroup(40)
+var m = Mutex(0)
+var wg = WaitGroup(40)
 loop (40) {{
   go do {{
     let s = add(1, 2)
-    let g = m.lock()
+    var g = m.lock()
     g.set(g.get() + s)
     g.unlock()
     wg.done()
   }}
 }}
 wg.wait()
-let g = m.lock()
+var g = m.lock()
 let total = g.get()
 g.unlock()
 total

@@ -42,6 +42,7 @@ enum CompKind {
 enum OpenHandler {
     Try,
     With { ctx: String },
+    Defer { body: Block },
 }
 
 pub struct Generator {
@@ -73,6 +74,7 @@ pub struct Generator {
     yielding: bool,
     /// 脚本 `{ }` 内已 `let`/`var` 的名字；这些名遮住未逃逸快局部。
     block_shadows: Vec<HashSet<String>>,
+    const_context: Arc<crate::compiler::const_eval::ConstContext>,
 }
 
 struct CompileFnExtras<'a> {
@@ -109,49 +111,8 @@ impl Generator {
             current_return_wrapper: None,
             yielding: false,
             block_shadows: Vec::new(),
+            const_context: Arc::new(crate::compiler::const_eval::ConstContext::default()),
         }
-    }
-
-    /// 块内是否含本层 `yield`/`yield from`（不进入嵌套 `func`/`do` 体）。
-    fn block_has_yield(body: &Block) -> bool {
-        fn stmt_has(stmt: &Stmt) -> bool {
-            match stmt {
-                Stmt::Yield(_) | Stmt::YieldFrom(_) => true,
-                Stmt::If {
-                    then_block,
-                    elifs,
-                    else_block,
-                    ..
-                } => {
-                    Generator::block_has_yield(then_block)
-                        || elifs.iter().any(|(_, b)| Generator::block_has_yield(b))
-                        || else_block.as_ref().is_some_and(Generator::block_has_yield)
-                }
-                Stmt::While { body, .. }
-                | Stmt::Loop { body, .. }
-                | Stmt::For { body, .. }
-                | Stmt::With { body, .. }
-                | Stmt::Block(body) => Generator::block_has_yield(body),
-                Stmt::Try {
-                    body,
-                    catches,
-                    else_block,
-                } => {
-                    Generator::block_has_yield(body)
-                        || catches.iter().any(|c| Generator::block_has_yield(&c.body))
-                        || else_block.as_ref().is_some_and(Generator::block_has_yield)
-                }
-                Stmt::Match {
-                    cases, else_block, ..
-                } => {
-                    cases.iter().any(|c| Generator::block_has_yield(&c.body))
-                        || else_block.as_ref().is_some_and(Generator::block_has_yield)
-                }
-                // 嵌套 FuncDecl 的 yield 只属于内层；do 在表达式里单独编译。
-                _ => false,
-            }
-        }
-        body.iter().any(|s| stmt_has(&s.stmt))
     }
 
     fn global_slot(&mut self, name: &str) -> usize {
@@ -268,12 +229,14 @@ impl Generator {
             if a.is_kwsplat {
                 // kwargs = update(kwargs, dict) — 合并关键字参数字典
                 self.gen_expr(&a.value)?;
-                self.codegen.emit(Instruction::Load("__merge_kwargs__".into()));
+                self.codegen
+                    .emit(Instruction::Load("__merge_kwargs__".into()));
                 self.codegen.emit(Instruction::Call { argc: 2 });
             } else if let Some(name) = &a.name {
                 // kwargs[name] = value；保留 kwargs 在栈上
                 self.with_call_arg_temps(false, |this| {
-                    this.codegen.emit(Instruction::Push(Value::Text(name.clone())));
+                    this.codegen
+                        .emit(Instruction::Push(Value::Text(name.clone())));
                     this.gen_expr(&a.value)?;
                     this.codegen.emit(Instruction::DictSet);
                     Ok(())
@@ -491,6 +454,36 @@ impl Generator {
     }
 
     pub fn compile(mut self, program: &Program) -> Result<CompiledProgram> {
+        self.const_context = Arc::new(crate::compiler::const_eval::ConstContext::build(program)?);
+        self.compile_prepared(program)
+    }
+
+    pub fn compile_with_const_values(
+        self,
+        program: &Program,
+        values: HashMap<String, Value>,
+    ) -> Result<CompiledProgram> {
+        self.compile_with_const_imports(
+            program,
+            crate::compiler::const_eval::ConstImports {
+                values,
+                modules: HashMap::new(),
+            },
+        )
+    }
+
+    pub fn compile_with_const_imports(
+        mut self,
+        program: &Program,
+        imports: crate::compiler::const_eval::ConstImports,
+    ) -> Result<CompiledProgram> {
+        self.const_context = Arc::new(
+            crate::compiler::const_eval::ConstContext::build_with_imports(program, imports)?,
+        );
+        self.compile_prepared(program)
+    }
+
+    fn compile_prepared(mut self, program: &Program) -> Result<CompiledProgram> {
         // quote/snippet 用 block_depth 走名字 Load/Store，不要改成脚本快局部。
         let unescaped = if self.block_depth == 0 {
             free_vars::unescaped_script_var_names(program)
@@ -528,7 +521,8 @@ impl Generator {
         self.codegen.emit(Instruction::Ret);
         self.codegen.patch_labels().map_err(RuntimeError::msg)?;
         crate::specialize::specialize_instructions(&mut self.codegen.code);
-        let (compacted, remap) = crate::opcode::compact_bytecode(std::mem::take(&mut self.codegen.code));
+        let (compacted, remap) =
+            crate::opcode::compact_bytecode(std::mem::take(&mut self.codegen.code));
         let (fused, remap2) = crate::opcode::peephole_fuse(compacted);
         self.codegen.code = fused;
         crate::stack_effect::verify_compiled("script", &self.codegen.code)?;
@@ -650,7 +644,7 @@ impl Generator {
                 return_strong,
                 return_wrapper: return_wrapper.cloned(),
                 captured_names: HashSet::new(),
-                is_generator: Self::block_has_yield(body),
+                is_generator: crate::ast::block_has_yield(body),
             },
         )?;
         Ok(std::sync::Arc::new(func))
@@ -697,7 +691,8 @@ impl Generator {
     fn maybe_register_export(&mut self, visibility: Visibility, name: &str, top_level: bool) {
         // 历史语义：无修饰符与 `export` 均注册为导出；仅 `intern` 不导出。
         if top_level && visibility != Visibility::Internal {
-            self.codegen.emit(Instruction::RegisterExport(name.to_string()));
+            self.codegen
+                .emit(Instruction::RegisterExport(name.to_string()));
         }
     }
 
@@ -708,12 +703,14 @@ impl Generator {
             Stmt::VarDecl {
                 name,
                 is_const,
+                is_var,
                 init,
                 type_expr,
                 type_strong,
                 visibility,
                 ..
             } => {
+                let immutable = *is_const || !*is_var;
                 if self.current_func.is_some() && self.local_slots.is_some() {
                     let slot = self.ensure_local_slot(name);
                     if let Some(init) = init {
@@ -729,7 +726,7 @@ impl Generator {
                     self.codegen.emit(Instruction::BindFast {
                         slot,
                         name: name.clone(),
-                        is_const: *is_const,
+                        is_const: immutable,
                     });
                 } else if self.current_func.is_none() && self.block_depth > 0 {
                     if let Some(set) = self.block_shadows.last_mut() {
@@ -737,7 +734,7 @@ impl Generator {
                     }
                     self.codegen.emit(Instruction::NewVar {
                         name: name.clone(),
-                        is_const: *is_const,
+                        is_const: immutable,
                     });
                     if let Some(init) = init {
                         self.gen_expr(init)?;
@@ -761,10 +758,19 @@ impl Generator {
                     }
                     let slot = self.ensure_local_slot(name);
                     self.codegen.emit(Instruction::StoreFast(slot));
+                    if immutable {
+                        // Script fast locals need their first store before the
+                        // binding becomes immutable. `NewVar` seals subsequent
+                        // stores without changing the already initialized slot.
+                        self.codegen.emit(Instruction::NewVar {
+                            name: name.clone(),
+                            is_const: true,
+                        });
+                    }
                 } else {
                     self.codegen.emit(Instruction::NewVar {
                         name: name.clone(),
-                        is_const: *is_const,
+                        is_const: immutable,
                     });
                     if let Some(init) = init {
                         self.gen_expr(init)?;
@@ -787,11 +793,12 @@ impl Generator {
                 pattern,
                 init,
                 is_const,
+                is_var,
                 visibility,
                 ..
             } => {
                 self.gen_expr(init)?;
-                self.gen_destruct_bind(pattern, *is_const, true)?;
+                self.gen_destruct_bind(pattern, *is_const || !*is_var, true)?;
                 if top_level {
                     for name in destruct_bound_names(pattern) {
                         self.maybe_register_export(*visibility, &name, true);
@@ -846,7 +853,11 @@ impl Generator {
                 visibility,
                 decorators,
                 is_generator,
+                is_const,
             } => {
+                if *is_const {
+                    return Ok(());
+                }
                 let is_gen = *is_generator;
                 if type_params.is_empty() {
                     let param_names: HashSet<String> =
@@ -878,11 +889,13 @@ impl Generator {
                     self.emit_function_value_with_defaults(params, func)?;
                     if !free.is_empty() {
                         for fname in &free {
-                            self.codegen.emit(Instruction::Push(Value::Text(fname.clone())));
+                            self.codegen
+                                .emit(Instruction::Push(Value::Text(fname.clone())));
                             self.emit_load_name(fname);
                         }
                         self.codegen.emit(Instruction::DictNew(free.len()));
-                        self.codegen.emit(Instruction::Load("__make_closure__".into()));
+                        self.codegen
+                            .emit(Instruction::Load("__make_closure__".into()));
                         self.codegen.emit(Instruction::Call { argc: 2 });
                     }
                 } else {
@@ -946,7 +959,8 @@ impl Generator {
                 self.program
                     .macros
                     .insert(name.clone(), Arc::new(mac.clone()));
-                self.codegen.emit(Instruction::Push(Value::Macro(Arc::new(mac))));
+                self.codegen
+                    .emit(Instruction::Push(Value::Macro(Arc::new(mac))));
                 self.codegen.emit(Instruction::NewVar {
                     name: name.clone(),
                     is_const: false,
@@ -976,7 +990,8 @@ impl Generator {
                             is_generator: false,
                         },
                     )?;
-                    self.codegen.emit(Instruction::Push(Value::Text(name.clone())));
+                    self.codegen
+                        .emit(Instruction::Push(Value::Text(name.clone())));
                     self.codegen
                         .emit(Instruction::Push(Value::Function(Arc::new(handler))));
                     self.codegen.emit(Instruction::ResolveFuncTypes);
@@ -984,7 +999,8 @@ impl Generator {
                         .emit(Instruction::Load("__register_dispatch_handler__".into()));
                     self.codegen.emit(Instruction::Call { argc: 2 });
                 } else {
-                    self.codegen.emit(Instruction::Push(Value::Text(name.clone())));
+                    self.codegen
+                        .emit(Instruction::Push(Value::Text(name.clone())));
                     self.codegen
                         .emit(Instruction::Load("__ensure_dispatch__".into()));
                     self.codegen.emit(Instruction::Call { argc: 1 });
@@ -1052,9 +1068,7 @@ impl Generator {
                 self.loop_continue_labels.push(start);
                 self.loop_handler_depths.push(self.handler_stack.len());
                 self.loop_owns_stack_counter.push(false);
-                for s in body {
-                    self.gen_stmt(s, false)?;
-                }
+                self.gen_block(body, false)?;
                 self.loop_break_labels.pop();
                 self.loop_continue_labels.pop();
                 self.loop_handler_depths.pop();
@@ -1078,9 +1092,7 @@ impl Generator {
                     self.loop_continue_labels.push(start);
                     self.loop_handler_depths.push(self.handler_stack.len());
                     self.loop_owns_stack_counter.push(true);
-                    for s in body {
-                        self.gen_stmt(s, false)?;
-                    }
+                    self.gen_block(body, false)?;
                     self.loop_break_labels.pop();
                     self.loop_continue_labels.pop();
                     self.loop_handler_depths.pop();
@@ -1094,9 +1106,7 @@ impl Generator {
                     self.loop_continue_labels.push(start);
                     self.loop_handler_depths.push(self.handler_stack.len());
                     self.loop_owns_stack_counter.push(false);
-                    for s in body {
-                        self.gen_stmt(s, false)?;
-                    }
+                    self.gen_block(body, false)?;
                     self.loop_break_labels.pop();
                     self.loop_continue_labels.pop();
                     self.loop_handler_depths.pop();
@@ -1138,6 +1148,11 @@ impl Generator {
                     .ok_or_else(|| RuntimeError::msg("continue outside loop"))?;
                 self.emit_handler_exit_cleanups(depth);
                 self.codegen.emit(Instruction::Goto(lbl));
+            }
+            Stmt::Defer(_) => {
+                return Err(RuntimeError::msg(
+                    "internal: defer must be compiled as part of its enclosing block",
+                ));
             }
             Stmt::Block(stmts) => {
                 self.codegen.emit(Instruction::EnterScope);
@@ -1654,7 +1669,8 @@ impl Generator {
                 self.codegen.emit(Instruction::GotoIfNot(fail_label));
                 self.emit_load_match_at(temp, path);
                 self.codegen.emit(Instruction::ListLen);
-                self.codegen.emit(Instruction::PushSmall(elems.len() as i64));
+                self.codegen
+                    .emit(Instruction::PushSmall(elems.len() as i64));
                 self.codegen.emit(Instruction::Eq);
                 self.codegen.emit(Instruction::GotoIfNot(fail_label));
                 for (i, elem) in elems.iter().enumerate() {
@@ -1665,7 +1681,8 @@ impl Generator {
             }
             Pattern::Struct { type_name, .. } => {
                 self.emit_load_match_at(temp, path);
-                self.codegen.emit(Instruction::IsInstance(type_name.clone()));
+                self.codegen
+                    .emit(Instruction::IsInstance(type_name.clone()));
                 self.codegen.emit(Instruction::GotoIfNot(fail_label));
             }
             Pattern::Or(_) => {
@@ -1686,7 +1703,14 @@ impl Generator {
         }
         if let Some((vname, cname)) = type_name.rsplit_once('.') {
             // 导入方 compile unit 没有 variant_defs，仍按内部 case-struct 名匹配。
-            return crate::enum_variant::case_struct_name(vname, cname);
+            let canonical = if !self.program.variant_defs.contains_key(vname)
+                && matches!(vname, "Result" | "Option" | "Either")
+            {
+                format!("std.variants.{vname}")
+            } else {
+                vname.to_string()
+            };
+            return crate::enum_variant::case_struct_name(&canonical, cname);
         }
         type_name.to_string()
     }
@@ -1703,7 +1727,8 @@ impl Generator {
             self.emit_load_match_at(temp, path);
             self.codegen
                 .emit(Instruction::Push(Value::type_ref(type_name.to_string())));
-            self.codegen.emit(Instruction::Load("__variant_is__".into()));
+            self.codegen
+                .emit(Instruction::Load("__variant_is__".into()));
             self.codegen.emit(Instruction::Call { argc: 2 });
             self.codegen.emit(Instruction::GotoIfNot(fail_label));
             if let Some(inner) = args.first() {
@@ -1758,7 +1783,8 @@ impl Generator {
     fn emit_load_match_slot(&mut self, temp: &str, path: &[usize], index: usize) -> Result<()> {
         self.emit_load_match_at(temp, path);
         self.codegen.emit(Instruction::PushSmall(index as i64));
-        self.codegen.emit(Instruction::Load("__struct_slot__".into()));
+        self.codegen
+            .emit(Instruction::Load("__struct_slot__".into()));
         self.codegen.emit(Instruction::Call { argc: 2 });
         Ok(())
     }
@@ -1906,18 +1932,21 @@ impl Generator {
 
         if let Some(gen_func) = generate_func {
             self.emit_enum_all_dict(members)?;
-            self.codegen.emit(Instruction::Push(Value::Function(gen_func)));
+            self.codegen
+                .emit(Instruction::Push(Value::Function(gen_func)));
             self.codegen.emit(Instruction::Call { argc: 1 });
             let values_temp = self.codegen.fresh_temp("__enum_values");
             self.emit_store_temp(&values_temp);
             self.codegen
                 .emit(Instruction::Push(Value::type_ref(name.to_string())));
             for m in members {
-                self.codegen.emit(Instruction::Push(Value::Text(m.name.clone())));
+                self.codegen
+                    .emit(Instruction::Push(Value::Text(m.name.clone())));
             }
             self.codegen.emit(Instruction::VecNew(members.len()));
             self.emit_load_temp(&values_temp);
-            self.codegen.emit(Instruction::Load("__finalize_enum__".into()));
+            self.codegen
+                .emit(Instruction::Load("__finalize_enum__".into()));
             self.codegen.emit(Instruction::Call { argc: 3 });
         } else {
             let member_infos = crate::enum_variant::default_enum_values(members)?;
@@ -1949,7 +1978,8 @@ impl Generator {
 
     fn emit_enum_all_dict(&mut self, members: &[EnumMemberDecl]) -> Result<()> {
         for m in members.iter().rev() {
-            self.codegen.emit(Instruction::Push(Value::Text(m.name.clone())));
+            self.codegen
+                .emit(Instruction::Push(Value::Text(m.name.clone())));
             if let Some(expr) = &m.value {
                 let num = crate::enum_variant::eval_const_num(expr)?;
                 self.codegen.emit(Instruction::Push(Value::Num(num)));
@@ -1977,7 +2007,8 @@ impl Generator {
 
     fn gen_fstring(&mut self, parts: &[FStringPart]) -> Result<()> {
         if parts.is_empty() {
-            self.codegen.emit(Instruction::Push(Value::Text(String::new())));
+            self.codegen
+                .emit(Instruction::Push(Value::Text(String::new())));
             return Ok(());
         }
         let mut first = true;
@@ -2055,21 +2086,130 @@ impl Generator {
         let last_value_idx = block
             .iter()
             .rposition(|s| !matches!(s.stmt, Stmt::Comment { .. }));
-        if keep_last_value
-            && (last_value_idx.is_none()
-                || !Self::stmt_yields_value(&block[last_value_idx.expect("checked")].stmt))
-        {
-            for located in block {
-                self.gen_stmt(located, false)?;
-            }
+        let produces_value =
+            last_value_idx.is_some_and(|i| Self::stmt_yields_value(&block[i].stmt));
+        self.gen_block_range(block, 0, keep_last_value && produces_value, last_value_idx)?;
+        if keep_last_value && !produces_value {
             self.codegen.emit(Instruction::Push(Value::None));
-        } else {
-            for (i, located) in block.iter().enumerate() {
-                let keep = keep_last_value && Some(i) == last_value_idx;
-                self.gen_stmt(located, keep)?;
-            }
         }
         self.pop_type_scope();
+        Ok(())
+    }
+
+    fn gen_block_range(
+        &mut self,
+        block: &Block,
+        start: usize,
+        keep_last_value: bool,
+        last_value_idx: Option<usize>,
+    ) -> Result<()> {
+        let mut i = start;
+        while i < block.len() {
+            if let Stmt::Defer(body) = &block[i].stmt {
+                self.validate_defer_body(body)?;
+                return self.gen_defer_region(block, i + 1, body, keep_last_value, last_value_idx);
+            }
+            let keep = keep_last_value && Some(i) == last_value_idx;
+            self.gen_stmt(&block[i], keep)?;
+            i += 1;
+        }
+        Ok(())
+    }
+
+    fn gen_defer_region(
+        &mut self,
+        block: &Block,
+        rest_start: usize,
+        cleanup: &Block,
+        keep_last_value: bool,
+        last_value_idx: Option<usize>,
+    ) -> Result<()> {
+        let catch = self.codegen.fresh_label();
+        let success = self.codegen.fresh_label();
+        let end = self.codegen.fresh_label();
+        self.codegen.emit(Instruction::EnterTry {
+            catch_label: catch,
+            else_label: success,
+            end_label: end,
+        });
+        self.handler_stack.push(OpenHandler::Defer {
+            body: cleanup.clone(),
+        });
+        self.gen_block_range(block, rest_start, keep_last_value, last_value_idx)?;
+        self.codegen.emit(Instruction::EndTry);
+        self.handler_stack.pop();
+
+        self.codegen.mark_label(success);
+        self.gen_block(cleanup, false)?;
+        self.codegen.emit(Instruction::Goto(end));
+
+        self.codegen.mark_label(catch);
+        self.codegen.emit(Instruction::PopTry);
+        self.gen_block(cleanup, false)?;
+        self.codegen.emit(Instruction::Rethrow);
+        self.codegen.mark_label(end);
+        Ok(())
+    }
+
+    fn validate_defer_body(&self, block: &Block) -> Result<()> {
+        fn invalid(stmt: &Stmt) -> bool {
+            match stmt {
+                Stmt::Return(_)
+                | Stmt::Break
+                | Stmt::Continue
+                | Stmt::Yield(_)
+                | Stmt::YieldFrom(_) => true,
+                Stmt::If {
+                    then_block,
+                    elifs,
+                    else_block,
+                    ..
+                } => {
+                    then_block.iter().any(|s| invalid(&s.stmt))
+                        || elifs
+                            .iter()
+                            .any(|(_, b)| b.iter().any(|s| invalid(&s.stmt)))
+                        || else_block
+                            .as_ref()
+                            .is_some_and(|b| b.iter().any(|s| invalid(&s.stmt)))
+                }
+                Stmt::While { body, .. }
+                | Stmt::Loop { body, .. }
+                | Stmt::For { body, .. }
+                | Stmt::Block(body)
+                | Stmt::Defer(body)
+                | Stmt::With { body, .. } => body.iter().any(|s| invalid(&s.stmt)),
+                Stmt::Try {
+                    body,
+                    catches,
+                    else_block,
+                } => {
+                    body.iter().any(|s| invalid(&s.stmt))
+                        || catches
+                            .iter()
+                            .any(|c| c.body.iter().any(|s| invalid(&s.stmt)))
+                        || else_block
+                            .as_ref()
+                            .is_some_and(|b| b.iter().any(|s| invalid(&s.stmt)))
+                }
+                Stmt::Match {
+                    cases, else_block, ..
+                } => {
+                    cases
+                        .iter()
+                        .any(|c| c.body.iter().any(|s| invalid(&s.stmt)))
+                        || else_block
+                            .as_ref()
+                            .is_some_and(|b| b.iter().any(|s| invalid(&s.stmt)))
+                }
+                _ => false,
+            }
+        }
+        if block.iter().any(|s| invalid(&s.stmt)) {
+            return Err(RuntimeError::msg(
+                "defer body cannot contain return, break, continue, or yield",
+            ));
+        }
         Ok(())
     }
 
@@ -2337,6 +2477,7 @@ impl Generator {
             current_return_wrapper: return_wrapper,
             yielding: is_generator,
             block_shadows: Vec::new(),
+            const_context: self.const_context.clone(),
         };
         for p in params {
             if let (Some(ty), true) = (&p.type_expr, p.type_strong) {
@@ -2345,34 +2486,8 @@ impl Generator {
         }
         // 隐式返回：块末尾产生值的语句（表达式 / if / match / …）留在栈上并 Ret；
         // 显式 `return` / `return expr` 仍走 Return；空 `return` → none。
-        if body.is_empty() {
-            sub.gen_return_expr(None)?;
-        } else {
-            let last = body.len() - 1;
-            for (i, s) in body.iter().enumerate() {
-                if i != last {
-                    sub.gen_stmt(s, false)?;
-                    continue;
-                }
-                match &s.stmt {
-                    Stmt::Return(_) => {
-                        sub.gen_stmt(s, false)?;
-                    }
-                    Stmt::Yield(_) | Stmt::YieldFrom(_) => {
-                        sub.gen_stmt(s, false)?;
-                        sub.gen_return_expr(None)?;
-                    }
-                    other if Self::stmt_yields_value(other) => {
-                        sub.gen_stmt(s, true)?;
-                        sub.gen_return_from_tos()?;
-                    }
-                    _ => {
-                        sub.gen_stmt(s, false)?;
-                        sub.gen_return_expr(None)?;
-                    }
-                }
-            }
-        }
+        sub.gen_block(body, true)?;
+        sub.gen_return_from_tos()?;
         if let Some(err) = sub.codegen_error.take() {
             return Err(err);
         }
@@ -2505,6 +2620,14 @@ impl Generator {
                     self.codegen.emit(Instruction::Call { argc: 2 });
                     self.codegen.emit(Instruction::Pop);
                 }
+                OpenHandler::Defer { body } => {
+                    self.codegen.emit(Instruction::PopTry);
+                    // 已在注册时验证不含非局部控制流；普通表达式会自行 Pop，
+                    // 因而不会破坏栈上暂存的返回值。
+                    if let Err(error) = self.gen_block(&body, false) {
+                        self.codegen_error = Some(error);
+                    }
+                }
             }
         }
     }
@@ -2611,10 +2734,9 @@ impl Generator {
             current_return_wrapper: None,
             yielding: false,
             block_shadows: Vec::new(),
+            const_context: self.const_context.clone(),
         };
-        for s in body {
-            sub.gen_stmt(s, false)?;
-        }
+        sub.gen_block(body, false)?;
         if let Some(err) = sub.codegen_error.take() {
             return Err(err);
         }
@@ -2655,10 +2777,12 @@ impl Generator {
                     .slot_a
                     .as_ref()
                     .ok_or_else(|| RuntimeError::msg("macro call AST missing callee"))?;
-                self.codegen.emit(Instruction::Push(Value::RuntimeAst(Arc::new(
-                    (**callee).clone(),
-                ))));
-                self.codegen.emit(Instruction::Load("__ast_macro_call__".into()));
+                self.codegen
+                    .emit(Instruction::Push(Value::RuntimeAst(Arc::new(
+                        (**callee).clone(),
+                    ))));
+                self.codegen
+                    .emit(Instruction::Load("__ast_macro_call__".into()));
                 self.codegen.emit(Instruction::Call { argc: 2 });
             }
             _ => {
@@ -2712,6 +2836,51 @@ impl Generator {
 
     fn gen_expr(&mut self, expr: &Expr) -> Result<()> {
         self.codegen.set_loc(expr.loc.line, expr.loc.column);
+        let direct_const_call = match &expr.kind {
+            ExprKind::Call { callee, .. } => match &callee.kind {
+                ExprKind::Var(name) if self.const_context.is_const_function(name) => {
+                    Some(name.as_str())
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let foldable_shape = !matches!(
+            expr.kind,
+            ExprKind::Number(_)
+                | ExprKind::String(_)
+                | ExprKind::Bool(_)
+                | ExprKind::None
+                | ExprKind::Bytes(_)
+                | ExprKind::List(_)
+                | ExprKind::Dict(_)
+                | ExprKind::Set(_)
+        );
+        match foldable_shape
+            .then(|| self.const_context.try_eval(expr))
+            .transpose()
+            .map(|result| result.flatten())
+        {
+            Ok(Some(value))
+                if !value_contains_frozen(&value)
+                    || direct_const_call.is_some()
+                    || matches!(&expr.kind, ExprKind::Var(name) if self.const_context.value(name).is_some())
+                    || matches!(&expr.kind, ExprKind::Member { object, .. } if matches!(&object.kind, ExprKind::Var(name) if self.const_context.is_module(name))) =>
+            {
+                self.codegen.emit(Instruction::Push(value));
+                return Ok(());
+            }
+            Ok(Some(_)) => {}
+            Err(error) if direct_const_call.is_some() => return Err(error),
+            // Opportunistic constant folding must not turn a runtime error into a
+            // compile error (notably inside try/catch).
+            Err(_) | Ok(None) => {}
+        }
+        if let Some(name) = direct_const_call {
+            return Err(RuntimeError::msg(format!(
+                "const func `{name}` requires compile-time arguments"
+            )));
+        }
         match &expr.kind {
             ExprKind::Number(n) => {
                 if let Ok(sized) = crate::sized::SizedNum::from_literal(n) {
@@ -2853,7 +3022,8 @@ impl Generator {
                     for a in args {
                         self.gen_expr(&a.value)?;
                     }
-                    self.codegen.emit(Instruction::CallSelf { argc: args.len() });
+                    self.codegen
+                        .emit(Instruction::CallSelf { argc: args.len() });
                 } else {
                     for a in args {
                         self.gen_expr(&a.value)?;
@@ -2958,7 +3128,7 @@ impl Generator {
                     .filter(|n| self.is_enclosing_local(n))
                     .collect();
                 let captured: HashSet<String> = free.iter().cloned().collect();
-                let is_generator = Self::block_has_yield(body);
+                let is_generator = crate::ast::block_has_yield(body);
                 let func = self.compile_function(
                     "<do>",
                     params,
@@ -2974,11 +3144,13 @@ impl Generator {
                 self.emit_function_value_with_defaults(params, func)?;
                 if !free.is_empty() {
                     for name in &free {
-                        self.codegen.emit(Instruction::Push(Value::Text(name.clone())));
+                        self.codegen
+                            .emit(Instruction::Push(Value::Text(name.clone())));
                         self.emit_load_name(name);
                     }
                     self.codegen.emit(Instruction::DictNew(free.len()));
-                    self.codegen.emit(Instruction::Load("__make_closure__".into()));
+                    self.codegen
+                        .emit(Instruction::Load("__make_closure__".into()));
                     self.codegen.emit(Instruction::Call { argc: 2 });
                 }
             }
@@ -3027,14 +3199,16 @@ impl Generator {
                         self.codegen.emit(Instruction::ListAppend);
                     }
                     self.gen_frozen_ast_expr(callee);
-                    self.codegen.emit(Instruction::Load("__ast_macro_call__".into()));
+                    self.codegen
+                        .emit(Instruction::Load("__ast_macro_call__".into()));
                     self.codegen.emit(Instruction::Call { argc: 2 });
                 } else {
                     for arg in args {
                         self.gen_push_macro_call_arg(arg)?;
                     }
                     self.gen_macro_callee(callee)?;
-                    self.codegen.emit(Instruction::MacroCall { argc: args.len() });
+                    self.codegen
+                        .emit(Instruction::MacroCall { argc: args.len() });
                 }
             }
             ExprKind::Quote {
@@ -3106,6 +3280,29 @@ impl Generator {
             ExprKind::Snap { operand } => {
                 self.gen_expr(operand)?;
                 self.codegen.emit(Instruction::Snap);
+            }
+            ExprKind::TryPropagate { operand } => {
+                if self.current_func.is_none() || self.yielding {
+                    return Err(RuntimeError::msg(
+                        "? is only valid inside a non-generator function",
+                    ));
+                }
+                let success = self.codegen.fresh_label();
+                let value = self.codegen.fresh_temp("__try_value");
+                self.gen_expr(operand)?;
+                self.emit_store_temp(&value);
+                self.emit_load_temp(&value);
+                self.codegen
+                    .emit(Instruction::Load("__try_failed__".into()));
+                self.codegen.emit(Instruction::Call { argc: 1 });
+                self.codegen.emit(Instruction::GotoIfNot(success));
+                self.emit_load_temp(&value);
+                self.gen_return_from_tos()?;
+                self.codegen.mark_label(success);
+                self.emit_load_temp(&value);
+                self.codegen
+                    .emit(Instruction::Load("__try_unwrap__".into()));
+                self.codegen.emit(Instruction::Call { argc: 1 });
             }
             ExprKind::Await { operand } => {
                 if let ExprKind::Call { callee, args } = &operand.kind {
@@ -3373,7 +3570,8 @@ impl Generator {
         self.codegen.emit(Instruction::SelectNextIndex);
         self.emit_store_temp(&idx_tmp);
         self.emit_load_temp(&idx_tmp);
-        self.codegen.emit(Instruction::Push(Value::Num(Num::Small(-1))));
+        self.codegen
+            .emit(Instruction::Push(Value::Num(Num::Small(-1))));
         self.codegen.emit(Instruction::Eq);
         let have_case = self.codegen.fresh_label();
         self.codegen.emit(Instruction::GotoIfNot(have_case));
@@ -3388,7 +3586,8 @@ impl Generator {
             self.codegen.emit(Instruction::SelectNextIndex);
             self.emit_store_temp(&idx_tmp);
             self.emit_load_temp(&idx_tmp);
-            self.codegen.emit(Instruction::Push(Value::Num(Num::Small(-1))));
+            self.codegen
+                .emit(Instruction::Push(Value::Num(Num::Small(-1))));
             self.codegen.emit(Instruction::Eq);
             let have_case2 = self.codegen.fresh_label();
             self.codegen.emit(Instruction::GotoIfNot(have_case2));
@@ -3654,11 +3853,13 @@ impl Generator {
             .emit(Instruction::Push(Value::Function(Arc::new(elem_fn))));
         if !elem_free.is_empty() {
             for name in &elem_free {
-                self.codegen.emit(Instruction::Push(Value::Text(name.clone())));
+                self.codegen
+                    .emit(Instruction::Push(Value::Text(name.clone())));
                 self.emit_load_name(name);
             }
             self.codegen.emit(Instruction::DictNew(elem_free.len()));
-            self.codegen.emit(Instruction::Load("__make_closure__".into()));
+            self.codegen
+                .emit(Instruction::Load("__make_closure__".into()));
             self.codegen.emit(Instruction::Call { argc: 2 });
         }
 
@@ -3688,17 +3889,20 @@ impl Generator {
                 .emit(Instruction::Push(Value::Function(Arc::new(g_fn))));
             if !g_free.is_empty() {
                 for name in &g_free {
-                    self.codegen.emit(Instruction::Push(Value::Text(name.clone())));
+                    self.codegen
+                        .emit(Instruction::Push(Value::Text(name.clone())));
                     self.emit_load_name(name);
                 }
                 self.codegen.emit(Instruction::DictNew(g_free.len()));
-                self.codegen.emit(Instruction::Load("__make_closure__".into()));
+                self.codegen
+                    .emit(Instruction::Load("__make_closure__".into()));
                 self.codegen.emit(Instruction::Call { argc: 2 });
             }
         }
         self.codegen.emit(Instruction::VecNew(guards.len()));
 
-        self.codegen.emit(Instruction::Load("__make_genexpr__".into()));
+        self.codegen
+            .emit(Instruction::Load("__make_genexpr__".into()));
         self.codegen.emit(Instruction::Call { argc: 3 });
         Ok(())
     }
@@ -3718,9 +3922,7 @@ impl Generator {
         self.loop_continue_labels.push(start);
         self.loop_handler_depths.push(self.handler_stack.len());
         self.loop_owns_stack_counter.push(false);
-        for s in body {
-            self.gen_stmt(s, false)?;
-        }
+        self.gen_block(body, false)?;
         self.loop_break_labels.pop();
         self.loop_continue_labels.pop();
         self.loop_handler_depths.pop();
@@ -3834,6 +4036,14 @@ impl Generator {
             }
         }
         Ok(())
+    }
+}
+
+fn value_contains_frozen(value: &Value) -> bool {
+    match value {
+        Value::Frozen(_) => true,
+        Value::Tuple(items) => items.iter().any(value_contains_frozen),
+        _ => false,
     }
 }
 

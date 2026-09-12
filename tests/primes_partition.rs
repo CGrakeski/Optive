@@ -24,7 +24,7 @@ fn cyclic_parallel_matches_sequential_small() {
     let to = 10_001u32;
     let seq = format!(
         r"
-const let TO = {to}
+const TO = {to}
 {IS_PRIME}
 var total = 1
 var n = 3
@@ -40,9 +40,9 @@ total
     let tasks = 4usize;
     let par = format!(
         r"
-const let TO = {to}
-const let STEP = {tasks}
-const let ODD_STEP = STEP + STEP
+const TO = {to}
+const STEP = {tasks}
+const ODD_STEP = STEP + STEP
 {IS_PRIME}
 func worker(id, box, wg) {{
   var n = 3 + id * 2
@@ -53,7 +53,7 @@ func worker(id, box, wg) {{
     if (is_prime(n)) {{ local = local + 1 }}
     n = n + ODD_STEP
   }}
-  let g = box.lock()
+  var g = box.lock()
   var rows = g.get()
   rows.append(local)
   g.set(rows)
@@ -63,16 +63,16 @@ func worker(id, box, wg) {{
 func start_worker(id, box, wg) {{
   go do {{ worker(id, box, wg) }}
 }}
-let box = Mutex([])
-let wg = WaitGroup(STEP)
+var box = Mutex([])
+var wg = WaitGroup(STEP)
 var wid = 0
 loop (STEP) {{
   start_worker(wid, box, wg)
   wid = wid + 1
 }}
 wg.wait()
-let g = box.lock()
-let rows = g.get()
+var g = box.lock()
+var rows = g.get()
 g.unlock()
 var total = 0
 var i = 0
@@ -105,7 +105,7 @@ fn cyclic_parallel_runs_helpers_medium() {
     let to = 50_001u32;
     let seq = format!(
         r"
-const let TO = {to}
+const TO = {to}
 {IS_PRIME}
 var total = 1
 var n = 3
@@ -125,9 +125,9 @@ total
     let tasks = 4usize;
     let par = format!(
         r"
-const let TO = {to}
-const let STEP = {tasks}
-const let ODD_STEP = STEP + STEP
+const TO = {to}
+const STEP = {tasks}
+const ODD_STEP = STEP + STEP
 {IS_PRIME}
 func worker(id, box, wg) {{
   var n = 3 + id * 2
@@ -138,7 +138,7 @@ func worker(id, box, wg) {{
     if (is_prime(n)) {{ local = local + 1 }}
     n = n + ODD_STEP
   }}
-  let g = box.lock()
+  var g = box.lock()
   var rows = g.get()
   rows.append(local)
   g.set(rows)
@@ -148,16 +148,16 @@ func worker(id, box, wg) {{
 func start_worker(id, box, wg) {{
   go do {{ worker(id, box, wg) }}
 }}
-let box = Mutex([])
-let wg = WaitGroup(STEP)
+var box = Mutex([])
+var wg = WaitGroup(STEP)
 var wid = 0
 loop (STEP) {{
   start_worker(wid, box, wg)
   wid = wid + 1
 }}
 wg.wait()
-let g = box.lock()
-let rows = g.get()
+var g = box.lock()
+var rows = g.get()
 g.unlock()
 var total = 0
 var i = 0

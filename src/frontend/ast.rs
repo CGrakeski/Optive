@@ -178,6 +178,7 @@ pub enum Stmt {
     },
     FuncDecl {
         visibility: Visibility,
+        is_const: bool,
         decorators: Vec<Expr>,
         name: String,
         type_params: Vec<(String, Option<Expr>)>,
@@ -219,6 +220,8 @@ pub enum Stmt {
     },
     Break,
     Continue,
+    /// 在离开当前词法块时按后进先出顺序执行。
+    Defer(Block),
     Try {
         body: Block,
         catches: Vec<CatchClause>,
@@ -372,6 +375,51 @@ pub enum DelTarget {
 
 pub type Block = Vec<LocatedStmt>;
 
+/// Whether this lexical block yields from its own function or generator scope.
+///
+/// Nested named or anonymous function bodies are deliberately not entered.
+#[must_use]
+pub fn block_has_yield(body: &Block) -> bool {
+    fn stmt_has_yield(stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Yield(_) | Stmt::YieldFrom(_) => true,
+            Stmt::If {
+                then_block,
+                elifs,
+                else_block,
+                ..
+            } => {
+                block_has_yield(then_block)
+                    || elifs.iter().any(|(_, block)| block_has_yield(block))
+                    || else_block.as_ref().is_some_and(block_has_yield)
+            }
+            Stmt::While { body, .. }
+            | Stmt::Loop { body, .. }
+            | Stmt::For { body, .. }
+            | Stmt::With { body, .. }
+            | Stmt::Block(body) => block_has_yield(body),
+            Stmt::Try {
+                body,
+                catches,
+                else_block,
+            } => {
+                block_has_yield(body)
+                    || catches.iter().any(|catch| block_has_yield(&catch.body))
+                    || else_block.as_ref().is_some_and(block_has_yield)
+            }
+            Stmt::Match {
+                cases, else_block, ..
+            } => {
+                cases.iter().any(|case| block_has_yield(&case.body))
+                    || else_block.as_ref().is_some_and(block_has_yield)
+            }
+            _ => false,
+        }
+    }
+
+    body.iter().any(|located| stmt_has_yield(&located.stmt))
+}
+
 /// 1-based 源码位置（与词法器 token 坐标一致）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SourceLoc {
@@ -504,6 +552,10 @@ pub enum ExprKind {
     },
     /// `snap expr` — 若为 `none` 则抛异常，否则返回 `expr`。
     Snap {
+        operand: Box<Expr>,
+    },
+    /// `expr?`：解包标准 Result/Option，失败时从当前函数提前返回。
+    TryPropagate {
         operand: Box<Expr>,
     },
     /// `await expr` — 启动并等待。
@@ -821,6 +873,12 @@ pub fn fill_placeholders(expr: &Expr, repl: &Expr) -> Expr {
         ExprKind::Snap { operand } => Expr::new(
             expr.loc,
             ExprKind::Snap {
+                operand: Box::new(fill_placeholders(operand, repl)),
+            },
+        ),
+        ExprKind::TryPropagate { operand } => Expr::new(
+            expr.loc,
+            ExprKind::TryPropagate {
                 operand: Box::new(fill_placeholders(operand, repl)),
             },
         ),

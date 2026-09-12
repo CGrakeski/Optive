@@ -17,8 +17,8 @@ use crate::parser::Parser;
 use crate::token::{Token, TokenKind};
 
 use crate::api_registry::{
-    handle_member_sig, handle_members, std_export_doc, std_export_sig, std_module_doc, BUILTINS,
-    SNIPPETS, STD_EXPORTS, STD_MODULES,
+    handle_member_sig, handle_members, is_std_export, is_std_spec, split_std_spec, std_export_doc,
+    std_export_sig, std_module, std_module_doc, BUILTINS, SNIPPETS, STD_EXPORTS, STD_MODULES,
 };
 use crate::token::KEYWORDS;
 use symbols::{
@@ -27,9 +27,14 @@ use symbols::{
     KIND_SNIPPET,
 };
 use workspace::{
-    find_export, is_std_spec, load_index, load_module, path_to_uri, resolve_doc,
-    resolve_import_file,
+    find_export, load_index, load_module, path_to_uri, resolve_doc, resolve_import_file,
 };
+
+/// Convert a filesystem path to the canonical URI used by project-wide diagnostics.
+#[must_use]
+pub fn file_uri(path: &std::path::Path) -> String {
+    workspace::path_to_uri(path)
+}
 
 pub fn run_stdio() -> io::Result<()> {
     let stdin = io::stdin();
@@ -337,7 +342,7 @@ pub fn completion_in(
         }
         return Json::Array(items);
     }
-    if let Some(mod_name) = parent.strip_prefix("std.") {
+    if let Some(mod_name) = std_module(&parent) {
         for (m, exp) in STD_EXPORTS {
             if *m == mod_name {
                 push(exp, KIND_FUNC, &std_export_doc(m, exp), "0", None);
@@ -424,14 +429,12 @@ pub fn hover_in(
     if typed == "std" {
         return hover_md("std — standard library module");
     }
-    if let Some(rest) = typed.strip_prefix("std.") {
-        if rest.split('.').nth(1).is_none() && STD_MODULES.contains(&rest) {
-            return hover_md(&std_module_doc(rest));
-        }
-        if let Some((m, exp)) = rest.split_once('.') {
-            if STD_EXPORTS.iter().any(|(mm, e)| *mm == m && *e == exp) {
-                return hover_md(&std_export_doc(m, exp));
-            }
+    if let Some(m) = std_module(&typed) {
+        return hover_md(&std_module_doc(m));
+    }
+    if let Some((m, Some(exp))) = split_std_spec(&typed) {
+        if is_std_export(m, exp) {
+            return hover_md(&std_export_doc(m, exp));
         }
     }
     if let Some((_, doc)) = BUILTINS.iter().find(|(n, _)| *n == typed) {
@@ -459,10 +462,8 @@ pub fn hover_in(
     }
     if let Some(s) = idx.def_of(&typed, line_1).or_else(|| idx.any_def(&typed)) {
         if let Some((spec, exp)) = &s.imported_from {
-            if is_std_spec(spec) {
-                if let Some(m) = spec.strip_prefix("std.") {
-                    return hover_md(&std_export_doc(m, exp));
-                }
+            if let Some((m, _)) = split_std_spec(spec) {
+                return hover_md(&std_export_doc(m, exp));
             }
             if let Some((_, tidx)) = load_index(uri, spec, docs) {
                 if let Some(e) = find_export(&tidx, exp) {
@@ -755,13 +756,11 @@ fn resolve_signature(
     idx: &FileIndex,
     name: &str,
 ) -> String {
-    if let Some(rest) = name.strip_prefix("std.") {
-        if let Some((m, exp)) = rest.split_once('.') {
-            if let Some(sig) = std_export_sig(m, exp) {
-                return sig;
-            }
-            return format!("std.{m}.{exp}(...)");
+    if let Some((m, Some(exp))) = split_std_spec(name) {
+        if let Some(sig) = std_export_sig(m, exp) {
+            return sig;
         }
+        return format!("std.{m}.{exp}(...)");
     }
     if let Some((parent, exp)) = name.rsplit_once('.') {
         if let Some(ty) = infer_receiver_from_index(idx, parent) {
@@ -784,13 +783,11 @@ fn resolve_signature(
     }
     if let Some(s) = idx.any_def(name) {
         if let Some((spec, exp)) = &s.imported_from {
-            if is_std_spec(spec) {
-                if let Some(m) = spec.strip_prefix("std.") {
-                    if let Some(sig) = std_export_sig(m, exp) {
-                        return sig;
-                    }
-                    return std_export_doc(m, exp);
+            if let Some((m, _)) = split_std_spec(spec) {
+                if let Some(sig) = std_export_sig(m, exp) {
+                    return sig;
                 }
+                return std_export_doc(m, exp);
             }
             if let Some((_, tidx)) = load_index(uri, spec, docs) {
                 if let Some(e) = find_export(&tidx, exp) {
@@ -969,7 +966,7 @@ fn walk_stmt_calls(
             }
             collect_call_hints(body, uri, docs, idx, out);
         }
-        Stmt::MacroDecl { body, .. } | Stmt::Block(body) => {
+        Stmt::MacroDecl { body, .. } | Stmt::Block(body) | Stmt::Defer(body) => {
             collect_call_hints(body, uri, docs, idx, out)
         }
         Stmt::FriendFuncDecl { body, .. } => {
@@ -1137,7 +1134,8 @@ fn walk_expr_calls(
         | ExprKind::Handle { operand }
         | ExprKind::Go { operand }
         | ExprKind::Snap { operand }
-        | ExprKind::Await { operand } => walk_expr_calls(operand, uri, docs, idx, out),
+        | ExprKind::Await { operand }
+        | ExprKind::TryPropagate { operand } => walk_expr_calls(operand, uri, docs, idx, out),
         ExprKind::Binary { left, right, .. } => {
             walk_expr_calls(left, uri, docs, idx, out);
             walk_expr_calls(right, uri, docs, idx, out);
@@ -1761,14 +1759,22 @@ fn publish_diags(
         .map(|(line, col, message)| {
             let sl = line.saturating_sub(1);
             let sc = col.saturating_sub(1);
+            let metadata = crate::semantic::diagnostic_metadata(&message);
             json!({
                 "range": {
                     "start": { "line": sl, "character": sc },
                     "end": { "line": sl, "character": sc + 1 }
                 },
-                "severity": 1,
+                "severity": match metadata.severity {
+                    crate::semantic::Severity::Error => 1,
+                    crate::semantic::Severity::Warning => 2,
+                },
+                "code": metadata.code,
                 "source": "Optive",
-                "message": message
+                "message": message,
+                "data": {
+                    "help": metadata.help,
+                }
             })
         })
         .collect();
@@ -1799,6 +1805,62 @@ mod tests {
     #[test]
     fn diagnostics_clean_source() {
         assert!(diagnostics("let x = 1\n", "x.tive").is_empty());
+    }
+
+    #[test]
+    fn diagnostics_validate_question_context_and_channel() {
+        let outside = diagnostics("Result.Ok(1)?\n", "x.tive");
+        assert!(outside
+            .iter()
+            .any(|(_, _, message)| message.contains("enclosing function")));
+
+        let wrong_channel = diagnostics(
+            "use std.variants.{ Result, Option }\nfunc f() -> Result { return Option.Some(1)? }\n",
+            "x.tive",
+        );
+        assert!(wrong_channel
+            .iter()
+            .any(|(_, _, message)| message.contains("cannot propagate Option")));
+
+        let wrong_operand = diagnostics(
+            "use std.variants.{ Result }\nfunc f() -> Result { return 1? }\n",
+            "x.tive",
+        );
+        assert!(wrong_operand
+            .iter()
+            .any(|(_, _, message)| message.contains("operand has type num")));
+
+        let nested_in_slice = diagnostics(
+            "use std.variants.{ Result }\nfunc f() -> Result { return [1, 2][1? :] }\n",
+            "x.tive",
+        );
+        assert!(nested_in_slice
+            .iter()
+            .any(|(_, _, message)| message.contains("operand has type num")));
+
+        let anonymous_generator = diagnostics(
+            "use std.variants.{ Result }\nlet f = do() -> Result { yield 1\nreturn Result.Ok(1)? }\n",
+            "x.tive",
+        );
+        assert!(anonymous_generator
+            .iter()
+            .any(|(_, _, message)| message.contains("generator")));
+
+        let nested_in_assignment_target = diagnostics(
+            "use std.variants.{ Result }\nfunc f() -> Result { var xs = [1]\nxs[1?] = 2\nreturn Result.Ok(2) }\n",
+            "x.tive",
+        );
+        assert!(nested_in_assignment_target
+            .iter()
+            .any(|(_, _, message)| message.contains("operand has type num")));
+
+        let nested_in_del_target = diagnostics(
+            "use std.variants.{ Result }\nfunc f() -> Result { var xs = [1]\ndel xs[1?]\nreturn Result.Ok(2) }\n",
+            "x.tive",
+        );
+        assert!(nested_in_del_target
+            .iter()
+            .any(|(_, _, message)| message.contains("operand has type num")));
     }
 
     #[test]

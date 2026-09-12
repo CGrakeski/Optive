@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::runtime_ast;
@@ -7,6 +7,7 @@ use crate::vm::Vm;
 use crate::Result;
 
 use crate::shared::{Shared, SyncCell};
+pub(crate) use crate::value::value_key_to_value;
 
 mod collections;
 mod dict;
@@ -193,6 +194,14 @@ pub fn build_std_module() -> Shared<ModuleObject> {
             ("singleton", builtin(decos_singleton)),
         ],
     );
+    let variants = submodule(
+        "variants",
+        &[
+            ("Result", Value::type_ref("std.variants.Result")),
+            ("Option", Value::type_ref("std.variants.Option")),
+            ("Either", Value::type_ref("std.variants.Either")),
+        ],
+    );
 
     let mut std_children = HashMap::new();
     std_children.insert("math".into(), math);
@@ -202,6 +211,7 @@ pub fn build_std_module() -> Shared<ModuleObject> {
     std_children.insert("dict".into(), dict);
     std_children.insert("ast".into(), ast);
     std_children.insert("decos".into(), decos);
+    std_children.insert("variants".into(), variants);
     std_children.insert("typing".into(), build_typing_module());
     std_children.insert("functional".into(), build_functional_module());
     std_children.insert(
@@ -213,6 +223,7 @@ pub fn build_std_module() -> Shared<ModuleObject> {
     std_children.insert("async".into(), build_async_module());
     std_children.insert("text".into(), text::build_text_module());
     std_children.insert("path".into(), build_path_module());
+    std_children.insert("package".into(), build_package_module());
     std_children.insert("fs".into(), build_fs_module());
     std_children.insert("os".into(), build_os_module());
     std_children.insert("json".into(), build_json_module());
@@ -241,6 +252,47 @@ pub fn build_std_module() -> Shared<ModuleObject> {
         live_globals: None,
         ..Default::default()
     })
+}
+
+fn build_package_module() -> Shared<ModuleObject> {
+    submodule(
+        "package",
+        &[
+            ("id", builtin(package_id)),
+            ("data_dir", builtin(package_data_dir)),
+            ("cache_dir", builtin(package_cache_dir)),
+            ("temp_dir", builtin(package_temp_dir)),
+        ],
+    )
+}
+
+fn package_id(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    expect_arity("package.id", args, 0)?;
+    Ok(Value::Text(vm.current_package_id.clone()))
+}
+
+fn package_dir(vm: &mut Vm, args: &[Value], kind: &str) -> Result<Value> {
+    expect_arity(&format!("package.{kind}_dir"), args, 0)?;
+    let path = crate::caps::package_state_dir(&vm.current_package_id, kind);
+    std::fs::create_dir_all(&path).map_err(|e| {
+        crate::error::RuntimeError::io_err(format!(
+            "cannot create package {kind} directory {}: {e}",
+            path.display()
+        ))
+    })?;
+    Ok(Value::Text(path.to_string_lossy().into_owned()))
+}
+
+fn package_data_dir(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    package_dir(vm, args, "data")
+}
+
+fn package_cache_dir(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    package_dir(vm, args, "cache")
+}
+
+fn package_temp_dir(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    package_dir(vm, args, "temp")
 }
 
 pub(crate) fn exports(entries: &[(&str, Value)]) -> HashMap<String, Value> {
@@ -376,14 +428,6 @@ pub(crate) fn value_to_list(v: &Value) -> Result<Vec<Value>> {
     }
 }
 
-pub(crate) fn value_key_to_value(k: &ValueKey) -> Value {
-    match k {
-        ValueKey::Bool(b) => Value::Bool(*b),
-        ValueKey::NumInt(n) => Value::Num(Num::from_bigint(n.clone())),
-        ValueKey::Text(s) => Value::Text(s.clone()),
-    }
-}
-
 fn ast_parse(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let source = expect_text("parse", args, 0)?;
     Ok(runtime_ast::parse_to_ast(&source)?.into_value())
@@ -489,22 +533,35 @@ fn decos_once(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
 }
 
 fn decos_memoize(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    const MAX_MEMOIZE_ENTRIES: usize = 1024;
     expect_arity("memoize", args, 1)?;
     let inner = expect_function("memoize", args, 0)?;
-    let cache = SyncCell::new(HashMap::<Vec<ValueKey>, Value>::new());
+    let cache = SyncCell::new((
+        HashMap::<Vec<ValueKey>, Value>::new(),
+        VecDeque::<Vec<ValueKey>>::new(),
+    ));
     Ok(Value::builtin("memoize", move |vm, call_args| {
         let key: Vec<ValueKey> = call_args
             .iter()
             .map(ValueKey::from_value)
             .collect::<Result<Vec<_>>>()?;
-        if let Some(hit) = cache.borrow().get(&key) {
+        if let Some(hit) = cache.borrow().0.get(&key) {
             return Ok(hit.clone());
         }
         let result = vm.call_user_function(inner.clone(), call_args.to_vec())?;
         if vm.nested_user_call_suspended {
             return Ok(result);
         }
-        cache.borrow_mut().insert(key, result.clone());
+        let mut state = cache.borrow_mut();
+        if !state.0.contains_key(&key) {
+            if state.0.len() >= MAX_MEMOIZE_ENTRIES {
+                if let Some(oldest) = state.1.pop_front() {
+                    state.0.remove(&oldest);
+                }
+            }
+            state.1.push_back(key.clone());
+        }
+        state.0.insert(key, result.clone());
         Ok(result)
     }))
 }

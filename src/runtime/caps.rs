@@ -131,6 +131,9 @@ pub struct Capabilities {
     pub ffi: bool,
     /// 对第三方依赖的授权；默认最小权限。
     pub dep_grant: DepGrant,
+    /// Package source roots are immutable even when the ambient filesystem or
+    /// `--trust-deps` is enabled. Package state belongs in a data/cache dir.
+    pub immutable_roots: Vec<PathBuf>,
 }
 
 impl Default for Capabilities {
@@ -150,6 +153,7 @@ impl Capabilities {
             process: true,
             ffi: true,
             dep_grant: DepGrant::none(),
+            immutable_roots: Vec::new(),
         }
     }
 
@@ -166,15 +170,19 @@ impl Capabilities {
             process: false,
             ffi: false,
             dep_grant: DepGrant::none(),
+            immutable_roots: Vec::new(),
         }
     }
 
     /// 执行第三方包代码时使用的能力：默认只读包根，禁网 / 环境 / 进程 / FFI。
     /// `--trust-deps` 时依赖继承当前宿主能力。
     #[must_use]
-    pub fn restrict_for_dependency(&self, package_root: &Path) -> Self {
+    pub fn restrict_for_dependency(&self, package_root: &Path, package_id: &str) -> Self {
+        let state_roots = package_state_roots(package_id);
         if self.dep_grant.trust_all {
-            return self.clone();
+            let mut trusted = self.clone();
+            trusted.immutable_roots.push(package_root.to_path_buf());
+            return trusted;
         }
         Self {
             network: self.network && self.dep_grant.network,
@@ -182,10 +190,11 @@ impl Capabilities {
             process: self.process && self.dep_grant.process,
             ffi: self.ffi && self.dep_grant.ffi,
             fs: FsPolicy::Scoped {
-                read_write: Vec::new(),
+                read_write: state_roots,
                 read_only: vec![package_root.to_path_buf()],
             },
             dep_grant: self.dep_grant,
+            immutable_roots: vec![package_root.to_path_buf()],
         }
     }
 
@@ -255,6 +264,9 @@ impl Capabilities {
         project_root: &Path,
         dependency_roots: impl IntoIterator<Item = PathBuf>,
     ) {
+        let dependency_roots: Vec<PathBuf> = dependency_roots.into_iter().collect();
+        self.immutable_roots
+            .extend(dependency_roots.iter().cloned());
         match &mut self.fs {
             FsPolicy::Unrestricted => {}
             FsPolicy::Allow(read_write) => {
@@ -557,6 +569,21 @@ impl Capabilities {
         access: FsAccess,
     ) -> Result<FsTarget, RuntimeError> {
         let path = path.as_ref();
+        if access == FsAccess::Write && !self.immutable_roots.is_empty() {
+            let absolute = absolute_lexical(path)?;
+            for root in &self.immutable_roots {
+                let root = absolute_lexical(root)?;
+                if lexical_relative_under(&absolute, &root).is_some()
+                    || lexical_relative_under(&root, &absolute).is_some()
+                {
+                    return Err(path_error(
+                        op,
+                        path,
+                        "installed package source is immutable",
+                    ));
+                }
+            }
+        }
         let (read_write, read_only): (&[PathBuf], &[PathBuf]) = match &self.fs {
             FsPolicy::Unrestricted => return Ok(FsTarget::Ambient(path.to_path_buf())),
             FsPolicy::Allow(roots) => (roots, &[]),
@@ -638,6 +665,47 @@ impl Capabilities {
         }
         Err(path_error(op, path, "path is outside sandbox roots"))
     }
+}
+
+/// Writable state is kept outside immutable source packs and isolated by exact
+/// package identity. These paths are stable across processes for data/cache;
+/// temp additionally uses the current process id.
+#[must_use]
+pub fn package_state_dir(package_id: &str, kind: &str) -> PathBuf {
+    let home = std::env::var_os("OPTIVE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|p| PathBuf::from(p).join(".optive"))
+        })
+        .unwrap_or_else(|| std::env::temp_dir().join(".optive"));
+    let safe_id: String = package_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if kind == "temp" {
+        home.join("state")
+            .join(kind)
+            .join(std::process::id().to_string())
+            .join(safe_id)
+    } else {
+        home.join("state").join(kind).join(safe_id)
+    }
+}
+
+fn package_state_roots(package_id: &str) -> Vec<PathBuf> {
+    ["data", "cache", "temp"]
+        .into_iter()
+        .map(|kind| package_state_dir(package_id, kind))
+        .collect()
 }
 
 fn fs_io_error(op: &str, error: std::io::Error) -> RuntimeError {
@@ -839,7 +907,7 @@ mod tests {
         let root = std::env::temp_dir().join("optive-dep-root");
         let _ = std::fs::create_dir_all(&root);
         let host = Capabilities::full();
-        let dep = host.restrict_for_dependency(&root);
+        let dep = host.restrict_for_dependency(&root, "dep-test");
         assert!(dep.check_network("get").is_err());
         assert!(dep.check_ffi("frompath").is_err());
         assert!(dep.check_env("setenv").is_err());
@@ -850,7 +918,7 @@ mod tests {
         let mut trusted = Capabilities::full();
         trusted.dep_grant.trust_all = true;
         assert!(trusted
-            .restrict_for_dependency(&root)
+            .restrict_for_dependency(&root, "dep-test")
             .check_network("get")
             .is_ok());
     }

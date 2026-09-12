@@ -1,5 +1,6 @@
 //! 命令行辅助（`run` / `new` / 清单 / 包管理）。
 
+pub mod build_cmd;
 pub mod cache;
 pub mod caps;
 pub mod check;

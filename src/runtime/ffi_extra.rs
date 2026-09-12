@@ -1271,10 +1271,18 @@ unsafe impl Sync for CallbackOwned {}
 
 #[cfg(not(target_os = "android"))]
 struct CallbackData {
+    /// `callback_free` drops this payload while retaining only the tiny native
+    /// trampoline tombstone.  The tombstone must remain because C may still
+    /// hold the function pointer after the Optive handle is disabled.
+    payload: Mutex<Option<CallbackPayload>>,
+}
+
+#[cfg(not(target_os = "android"))]
+#[derive(Clone)]
+struct CallbackPayload {
     callable: Value,
     arg_abis: Vec<AbiType>,
     ret_abi: AbiType,
-    live: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(not(target_os = "android"))]
@@ -1339,10 +1347,11 @@ pub fn builtin_callback(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let cif = Cif::new(arg_ffi, ret_abi.ffi_type());
 
     let data = Box::new(CallbackData {
-        callable,
-        arg_abis,
-        ret_abi,
-        live: std::sync::atomic::AtomicBool::new(true),
+        payload: Mutex::new(Some(CallbackPayload {
+            callable,
+            arg_abis,
+            ret_abi,
+        })),
     });
     let data_ptr = Box::into_raw(data);
 
@@ -1352,28 +1361,28 @@ pub fn builtin_callback(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         args: *const *const c_void,
         userdata: &mut CallbackData,
     ) {
-        if !userdata.live.load(Ordering::Acquire) {
+        let Some(payload) = userdata.payload.lock().clone() else {
             eprintln!("optive FFI callback: invoked after callback_free; returning 0");
             *ret = 0;
             return;
-        }
+        };
         let Ok(vm) = active_vm() else {
             // 无活动 VM：无法安全回调；返回零并尽量不静默到不可观测。
             eprintln!("optive FFI callback: no active VM; returning 0");
             *ret = 0;
             return;
         };
-        let mut call_args = Vec::with_capacity(userdata.arg_abis.len());
-        for (i, abi) in userdata.arg_abis.iter().enumerate() {
+        let mut call_args = Vec::with_capacity(payload.arg_abis.len());
+        for (i, abi) in payload.arg_abis.iter().enumerate() {
             let p = unsafe { *args.add(i) };
             call_args.push(unsafe { decode_cb_arg(p.cast_mut(), abi.clone()) });
         }
-        let result = vm.call_value(userdata.callable.clone(), call_args);
+        let result = vm.call_value(payload.callable, call_args);
         let val = result.unwrap_or_else(|e| {
             eprintln!("optive FFI callback error: {}", e.message());
             Value::None
         });
-        *ret = encode_cb_ret_u64(&val, userdata.ret_abi.clone());
+        *ret = encode_cb_ret_u64(&val, payload.ret_abi);
     }
 
     let callback: CallbackMut<CallbackData, u64> = trampoline;
@@ -1415,9 +1424,9 @@ pub fn builtin_callback_free(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
     let id = expect_usize("callback_free", &args[0])?;
     if let Some(owned) = CALLBACKS.lock().get(&id) {
-        // 失效 trampoline，但不释放可执行闭包：原生侧可能仍持有函数指针。
+        // 释放捕获的 Optive 对象图；只保留防止悬空函数指针的最小 trampoline。
         unsafe {
-            (*owned._keep.1).live.store(false, Ordering::Release);
+            (*owned._keep.1).payload.lock().take();
         }
     }
     Ok(Value::None)
@@ -1563,4 +1572,25 @@ fn expect_ptr_or_usize(name: &str, v: &Value) -> Result<usize> {
 
 fn expect_ptr_or_usize_label(ctx: &str, v: &Value) -> Result<usize> {
     expect_ptr_label(ctx, v).or_else(|_| expect_usize_label(ctx, v))
+}
+
+#[cfg(all(test, not(target_os = "android")))]
+mod callback_tests {
+    use super::*;
+
+    #[test]
+    fn disabling_callback_drops_captured_optive_graph() {
+        let captured = Shared::new(vec![Value::Num(Num::from_i64(1))]);
+        let data = CallbackData {
+            payload: Mutex::new(Some(CallbackPayload {
+                callable: Value::List(captured.clone()),
+                arg_abis: Vec::new(),
+                ret_abi: AbiType::Void,
+            })),
+        };
+        assert_eq!(captured.strong_count(), 2);
+        data.payload.lock().take();
+        assert_eq!(captured.strong_count(), 1);
+        assert!(data.payload.lock().is_none());
+    }
 }

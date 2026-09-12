@@ -26,7 +26,7 @@ fn use_std_math_range() {
     assert_num(
         r"
 use std.math.{ range }
-let n = 0
+var n = 0
 for (x in range(1, 4)) { n = n + x }
 n
 ",

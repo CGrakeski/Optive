@@ -198,7 +198,7 @@ fn handle_host_errors() {
 fn handle_break_clears_try_frame() {
     assert_num(
         r"
-let n = 0
+var n = 0
 loop {
     let _ = handle (1 / 0)
     n = n + 1
@@ -219,7 +219,7 @@ try {
 fn handle_break_inside_match_operand() {
     assert_num(
         r"
-let n = 0
+var n = 0
 loop {
     n = n + 1
     let _ = handle (match (n) {

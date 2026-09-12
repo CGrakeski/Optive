@@ -66,7 +66,7 @@ fn del_missing_binding() {
 fn del_const_binding() {
     run_err(
         r"
-const let x = 1
+const x = 1
 del x
 ",
     );
@@ -110,7 +110,7 @@ fn del_function_local() {
     assert_num(
         r"
 func f() {
-    let a = 1
+    var a = 1
     del a
     return 2
 }

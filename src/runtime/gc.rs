@@ -824,6 +824,13 @@ pub fn mark_value(val: &Value, marked: &mut FxHashSet<usize>, worklist: &mut Vec
                 worklist.push(v.clone());
             }
         }
+        Value::Frozen(frozen) => match frozen.as_ref() {
+            crate::value::FrozenValue::List(items) => worklist.extend(items.iter().cloned()),
+            crate::value::FrozenValue::Dict(items) => {
+                worklist.extend(items.iter().map(|(_, value)| value.clone()));
+            }
+            crate::value::FrozenValue::Set(_) => {}
+        },
         Value::Variant(v) => {
             worklist.push(v.payload.clone());
         }

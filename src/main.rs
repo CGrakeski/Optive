@@ -9,15 +9,16 @@ use std::borrow::Cow;
 
 use optive::custom::{self, CliMsg, Diag, ReplMsg};
 use optive::{repl_needs_continuation, run_source_in_vm, vm::Vm};
+use rustyline::completion::{Completer as CompleterTrait, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::{CmdKind, Highlighter};
 use rustyline::history::DefaultHistory;
-use rustyline::{Completer, Editor, Helper, Hinter, Validator};
+use rustyline::{Context, Editor, Helper, Hinter, Result as ReadlineResult, Validator};
 
 use crate::cli::debug_cmd::inject_dep_map;
 use cli::color;
 use cli::main_index;
-use cli::repl_highlight::{self, LineHighlightCache};
+use cli::repl_highlight::LineHighlightCache;
 use cli::resolve::EnsureResult;
 use optive::caps::Capabilities;
 
@@ -25,10 +26,64 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Windows 上 rustyline 按原始 prompt 算宽度且不忽略 ANSI；
 /// 颜色只能放在 Highlighter，不能塞进 `readline` 的 prompt 字符串。
-#[derive(Helper, Completer, Hinter, Validator)]
+#[derive(Helper, Hinter, Validator)]
 struct ReplHelper {
     colored_prompt: String,
+    completion_prefix: String,
     line_cache: LineHighlightCache,
+}
+
+impl CompleterTrait for ReplHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> ReadlineResult<(usize, Vec<Self::Candidate>)> {
+        Ok(repl_completions(&self.completion_prefix, line, pos))
+    }
+}
+
+fn repl_completions(prefix: &str, line: &str, pos: usize) -> (usize, Vec<Pair>) {
+    let pos = floor_char_boundary(line, pos.min(line.len()));
+    let before = &line[..pos];
+    let start = before
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !ch.is_alphanumeric() && *ch != '_')
+        .map_or(0, |(index, ch)| index + ch.len_utf8());
+
+    let mut source = prefix.to_string();
+    if !source.is_empty() && !source.ends_with('\n') {
+        source.push('\n');
+    }
+    let lsp_line = source.bytes().filter(|byte| *byte == b'\n').count();
+    source.push_str(line);
+    let lsp_column = before.encode_utf16().count();
+    let items = optive::lsp::completion(&source, lsp_line, lsp_column);
+    let candidates = items
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let label = item.get("label")?.as_str()?.to_string();
+            let detail = item.get("detail").and_then(serde_json::Value::as_str);
+            Some(Pair {
+                display: detail.map_or_else(|| label.clone(), |text| format!("{label}\t{text}")),
+                replacement: label,
+            })
+        })
+        .collect();
+    (start, candidates)
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 impl Highlighter for ReplHelper {
@@ -48,8 +103,8 @@ impl Highlighter for ReplHelper {
         }
     }
 
-    fn highlight_char(&self, _line: &str, _pos: usize, _kind: CmdKind) -> bool {
-        repl_highlight::highlight_enabled()
+    fn highlight_char(&self, line: &str, pos: usize, kind: CmdKind) -> bool {
+        self.line_cache.should_refresh(line, pos, kind)
     }
 }
 
@@ -99,6 +154,27 @@ fn t_repl(msg: ReplMsg) -> String {
 
 fn main() {
     let raw_args: Vec<String> = env::args().collect();
+    match std::env::current_exe()
+        .map_err(|error| error.to_string())
+        .and_then(|path| optive::compiler::standalone::read(&path))
+    {
+        Ok(Some(bundle)) => {
+            color::init(color::ColorChoice::Auto);
+            init_custom(None);
+            let script_args = raw_args.iter().skip(1).cloned().collect::<Vec<_>>();
+            if let Err(error) = cmd_run_bundle_bytes(&bundle, Capabilities::full(), &script_args) {
+                color::eprint_error(error.to_string());
+                process::exit(1);
+            }
+            return;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            color::init(color::ColorChoice::Auto);
+            color::eprint_error(format!("Error: {error}"));
+            process::exit(1);
+        }
+    }
     let (color_choice, args) = color::take_color_args(&raw_args);
     color::init(color_choice);
     let (quiet, args) = color::take_quiet_arg(&args);
@@ -196,6 +272,25 @@ fn main() {
                 }
                 return;
             }
+            "repl" => {
+                let (caps, rest) = parse_caps_or_exit(&args);
+                if rest.len() > 1 {
+                    color::eprint_error("usage: Optive repl [path] [capability flags]");
+                    process::exit(2);
+                }
+                if let Err(error) = cmd_repl_project(rest.first().map(Path::new), caps) {
+                    color::eprint_error(format!("Error: {error}"));
+                    process::exit(1);
+                }
+                return;
+            }
+            "build" => {
+                if let Err(e) = cli::build_cmd::cmd_build(&args[2..]) {
+                    color::eprint_error(format!("Error: {e}"));
+                    process::exit(1);
+                }
+                return;
+            }
             "new" => {
                 if args.len() != 3 {
                     color::eprint_error("usage: Optive new <ProjectName>");
@@ -263,12 +358,7 @@ fn main() {
                 return;
             }
             "check" => {
-                if args.len() > 3 {
-                    color::eprint_error("usage: Optive check [path]");
-                    process::exit(2);
-                }
-                let path = args.get(2).map(PathBuf::from);
-                if let Err(e) = cli::check::cmd_check(path.as_deref()) {
+                if let Err(e) = cli::check::cmd_check_args(&args[2..]) {
                     color::eprint_error(format!("Error: {e}"));
                     process::exit(1);
                 }
@@ -393,6 +483,9 @@ fn cmd_run(
     mut caps: Capabilities,
     script_args: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(bundle_path) = path.filter(|candidate| optive::bundle::is_bundle_path(candidate)) {
+        return cmd_run_bundle(bundle_path, caps, script_args);
+    }
     let project = cli::manifest::find_project(path)?;
     print_project_header(&project);
     let ensured = cli::deps::ensure_for_run(&project)?;
@@ -416,6 +509,63 @@ fn cmd_run(
         caps,
         Some(build_script_argv(&entry_display, script_args)),
     )?;
+    Ok(())
+}
+
+fn cmd_repl_project(
+    path: Option<&Path>,
+    mut caps: Capabilities,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let project = cli::manifest::find_project(path)?;
+    print_project_header(&project);
+    let ensured = cli::deps::ensure_for_run(&project)?;
+    print_ensure_report(&ensured);
+    env::set_current_dir(&project.root)?;
+    caps.configure_project_fs(
+        &project.root,
+        ensured.dep_map.values().map(|binding| binding.path.clone()),
+    );
+    color::status_line("Starting project REPL");
+    repl_with_project(caps, Some((project.root, ensured)));
+    Ok(())
+}
+
+fn cmd_run_bundle(
+    path: &Path,
+    caps: Capabilities,
+    script_args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes =
+        std::fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    cmd_run_bundle_bytes(&bytes, caps, script_args)
+}
+
+fn cmd_run_bundle_bytes(
+    bytes: &[u8],
+    caps: Capabilities,
+    script_args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let image = optive::bundle::BundleImage::decode(bytes)?;
+    let entry = image
+        .get(&image.entry_package, &image.entry_module)
+        .ok_or_else(|| {
+            format!(
+                "bundle entry {}:{} is missing",
+                image.entry_package, image.entry_module
+            )
+        })?;
+    let compiled = optive::bc_cache::decode_program(&entry.bytecode)
+        .map_err(|error| format!("bundle entry bytecode is unreadable: {error}"))?;
+    let entry_display = format!("bundle:{}:{}", image.entry_package, image.entry_module);
+    color::status_line(&format!("Running {entry_display}"));
+    let mut vm = Vm::new();
+    vm.install_caps(caps);
+    vm.argv_override = Some(build_script_argv(&entry_display, script_args));
+    vm.current_package_id = image.entry_package.clone();
+    vm.source_file = entry_display.clone();
+    vm.bundle = Some(std::sync::Arc::new(image));
+    vm.load_program(compiled)?;
+    vm.run().map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -777,10 +927,15 @@ fn print_help() {
     println!();
     println!("{}", t_cli(CliMsg::HelpUsageHeader));
     println!("{}", t_cli(CliMsg::HelpRepl));
+    println!("  Optive repl [path]              Start a project-aware REPL");
     println!("{}", t_cli(CliMsg::HelpRunScript));
     println!("{}", t_cli(CliMsg::HelpRunCode));
     println!("{}", t_cli(CliMsg::HelpNew));
     println!("{}", t_cli(CliMsg::HelpRun));
+    println!(
+        "  Optive build [path] [--explain] [--clean] [--bundle|--exe] [--target TARGET] [--output PATH] [--all-modules] [--jobs N] [--emit bytecode|interface|all]"
+    );
+    println!("  Optive run <app.tivb>");
     println!("{}", t_cli(CliMsg::HelpUp));
     println!("{}", t_cli(CliMsg::HelpAdd));
     println!("{}", t_cli(CliMsg::HelpSearch));
@@ -832,10 +987,101 @@ fn history_path() -> PathBuf {
     if let Some(p) = env::var_os("OPTIVE_HISTORY") {
         return PathBuf::from(p);
     }
-    if let Some(home) = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")) {
-        return PathBuf::from(home).join(".optive_history");
+    cli::home::optive_home().join("repl.history")
+}
+
+#[derive(Debug, Clone)]
+struct ReplCell {
+    id: usize,
+    source: String,
+}
+
+fn new_repl_vm(caps: &Capabilities, project: Option<&(PathBuf, EnsureResult)>) -> Vm {
+    let mut vm = Vm::new();
+    vm.install_caps(caps.clone());
+    if let Some((root, ensured)) = project {
+        inject_dep_map(&mut vm, ensured, root);
     }
-    PathBuf::from(".optive_history")
+    vm
+}
+
+fn print_repl_check(source: &str) {
+    if source.trim().is_empty() {
+        println!("check: no cells");
+        return;
+    }
+    let diagnostics = optive::lsp::diagnostics(source, "<repl:check>");
+    if diagnostics.is_empty() {
+        println!("check: ok");
+        return;
+    }
+    for (line, column, message) in diagnostics {
+        let metadata = optive::semantic::diagnostic_metadata(&message);
+        let severity = match metadata.severity {
+            optive::semantic::Severity::Error => "error",
+            optive::semantic::Severity::Warning => "warning",
+        };
+        println!(
+            "{severity}[{}] <repl:check>:{line}:{column}: {message}",
+            metadata.code
+        );
+        if let Some(help) = metadata.help {
+            println!("  help: {help}");
+        }
+    }
+}
+
+fn print_repl_vars(vm: &Vm) {
+    let builtins: std::collections::HashSet<&str> = optive::api_registry::BUILTINS
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    let core_types: std::collections::HashSet<&str> =
+        optive::type_registry::global_type_names().collect();
+    let function_names: std::collections::HashSet<String> =
+        vm.functions.keys().into_iter().collect();
+    let mut values: Vec<_> = vm
+        .debug_list_globals()
+        .into_iter()
+        .filter(|(name, value)| {
+            !name.starts_with("__")
+                && !builtins.contains(name.as_str())
+                && !core_types.contains(name.as_str())
+                && !function_names.contains(name)
+                && !matches!(
+                    value,
+                    optive::value::Value::TypeRef(_) | optive::value::Value::TypeSpec(_)
+                )
+        })
+        .collect();
+    values.sort_by(|left, right| left.0.cmp(&right.0));
+    if values.is_empty() {
+        println!("<no user variables>");
+    } else {
+        for (name, value) in values {
+            println!("{name} = {}", value.display_string());
+        }
+    }
+}
+
+fn print_repl_functions(vm: &Vm) {
+    let mut names = vm.functions.keys();
+    names.sort();
+    if names.is_empty() {
+        println!("<no user functions>");
+    } else {
+        for name in names {
+            println!("{name}");
+        }
+    }
+}
+
+fn append_repl_cell_source(session_source: &mut String, source: &str) {
+    if !session_source.is_empty() && !session_source.ends_with('\n') {
+        session_source.push('\n');
+    }
+    session_source.push_str(source);
+    session_source.push('\n');
 }
 
 fn print_repl_help() {
@@ -844,13 +1090,26 @@ fn print_repl_help() {
     println!("{}", t_repl(ReplMsg::HelpQuit));
     println!("{}", t_repl(ReplMsg::HelpCtrlC));
     println!("{}", t_repl(ReplMsg::HelpCtrlD));
+    println!("  :cancel            Cancel unfinished multi-line input");
+    println!("  :reset             Clear all user state and cells");
+    println!("  :vars              List user variables");
+    println!("  :functions         List user functions");
+    println!("  :caps              Show active host capabilities");
+    println!("  :check [code]      Statically check the session or extra code");
+    println!("  :history           List executed cells");
+    println!("  :show <cell>       Show one cell");
 }
 
 fn repl(caps: Capabilities) {
+    repl_with_project(caps, None);
+}
+
+fn repl_with_project(caps: Capabilities, project: Option<(PathBuf, EnsureResult)>) {
     let mut rl: Editor<ReplHelper, DefaultHistory> = match Editor::new() {
         Ok(mut e) => {
             e.set_helper(Some(ReplHelper {
                 colored_prompt: String::new(),
+                completion_prefix: String::new(),
                 line_cache: LineHighlightCache::default(),
             }));
             e
@@ -861,11 +1120,17 @@ fn repl(caps: Capabilities) {
         }
     };
     let hist = history_path();
-    let _ = rl.load_history(&hist);
+    if let Err(error) = rl.load_history(&hist) {
+        if !matches!(error, ReadlineError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound)
+        {
+            color::eprint_error(format!("REPL history load failed: {error}"));
+        }
+    }
 
-    let mut vm = Vm::new();
-    vm.install_caps(caps);
+    let mut vm = new_repl_vm(&caps, project.as_ref());
     let mut accumulator = String::new();
+    let mut session_source = String::new();
+    let mut cells: Vec<ReplCell> = Vec::new();
     let pack = custom::active_pack();
     let primary = pack.repl_prompt().to_string();
     let continuation = pack.repl_continuation().to_string();
@@ -883,11 +1148,23 @@ fn repl(caps: Capabilities) {
             } else {
                 String::new()
             };
+            h.completion_prefix.clone_from(&session_source);
+            if !accumulator.is_empty() {
+                if !h.completion_prefix.is_empty() && !h.completion_prefix.ends_with('\n') {
+                    h.completion_prefix.push('\n');
+                }
+                h.completion_prefix.push_str(&accumulator);
+                h.completion_prefix.push('\n');
+            }
         }
         match rl.readline(prompt) {
             Ok(line) => {
                 let trimmed = line.trim_end();
                 let cmd = trimmed.trim();
+                if !accumulator.is_empty() && cmd == ":cancel" {
+                    accumulator.clear();
+                    continue;
+                }
                 if accumulator.is_empty() {
                     match cmd {
                         ":help" | "help" => {
@@ -895,17 +1172,79 @@ fn repl(caps: Capabilities) {
                             continue;
                         }
                         ":quit" | ":exit" | "quit" | "exit" => break,
+                        ":reset" => {
+                            vm = new_repl_vm(&caps, project.as_ref());
+                            session_source.clear();
+                            cells.clear();
+                            println!("REPL state reset");
+                            continue;
+                        }
+                        ":vars" => {
+                            print_repl_vars(&vm);
+                            continue;
+                        }
+                        ":functions" => {
+                            print_repl_functions(&vm);
+                            continue;
+                        }
+                        ":caps" => {
+                            println!("network: {}", caps.network);
+                            println!("environment: {}", caps.env);
+                            println!("process: {}", caps.process);
+                            println!("ffi: {}", caps.ffi);
+                            println!("filesystem: {:?}", caps.fs);
+                            continue;
+                        }
+                        ":history" => {
+                            if cells.is_empty() {
+                                println!("<no cells>");
+                            } else {
+                                for cell in &cells {
+                                    let preview = cell.source.lines().next().unwrap_or("");
+                                    let suffix = if cell.source.lines().count() > 1 {
+                                        " …"
+                                    } else {
+                                        ""
+                                    };
+                                    println!("{}: {preview}{suffix}", cell.id);
+                                }
+                            }
+                            continue;
+                        }
                         _ => {}
+                    }
+                    if let Some(raw_id) = cmd.strip_prefix(":show ") {
+                        match raw_id
+                            .trim()
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|id| cells.iter().find(|cell| cell.id == id))
+                        {
+                            Some(cell) => println!("{}", cell.source),
+                            None => color::eprint_error("unknown REPL cell"),
+                        }
+                        continue;
+                    }
+                    if cmd == ":check" || cmd.starts_with(":check ") {
+                        let extra = cmd.strip_prefix(":check").unwrap_or("").trim();
+                        let mut source = session_source.clone();
+                        if !extra.is_empty() {
+                            append_repl_cell_source(&mut source, extra);
+                        }
+                        print_repl_check(&source);
+                        continue;
+                    }
+                    if cmd.starts_with(':') {
+                        color::eprint_error(format!("unknown REPL command: {cmd}"));
+                        continue;
                     }
                 }
                 if cmd.is_empty() {
                     if !accumulator.is_empty() {
-                        accumulator.clear();
+                        accumulator.push('\n');
                     }
                     continue;
                 }
-
-                let _ = rl.add_history_entry(trimmed);
 
                 if !accumulator.is_empty() {
                     accumulator.push('\n');
@@ -918,9 +1257,19 @@ fn repl(caps: Capabilities) {
 
                 let segment = accumulator.clone();
                 accumulator.clear();
+                let cell_id = cells.len() + 1;
+                let cell_file = format!("<repl:{cell_id}>");
+                if let Err(error) = rl.add_history_entry(&segment) {
+                    color::eprint_error(format!("REPL history update failed: {error}"));
+                }
 
-                match run_source_in_vm(&mut vm, &segment, "<repl>") {
+                match run_source_in_vm(&mut vm, &segment, &cell_file) {
                     Ok(v) => {
+                        append_repl_cell_source(&mut session_source, &segment);
+                        cells.push(ReplCell {
+                            id: cell_id,
+                            source: segment,
+                        });
                         if !matches!(v, optive::value::Value::None) {
                             println!("{}", v.display_string());
                         }
@@ -944,5 +1293,49 @@ fn repl(caps: Capabilities) {
         }
     }
 
-    let _ = rl.save_history(&hist);
+    if let Some(parent) = hist.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            color::eprint_error(format!("REPL history directory failed: {error}"));
+            return;
+        }
+    }
+    if let Err(error) = rl.save_history(&hist) {
+        color::eprint_error(format!("REPL history save failed: {error}"));
+    }
+}
+
+#[cfg(test)]
+mod repl_tests {
+    use super::*;
+
+    #[test]
+    fn completion_uses_prior_repl_cells() {
+        let (_, candidates) = repl_completions("func alpha() { return 1 }\n", "alp", "alp".len());
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.replacement == "alpha"));
+    }
+
+    #[test]
+    fn completion_replaces_only_member_suffix() {
+        let (start, candidates) = repl_completions("", "std.ma", "std.ma".len());
+        assert_eq!(start, "std.".len());
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.replacement == "math"));
+    }
+
+    #[test]
+    fn completion_position_never_splits_utf8() {
+        assert_eq!(floor_char_boundary("名x", 1), 0);
+        assert_eq!(floor_char_boundary("名x", 3), 3);
+    }
+
+    #[test]
+    fn cell_source_is_separated_for_analysis() {
+        let mut source = String::new();
+        append_repl_cell_source(&mut source, "let x = 1");
+        append_repl_cell_source(&mut source, "x + 1");
+        assert_eq!(source, "let x = 1\nx + 1\n");
+    }
 }

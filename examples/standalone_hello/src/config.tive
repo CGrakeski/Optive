@@ -1,0 +1,2 @@
+// Everything exported here is consumed by the entry module at compile time.
+export const APP_NAME = "Optive standalone demo"

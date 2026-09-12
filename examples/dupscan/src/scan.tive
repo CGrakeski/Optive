@@ -46,7 +46,7 @@ friend func rec_line(r :: FileRec) {
     return std.concat(str(r.size), " ", r.digest, " ", r.path)
 }
 
-const let SKIP_DIRS = {".git", "target", "node_modules", ".optive", "__pycache__", "dist", "build"}
+const SKIP_DIRS = (".git", "target", "node_modules", ".optive", "__pycache__", "dist", "build")
 
 memoize
 func skip_name(name) {

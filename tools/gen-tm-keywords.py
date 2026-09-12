@@ -22,6 +22,7 @@ CONTROL = {
     "in",
     "break",
     "continue",
+    "defer",
     "return",
     "match",
     "case",

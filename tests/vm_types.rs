@@ -60,7 +60,7 @@ fn strong_var_init_rejects_mismatch() {
 fn strong_var_reassign_rejects_mismatch() {
     assert!(caught_type_error(
         r#"
-let b:: num = 1
+var b:: num = 1
 b = "oops"
 "#
     ));
@@ -70,7 +70,7 @@ b = "oops"
 fn soft_reassign_no_check() {
     assert_num(
         r#"
-let a: num = 1
+var a: num = 1
 a = "oops"
 1
 "#,

@@ -1,0 +1,18 @@
+import config
+
+const func banner(name) {
+    return config.APP_NAME + ": hello, " + name + "!"
+}
+
+// A standalone executable receives arguments through the same API as `run`.
+let args = std.os.args()[2:]
+let name = if len(args) > 0 then args[0] else "world"
+
+// config.APP_NAME and this const-func call are resolved while building.
+const DEFAULT_MESSAGE = banner("world")
+
+if (len(args) == 0) {
+    print(DEFAULT_MESSAGE)
+} else {
+    print(config.APP_NAME + ": hello, " + name + "!")
+}

@@ -103,7 +103,7 @@ loop (1000000) { }
 ";
 
 const ARITH_LOOP_SRC: &str = r"
-let sum = 0
+var sum = 0
 loop (100000) {
     sum = sum + 1
 }

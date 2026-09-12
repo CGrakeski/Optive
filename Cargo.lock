@@ -2605,6 +2605,7 @@ dependencies = [
  "toml",
  "toml_edit",
  "tungstenite",
+ "unicode-width",
 ]
 
 [[package]]

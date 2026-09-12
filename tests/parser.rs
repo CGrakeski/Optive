@@ -130,7 +130,7 @@ fn parse_var_decl() {
 
 #[test]
 fn parse_const_decl() {
-    parse_ok("const let x = 1");
+    parse_ok("const x = 1");
 }
 
 #[test]

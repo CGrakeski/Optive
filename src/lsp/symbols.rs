@@ -461,7 +461,7 @@ fn walk_stmt(st: &LocatedStmt, lo: usize, hi: usize, idx: &mut FileIndex) {
         }
         Stmt::DestructAssign { value, .. } => walk_expr(value, idx),
         Stmt::Del(t) => walk_del(t, idx),
-        Stmt::Block(b) => walk_block(b, st.line, block_hi(b, hi), idx),
+        Stmt::Block(b) | Stmt::Defer(b) => walk_block(b, st.line, block_hi(b, hi), idx),
         Stmt::Break | Stmt::Continue | Stmt::Comment { .. } => {}
     }
 }

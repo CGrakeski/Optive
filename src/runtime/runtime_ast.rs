@@ -323,6 +323,7 @@ pub fn ast_from_expr(expr: &Expr) -> RuntimeAstNode {
         | ExprKind::ParFor { .. }
         | ExprKind::ParBlock { .. }
         | ExprKind::Snap { .. }
+        | ExprKind::TryPropagate { .. }
         | ExprKind::Await { .. }
         | ExprKind::Suspend
         | ExprKind::Select { .. }

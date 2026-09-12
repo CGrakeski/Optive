@@ -18,6 +18,26 @@ pub fn format_parse_error(source: &str, file: &str, err: &ParseError) -> String 
     format_located_error(source, file, *line, *column, message)
 }
 
+/// Format a static-check diagnostic with a severity/code label and optional help.
+#[must_use]
+pub fn format_check_diagnostic(
+    source: &str,
+    file: &str,
+    line: usize,
+    column: usize,
+    label: &str,
+    message: &str,
+    help: Option<&str>,
+) -> String {
+    let mut rendered = format_source_error(source, file, line, column, label, "--> ", message);
+    if let Some(help) = help {
+        rendered.push_str("help: ");
+        rendered.push_str(help);
+        rendered.push('\n');
+    }
+    rendered
+}
+
 /// 格式化词法错误：源码上下文 + 插入符行。
 #[must_use]
 pub fn format_lex_error(source: &str, file: &str, err: &LexError) -> String {
@@ -138,19 +158,19 @@ fn source_line(source: &str, line: usize) -> Option<&str> {
 /// 将 1-based 源码列号转为 `text` 上的显示偏移（并夹紧）。
 fn caret_display_col(text: &str, column: usize) -> usize {
     let col_idx = column.saturating_sub(1);
-    let mut display = 0usize;
-    for (i, ch) in text.chars().enumerate() {
-        if i >= col_idx {
-            break;
+    display_width(text.chars().take(col_idx)).min(display_width(text.chars()))
+}
+
+fn display_width(chars: impl Iterator<Item = char>) -> usize {
+    use unicode_width::UnicodeWidthChar;
+
+    chars.fold(0, |column, ch| {
+        if ch == '\t' {
+            column + (4 - column % 4)
+        } else {
+            column + ch.width().unwrap_or(0)
         }
-        display += char_display_width(ch);
-    }
-    display.min(
-        text.chars()
-            .map(char_display_width)
-            .sum::<usize>()
-            .saturating_sub(0),
-    )
+    })
 }
 
 fn format_source_error(
@@ -183,11 +203,7 @@ fn format_source_error(
         out.push_str(&format!("{display_line:>3} | {text}\n"));
         if i == line_idx {
             out.push_str(&format!("{:>3} | ", ""));
-            let caret_pad = text
-                .chars()
-                .take(col_idx)
-                .map(char_display_width)
-                .sum::<usize>();
+            let caret_pad = display_width(text.chars().take(col_idx));
             for _ in 0..caret_pad {
                 out.push(' ');
             }
@@ -196,14 +212,6 @@ fn format_source_error(
     }
 
     out
-}
-
-const fn char_display_width(ch: char) -> usize {
-    if ch == '\t' {
-        4
-    } else {
-        1
-    }
 }
 
 /// 为已编译程序中每个函数挂上定义处源码与文件名。
@@ -425,5 +433,9 @@ mod tests {
     fn caret_uses_recorded_column() {
         assert_eq!(caret_display_col("func b() { c }", 12), 11);
         assert_eq!(caret_display_col("  x", 3), 2);
+        assert_eq!(caret_display_col("中文x", 3), 4);
+        assert_eq!(caret_display_col("e\u{301}x", 3), 1);
+        assert_eq!(caret_display_col("\tx", 2), 4);
+        assert_eq!(caret_display_col("a\tx", 3), 4);
     }
 }

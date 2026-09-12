@@ -27,6 +27,7 @@ pub enum TokenKind {
     KwWhile,
     KwBreak,
     KwContinue,
+    KwDefer,
     KwImport,
     KwUse,
     KwAs,
@@ -75,6 +76,7 @@ pub enum TokenKind {
     Caret,
     Tilde,
     Bang,
+    Question,
     EqEq,
     Ne,
     Lt,
@@ -138,10 +140,10 @@ impl fmt::Display for TokenKind {
 /// 语言关键字的单一列表；词法器与编辑器服务共同使用。
 pub const KEYWORDS: &[&str] = &[
     "let", "var", "const", "func", "gen", "friend", "do", "return", "if", "elif", "else", "and",
-    "or", "not", "loop", "while", "break", "continue", "import", "use", "as", "intern", "export",
-    "with", "make", "for", "in", "is", "then", "handle", "go", "par", "snap", "await", "select",
-    "yield", "suspend", "variant", "enum", "struct", "protocol", "macro", "quote", "typed",
-    "match", "case", "try", "catch", "throw", "del", "outside", "overload",
+    "or", "not", "loop", "while", "break", "continue", "defer", "import", "use", "as", "intern",
+    "export", "with", "make", "for", "in", "is", "then", "handle", "go", "par", "snap", "await",
+    "select", "yield", "suspend", "variant", "enum", "struct", "protocol", "macro", "quote",
+    "typed", "match", "case", "try", "catch", "throw", "del", "outside", "overload",
 ];
 
 #[must_use]
@@ -165,6 +167,7 @@ pub fn keyword_or_ident(text: &str) -> TokenKind {
         "while" => TokenKind::KwWhile,
         "break" => TokenKind::KwBreak,
         "continue" => TokenKind::KwContinue,
+        "defer" => TokenKind::KwDefer,
         "import" => TokenKind::KwImport,
         "use" => TokenKind::KwUse,
         "as" => TokenKind::KwAs,

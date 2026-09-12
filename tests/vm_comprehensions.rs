@@ -75,7 +75,7 @@ to_list((x for (x in range(1, 6)) if (x == 2 or x == 4)))
 fn generator_exp_is_lazy() {
     assert_num(
         r"
-let hits = 0
+var hits = 0
 func bump(x) {
     hits = hits + 1
     return x

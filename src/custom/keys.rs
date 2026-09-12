@@ -200,11 +200,11 @@ impl CliMsg {
                 "  Optive test [path] [--cover] [--filter P] [--jobs N] [--junit F] [--lcov F] [--cobertura F] [--cover-min N] [-- args...]"
             }
             Self::HelpCheck => {
-                "  Optive check [path]             Parse + name/std/arity check (no VM)"
+                "  Optive check [path] [options]   Project static analysis (no VM)"
             }
             Self::HelpLsp => "  Optive lsp                     Language server (diagnostics, rename, tokens)",
             Self::HelpDap => "  Optive dap                     Debug adapter (stdio DAP; breakpoints / fibers)",
-            Self::HelpIndex => "  Optive index sync              Fetch the package index (default: Gitee optindex)",
+            Self::HelpIndex => "  Optive index sync              Fetch the package index (default: GitHub Optindex)",
             Self::HelpIndexChange => "  Optive index change <url>      Set index git remote + sync",
             Self::HelpCustom => "  Optive custom ...                Manage customization packs",
             Self::HelpCapsHeader => "Runtime capability flags (apply to run / up / debug / test / <script> / -c):",
@@ -231,7 +231,7 @@ impl CliMsg {
             Self::HelpOptiveHome => "  OPTIVE_HOME              Global pack/ + index.db + index.url root",
             Self::HelpLocalDeps => "  OPTIVE_USE_LOCAL_DEPS=1  Debug: install into project deps/ (unmarked dirs need OPTIVE_ALLOW_UNVERIFIED_FIXTURE=1)",
             Self::HelpOptiveCustomEnv => "  OPTIVE_CUSTOM=a,b        Override active customization packs",
-            Self::HelpOptiveIndexUrl => "  OPTIVE_INDEX_URL         Override package index git remote (default: gitee.com/CGrakeski/optindex)",
+            Self::HelpOptiveIndexUrl => "  OPTIVE_INDEX_URL         Override package index git remote (default: github.com/CGrakeski/Optindex)",
             Self::HelpOptiveIndexPin => "  OPTIVE_INDEX_PIN         Require index HEAD to equal this full commit id",
             Self::HelpOptiveIndexPolicy => "  OPTIVE_INDEX_POLICY      Index trust: off (default), signed, or strict",
             Self::HelpFiles => "Files: Optive.toml, Optive.lock, Optive.cache, .optive/bc (bytecode), Custom.toml",

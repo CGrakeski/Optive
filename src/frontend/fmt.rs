@@ -36,6 +36,13 @@ pub fn format_program(program: &Program) -> String {
     s
 }
 
+#[must_use]
+pub fn format_expr(expr: &Expr) -> String {
+    let mut out = Formatter::new();
+    out.emit_expr(expr, 0);
+    out.buf
+}
+
 struct Formatter {
     buf: String,
 }
@@ -119,8 +126,9 @@ impl Formatter {
                 self.emit_visibility(*visibility);
                 if *is_const {
                     self.buf.push_str("const ");
+                } else {
+                    self.buf.push_str(if *is_var { "var " } else { "let " });
                 }
-                self.buf.push_str(if *is_var { "var " } else { "let " });
                 self.buf.push_str(name);
                 if let Some(t) = type_expr {
                     self.buf.push_str(if *type_strong { " :: " } else { ": " });
@@ -141,8 +149,9 @@ impl Formatter {
                 self.emit_visibility(*visibility);
                 if *is_const {
                     self.buf.push_str("const ");
+                } else {
+                    self.buf.push_str(if *is_var { "var " } else { "let " });
                 }
-                self.buf.push_str(if *is_var { "var " } else { "let " });
                 self.emit_destruct(pattern);
                 self.buf.push_str(" = ");
                 self.emit_expr(init, depth);
@@ -168,6 +177,7 @@ impl Formatter {
                 return_wrapper,
                 body,
                 is_generator,
+                is_const,
             } => {
                 for d in decorators {
                     self.emit_expr(d, depth);
@@ -175,6 +185,9 @@ impl Formatter {
                     self.indent(depth);
                 }
                 self.emit_visibility(*visibility);
+                if *is_const {
+                    self.buf.push_str("const ");
+                }
                 if *is_generator {
                     self.buf.push_str("gen ");
                 } else {
@@ -297,6 +310,10 @@ impl Formatter {
             }
             Stmt::Break => self.buf.push_str("break"),
             Stmt::Continue => self.buf.push_str("continue"),
+            Stmt::Defer(body) => {
+                self.buf.push_str("defer ");
+                self.emit_block(body, depth);
+            }
             Stmt::Try {
                 body,
                 catches,
@@ -1186,6 +1203,10 @@ impl Formatter {
                 self.buf.push_str(name);
                 self.buf.push_str(" := ");
                 self.emit_expr_replacing(value, depth, replace_var, with);
+            }
+            ExprKind::TryPropagate { operand } => {
+                self.emit_expr_replacing(operand, depth, replace_var, with);
+                self.buf.push('?');
             }
             ExprKind::DoFunc {
                 params,

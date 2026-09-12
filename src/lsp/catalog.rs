@@ -53,6 +53,7 @@ pub const STD_MODULES: &[&str] = &[
     "async",
     "text",
     "path",
+    "package",
     "fs",
     "os",
     "json",
@@ -72,11 +73,15 @@ pub const STD_MODULES: &[&str] = &[
     "toml",
     "yaml",
     "xml",
+    "variants",
 ];
 
 /// `(module, export)`。`module == ""` 表示 `std` 根上的名字。
 pub const STD_EXPORTS: &[(&str, &str)] = &[
     ("", "concat"),
+    ("variants", "Result"),
+    ("variants", "Option"),
+    ("variants", "Either"),
     ("math", "sin"),
     ("math", "cos"),
     ("math", "tan"),
@@ -324,6 +329,10 @@ pub const STD_EXPORTS: &[(&str, &str)] = &[
     ("path", "abspath"),
     ("path", "normalize"),
     ("path", "splitext"),
+    ("package", "id"),
+    ("package", "data_dir"),
+    ("package", "cache_dir"),
+    ("package", "temp_dir"),
     ("fs", "exists"),
     ("fs", "is_file"),
     ("fs", "is_dir"),
@@ -517,6 +526,10 @@ pub const STD_SIGS: &[(&str, &str, &str)] = &[
     ("fs", "rename", "std.fs.rename(from, to)"),
     ("fs", "copy", "std.fs.copy(from, to)"),
     ("path", "join", "std.path.join(*parts)"),
+    ("package", "id", "std.package.id()"),
+    ("package", "data_dir", "std.package.data_dir()"),
+    ("package", "cache_dir", "std.package.cache_dir()"),
+    ("package", "temp_dir", "std.package.temp_dir()"),
     ("os", "getenv", "std.os.getenv(name)"),
     ("os", "setenv", "std.os.setenv(name, value)"),
     ("os", "args", "std.os.args()"),
@@ -675,7 +688,7 @@ pub fn std_export_sig(module: &str, name: &str) -> Option<String> {
     if let Some((_, _, s)) = STD_SIGS.iter().find(|(m, n, _)| *m == module && *n == name) {
         return Some((*s).to_string());
     }
-    if STD_EXPORTS.iter().any(|(m, n)| *m == module && *n == name) {
+    if is_std_export(module, name) {
         return Some(if module.is_empty() {
             format!("std.{name}(...)")
         } else {
@@ -683,6 +696,75 @@ pub fn std_export_sig(module: &str, name: &str) -> Option<String> {
         });
     }
     None
+}
+
+/// `std` 根上一个可见名字：要么是子模块，要么是根导出。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StdRootItem {
+    Module(&'static str),
+    Export(&'static str),
+}
+
+/// 在静态模块表中查找已知子模块名（不含 `std.` 前缀）。
+#[must_use]
+pub fn known_std_module(name: &str) -> Option<&'static str> {
+    STD_MODULES.iter().copied().find(|&m| m == name)
+}
+
+/// 在静态导出表中查找已知导出名；命中时返回表里的 `&'static str`。
+#[must_use]
+pub fn known_std_export(module: &str, name: &str) -> Option<&'static str> {
+    STD_EXPORTS
+        .iter()
+        .find(|(m, e)| *m == module && *e == name)
+        .map(|(_, e)| *e)
+}
+
+/// `path` 形如 `std.<module>` 且为已知模块时，返回该模块的静态名。
+///
+/// 处理 `import std.math`、成员访问 `std.math.sin` 等路径解析。
+#[must_use]
+pub fn std_module(path: &str) -> Option<&'static str> {
+    let m = path.strip_prefix("std.")?;
+    if m.is_empty() || m.contains('.') {
+        return None;
+    }
+    known_std_module(m)
+}
+
+/// `module == ""` 时表示 `std` 根上的导出（如 `std.concat`）。
+#[must_use]
+pub fn is_std_export(module: &str, name: &str) -> bool {
+    known_std_export(module, name).is_some()
+}
+
+/// `std` 根上可见名字的归属（`use std.{ x }` / `std.<name>`）。
+#[must_use]
+pub fn std_root_item(name: &str) -> Option<StdRootItem> {
+    if let Some(m) = known_std_module(name) {
+        return Some(StdRootItem::Module(m));
+    }
+    known_std_export("", name).map(StdRootItem::Export)
+}
+
+/// `std.<module>[.<export>]` 路径的统一拆解。
+///
+/// `std.math` → `("math", None)`，`std.math.sin` → `("math", Some("sin"))`，
+/// `std` 本身或非 std 前缀返回 `None`。不做已知性校验——
+/// 调用方按需配合 [`std_module`] / [`is_std_export`] 判断。
+#[must_use]
+pub fn split_std_spec(spec: &str) -> Option<(&str, Option<&str>)> {
+    let rest = spec.strip_prefix("std.")?;
+    match rest.split_once('.') {
+        Some((m, e)) => Some((m, Some(e))),
+        None => Some((rest, None)),
+    }
+}
+
+/// import spec 是否指向内置 `std` 模块（而非磁盘上的用户模块）。
+#[must_use]
+pub fn is_std_spec(spec: &str) -> bool {
+    spec == "std" || spec.starts_with("std.")
 }
 
 pub fn std_export_doc(module: &str, name: &str) -> String {
@@ -850,3 +932,32 @@ pub const SNIPPETS: &[Snippet] = &[
         detail: "try/catch",
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn std_path_helpers_roundtrip_known_names() {
+        assert_eq!(std_module("std.math"), Some("math"));
+        assert_eq!(std_module("std"), None);
+        assert_eq!(std_module("std.math.sin"), None);
+        assert_eq!(known_std_export("math", "sin"), Some("sin"));
+        assert!(is_std_export("math", "sin"));
+        assert!(!is_std_export("math", "no_such_fn"));
+        assert_eq!(std_root_item("math"), Some(StdRootItem::Module("math")));
+        assert_eq!(split_std_spec("std.math.sin"), Some(("math", Some("sin"))));
+        assert_eq!(split_std_spec("std.math"), Some(("math", None)));
+        assert_eq!(split_std_spec("std"), None);
+        assert!(is_std_spec("std"));
+        assert!(is_std_spec("std.math"));
+        assert!(!is_std_spec("math"));
+    }
+
+    #[test]
+    fn std_root_item_distinguishes_module_and_export() {
+        assert_eq!(std_root_item("concat"), Some(StdRootItem::Export("concat")));
+        assert_eq!(std_root_item("fs"), Some(StdRootItem::Module("fs")));
+        assert_eq!(std_root_item("definitely_not_real"), None);
+    }
+}

@@ -43,7 +43,7 @@ n
 ";
 
 const CHANNEL_PING: &str = r"
-const let N = 20000
+const N = 20000
 let a = Channel(1)
 let b = Channel(1)
 go do {
@@ -86,9 +86,9 @@ const PRIMES_EXPECT: &str = "9592";
 fn parallel_primes_chunked_src(to: u32) -> String {
     format!(
         r"
-const let FROM = 2
-const let TO = {to}
-const let WORKERS = 8
+const FROM = 2
+const TO = {to}
+const WORKERS = 8
 {IS_PRIME}
 func worker(id, lo, hi, box, wg) {{
   var n = lo
@@ -144,7 +144,7 @@ total
 fn sequential_primes_src(to: u32) -> String {
     format!(
         r"
-const let TO = {to}
+const TO = {to}
 {IS_PRIME}
 func count_primes() {{
   var total = 1
@@ -165,9 +165,9 @@ count_primes()
 fn cyclic_primes_src(to: u32, tasks: usize) -> String {
     format!(
         r"
-const let TO = {to}
-const let STEP = {tasks}
-const let ODD_STEP = STEP + STEP
+const TO = {to}
+const STEP = {tasks}
+const ODD_STEP = STEP + STEP
 {IS_PRIME}
 func worker(id, box, wg) {{
   var n = 3 + id * 2

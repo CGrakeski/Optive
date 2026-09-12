@@ -158,6 +158,7 @@ fn collect_stmt_scoped(stmt: &Stmt, locals: &mut HashMap<String, ()>, free: &mut
             }
         }
         Stmt::Break | Stmt::Continue => {}
+        Stmt::Defer(body) => collect_block(body, locals, free),
         Stmt::Comment { .. } => {}
         Stmt::Try {
             body,
@@ -475,7 +476,10 @@ fn collect_expr(expr: &Expr, locals: &HashMap<String, ()>, free: &mut HashSet<St
             collect_expr(else_expr, locals, free);
         }
         ExprKind::Handle { operand } => collect_expr(operand, locals, free),
-        ExprKind::Go { operand } | ExprKind::Await { operand } | ExprKind::Snap { operand } => {
+        ExprKind::Go { operand }
+        | ExprKind::Await { operand }
+        | ExprKind::Snap { operand }
+        | ExprKind::TryPropagate { operand } => {
             collect_expr(operand, locals, free);
         }
         ExprKind::ParFor { items, body } => {
@@ -542,6 +546,7 @@ pub fn unescaped_script_var_names(program: &Program) -> Vec<String> {
 fn collect_top_level_var_names(stmt: &Stmt, out: &mut Vec<String>, seen: &mut HashSet<String>) {
     if let Stmt::VarDecl {
         is_const: false,
+        is_var: true,
         name,
         ..
     } = stmt
@@ -731,7 +736,7 @@ fn walk_stmt_callables(stmt: &Stmt, free: &mut HashSet<String>) {
                 walk_block_callables(&m.body, free);
             }
         }
-        Stmt::Block(body) => walk_block_callables(body, free),
+        Stmt::Block(body) | Stmt::Defer(body) => walk_block_callables(body, free),
         Stmt::ProtocolDecl { .. }
         | Stmt::Break
         | Stmt::Continue
@@ -859,7 +864,8 @@ fn walk_expr_callables(expr: &Expr, free: &mut HashSet<String>) {
         | ExprKind::Handle { operand }
         | ExprKind::Go { operand }
         | ExprKind::Await { operand }
-        | ExprKind::Snap { operand } => walk_expr_callables(operand, free),
+        | ExprKind::Snap { operand }
+        | ExprKind::TryPropagate { operand } => walk_expr_callables(operand, free),
         ExprKind::Binary { left, right, .. } | ExprKind::Pipeline { left, right, .. } => {
             walk_expr_callables(left, free);
             walk_expr_callables(right, free);
@@ -982,7 +988,7 @@ mod tests {
     #[test]
     fn arith_loop_counter_is_unescaped() {
         assert_eq!(
-            unescaped("let sum = 0\nloop (10) { sum = sum + 1 }\nsum\n"),
+            unescaped("var sum = 0\nloop (10) { sum = sum + 1 }\nsum\n"),
             vec!["sum".to_string()]
         );
     }
@@ -990,7 +996,7 @@ mod tests {
     #[test]
     fn nested_func_escapes_top_level_name() {
         assert_eq!(
-            unescaped("let n = 1\nfunc f() { return n }\nn = 2\nf()\n"),
+            unescaped("var n = 1\nfunc f() { return n }\nn = 2\nf()\n"),
             Vec::<String>::new()
         );
     }
@@ -1030,9 +1036,9 @@ mod tests {
     }
 
     #[test]
-    fn sibling_let_not_escaped_by_unrelated_func() {
+    fn sibling_var_not_escaped_by_unrelated_func() {
         assert_eq!(
-            unescaped("let sum = 0\nfunc id(x) { return x }\nsum = sum + 1\nsum\n"),
+            unescaped("var sum = 0\nfunc id(x) { return x }\nsum = sum + 1\nsum\n"),
             vec!["sum".to_string()]
         );
     }

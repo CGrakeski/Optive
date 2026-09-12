@@ -437,6 +437,7 @@ impl Lexer {
             '^' => TokenKind::Caret,
             '~' => TokenKind::Tilde,
             '!' => TokenKind::Bang,
+            '?' => TokenKind::Question,
             '<' => TokenKind::Lt,
             '>' => TokenKind::Gt,
             '=' => TokenKind::Assign,

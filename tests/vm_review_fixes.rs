@@ -18,16 +18,16 @@ use optive::vm::Vm;
 fn once_run_caches_under_parallel_go() {
     // Many concurrent Once.run should all see the same value; bump runs once.
     let src = r"
-let o = Once()
-let counter = Mutex(0)
+var o = Once()
+var counter = Mutex(0)
 func bump() {
-  let g = counter.lock()
+  var g = counter.lock()
   g.set(g.get() + 1)
   let v = g.get()
   g.unlock()
   return 100 + v
 }
-let wg = WaitGroup(16)
+var wg = WaitGroup(16)
 var i = 0
 loop (16) {
   go do {
@@ -38,7 +38,7 @@ loop (16) {
 }
 wg.wait()
 let a = o.run(bump)
-let g = counter.lock()
+var g = counter.lock()
 let n = g.get()
 g.unlock()
 a + n
@@ -53,27 +53,27 @@ a + n
 fn barrier_with_suspend_does_not_release_early() {
     // 3 parties; one fiber suspends while waiting. Must not fire until all 3 wait.
     let src = r"
-let b = Barrier(3)
-let box = Mutex(0)
-let wg = WaitGroup(2)
+var b = Barrier(3)
+var box = Mutex(0)
+var wg = WaitGroup(2)
 go do {
   suspend
   b.wait()
-  let g = box.lock()
+  var g = box.lock()
   g.set(g.get() + 1)
   g.unlock()
   wg.done()
 }
 go do {
   b.wait()
-  let g = box.lock()
+  var g = box.lock()
   g.set(g.get() + 1)
   g.unlock()
   wg.done()
 }
 b.wait()
 wg.wait()
-let g = box.lock()
+var g = box.lock()
 g.set(g.get() + 10)
 let n = g.get()
 g.unlock()
@@ -109,10 +109,10 @@ h.xs.append("bad")
 fn once_sequential_still_works() {
     assert_num(
         r"
-let o = Once()
-let counter = Mutex(0)
+var o = Once()
+var counter = Mutex(0)
 func bump() {
-  let g = counter.lock()
+  var g = counter.lock()
   g.set(g.get() + 1)
   let v = g.get()
   g.unlock()
@@ -120,7 +120,7 @@ func bump() {
 }
 let a = o.run(bump)
 let b = o.run(bump)
-let g = counter.lock()
+var g = counter.lock()
 let n = g.get()
 g.unlock()
 a + b + n

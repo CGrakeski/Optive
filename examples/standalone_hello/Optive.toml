@@ -1,0 +1,7 @@
+[package]
+name = "standalone_hello"
+entry = "src/main.tive"
+description = "Build an Optive project into one self-contained executable"
+requires_optive = ">=0.2.0"
+
+[dependencies]

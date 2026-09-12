@@ -3,35 +3,58 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    Block, CatchPattern, DelTarget, DestructElem, DestructPattern, Expr, ExprKind, LValue,
+    Block, CallArg, CatchPattern, DelTarget, DestructElem, DestructPattern, Expr, ExprKind, LValue,
     LocatedStmt, ModuleRef, Pattern, PatternElem, Program, Stmt,
 };
 use crate::type_registry;
 
-use crate::api_registry::{builtin_arity, std_arity, BUILTINS, STD_EXPORTS, STD_MODULES};
+use crate::api_registry::{
+    builtin_arity, known_std_export, known_std_module, split_std_spec, std_arity, std_module,
+    std_root_item, StdRootItem, BUILTINS,
+};
 
 pub type Diag = (usize, usize, String);
 
 pub fn analyze_program(program: &Program) -> Vec<Diag> {
     let mut cx = Cx {
         scopes: vec![global_names()],
-        std_alias: HashMap::new(),
-        std_mod_alias: HashMap::new(),
-        user_defined: HashSet::new(),
+        user_signatures: vec![HashMap::new()],
+        std_bindings: vec![HashMap::new()],
+        user_bindings: vec![HashSet::new()],
         diags: Vec::new(),
     };
     walk_block(&program.stmts, &mut cx);
     cx.diags
 }
 
+/// `import std.math` / `use std.math.{ sin }` 引入的 std 绑定。
+///
+/// 名字取自 registry 静态表，避免每次 hoist 再分配 `String`。
+#[derive(Clone, Copy)]
+enum StdBinding {
+    /// 绑定到整个子模块，如 `import std.math` 后的 `math`。
+    Module(&'static str),
+    /// 绑定到单个导出，如 `use std.math.{ sin }` 后的 `sin`。
+    Export {
+        module: &'static str,
+        name: &'static str,
+    },
+}
+
+#[derive(Clone)]
+struct UserSignature {
+    parameters: Vec<(String, bool)>,
+    variadic: bool,
+    keyword_variadic: bool,
+}
+
 struct Cx {
     scopes: Vec<HashSet<String>>,
-    /// 本地名 → `(std_module, export)`，供 arity。
-    std_alias: HashMap<String, (&'static str, &'static str)>,
-    /// `use std.{ math }` / `import std.math` → 本地模块名。
-    std_mod_alias: HashMap<String, &'static str>,
-    /// 用户声明的名字；arity 检查跳过 builtin 表。
-    user_defined: HashSet<String>,
+    user_signatures: Vec<HashMap<String, UserSignature>>,
+    /// 本地名 → std 绑定。std 路径校验与 arity 检查都从这里取归属。
+    std_bindings: Vec<HashMap<String, StdBinding>>,
+    /// 各词法作用域内由用户声明的名字；arity 检查据此跳过 builtin 表。
+    user_bindings: Vec<HashSet<String>>,
     diags: Vec<Diag>,
 }
 
@@ -44,7 +67,9 @@ impl Cx {
 
     fn define_user(&mut self, name: impl Into<String>) {
         let name = name.into();
-        self.user_defined.insert(name.clone());
+        if let Some(scope) = self.user_bindings.last_mut() {
+            scope.insert(name.clone());
+        }
         self.define(name);
     }
 
@@ -54,10 +79,82 @@ impl Cx {
 
     fn push(&mut self) {
         self.scopes.push(HashSet::new());
+        self.user_signatures.push(HashMap::new());
+        self.user_bindings.push(HashSet::new());
+        self.std_bindings.push(HashMap::new());
     }
 
     fn pop(&mut self) {
         self.scopes.pop();
+        self.user_signatures.pop();
+        self.user_bindings.pop();
+        self.std_bindings.pop();
+    }
+
+    fn define_user_signature(&mut self, name: &str, params: &[crate::ast::FuncParam]) {
+        let signature = UserSignature {
+            parameters: params
+                .iter()
+                .filter(|param| !param.is_variadic && !param.is_kwvariadic)
+                .map(|param| (param.name.clone(), param.default_expr.is_none()))
+                .collect(),
+            variadic: params.iter().any(|param| param.is_variadic),
+            keyword_variadic: params.iter().any(|param| param.is_kwvariadic),
+        };
+        if let Some(scope) = self.user_signatures.last_mut() {
+            scope.insert(name.to_string(), signature);
+        }
+    }
+
+    fn user_signature(&self, name: &str) -> Option<&UserSignature> {
+        self.user_signatures
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name))
+    }
+
+    fn is_user_bound_path(&self, path: &str) -> bool {
+        let head = path.split('.').next().unwrap_or(path);
+        self.user_bindings
+            .iter()
+            .rev()
+            .any(|scope| scope.contains(head))
+    }
+
+    fn std_binding(&self, name: &str) -> Option<StdBinding> {
+        self.std_bindings
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).copied())
+    }
+
+    fn define_std_binding(&mut self, name: String, binding: StdBinding) {
+        if let Some(scope) = self.std_bindings.last_mut() {
+            scope.insert(name, binding);
+        }
+    }
+
+    /// 把调用路径解析为 `(std 模块, 导出)`，供 arity 检查。
+    ///
+    /// 覆盖三种写法：全限定 `std.math.sin`、模块别名后的 `math.sin`、
+    /// 导出别名后的 `sin`。不是 std 调用时返回 `None`。
+    fn std_call_spec<'a>(&'a self, path: &'a str) -> Option<(&'a str, &'a str)> {
+        if let Some((m, exp)) = split_std_spec(path) {
+            // `std.math.sin` → ("math", "sin")；`std.concat` 是根导出 → ("", "concat")。
+            return Some(match exp {
+                Some(e) => (m, e),
+                None => ("", m),
+            });
+        }
+        if let Some((head, exp)) = path.split_once('.') {
+            if let Some(StdBinding::Module(module)) = self.std_binding(head) {
+                return Some((module, exp));
+            }
+        }
+        if let Some(StdBinding::Export { module, name }) = self.std_binding(path) {
+            return Some((module, name));
+        }
+        None
     }
 }
 
@@ -85,8 +182,11 @@ fn walk_block(stmts: &Block, cx: &mut Cx) {
 
 fn hoist_stmt(stmt: &Stmt, cx: &mut Cx) {
     match stmt {
-        Stmt::FuncDecl { name, .. }
-        | Stmt::FriendFuncDecl { name, .. }
+        Stmt::FuncDecl { name, params, .. } => {
+            cx.define_user(name.clone());
+            cx.define_user_signature(name, params);
+        }
+        Stmt::FriendFuncDecl { name, .. }
         | Stmt::StructDecl { name, .. }
         | Stmt::EnumDecl { name, .. }
         | Stmt::VariantDecl { name, .. }
@@ -96,64 +196,42 @@ fn hoist_stmt(stmt: &Stmt, cx: &mut Cx) {
             let key = alias.as_deref().unwrap_or(path.as_str());
             let short = key.rsplit('.').next().unwrap_or(key);
             cx.define(short.to_string());
-            if let Some(m) = path.strip_prefix("std.") {
-                if !m.contains('.') && STD_MODULES.contains(&m) {
-                    cx.std_mod_alias.insert(short.to_string(), intern_mod(m));
-                }
+            if let Some(m) = std_module(path) {
+                cx.define_std_binding(short.to_string(), StdBinding::Module(m));
             }
         }
         Stmt::Use { module, items } => {
-            let parts = match module {
-                ModuleRef::Qualified(p) => p.as_slice(),
-                ModuleRef::FilePath { .. } => &[],
-            };
             for it in items {
                 let local = it.alias.as_deref().unwrap_or(it.name.as_str());
                 cx.define(local.to_string());
-                if parts.first().map(String::as_str) == Some("std") {
-                    match parts.len() {
-                        1 => {
-                            if STD_MODULES.contains(&it.name.as_str()) {
-                                cx.std_mod_alias
-                                    .insert(local.to_string(), intern_mod(&it.name));
-                            } else if let Some((m, e)) = STD_EXPORTS
-                                .iter()
-                                .find(|(m, e)| m.is_empty() && *e == it.name)
-                            {
-                                cx.std_alias.insert(local.to_string(), (*m, *e));
-                            }
-                        }
-                        2 => {
-                            let mod_name = parts[1].as_str();
-                            if STD_EXPORTS
-                                .iter()
-                                .any(|(m, e)| *m == mod_name && *e == it.name)
-                            {
-                                cx.std_alias.insert(
-                                    local.to_string(),
-                                    (intern_mod(mod_name), intern_exp(mod_name, &it.name)),
-                                );
-                            }
-                        }
-                        _ => {}
+                let binding = match module {
+                    // `use std.{ x }`：x 是子模块或 std 根导出。
+                    ModuleRef::Qualified(parts) if parts.as_slice() == ["std"] => {
+                        std_root_item(&it.name).map(|item| match item {
+                            StdRootItem::Module(m) => StdBinding::Module(m),
+                            StdRootItem::Export(n) => StdBinding::Export {
+                                module: "",
+                                name: n,
+                            },
+                        })
                     }
+                    // `use std.math.{ sin }`：已知模块的单个导出。
+                    ModuleRef::Qualified(parts) if parts.len() == 2 && parts[0] == "std" => {
+                        let m = parts[1].as_str();
+                        match (known_std_module(m), known_std_export(m, &it.name)) {
+                            (Some(module), Some(name)) => Some(StdBinding::Export { module, name }),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(b) = binding {
+                    cx.define_std_binding(local.to_string(), b);
                 }
             }
         }
         _ => {}
     }
-}
-
-fn intern_mod(m: &str) -> &'static str {
-    STD_MODULES.iter().copied().find(|x| *x == m).unwrap_or("")
-}
-
-fn intern_exp(module: &str, exp: &str) -> &'static str {
-    STD_EXPORTS
-        .iter()
-        .find(|(m, e)| *m == module && *e == exp)
-        .map(|(_, e)| *e)
-        .unwrap_or("")
 }
 
 fn walk_stmt(st: &LocatedStmt, cx: &mut Cx) {
@@ -406,7 +484,7 @@ fn walk_stmt(st: &LocatedStmt, cx: &mut Cx) {
         }
         Stmt::DestructAssign { value, .. } => walk_expr(value, cx),
         Stmt::Del(t) => walk_del_target(t, cx),
-        Stmt::Block(b) => walk_block(b, cx),
+        Stmt::Block(b) | Stmt::Defer(b) => walk_block(b, cx),
         Stmt::MacroDecl { params, body, .. } => {
             cx.push();
             for p in params {
@@ -449,7 +527,7 @@ fn walk_expr(expr: &Expr, cx: &mut Cx) {
             }
             if !splat {
                 if let Some(path) = expr_path(callee) {
-                    check_arity_mut(&path, args.len(), expr.loc.line, expr.loc.column, cx);
+                    check_call_signature(&path, args, expr.loc.line, expr.loc.column, cx);
                 }
             }
         }
@@ -457,6 +535,7 @@ fn walk_expr(expr: &Expr, cx: &mut Cx) {
         | ExprKind::Handle { operand }
         | ExprKind::Go { operand }
         | ExprKind::Snap { operand }
+        | ExprKind::TryPropagate { operand }
         | ExprKind::Await { operand } => walk_expr(operand, cx),
         ExprKind::Binary { left, right, .. } => {
             walk_expr(left, cx);
@@ -669,38 +748,35 @@ fn expr_path(expr: &Expr) -> Option<String> {
     }
 }
 
+/// 校验 `base.field` 形式的 std 成员访问，未知名给出诊断。
+///
+/// `base` 可以是 `std`、`std.<module>`、`import std.<module>` 引入的本地名。
 fn check_std_path(base: &str, field: &str, line: usize, col: usize, cx: &mut Cx) {
+    if cx.is_user_bound_path(base) {
+        return;
+    }
     if base == "std" {
-        if STD_MODULES.contains(&field)
-            || STD_EXPORTS.iter().any(|(m, e)| m.is_empty() && *e == field)
-        {
+        if std_root_item(field).is_some() {
             return;
         }
         cx.diags
             .push((line, col, format!("unknown std module or export `{field}`")));
         return;
     }
-    let aliased = cx.std_mod_alias.get(base).copied();
-    let mod_name = if let Some(m) = aliased {
-        Some(m)
-    } else {
-        base.strip_prefix("std.")
-            .filter(|m| !m.contains('.') && STD_MODULES.contains(m))
+    let module = match cx.std_binding(base) {
+        Some(StdBinding::Module(module)) => module,
+        // 导出别名上再取成员不属于 std 路径，交给普通名字检查。
+        Some(StdBinding::Export { .. }) => return,
+        None => match std_module(base) {
+            Some(m) => m,
+            None => return,
+        },
     };
-    let Some(mod_name) = mod_name else {
-        return;
-    };
-    if STD_EXPORTS
-        .iter()
-        .any(|(m, e)| *m == mod_name && *e == field)
-    {
+    if known_std_export(module, field).is_some() {
         return;
     }
-    cx.diags.push((
-        line,
-        col,
-        format!("unknown export `std.{mod_name}.{field}`"),
-    ));
+    cx.diags
+        .push((line, col, format!("unknown export `std.{module}.{field}`")));
 }
 
 fn bind_type_params(params: &[(String, Option<Expr>)], cx: &mut Cx) {
@@ -772,31 +848,134 @@ fn walk_pattern_exprs(p: &Pattern, cx: &mut Cx) {
     }
 }
 
-fn check_arity_mut(path: &str, argc: usize, line: usize, col: usize, cx: &mut Cx) {
-    let spec = if let Some((m, e)) = cx.std_alias.get(path) {
-        Some((*m, *e))
-    } else if let Some(rest) = path.strip_prefix("std.") {
-        if let Some((m, e)) = rest.split_once('.') {
-            Some((m, e))
-        } else {
-            Some(("", rest))
-        }
-    } else if let Some((head, exp)) = path.split_once('.') {
-        cx.std_mod_alias.get(head).map(|m| (*m, exp))
-    } else {
-        None
-    };
-    let range = if let Some((m, e)) = spec {
+fn check_call_signature(path: &str, args: &[CallArg], line: usize, col: usize, cx: &mut Cx) {
+    if let Some(signature) = cx.user_signature(path).cloned() {
+        check_user_call(path, args, line, col, &signature, &mut cx.diags);
+        return;
+    }
+    let range = if cx.is_user_bound_path(path) {
+        return;
+    } else if let Some((m, e)) = cx.std_call_spec(path) {
         std_arity(m, e)
-    } else if cx.user_defined.contains(path) {
-        None
     } else {
         builtin_arity(path)
     };
     let Some((min, max)) = range else {
         return;
     };
-    if argc >= min && max.is_none_or(|mx| argc <= mx) {
+    emit_arity(path, args.len(), min, max, line, col, &mut cx.diags);
+}
+
+fn check_user_call(
+    path: &str,
+    args: &[CallArg],
+    line: usize,
+    col: usize,
+    signature: &UserSignature,
+    diags: &mut Vec<Diag>,
+) {
+    if args.iter().all(|argument| argument.name.is_none()) {
+        if !signature.variadic && args.len() > signature.parameters.len() {
+            let min = signature
+                .parameters
+                .iter()
+                .filter(|(_, required)| *required)
+                .count();
+            emit_arity(
+                path,
+                args.len(),
+                min,
+                Some(signature.parameters.len()),
+                line,
+                col,
+                diags,
+            );
+        }
+        for (index, (name, required)) in signature.parameters.iter().enumerate() {
+            if *required && index >= args.len() {
+                diags.push((
+                    line,
+                    col,
+                    format!("`{path}` is missing required argument `{name}`"),
+                ));
+            }
+        }
+        return;
+    }
+
+    let mut saw_named = false;
+    for argument in args {
+        if argument.name.is_some() {
+            saw_named = true;
+        } else if saw_named {
+            // The shared extra pass emits the dedicated ordering diagnostic.
+            // Avoid speculative binding diagnostics after the first invalid order.
+            return;
+        }
+    }
+
+    let positional = args
+        .iter()
+        .take_while(|argument| argument.name.is_none())
+        .count();
+    if !signature.variadic && positional > signature.parameters.len() {
+        emit_arity(
+            path,
+            positional,
+            0,
+            Some(signature.parameters.len()),
+            line,
+            col,
+            diags,
+        );
+    }
+
+    let mut supplied_named = HashSet::new();
+    for argument in args.iter().filter(|argument| argument.name.is_some()) {
+        let name = argument.name.as_deref().unwrap_or_default();
+        let parameter_index = signature
+            .parameters
+            .iter()
+            .position(|(parameter, _)| parameter == name);
+        match parameter_index {
+            Some(index) if index < positional => diags.push((
+                argument.value.loc.line,
+                argument.value.loc.column,
+                format!("`{path}` receives multiple values for argument `{name}`"),
+            )),
+            Some(_) => {
+                supplied_named.insert(name);
+            }
+            None if !signature.keyword_variadic => diags.push((
+                argument.value.loc.line,
+                argument.value.loc.column,
+                format!("`{path}` has no named argument `{name}`"),
+            )),
+            None => {}
+        }
+    }
+
+    for (index, (name, required)) in signature.parameters.iter().enumerate() {
+        if *required && index >= positional && !supplied_named.contains(name.as_str()) {
+            diags.push((
+                line,
+                col,
+                format!("`{path}` is missing required argument `{name}`"),
+            ));
+        }
+    }
+}
+
+fn emit_arity(
+    path: &str,
+    argc: usize,
+    min: usize,
+    max: Option<usize>,
+    line: usize,
+    col: usize,
+    diags: &mut Vec<Diag>,
+) {
+    if argc >= min && max.is_none_or(|maximum| argc <= maximum) {
         return;
     }
     let expect = match max {
@@ -804,7 +983,7 @@ fn check_arity_mut(path: &str, argc: usize, line: usize, col: usize, cx: &mut Cx
         Some(mx) => format!("{min}..{mx}"),
         None => format!("{min}+"),
     };
-    cx.diags.push((
+    diags.push((
         line,
         col,
         format!("`{path}` expects {expect} argument(s), got {argc}"),
@@ -893,6 +1072,114 @@ mod tests {
         assert!(
             diags("std.http.serve(80, handler, \"0.0.0.0\")\nfunc handler(req) { req }\n")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn arity_user_functions_with_defaults_and_variadics() {
+        let fixed = diags("func add(a, b = 1) { return a + b }\nadd()\nadd(1, 2, 3)\n");
+        assert!(
+            fixed
+                .iter()
+                .any(|message| message.contains("missing required argument `a`")),
+            "{fixed:?}"
+        );
+        assert!(
+            fixed
+                .iter()
+                .any(|message| message.contains("`add` expects")),
+            "{fixed:?}"
+        );
+
+        let variadic =
+            diags("func collect(first, *rest) { return first }\ncollect()\ncollect(1, 2, 3)\n");
+        assert!(
+            variadic
+                .iter()
+                .any(|message| message.contains("missing required argument `first`")),
+            "{variadic:?}"
+        );
+    }
+
+    #[test]
+    fn local_shadowing_does_not_disable_outer_builtin_arity() {
+        let diagnostics = diags("func f() { let len = 1 }\nlen()\n");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|message| message.contains("`len` expects 1 argument(s), got 0")),
+            "{diagnostics:?}"
+        );
+
+        let shadowed = diags("let len = 1\nlen()\n");
+        assert!(
+            !shadowed
+                .iter()
+                .any(|message| message.contains("`len` expects")),
+            "{shadowed:?}"
+        );
+    }
+
+    #[test]
+    fn user_named_arguments_follow_the_declared_signature() {
+        let missing = diags("func f(a, b = 2) { return a }\nf(b = 3)\n");
+        assert!(
+            missing
+                .iter()
+                .any(|message| message.contains("missing required argument `a`")),
+            "{missing:?}"
+        );
+
+        let duplicate = diags("func f(a) { return a }\nf(1, a = 2)\n");
+        assert!(
+            duplicate
+                .iter()
+                .any(|message| message.contains("multiple values for argument `a`")),
+            "{duplicate:?}"
+        );
+
+        let unknown = diags("func f(a) { return a }\nf(other = 1)\n");
+        assert!(
+            unknown
+                .iter()
+                .any(|message| message.contains("no named argument `other`")),
+            "{unknown:?}"
+        );
+
+        let keyword_variadic =
+            diags("func f(a, **options) { return a }\nf(1, 2)\nf(1, other = 2)\n");
+        assert_eq!(
+            keyword_variadic
+                .iter()
+                .filter(|message| message.contains("`f` expects"))
+                .count(),
+            1,
+            "{keyword_variadic:?}"
+        );
+    }
+
+    #[test]
+    fn std_aliases_obey_lexical_scope_and_shadowing() {
+        let leaked =
+            diags("func setup() { import std.math as private_math }\nprivate_math.sin()\n");
+        assert!(
+            leaked
+                .iter()
+                .any(|message| message.contains("undefined name `private_math`")),
+            "{leaked:?}"
+        );
+        assert!(
+            !leaked.iter().any(|message| message.contains("expects")),
+            "{leaked:?}"
+        );
+
+        let shadowed =
+            diags("import std.math as math\nfunc f() { let math = 1\nmath.not_an_export() }\n");
+        assert!(
+            !shadowed
+                .iter()
+                .any(|message| message.contains("unknown export")),
+            "{shadowed:?}"
         );
     }
 }

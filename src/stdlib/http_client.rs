@@ -3,6 +3,7 @@ use crate::shared::Shared;
 use crate::value::{builtin_repr, DictMap, ModuleObject, Num, Value, ValueKey};
 use crate::vm::Vm;
 use crate::Result;
+use std::sync::LazyLock;
 
 pub(super) fn build_http_module() -> Shared<ModuleObject> {
     submodule(
@@ -90,15 +91,28 @@ fn opt_num(opts: &Value, key: &str) -> Option<i64> {
 const DEFAULT_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const MAX_HTTP_BODY: u64 = 8 * 1024 * 1024;
 
-fn extract_timeout(opts: &Value) -> Option<std::time::Duration> {
+fn extract_timeout(opts: &Value) -> Result<Option<std::time::Duration>> {
     if let Value::Dict(d) = opts {
-        if let Some(Value::Num(n)) = d.borrow().get(&ValueKey::Text("timeout".into())) {
-            if let Some(secs) = n.to_i64() {
-                return Some(std::time::Duration::from_secs(secs.max(0) as u64));
+        if let Some(value) = d.borrow().get(&ValueKey::Text("timeout".into())) {
+            let Value::Num(n) = value else {
+                return Err(crate::error::RuntimeError::type_err(
+                    "http: timeout must be a positive integer number of seconds",
+                ));
+            };
+            let Some(secs) = n.to_i64() else {
+                return Err(crate::error::RuntimeError::value_err(
+                    "http: timeout must be a positive integer number of seconds",
+                ));
+            };
+            if secs <= 0 {
+                return Err(crate::error::RuntimeError::value_err(
+                    "http: timeout must be greater than zero",
+                ));
             }
+            return Ok(Some(std::time::Duration::from_secs(secs as u64)));
         }
     }
-    None
+    Ok(None)
 }
 
 fn response_to_dict(resp: reqwest::blocking::Response) -> Result<Value> {
@@ -106,12 +120,17 @@ fn response_to_dict(resp: reqwest::blocking::Response) -> Result<Value> {
     let status = resp.status().as_u16();
     let url = resp.url().to_string();
     let mut header_map = DictMap::new();
+    let mut raw_headers = Vec::new();
     for (k, v) in resp.headers() {
         let val = v.to_str().unwrap_or("");
         header_map.insert(
             ValueKey::Text(k.as_str().to_string()),
             Value::Text(val.to_string()),
         );
+        raw_headers.push(Value::List(Shared::new(vec![
+            Value::Text(k.as_str().to_string()),
+            Value::Text(val.to_string()),
+        ])));
     }
     let mut limited = resp.take(MAX_HTTP_BODY + 1);
     let mut raw = Vec::new();
@@ -131,8 +150,16 @@ fn response_to_dict(resp: reqwest::blocking::Response) -> Result<Value> {
     );
     out.insert(ValueKey::Text("body".into()), Value::Text(body));
     out.insert(
+        ValueKey::Text("bytes".into()),
+        Value::Bytes(std::sync::Arc::new(raw)),
+    );
+    out.insert(
         ValueKey::Text("headers".into()),
         Value::Dict(Shared::new(header_map)),
+    );
+    out.insert(
+        ValueKey::Text("raw_headers".into()),
+        Value::List(Shared::new(raw_headers)),
     );
     out.insert(
         ValueKey::Text("ok".into()),
@@ -146,7 +173,7 @@ fn build_client(opts: &Value) -> Result<reqwest::blocking::Client> {
     // 与 std.net TLS 相同：先装 ring，避免 rustls 0.23 无默认 CryptoProvider。
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut builder = reqwest::blocking::Client::builder()
-        .timeout(extract_timeout(opts).unwrap_or(DEFAULT_HTTP_TIMEOUT));
+        .timeout(extract_timeout(opts)?.unwrap_or(DEFAULT_HTTP_TIMEOUT));
     if let Some(p) = opt_str(opts, "proxy") {
         let proxy = reqwest::Proxy::all(&p).map_err(|e| {
             crate::error::RuntimeError::value_err(format!("http: invalid proxy '{p}': {e}"))
@@ -163,11 +190,32 @@ fn build_client(opts: &Value) -> Result<reqwest::blocking::Client> {
             reqwest::redirect::Policy::none()
         });
     } else if let Some(n) = opt_num(opts, "follow_redirects") {
-        builder = builder.redirect(reqwest::redirect::Policy::limited(n.max(0) as usize));
+        if !(0..=100).contains(&n) {
+            return Err(crate::error::RuntimeError::value_err(
+                "http: follow_redirects must be between 0 and 100",
+            ));
+        }
+        builder = builder.redirect(reqwest::redirect::Policy::limited(n as usize));
     }
     builder.build().map_err(|e| {
         crate::error::RuntimeError::io_err(format!("http: failed to build client: {e}"))
     })
+}
+
+static DEFAULT_CLIENT: LazyLock<reqwest::blocking::Client> = LazyLock::new(|| {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::blocking::Client::builder()
+        .timeout(DEFAULT_HTTP_TIMEOUT)
+        .build()
+        .expect("default HTTP client configuration is valid")
+});
+
+fn client_for(opts: &Value) -> Result<reqwest::blocking::Client> {
+    match opts {
+        Value::Dict(d) if d.borrow().is_empty() => Ok(DEFAULT_CLIENT.clone()),
+        Value::None => Ok(DEFAULT_CLIENT.clone()),
+        _ => build_client(opts),
+    }
 }
 
 fn apply_auth(
@@ -222,7 +270,7 @@ fn http_get(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let op = builtin_repr("get");
     let url = expect_text(&op, args, 0)?;
     let opts = args.get(1).cloned().unwrap_or(Value::None);
-    let client = build_client(&opts)?;
+    let client = client_for(&opts)?;
     send_request(vm, &op, &url, &opts, client.get(url.as_str()))
 }
 
@@ -232,7 +280,7 @@ fn http_post(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let url = expect_text(&op, args, 0)?;
     let body = expect_text(&op, args, 1)?;
     let opts = args.get(2).cloned().unwrap_or(Value::None);
-    let client = build_client(&opts)?;
+    let client = client_for(&opts)?;
     send_request(vm, &op, &url, &opts, client.post(url.as_str()).body(body))
 }
 
@@ -242,7 +290,7 @@ fn http_put(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let url = expect_text(&op, args, 0)?;
     let body = expect_text(&op, args, 1)?;
     let opts = args.get(2).cloned().unwrap_or(Value::None);
-    let client = build_client(&opts)?;
+    let client = client_for(&opts)?;
     send_request(vm, &op, &url, &opts, client.put(url.as_str()).body(body))
 }
 
@@ -251,7 +299,7 @@ fn http_delete(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let op = builtin_repr("delete");
     let url = expect_text(&op, args, 0)?;
     let opts = args.get(1).cloned().unwrap_or(Value::None);
-    let client = build_client(&opts)?;
+    let client = client_for(&opts)?;
     send_request(vm, &op, &url, &opts, client.delete(url.as_str()))
 }
 
@@ -261,7 +309,7 @@ fn http_patch(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let url = expect_text(&op, args, 0)?;
     let body = expect_text(&op, args, 1)?;
     let opts = args.get(2).cloned().unwrap_or(Value::None);
-    let client = build_client(&opts)?;
+    let client = client_for(&opts)?;
     send_request(vm, &op, &url, &opts, client.patch(url.as_str()).body(body))
 }
 
@@ -270,7 +318,7 @@ fn http_head(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let op = builtin_repr("head");
     let url = expect_text(&op, args, 0)?;
     let opts = args.get(1).cloned().unwrap_or(Value::None);
-    let client = build_client(&opts)?;
+    let client = client_for(&opts)?;
     send_request(vm, &op, &url, &opts, client.head(url.as_str()))
 }
 
@@ -280,7 +328,7 @@ fn http_request(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let method = expect_text(&op, args, 0)?;
     let url = expect_text(&op, args, 1)?;
     let opts = args.get(2).cloned().unwrap_or(Value::None);
-    let client = build_client(&opts)?;
+    let client = client_for(&opts)?;
     let m = method.to_uppercase();
     let mut req_builder = match m.as_str() {
         "GET" => client.get(url.as_str()),

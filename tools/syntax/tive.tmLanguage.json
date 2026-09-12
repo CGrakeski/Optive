@@ -134,7 +134,7 @@
       "patterns": [
         {
           "name": "keyword.control.tive",
-          "match": "\\b(continue|outside|suspend|handle|return|select|await|break|catch|match|throw|while|yield|case|elif|else|loop|snap|then|for|gen|par|try|do|go|if|in)\\b"
+          "match": "\\b(continue|outside|suspend|handle|return|select|await|break|catch|defer|match|throw|while|yield|case|elif|else|loop|snap|then|for|gen|par|try|do|go|if|in)\\b"
         },
         {
           "name": "keyword.operator.logical.tive",
@@ -181,7 +181,7 @@
         },
         {
           "name": "keyword.operator.tive",
-          "match": "(==|!=|<=|>=|->|=>|\\+\\+|--|\\+=|-=|\\*=|/=|::|\\+|-|\\*|/|=|<|>|%|&|\\||\\^|!)"
+          "match": "(==|!=|<=|>=|->|=>|\\+\\+|--|\\+=|-=|\\*=|/=|::|\\+|-|\\*|/|=|<|>|%|&|\\||\\^|!|\\?)"
         }
       ]
     }

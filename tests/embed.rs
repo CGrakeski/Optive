@@ -18,7 +18,7 @@ fn embed_host_function() {
 #[test]
 fn reset_script_bindings_allows_const_rerun() {
     let mut vm = optive::vm::Vm::new();
-    let src = "const let FROM = 2\nFROM + 40\n";
+    let src = "const FROM = 2\nFROM + 40\n";
     let first = optive::run_source_in_vm(&mut vm, src, "<rerun>").unwrap();
     assert_eq!(first.display_string(), "42");
     vm.reset_script_bindings();

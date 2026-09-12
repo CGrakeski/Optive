@@ -98,9 +98,9 @@ count_primes()
 ";
 
 const PARALLEL_PRIMES_SRC: &str = r"
-const let FROM = 2
-const let TO = 50001
-const let WORKERS = 8
+const FROM = 2
+const TO = 50001
+const WORKERS = 8
 
 func is_prime(n) {
   if (n < 2) { return false }
@@ -161,7 +161,7 @@ total
 ";
 
 const CHANNEL_PING_SRC: &str = r"
-const let N = 20000
+const N = 20000
 let a = Channel(1)
 let b = Channel(1)
 go do {

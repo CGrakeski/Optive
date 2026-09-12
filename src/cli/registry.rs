@@ -28,7 +28,7 @@ pub fn load_pack_index() -> Result<BTreeMap<String, String>, Box<dyn std::error:
     let path = index_json_path();
     if !path.is_file() {
         return Err(format!(
-            "index.json not found at {}; run `Optive index sync` (default: gitee.com/CGrakeski/optindex), or put one there / `Optive index change <url>`",
+            "index.json not found at {}; run `Optive index sync` (default: github.com/CGrakeski/Optindex), or put one there / `Optive index change <url>`",
             path.display()
         )
         .into());
@@ -59,7 +59,7 @@ pub fn lookup_pack_url(name: &str) -> Result<String, Box<dyn std::error::Error>>
             "pack `{name}` not found in {}\n  \
                  this file is the local checkout (not fetched on `up`/`add`).\n  \
                  run `Optive index sync` to refresh from the configured remote\n  \
-                 (default: https://gitee.com/CGrakeski/optindex.git).\n  \
+                 (default: https://github.com/CGrakeski/Optindex.git).\n  \
                  packs currently listed: {shown}",
             index_json_path().display()
         )

@@ -10,6 +10,10 @@ mod common;
 
 use common::{assert_num, run_err, value};
 use optive::value::Value;
+use optive::value::ValueKey;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::thread;
 
 /// `std.http` 模块应当可被导入，且导出常见动词。
 #[test]
@@ -74,6 +78,68 @@ import std.http as http
 http.request("FROBNICATE", "https://example.com")
 "#,
     );
+}
+
+#[test]
+fn http_options_reject_invalid_limits_before_network_io() {
+    run_err(
+        r#"
+import std.http as http
+http.get("http://127.0.0.1:1", { "timeout": -1 })
+"#,
+    );
+    run_err(
+        r#"
+import std.http as http
+http.get("http://127.0.0.1:1", { "follow_redirects": 101 })
+"#,
+    );
+}
+
+#[test]
+fn http_preserves_binary_body_and_duplicate_headers() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("listener address");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).expect("read request");
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\nConnection: close\r\n\r\n\xff\0x",
+            )
+            .expect("write response");
+    });
+    let response = value(&format!(
+        r#"
+import std.http as http
+http.get("http://{addr}")
+"#
+    ));
+    server.join().expect("server thread");
+
+    let Value::Dict(response) = response else {
+        panic!("expected response dict");
+    };
+    let response = response.borrow();
+    match response.get(&ValueKey::Text("bytes".into())) {
+        Some(Value::Bytes(bytes)) => assert_eq!(bytes.as_slice(), &[0xff, 0, b'x']),
+        other => panic!("expected raw response bytes, got {other:?}"),
+    }
+    let Some(Value::List(headers)) = response.get(&ValueKey::Text("raw_headers".into())) else {
+        panic!("expected raw_headers list");
+    };
+    let cookie_count = headers
+        .borrow()
+        .iter()
+        .filter(|entry| match entry {
+            Value::List(pair) => {
+                matches!(pair.borrow().first(), Some(Value::Text(name)) if name == "set-cookie")
+            }
+            _ => false,
+        })
+        .count();
+    assert_eq!(cookie_count, 2);
 }
 
 /// 真实网络请求：对 example.com 做 GET，断言 200 与 body 含 HTML。

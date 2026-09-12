@@ -34,7 +34,7 @@ fn mn_go_await_basic() {
     assert_num_workers(
         4,
         r"
-let t = go do { return 40 + 2 }
+var t = go do { return 40 + 2 }
 await t
 ",
         "42",
@@ -46,18 +46,18 @@ fn mn_mutex_counter_many_tasks() {
     assert_num_workers(
         4,
         r"
-let m = Mutex(0)
-let wg = WaitGroup(50)
+var m = Mutex(0)
+var wg = WaitGroup(50)
 loop (50) {
   go do {
-    let g = m.lock()
+    var g = m.lock()
     g.set(g.get() + 1)
     g.unlock()
     wg.done()
   }
 }
 wg.wait()
-let g = m.lock()
+var g = m.lock()
 let n = g.get()
 g.unlock()
 n
@@ -71,7 +71,7 @@ fn mn_channel_pipeline() {
     assert_num_workers(
         4,
         r"
-let ch = Channel()
+var ch = Channel()
 go do {
   loop (20) {
     ch.send(1)
@@ -80,7 +80,7 @@ go do {
 }
 var sum = 0
 loop {
-  let v = ch.recv()
+  var v = ch.recv()
   if (v == none) {
     break
   }
@@ -98,7 +98,7 @@ fn mn_bounded_channel_nested_ok() {
     assert_num_workers(
         1,
         r"
-let ch = Channel(2)
+var ch = Channel(2)
 go do {
   loop (10) {
     ch.send(1)
@@ -107,7 +107,7 @@ go do {
 }
 var sum = 0
 loop {
-  let v = ch.recv()
+  var v = ch.recv()
   if (v == none) {
     break
   }
@@ -124,7 +124,7 @@ fn mn_bounded_channel_parallel_ok() {
     assert_num_workers(
         4,
         r"
-let ch = Channel(3)
+var ch = Channel(3)
 go do {
   loop (15) {
     ch.send(1)
@@ -133,7 +133,7 @@ go do {
 }
 var sum = 0
 loop {
-  let v = ch.recv()
+  var v = ch.recv()
   if (v == none) {
     break
   }
@@ -150,18 +150,18 @@ fn mn_waitgroup_fanout() {
     assert_num_workers(
         4,
         r"
-let wg = WaitGroup(32)
-let m = Mutex(0)
+var wg = WaitGroup(32)
+var m = Mutex(0)
 loop (32) {
   go do {
-    let g = m.lock()
+    var g = m.lock()
     g.set(g.get() + 3)
     g.unlock()
     wg.done()
   }
 }
 wg.wait()
-let g = m.lock()
+var g = m.lock()
 let n = g.get()
 g.unlock()
 n
@@ -255,8 +255,8 @@ fn mn_parallel_sum_via_channels() {
     assert_num_workers(
         4,
         r"
-let out = Channel()
-let wg = WaitGroup(4)
+var out = Channel()
+var wg = WaitGroup(4)
 go do {
   out.send(10)
   wg.done()
@@ -279,7 +279,7 @@ go do {
 }
 var sum = 0
 loop {
-  let v = out.recv()
+  var v = out.recv()
   if (v == none) {
     break
   }
@@ -299,7 +299,7 @@ fn mn_migrated_fiber_preserves_main_code() {
         assert_num_workers(
             8,
             r"
-let wg = WaitGroup(8)
+var wg = WaitGroup(8)
 loop (8) {
   go do {
     var i = 0
@@ -332,8 +332,8 @@ typed struct T {
   let path: text
   let n: num
 }
-let ch = Channel(8)
-let done = Channel(1)
+var ch = Channel(8)
+var done = Channel(1)
 go do {
   var i = 0
   while (i < 8) {
@@ -343,13 +343,13 @@ go do {
   ch.close()
 }
 go do {
-  let tasks = []
+  var tasks = []
   var w = 0
   while (w < 4) {
     tasks.append(go do {
       for (i in ch) {
-        let a = S(i)
-        let b = T(f"p{i}", i)
+        var a = S(i)
+        var b = T(f"p{i}", i)
         if (a.x != i or b.n != i) {
           throw RuntimeError("struct ctor mismatch")
         }
@@ -391,8 +391,8 @@ func worker(id, ch, wg) {
 func start(id, ch, wg) {
   go do { worker(id, ch, wg) }
 }
-let ch = Channel()
-let wg = WaitGroup(4)
+var ch = Channel()
+var wg = WaitGroup(4)
 var wid = 0
 loop (4) {
   start(wid, ch, wg)
@@ -405,7 +405,7 @@ go do {
 var sum = 0
 var n = 0
 loop {
-  let v = ch.recv()
+  var v = ch.recv()
   if (v == none) { break }
   if (type(v) != "num") {
     return -1

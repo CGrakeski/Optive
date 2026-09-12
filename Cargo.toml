@@ -63,6 +63,7 @@ crossbeam-deque = "0.8"
 num_cpus = "1"
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-bundle-always"] }
 cap-std = "4.0.3"
+unicode-width = "0.2"
 
 ## Android 交叉编不拉 libffi-sys：其 build 在 Windows 宿主上走 MSVC/`cl.exe`，
 ## 无法为 `aarch64-linux-android` 编 libffi。该目标上 `extern`/`C.callback` 运行时报错。
@@ -89,6 +90,15 @@ strip = true
 codegen-units = 1
 debug-assertions = false
 # 热循环大量 `-= 1`；溢出检查会给空循环/fib 增加可观开销。语义用 wrapping/显式检查覆盖。
+overflow-checks = false
+
+
+[profile.release-compfast]
+inherits = "release"
+lto = false
+strip = true
+codegen-units = 16
+debug-assertions = false
 overflow-checks = false
 
 ## 保留符号，供 samply / ETW 采样定位函数热点。

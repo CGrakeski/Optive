@@ -44,10 +44,8 @@ fn roots_from_params(params: &serde_json::Value) -> Vec<PathBuf> {
     roots
 }
 
-#[must_use]
-pub fn is_std_spec(spec: &str) -> bool {
-    spec == "std" || spec.starts_with("std.")
-}
+/// 内置 std 模块的判定统一走 `api_registry`，语义层与 LSP 共用一份。
+pub use crate::api_registry::is_std_spec;
 
 /// 从当前文档解析依赖模块：先查已打开的 `docs`，再读磁盘。
 #[must_use]

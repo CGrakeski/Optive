@@ -1,6 +1,6 @@
 //! `Optive index sync` / `index change <url>`：同步或更换包索引 Git 仓库。
 //!
-//! 默认官方索引：`https://gitee.com/CGrakeski/optindex.git`。
+//! 默认官方索引：`https://github.com/CGrakeski/Optindex.git`。
 //! 可用 `OPTIVE_INDEX_URL` / `index.url` 覆盖；本地 `OPTIVE_INDEX/index.json` 也可直接给 `search` / `add`。
 
 use std::error::Error;
@@ -11,7 +11,7 @@ use super::home;
 use super::registry;
 
 /// 未配置时使用的官方包索引远程。
-pub const DEFAULT_INDEX_URL: &str = "https://gitee.com/CGrakeski/optindex.git";
+pub const DEFAULT_INDEX_URL: &str = "https://github.com/CGrakeski/Optindex.git";
 
 /// 持久化的索引远程 URL（`$OPTIVE_HOME/index.url`）。
 pub fn index_url_config_path() -> std::path::PathBuf {
@@ -32,7 +32,7 @@ impl IndexUrlSource {
         match self {
             Self::Env => "OPTIVE_INDEX_URL",
             Self::File => "index.url",
-            Self::Default => "default (gitee optindex)",
+            Self::Default => "default (github CGrakeski/Optindex)",
         }
     }
 }

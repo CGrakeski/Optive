@@ -380,7 +380,18 @@ pub fn ensure_local_pack(
     let id = content_id(&source, &commit);
     git_ops::validate_dep_dir_name_pub(name)?;
     fs::create_dir_all(project_deps)?;
-    let target = project_deps.join(name);
+    let primary = project_deps.join(name);
+    // A project-local development store must still be able to represent two
+    // versions of the same logical dependency. Keep the pleasant `deps/name`
+    // path for the first identity and place additional identities beside it.
+    let primary_matches = fs::read_to_string(primary.join(".optive-id"))
+        .ok()
+        .is_some_and(|s| s.trim() == id);
+    let target = if !primary.exists() || primary_matches || !primary.join(".optive-id").is_file() {
+        primary
+    } else {
+        project_deps.join(format!("{name}-{}", &id[..12]))
+    };
     let marker = target.join(".optive-id");
     if target.is_dir() {
         let ok = fs::read_to_string(&marker)
@@ -593,7 +604,7 @@ fn require_full_object_id(kind: &str, id: &str) -> Result<(), Box<dyn std::error
     }
 }
 
-/// 对物化内容做稳定 SHA-256。忽略 VCS 元数据、`.optive-id` 与文件系统可执行位
+/// 对物化内容做稳定 SHA-256。忽略 VCS 元数据、Rust 构建产物、`.optive-id` 与文件系统可执行位
 ///（Git `tree` 已记录 mode）。包含空目录。
 pub fn content_digest(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
     let mut files = Vec::new();
@@ -663,7 +674,7 @@ fn collect_digest_entries(
 }
 
 fn should_ignore_dir(name: &str) -> bool {
-    matches!(name, ".git" | ".hg" | ".svn")
+    matches!(name, ".git" | ".hg" | ".svn" | "target")
 }
 
 fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
@@ -685,6 +696,39 @@ mod tests {
     }
 
     #[test]
+    fn local_store_keeps_same_name_different_versions_apart() {
+        let root = std::env::temp_dir().join(format!(
+            "optive-local-multiversion-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let deps = root.join("deps");
+        fs::create_dir_all(&deps).unwrap();
+        let source = normalize_git_url("https://example.com/shared.git");
+        let rev1 = "11".repeat(20);
+        let rev2 = "22".repeat(20);
+        let id1 = content_id(&source, &rev1);
+        let id2 = content_id(&source, &rev2);
+        let first = deps.join("shared");
+        let second = deps.join(format!("shared-{}", &id2[..12]));
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join(".optive-id"), &id1).unwrap();
+        fs::write(second.join(".optive-id"), &id2).unwrap();
+        fs::write(first.join("main.tive"), "export let v = 1\n").unwrap();
+        fs::write(second.join("main.tive"), "export let v = 2\n").unwrap();
+
+        let p1 = ensure_local_pack(&deps, "shared", &source, &rev1, None).unwrap();
+        let p2 = ensure_local_pack(&deps, "shared", &source, &rev2, None).unwrap();
+        assert_eq!(p1.path, first);
+        assert_eq!(p2.path, second);
+        assert_ne!(p1.identity.id, p2.identity.id);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn full_object_id_accepts_40_and_64_hex() {
         assert!(is_full_object_id(
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -698,7 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn content_digest_ignores_vcs_not_build_cache() {
+    fn content_digest_ignores_vcs_and_build_cache() {
         let root = std::env::temp_dir().join(format!(
             "optive-digest-{}-{}",
             std::process::id(),
@@ -717,7 +761,7 @@ mod tests {
         fs::write(root.join(".git/config"), "changed").unwrap();
         assert_eq!(first, content_digest(&root).unwrap());
         fs::write(root.join("target/out"), "other").unwrap();
-        assert_ne!(first, content_digest(&root).unwrap());
+        assert_eq!(first, content_digest(&root).unwrap());
         fs::write(root.join("src/main.tive"), "print(2)\n").unwrap();
         assert_ne!(first, content_digest(&root).unwrap());
         let _ = fs::remove_dir_all(&root);

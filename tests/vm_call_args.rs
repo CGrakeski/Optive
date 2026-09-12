@@ -32,7 +32,7 @@ add(3, 10)
 fn default_expr_evaluated_at_def() {
     assert_num(
         r"
-let n = 1
+var n = 1
 func f(x = n) { return x }
 n = 99
 f()

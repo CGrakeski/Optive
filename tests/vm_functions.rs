@@ -144,7 +144,7 @@ fn function_ellipsis_empty_body() {
 fn global_mutation_in_function() {
     assert_num(
         r"
-let counter = 0
+var counter = 0
 func bump() { counter = counter + 1 }
 bump()
 bump()
@@ -228,7 +228,7 @@ let result = {
 fn script_nested_assign_updates_unescaped() {
     assert_num(
         r"
-let x = 1
+var x = 1
 if (true) {
     x = x + 10
 }
@@ -242,7 +242,7 @@ x
 fn script_unescaped_arith_loop() {
     assert_num(
         r"
-let sum = 0
+var sum = 0
 loop (1000) {
     sum = sum + 1
 }
@@ -256,8 +256,8 @@ sum
 fn script_add_store_two_lets() {
     assert_num(
         r"
-let a = 10
-let b = 32
+var a = 10
+var b = 32
 a = a + b
 a
 ",
@@ -269,7 +269,7 @@ a
 fn escaped_top_level_sees_later_stores() {
     assert_num(
         r"
-let n = 1
+var n = 1
 func f() { return n }
 n = 2
 f()
@@ -282,7 +282,7 @@ f()
 fn heavy_call_from_script_does_not_clobber_fast_local() {
     assert_num(
         r"
-let x = 1
+var x = 1
 func g() { return 1 }
 func f() { return g() + 1 }
 x = x + 1
@@ -372,7 +372,7 @@ n
 fn go_do_reads_live_top_level() {
     assert_num(
         r"
-let n = 1
+var n = 1
 n = 2
 let t = go do { return n + 1 }
 await t

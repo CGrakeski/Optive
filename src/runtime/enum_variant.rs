@@ -141,6 +141,74 @@ pub fn build_variant_def(
     )
 }
 
+/// 安装不依赖源码模块的标准 variant。使用限定内部名，避免与用户声明冲突。
+pub(crate) fn install_standard_variants(vm: &mut crate::vm::Vm) {
+    use crate::ast::{StructField, VariantCaseDecl};
+
+    fn field(name: &str) -> StructField {
+        StructField {
+            mutable: false,
+            name: name.to_string(),
+            type_expr: None,
+            type_strong: false,
+            default_expr: None,
+        }
+    }
+
+    let specs = [
+        (
+            "std.variants.Result",
+            vec![],
+            vec![
+                VariantCaseDecl {
+                    name: "Ok".into(),
+                    fields: vec![field("value")],
+                },
+                VariantCaseDecl {
+                    name: "Err".into(),
+                    fields: vec![field("error")],
+                },
+            ],
+        ),
+        (
+            "std.variants.Option",
+            vec![],
+            vec![
+                VariantCaseDecl {
+                    name: "Some".into(),
+                    fields: vec![field("value")],
+                },
+                VariantCaseDecl {
+                    name: "None".into(),
+                    fields: vec![],
+                },
+            ],
+        ),
+        (
+            "std.variants.Either",
+            vec![],
+            vec![
+                VariantCaseDecl {
+                    name: "Left".into(),
+                    fields: vec![field("value")],
+                },
+                VariantCaseDecl {
+                    name: "Right".into(),
+                    fields: vec![field("value")],
+                },
+            ],
+        ),
+    ];
+
+    for (name, params, cases) in specs {
+        let (def, structs) = build_variant_def(name, params, &cases);
+        vm.variant_defs.insert(name.to_string(), def);
+        for (struct_name, def) in structs {
+            vm.struct_defs.insert(struct_name, def);
+        }
+    }
+}
+
 #[must_use]
 pub fn wrap_variant(
     inst_name: &str,

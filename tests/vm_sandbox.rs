@@ -50,6 +50,7 @@ fn no_network_blocks_http() {
         ffi: true,
         process: true,
         dep_grant: DepGrant::none(),
+        immutable_roots: Vec::new(),
     };
     // caps 检查在真正发请求之前触发，故无需真实网络。
     assert_caps_err(
@@ -159,6 +160,7 @@ fn allow_path_alone_keeps_network() {
         ffi: true,
         process: true,
         dep_grant: DepGrant::none(),
+        immutable_roots: Vec::new(),
     };
     // 文件在根下应可访问。
     let v = run_with_caps(
@@ -188,6 +190,7 @@ fn allow_path_blocks_escape() {
         ffi: true,
         process: true,
         dep_grant: DepGrant::none(),
+        immutable_roots: Vec::new(),
     };
     assert_caps_err(
         r#"
@@ -259,6 +262,7 @@ fn scoped_dependency_root_is_read_only() {
         ffi: false,
         process: false,
         dep_grant: DepGrant::none(),
+        immutable_roots: Vec::new(),
     };
     assert!(caps
         .resolve_fs_path("read", dep.join("module.tive"), FsAccess::Read)
@@ -523,7 +527,7 @@ fn dependency_default_denies_network_env_ffi_and_root_is_read_only() {
     // 宿主 full()：依赖默认禁网 / 禁 env / 禁 FFI；包根只读可读、不可写。
     let dep_root = fresh_sandbox_dir("dep_default");
     let host = Capabilities::full();
-    let dep = host.restrict_for_dependency(&dep_root);
+    let dep = host.restrict_for_dependency(&dep_root, "dep-test");
     assert!(dep.check_network("get").is_err());
     assert!(dep.check_env("setenv").is_err());
     assert!(dep.check_process("os.run").is_err());
@@ -543,7 +547,7 @@ fn dependency_trust_all_inherits_host_network_and_ffi() {
     let dep_root = fresh_sandbox_dir("dep_trust_all");
     let mut host = Capabilities::full();
     host.dep_grant.trust_all = true;
-    let dep = host.restrict_for_dependency(&dep_root);
+    let dep = host.restrict_for_dependency(&dep_root, "dep-test");
     assert!(dep.check_network("get").is_ok());
     assert!(dep.check_ffi("frompath").is_ok());
     assert!(dep.check_env("setenv").is_ok());
@@ -558,7 +562,7 @@ fn dependency_network_grant_alone_keeps_ffi_and_env_blocked() {
     let dep_root = fresh_sandbox_dir("dep_net_only");
     let mut host = Capabilities::full();
     host.dep_grant.network = true;
-    let dep = host.restrict_for_dependency(&dep_root);
+    let dep = host.restrict_for_dependency(&dep_root, "dep-test");
     assert!(dep.check_network("get").is_ok());
     assert!(dep.check_ffi("frompath").is_err());
     assert!(dep.check_env("setenv").is_err());
@@ -577,9 +581,9 @@ fn transitive_dependency_keeps_denied_grants_and_sees_only_own_root() {
     let dep_a = fresh_sandbox_dir("dep_transitive_a");
     let dep_b = fresh_sandbox_dir("dep_transitive_b");
     let host = Capabilities::full();
-    let caps_a = host.restrict_for_dependency(&dep_a);
+    let caps_a = host.restrict_for_dependency(&dep_a, "dep-a");
     assert!(caps_a.check_network("get").is_err());
-    let caps_b = caps_a.restrict_for_dependency(&dep_b);
+    let caps_b = caps_a.restrict_for_dependency(&dep_b, "dep-b");
     assert!(caps_b.check_network("get").is_err());
     assert!(caps_b.check_ffi("frompath").is_err());
     assert!(caps_b.check_env("setenv").is_err());

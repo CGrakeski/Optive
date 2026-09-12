@@ -9,8 +9,9 @@
 mod common;
 
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const LOCAL_DEPS_ENV: &[(&str, &str)] = &[
     ("OPTIVE_USE_LOCAL_DEPS", "1"),
@@ -65,6 +66,69 @@ fn run_optive_env(
     (code, stdout, stderr)
 }
 
+fn run_optive_with_stdin(
+    args: &[&str],
+    cwd: &std::path::Path,
+    input: &str,
+) -> (i32, String, String) {
+    let home = cwd.join(".optive_home");
+    fs::create_dir_all(&home).unwrap();
+    let mut child = Command::new(optive_bin())
+        .args(args)
+        .current_dir(cwd)
+        .env("OPTIVE_HOME", &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn Optive REPL");
+    child
+        .stdin
+        .take()
+        .expect("REPL stdin")
+        .write_all(input.as_bytes())
+        .expect("write REPL input");
+    let output = child.wait_with_output().expect("wait for Optive REPL");
+    (
+        output.status.code().unwrap_or(1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn project_repl_runs_cells_lists_state_and_tracks_cell_sources() {
+    let root = tempfile_project("project_repl");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Optive.toml"),
+        "[package]\nname = \"project_repl\"\nentry = \"src/main.tive\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/main.tive"), "0\n").unwrap();
+
+    let input = concat!(
+        "let answer = 41\n",
+        "answer + 1\n",
+        ":vars\n",
+        ":history\n",
+        ":check print(1 / 0)\n",
+        "func boom() { missing }\n",
+        "boom()\n",
+        ":quit\n",
+    );
+    let (code, stdout, stderr) =
+        run_optive_with_stdin(&["--color=never", "repl", "."], &root, input);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(stdout.contains("42"), "{stdout}");
+    assert!(stdout.contains("answer = 41"), "{stdout}");
+    assert!(stdout.contains("1: let answer = 41"), "{stdout}");
+    assert!(stdout.contains("error[E7001]"), "{stdout}");
+    assert!(stderr.contains("Project project_repl"), "{stderr}");
+    assert!(stderr.contains("<repl:3>"), "{stderr}");
+    assert!(stderr.contains("<repl:4>"), "{stderr}");
+}
+
 #[test]
 fn run_project_with_manifest_no_deps() {
     let root = tempfile_project("demo_no_deps");
@@ -92,6 +156,457 @@ entry = "src/main.tive"
         "status lines belong on stderr, got: {stderr:?}"
     );
     assert!(root.join("Optive.lock").is_file(), "should write lock");
+}
+
+#[test]
+fn build_emits_incremental_module_interfaces_and_bundle() {
+    let root = tempfile_project("build_artifacts");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Optive.toml"),
+        "[package]\nname = \"build_artifacts\"\nentry = \"src/main.tive\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/main.tive"),
+        "export const ANSWER = 6 * 7\nexport const func twice(x) { return x * 2 }\n",
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["build", "--bundle"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    let build = root.join(".optive/build");
+    assert!(build.join("graph.json").is_file());
+    assert!(build.join("app.tivb").is_file());
+    assert_eq!(fs::read_dir(build.join("modules")).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(build.join("interfaces")).unwrap().count(), 1);
+    let interface_path = fs::read_dir(build.join("interfaces"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let interface: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(interface_path).unwrap()).unwrap();
+    let answer = interface["exports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == "ANSWER")
+        .unwrap();
+    assert_eq!(answer["value"]["value"], 42);
+
+    let (code, stdout, stderr) = run_optive(&["build", "--explain"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(stdout.contains("HIT "), "{stdout}");
+    assert!(stdout.contains("reused 1"), "{stdout}");
+}
+
+#[test]
+fn build_uses_topological_const_interfaces_and_precise_invalidation() {
+    let root = tempfile_project("build_graph_ctfe");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Optive.toml"),
+        "[package]\nname = \"build_graph_ctfe\"\nentry = \"src/main.tive\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/constants.tive"),
+        "export const BASE = 21\nlet private_detail = 1\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/main.tive"),
+        "use constants.{ BASE }\nexport const ANSWER = BASE * 2\n",
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["build", "--explain"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(
+        stdout.contains("BUILD __root__:src/constants.tive"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("BUILD __root__:src/main.tive"), "{stdout}");
+
+    let interfaces = root.join(".optive/build/interfaces");
+    let main_interface = fs::read_dir(&interfaces)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| fs::read_to_string(entry.path()).unwrap())
+        .find(|text| text.contains("src/main.tive"))
+        .unwrap();
+    let main: serde_json::Value = serde_json::from_str(&main_interface).unwrap();
+    let answer = main["exports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == "ANSWER")
+        .unwrap();
+    assert_eq!(answer["value"]["value"], 42);
+
+    fs::write(
+        root.join("src/constants.tive"),
+        "export const BASE = 21\nlet private_detail = 999\n",
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run_optive(&["build", "--explain"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(
+        stdout.contains("BUILD __root__:src/constants.tive"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("HIT  __root__:src/main.tive"), "{stdout}");
+
+    fs::write(
+        root.join("src/constants.tive"),
+        "export const BASE = 22\nlet private_detail = 999\n",
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run_optive(&["build", "--explain"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(
+        stdout.contains("BUILD __root__:src/constants.tive"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("BUILD __root__:src/main.tive"), "{stdout}");
+}
+
+#[test]
+fn build_reports_module_cycles_with_the_cycle_path() {
+    let root = tempfile_project("build_cycle");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Optive.toml"),
+        "[package]\nname = \"build_cycle\"\nentry = \"src/main.tive\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/main.tive"), "import a\n").unwrap();
+    fs::write(root.join("src/a.tive"), "import b\n").unwrap();
+    fs::write(root.join("src/b.tive"), "import a\n").unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["build"], &root);
+    assert_ne!(code, 0, "stdout={stdout}");
+    assert!(stderr.contains("module dependency cycle"), "{stderr}");
+    assert!(
+        stderr.contains("src/a.tive") && stderr.contains("src/b.tive"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn build_injects_imported_module_namespace_into_ctfe() {
+    let root = tempfile_project("build_import_member");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Optive.toml"),
+        "[package]\nname = \"build_import_member\"\nentry = \"src/main.tive\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/config.tive"), "export const VALUE = 21\n").unwrap();
+    fs::write(
+        root.join("src/main.tive"),
+        "import config\nexport const ANSWER = config.VALUE * 2\n",
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["build", "--explain"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    let interfaces = root.join(".optive/build/interfaces");
+    let main = fs::read_dir(&interfaces)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| fs::read_to_string(entry.path()).unwrap())
+        .find(|text| text.contains("src/main.tive"))
+        .unwrap();
+    let main: serde_json::Value = serde_json::from_str(&main).unwrap();
+    let answer = main["exports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == "ANSWER")
+        .unwrap();
+    assert_eq!(answer["value"]["value"], 42);
+    assert_eq!(main["format"], 3);
+}
+
+#[test]
+fn build_emit_and_reachability_and_stale_gc() {
+    let root = tempfile_project("build_emit_reach");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Optive.toml"),
+        "[package]\nname = \"build_emit_reach\"\nentry = \"src/main.tive\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/main.tive"), "export const ANSWER = 1\n").unwrap();
+    fs::write(root.join("src/unused.tive"), "export const DEAD = 9\n").unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["build", "--emit", "interface"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert_eq!(
+        fs::read_dir(root.join(".optive/build/interfaces"))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(
+        fs::read_dir(root.join(".optive/build/modules"))
+            .unwrap()
+            .count(),
+        0
+    );
+
+    let (code, stdout, stderr) = run_optive(&["build", "--all-modules", "--emit", "all"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert_eq!(
+        fs::read_dir(root.join(".optive/build/interfaces"))
+            .unwrap()
+            .count(),
+        2
+    );
+    assert_eq!(
+        fs::read_dir(root.join(".optive/build/modules"))
+            .unwrap()
+            .count(),
+        2
+    );
+
+    fs::remove_file(root.join("src/unused.tive")).unwrap();
+    let (code, stdout, stderr) = run_optive(&["build"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert_eq!(
+        fs::read_dir(root.join(".optive/build/interfaces"))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(
+        fs::read_dir(root.join(".optive/build/modules"))
+            .unwrap()
+            .count(),
+        1
+    );
+}
+
+fn snapshot_build_dir(root: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    use std::collections::BTreeMap;
+    let build = root.join(".optive/build");
+    let mut files = BTreeMap::new();
+    for dir_name in ["modules", "interfaces"] {
+        let dir = build.join(dir_name);
+        if !dir.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            files.insert(
+                format!("{dir_name}/{}", entry.file_name().to_string_lossy()),
+                fs::read(entry.path()).unwrap(),
+            );
+        }
+    }
+    files.insert(
+        "graph.json".into(),
+        fs::read(build.join("graph.json")).unwrap(),
+    );
+    files
+}
+
+#[test]
+fn build_parallel_and_serial_artifacts_match() {
+    let root = tempfile_project("build_jobs_determinism");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Optive.toml"),
+        "[package]\nname = \"build_jobs_determinism\"\nentry = \"src/main.tive\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/a.tive"), "export const A = 1\n").unwrap();
+    fs::write(root.join("src/b.tive"), "export const B = 2\n").unwrap();
+    fs::write(
+        root.join("src/main.tive"),
+        "import a\nimport b\nexport const ANSWER = a.A + b.B\n",
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["build", "--jobs", "1", "--clean"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    let serial = snapshot_build_dir(&root);
+
+    let (code, stdout, stderr) = run_optive(&["build", "--jobs", "8", "--clean"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    let parallel = snapshot_build_dir(&root);
+    assert_eq!(serial, parallel);
+}
+
+#[test]
+fn build_bundle_is_binary_and_runnable() {
+    let root = tempfile_project("build_bundle_run");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Optive.toml"),
+        "[package]\nname = \"build_bundle_run\"\nentry = \"src/main.tive\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/config.tive"), "export const VALUE = 21\n").unwrap();
+    fs::write(
+        root.join("src/main.tive"),
+        "import config\nexport const ANSWER = config.VALUE * 2\nprint(ANSWER)\n",
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["build", "--bundle"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    let bundle = root.join(".optive/build/app.tivb");
+    let bytes = fs::read(&bundle).unwrap();
+    assert_eq!(&bytes[..4], b"TIVB");
+
+    let (code, stdout, stderr) = run_optive(&["run", bundle.to_str().unwrap()], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(stdout.contains("42"), "stdout={stdout}");
+
+    let mut corrupt = bytes.clone();
+    let last = corrupt.len() - 1;
+    corrupt[last] ^= 1;
+    let bad = root.join("bad.tivb");
+    fs::write(&bad, corrupt).unwrap();
+    let (code, stdout, stderr) = run_optive(&["run", bad.to_str().unwrap()], &root);
+    assert_ne!(code, 0, "stdout={stdout}");
+    assert!(stderr.contains("checksum"), "{stderr}");
+
+    let mut version = bytes;
+    version[4..8].copy_from_slice(&99u32.to_le_bytes());
+    let old = root.join("old.tivb");
+    fs::write(&old, version).unwrap();
+    let (code, stdout, stderr) = run_optive(&["run", old.to_str().unwrap()], &root);
+    assert_ne!(code, 0, "stdout={stdout}");
+    assert!(stderr.contains("unsupported tivb version 99"), "{stderr}");
+}
+
+#[test]
+fn build_exe_is_self_contained_and_runnable() {
+    let root = tempfile_project("build_standalone_exe");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Optive.toml"),
+        "[package]\nname = \"build_standalone_exe\"\nentry = \"src/main.tive\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/main.tive"),
+        "print(40 + 2)\nif (len(std.os.args()) > 2) { print(std.os.args()[2]) }\n",
+    )
+    .unwrap();
+
+    let copied = root.join("dist/copied-app.exe");
+    let (code, stdout, stderr) = run_optive(
+        &["build", "--exe", "--output", copied.to_str().unwrap()],
+        &root,
+    );
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    let name = if cfg!(windows) { "app.exe" } else { "app" };
+    let executable = root.join(".optive/build").join(name);
+    assert!(executable.is_file(), "missing {}", executable.display());
+    assert!(
+        copied.is_file(),
+        "missing copied output {}",
+        copied.display()
+    );
+    let output = Command::new(&executable)
+        .current_dir(&root)
+        .output()
+        .expect("run standalone executable");
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("42"));
+
+    // Flag-looking arguments belong to the packaged application, not Optive.
+    let output = Command::new(&executable)
+        .arg("--quiet")
+        .current_dir(&root)
+        .output()
+        .expect("run standalone executable with flag-like argument");
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("--quiet"));
+}
+
+#[test]
+fn build_failed_rebuild_keeps_previous_artifacts() {
+    let root = tempfile_project("build_atomic");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Optive.toml"),
+        "[package]\nname = \"build_atomic\"\nentry = \"src/main.tive\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/config.tive"), "export const VALUE = 1\n").unwrap();
+    fs::write(
+        root.join("src/main.tive"),
+        "import config\nexport const ANSWER = config.VALUE\n",
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run_optive(&["build"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    let before = snapshot_build_dir(&root);
+
+    fs::write(root.join("src/config.tive"), "export const VALUE = 2\n").unwrap();
+    fs::write(
+        root.join("src/main.tive"),
+        "import config\nexport const ANSWER = (\n",
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run_optive(&["build"], &root);
+    assert_ne!(code, 0, "stdout={stdout}");
+    assert!(stderr.contains("Error") || !stderr.is_empty(), "{stderr}");
+    let after = snapshot_build_dir(&root);
+    assert_eq!(before, after);
+}
+
+#[test]
+fn run_injects_imported_module_namespace_into_ctfe() {
+    let root = tempfile_project("run_import_member");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Optive.toml"),
+        "[package]\nname = \"run_import_member\"\nentry = \"src/main.tive\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/config.tive"), "export const VALUE = 21\n").unwrap();
+    fs::write(
+        root.join("src/main.tive"),
+        "import config\nexport const ANSWER = config.VALUE * 2\nprint(ANSWER)\n",
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["run"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(stdout.contains("42"), "stdout={stdout}");
+}
+
+#[test]
+fn run_resolves_src_package_module_like_build() {
+    let root = tempfile_project("run_src_module");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Optive.toml"),
+        "[package]\nname = \"run_src_module\"\nentry = \"src/main.tive\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/helper.tive"), "export let n = 21\n").unwrap();
+    fs::write(
+        root.join("src/main.tive"),
+        "import helper\nprint(helper.n * 2)\n",
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["run"], &root);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(stdout.contains("42"), "stdout={stdout}");
 }
 
 #[test]
@@ -441,7 +956,10 @@ greeter = { git = "https://github.com/example/greeter.git", rev = "ababababababa
     .unwrap();
     let (code, stdout, stderr) = run_optive_env(&["run", "--sandbox"], &root, LOCAL_DEPS_ENV);
     assert_ne!(code, 0, "stdout={stdout}");
-    assert!(stderr.contains("read-only dependency root"), "{stderr}");
+    assert!(
+        stderr.contains("installed package source is immutable"),
+        "{stderr}"
+    );
     assert!(!root.join("deps/greeter/hack.txt").exists());
 }
 
@@ -995,7 +1513,12 @@ entry = "src/main.tive"
     )
     .unwrap();
     fs::create_dir_all(root.join("src")).unwrap();
-    fs::write(root.join("src/main.tive"), "let x = 1\nprint(x)\n").unwrap();
+    fs::write(
+        root.join("src/main.tive"),
+        "use \"helper.tive\".{ answer }\nprint(answer)\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/helper.tive"), "export const answer = 1\n").unwrap();
 
     let (code, stdout, stderr) = run_optive(&["check"], &root);
     assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
@@ -1055,6 +1578,81 @@ entry = "src/main.tive"
         combined.contains("error") || combined.contains("FAILED") || combined.contains("lex"),
         "out={combined}"
     );
+}
+
+#[test]
+fn check_validates_question_operator_statically() {
+    let root = tempfile_project("check_question");
+    fs::write(
+        root.join("Optive.toml"),
+        r#"
+[package]
+name = "check_question"
+entry = "src/main.tive"
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/main.tive"),
+        "func bad() -> num { return 1? }\n",
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["check"], &root);
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        format!("{stdout}{stderr}").contains("returning Result or Option"),
+        "stdout={stdout}\nstderr={stderr}"
+    );
+}
+
+#[test]
+fn check_json_reports_codes_and_warning_policy() {
+    let root = tempfile_project("check_json");
+    fs::write(
+        root.join("Optive.toml"),
+        "[package]\nname = \"check_json\"\nentry = \"src/main.tive\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/main.tive"),
+        "use std.math.{ sin }\nprint(1)\n",
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["check", "--json"], &root);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON diagnostics");
+    assert_eq!(json[0]["severity"], "warning");
+    assert_eq!(json[0]["code"], "W1001");
+
+    let (code, stdout, stderr) = run_optive(&["check", "--deny-warnings", "--json"], &root);
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+}
+
+#[test]
+fn check_fails_for_missing_modules() {
+    let root = tempfile_project("check_missing_module");
+    fs::write(
+        root.join("Optive.toml"),
+        "[package]\nname = \"check_missing_module\"\nentry = \"src/main.tive\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/main.tive"),
+        "import \"missing.tive\" as missing\nprint(missing)\n",
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["check"], &root);
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+    let combined = format!("{stdout}{stderr}");
+    assert!(combined.contains("E2001"), "{combined}");
+    assert!(combined.contains("cannot resolve module"), "{combined}");
+    assert!(combined.contains("help:"), "{combined}");
 }
 
 #[test]

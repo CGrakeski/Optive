@@ -85,7 +85,7 @@ p.x = 2
 fn const_reassign_rejected() {
     run_err(
         r"
-const let x = 1
+const x = 1
 x = 2
 ",
     );
@@ -96,7 +96,7 @@ fn const_reassign_in_func_rejected() {
     run_err(
         r"
 func f() {
-    const let x = 1
+    const x = 1
     x = 2
     return x
 }

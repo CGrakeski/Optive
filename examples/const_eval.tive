@@ -1,0 +1,60 @@
+// Optive binding and compile-time evaluation demonstration.
+// Run from the repository root:
+//   cargo run --quiet --bin Optive -- examples/const_eval.tive
+
+// `let` is a runtime binding that cannot be reassigned.
+let title = "Optive compile-time evaluation"
+
+// `var` is the only reassignable binding.
+var runtime_total = 0
+loop (5) {
+    runtime_total = runtime_total + 1
+}
+
+// `const` must be fully computable by the compiler.
+const WIDTH = 12
+const HEIGHT = 7
+const AREA = WIDTH * HEIGHT
+
+// A const function exists only during compilation. Calls with compile-time
+// arguments are replaced with their resulting values in runtime bytecode.
+const func factorial(n) {
+    if (n <= 1) {
+        return 1
+    }
+    return n * factorial(n - 1)
+}
+
+const func fibonacci(n) {
+    if (n <= 1) {
+        return n
+    }
+    return fibonacci(n - 1) + fibonacci(n - 2)
+}
+
+const func sum_range(n) {
+    var total = 0
+    for (item in range(n)) {
+        total = total + item
+    }
+    return total + min(1, n) + abs(-2)
+}
+
+const FACTORIAL_6 = factorial(6)
+const FIBONACCI_10 = fibonacci(10)
+const SUM_RANGE = sum_range(4)
+const COMPILED_RESULTS = (AREA, FACTORIAL_6, FIBONACCI_10, SUM_RANGE)
+const TABLE = [
+    {"name": "area", "value": AREA},
+    {"name": "factorial", "value": FACTORIAL_6},
+]
+
+print(title)
+print(COMPILED_RESULTS)
+print(TABLE[1]["value"])
+print(runtime_total)
+
+// Uncommenting either example below intentionally causes an error:
+// title = "changed"                 // immutable `let`
+// const BAD = read_file("input.txt") // runtime effect in `const`
+// TABLE[0] = none                    // frozen compile-time collection

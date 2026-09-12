@@ -26,7 +26,7 @@ fn std_decos_log_decorator() {
     assert_num(
         r"
 use std.decos.{ log }
-let calls = 0
+var calls = 0
 log func f(x) {
     calls = calls + 1
     return x * 2
@@ -43,7 +43,7 @@ fn std_decos_memoize_caches_calls() {
     assert_num(
         r"
 use std.decos.{ memoize }
-let calls = 0
+var calls = 0
 memoize func f(x) {
     calls = calls + 1
     return x * 2
@@ -57,11 +57,33 @@ calls
 }
 
 #[test]
+fn std_decos_memoize_has_a_bounded_cache() {
+    assert_num(
+        r"
+use std.decos.{ memoize }
+var calls = 0
+memoize func f(x) {
+    calls = calls + 1
+    return x
+}
+var i = 0
+loop (1025) {
+    f(i)
+    i = i + 1
+}
+f(0)
+calls
+",
+        "1026",
+    );
+}
+
+#[test]
 fn std_decos_once_runs_once() {
     assert_num(
         r"
 use std.decos.{ once }
-let calls = 0
+var calls = 0
 once func f() {
     calls = calls + 1
     return 42

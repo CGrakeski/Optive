@@ -3,7 +3,7 @@ use crate::hot_code;
 use crate::opcode::{FunctionObject, Instruction, ModuleGlobalEnv};
 use crate::std_modules;
 use crate::value::{ModuleObject, Value};
-use crate::vm::{DepPackage, Vm};
+use crate::vm::{DepPackage, ModuleId, Vm};
 use crate::Result;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
@@ -105,12 +105,7 @@ pub fn find_module(vm: &mut Vm, module_name: &str) -> Result<Value> {
     if let Some(stripped) = module_name.strip_prefix("@str:") {
         return load_string_module(vm, stripped);
     }
-    if let Some(cached) = vm.module_cache.get(module_name) {
-        return Ok(Value::Module(cached.clone()));
-    }
     if let Some(mod_val) = resolve_builtin_path(vm, module_name) {
-        vm.module_cache
-            .insert(module_name.to_string(), mod_val.clone());
         return Ok(Value::Module(mod_val));
     }
     load_user_module(vm, module_name)
@@ -123,9 +118,7 @@ pub fn find_module_segments(vm: &mut Vm, parts: &[String]) -> Result<Value> {
     }
     let first = &parts[0];
     // 根段：命中缓存 / builtin / 用户根模块。
-    let mut cur_val = if let Some(cached) = vm.module_cache.get(first) {
-        Value::Module(cached.clone())
-    } else if let Some(root) = vm.builtin_modules.get(first.as_str()) {
+    let mut cur_val = if let Some(root) = vm.builtin_modules.get(first.as_str()) {
         Value::Module(root.clone())
     } else {
         load_user_module_segments(vm, &parts[..1])?
@@ -155,9 +148,6 @@ pub fn find_module_segments(vm: &mut Vm, parts: &[String]) -> Result<Value> {
 
 fn load_user_module_segments(vm: &mut Vm, parts: &[String]) -> Result<Value> {
     let dotted = parts.join(".");
-    if let Some(cached) = vm.module_cache.get(&dotted) {
-        return Ok(Value::Module(cached.clone()));
-    }
     load_user_module(vm, &dotted)
 }
 
@@ -203,7 +193,7 @@ impl<'a> ModuleContextGuard<'a> {
         let active = if package_id != "__root__" {
             package_root
                 .as_ref()
-                .map(|root| vm.host_caps.restrict_for_dependency(root))
+                .map(|root| vm.host_caps.restrict_for_dependency(root, &package_id))
                 .unwrap_or_else(|| vm.host_caps.clone())
         } else {
             vm.host_caps.clone()
@@ -270,6 +260,29 @@ fn run_module_source(
     );
     let vm = &mut *context;
     let compiled = crate::compile_with_context(vm, source, source_file)?;
+    finish_compiled_module(vm, compiled, package_name)
+}
+
+fn run_compiled_module(
+    vm: &mut Vm,
+    compiled: crate::opcode::CompiledProgram,
+    source_file: &str,
+    package_name: &str,
+    import_base: PathBuf,
+    package_id: String,
+    package_root: Option<PathBuf>,
+) -> Result<ModuleRunResult> {
+    let mut context =
+        ModuleContextGuard::new(vm, "", source_file, import_base, package_id, package_root);
+    let vm = &mut *context;
+    finish_compiled_module(vm, compiled, package_name)
+}
+
+fn finish_compiled_module(
+    vm: &mut Vm,
+    compiled: crate::opcode::CompiledProgram,
+    package_name: &str,
+) -> Result<ModuleRunResult> {
     let snap = vm.snapshot_for_module_init();
     let exports = vm.begin_module_init(&snap, package_name);
     let module_overload_keys: Vec<String> = compiled.overload_tables.keys().cloned().collect();
@@ -406,6 +419,10 @@ fn load_user_module(vm: &mut Vm, module_name: &str) -> Result<Value> {
         .copied()
         .ok_or_else(|| RuntimeError::value_err(format!("invalid module name: {module_name}")))?;
 
+    if let Some(loaded) = try_load_bundle_segments(vm, module_name, last, &path_components)? {
+        return Ok(loaded);
+    }
+
     // 1) 当前包声明的依赖
     if let Some(binding) = vm
         .dep_map
@@ -465,31 +482,42 @@ fn load_from_package(
     path_components: &[&str],
     binding: &DepPackage,
 ) -> Result<Value> {
-    let logical = path_components[0];
-    let file_path = if path_components.len() == 1 {
-        resolve_package_entry_file(vm, &binding.path, logical)?.ok_or_else(|| {
-            RuntimeError::msg(format!(
-                "package `{logical}` has no entry (tried [package].entry, src/main.tive, main.tive, {logical}.tive)"
-            ))
-        })?
-    } else {
-        locate_under_root(&vm.caps, &binding.path, &path_components[1..])?.ok_or_else(|| {
-            let rest = path_components[1..].join("/");
-            RuntimeError::msg(format!(
-                "Module not found: '{rest}' under package root {}",
-                binding.path.display()
-            ))
-        })?
-    };
-    let last = path_components.last().copied().unwrap_or(logical);
-    load_file_as_module(
-        vm,
-        module_name,
-        last,
-        &file_path,
-        binding.id.clone(),
-        Some(binding.path.clone()),
-    )
+    // The dependency edge authorizes reading the target package, not arbitrary
+    // sibling packs. Resolve and initialize under that target's capability and
+    // restore the caller package even when loading fails.
+    let target_caps = vm
+        .host_caps
+        .restrict_for_dependency(&binding.path, &binding.id);
+    let previous_caps = std::mem::replace(&mut vm.caps, target_caps);
+    let result = (|| {
+        let logical = path_components[0];
+        let file_path = if path_components.len() == 1 {
+            resolve_package_entry_file(vm, &binding.path, logical)?.ok_or_else(|| {
+                RuntimeError::msg(format!(
+                    "package `{logical}` has no entry (tried [package].entry, src/main.tive, main.tive, {logical}.tive)"
+                ))
+            })?
+        } else {
+            locate_under_root(&vm.caps, &binding.path, &path_components[1..])?.ok_or_else(|| {
+                let rest = path_components[1..].join("/");
+                RuntimeError::msg(format!(
+                    "Module not found: '{rest}' under package root {}",
+                    binding.path.display()
+                ))
+            })?
+        };
+        let last = path_components.last().copied().unwrap_or(logical);
+        load_file_as_module(
+            vm,
+            module_name,
+            last,
+            &file_path,
+            binding.id.clone(),
+            Some(binding.path.clone()),
+        )
+    })();
+    vm.caps = previous_caps;
+    result
 }
 
 fn load_file_as_module(
@@ -500,10 +528,25 @@ fn load_file_as_module(
     package_id: String,
     package_root: Option<PathBuf>,
 ) -> Result<Value> {
+    let canonical = file_path
+        .canonicalize()
+        .unwrap_or_else(|_| file_path.to_path_buf());
+    let identity_path = package_root
+        .as_ref()
+        .and_then(|root| root.canonicalize().ok())
+        .and_then(|root| canonical.strip_prefix(root).ok().map(Path::to_path_buf))
+        .unwrap_or(canonical);
+    let module_id = ModuleId {
+        package_id: package_id.clone(),
+        path: identity_path,
+    };
+    if let Some(cached) = vm.module_cache.get(&module_id) {
+        return Ok(Value::Module(cached.clone()));
+    }
     let source = read_module_file(vm, file_path)?;
     let placeholder = Shared::new(ModuleObject::new_user(last.to_string()));
     vm.module_cache
-        .insert(module_name.to_string(), placeholder.clone());
+        .insert(module_id.clone(), placeholder.clone());
     let import_base = file_path
         .parent()
         .map_or_else(|| vm.import_base.clone(), std::path::Path::to_path_buf);
@@ -525,7 +568,7 @@ fn load_file_as_module(
             Ok(Value::Module(placeholder))
         }
         Err(e) => {
-            vm.module_cache.remove(module_name);
+            vm.module_cache.remove(&module_id);
             Err(e)
         }
     }
@@ -547,14 +590,9 @@ fn resolve_package_entry_file(
             .caps
             .read_to_string("package manifest", &checked_manifest)
             .map_err(|e| RuntimeError::msg(format!("cannot read {}: {e}", p.display())))?;
-        let val: toml::Value = text
-            .parse()
+        let declared = crate::compiler::module_resolve::declared_package_entry(&text)
             .map_err(|e| RuntimeError::msg(format!("invalid {}: {e}", p.display())))?;
-        if let Some(entry) = val
-            .get("package")
-            .and_then(|pkg| pkg.get("entry"))
-            .and_then(|e| e.as_str())
-        {
+        if let Some(entry) = declared.as_deref() {
             let ep = secure_package_path(package_root, Path::new(entry), vm.caps.fs_restricted())?;
             if vm.caps.is_file("package entry", &ep)? {
                 return Ok(Some(ep));
@@ -617,26 +655,9 @@ fn locate_under_root(
     root: &Path,
     path_components: &[&str],
 ) -> Result<Option<PathBuf>> {
-    if path_components.is_empty() {
-        return Ok(None);
-    }
-    let Some(last) = path_components.last().copied() else {
-        return Ok(None);
-    };
-    let prefix = &path_components[..path_components.len() - 1];
-    let mut dir = root.to_path_buf();
-    for part in prefix {
-        dir.push(part);
-    }
-    let file_candidate = dir.join(format!("{last}.tive"));
-    if caps.lookup_is_file("module lookup", &file_candidate)? {
-        return Ok(Some(file_candidate));
-    }
-    let package_candidate = dir.join(last).join("main.tive");
-    if caps.lookup_is_file("module lookup", &package_candidate)? {
-        return Ok(Some(package_candidate));
-    }
-    Ok(None)
+    crate::compiler::module_resolve::locate_package_module(root, path_components, |path| {
+        caps.lookup_is_file("module lookup", path)
+    })
 }
 
 fn read_module_file(vm: &Vm, file_path: &Path) -> Result<String> {
@@ -785,13 +806,24 @@ pub fn load_string_module(vm: &mut Vm, path: &str) -> Result<Value> {
             return find_module_segments(vm, &parts);
         }
     }
+    if let Some(loaded) = try_load_bundle_file(vm, path)? {
+        return Ok(loaded);
+    }
     let file_path = resolve_import_path_with_caps(path, &vm.import_base, &vm.caps)?;
     let canonical = file_path
         .canonicalize()
-        .unwrap_or_else(|_| file_path.clone())
-        .to_string_lossy()
-        .to_string();
-    if let Some(cached) = vm.module_cache.get(&canonical) {
+        .unwrap_or_else(|_| file_path.clone());
+    let identity_path = vm
+        .package_root
+        .as_ref()
+        .and_then(|root| root.canonicalize().ok())
+        .and_then(|root| canonical.strip_prefix(root).ok().map(Path::to_path_buf))
+        .unwrap_or(canonical);
+    let module_id = ModuleId {
+        package_id: vm.current_package_id.clone(),
+        path: identity_path,
+    };
+    if let Some(cached) = vm.module_cache.get(&module_id) {
         return Ok(Value::Module(cached.clone()));
     }
     let source = read_module_file(vm, &file_path)?;
@@ -820,8 +852,104 @@ pub fn load_string_module(vm: &mut Vm, path: &str) -> Result<Value> {
         live_globals: Some(live_globals),
         ..Default::default()
     });
-    vm.module_cache.insert(canonical, module.clone());
+    vm.module_cache.insert(module_id, module.clone());
     Ok(Value::Module(module))
+}
+
+fn try_load_bundle_segments(
+    vm: &mut Vm,
+    module_name: &str,
+    last: &str,
+    parts: &[&str],
+) -> Result<Option<Value>> {
+    let Some(bundle) = vm.bundle.clone() else {
+        return Ok(None);
+    };
+    if let Some(package_id) = bundle.binding(&vm.current_package_id, parts[0]) {
+        if let Some(relative) = bundle.resolve_module(package_id, &parts[1..]) {
+            return load_bundle_module(vm, module_name, last, package_id, &relative).map(Some);
+        }
+    }
+    if let Some(relative) = bundle.resolve_module(&vm.current_package_id, parts) {
+        let package_id = vm.current_package_id.clone();
+        return load_bundle_module(vm, module_name, last, &package_id, &relative).map(Some);
+    }
+    Ok(None)
+}
+
+fn try_load_bundle_file(vm: &mut Vm, path: &str) -> Result<Option<Value>> {
+    let Some(bundle) = vm.bundle.clone() else {
+        return Ok(None);
+    };
+    let Some(current) = vm.source_file.strip_prefix("bundle:") else {
+        return Ok(None);
+    };
+    let Some((_package, current_module)) = current.split_once(':') else {
+        return Ok(None);
+    };
+    let package_id = vm.current_package_id.clone();
+    let Some(relative) = bundle.resolve_file(&package_id, current_module, path) else {
+        return Ok(None);
+    };
+    let last = Path::new(&relative)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("module");
+    load_bundle_module(vm, &relative, last, &package_id, &relative).map(Some)
+}
+
+fn load_bundle_module(
+    vm: &mut Vm,
+    module_name: &str,
+    last: &str,
+    package_id: &str,
+    relative: &str,
+) -> Result<Value> {
+    let module_id = ModuleId {
+        package_id: package_id.to_string(),
+        path: PathBuf::from(relative),
+    };
+    if let Some(cached) = vm.module_cache.get(&module_id) {
+        return Ok(Value::Module(cached.clone()));
+    }
+    let bytecode = vm
+        .bundle
+        .as_ref()
+        .and_then(|bundle| bundle.get(package_id, relative))
+        .map(|module| module.bytecode.clone())
+        .ok_or_else(|| {
+            RuntimeError::msg(format!("bundle is missing module {package_id}:{relative}"))
+        })?;
+    let compiled = crate::bc_cache::decode_program(&bytecode).map_err(|error| {
+        RuntimeError::msg(format!(
+            "bundle bytecode {package_id}:{relative} is unreadable: {error}"
+        ))
+    })?;
+    let placeholder = Shared::new(ModuleObject::new_user(last.to_string()));
+    vm.module_cache
+        .insert(module_id.clone(), placeholder.clone());
+    match run_compiled_module(
+        vm,
+        compiled,
+        &format!("bundle:{package_id}:{relative}"),
+        module_name,
+        PathBuf::new(),
+        package_id.to_string(),
+        None,
+    ) {
+        Ok((exports, live_globals)) => {
+            {
+                let mut module = placeholder.borrow_mut();
+                module.exports = exports;
+                module.live_globals = Some(live_globals);
+            }
+            Ok(Value::Module(placeholder))
+        }
+        Err(error) => {
+            vm.module_cache.remove(&module_id);
+            Err(error)
+        }
+    }
 }
 
 fn looks_like_package_spec(path: &str) -> bool {

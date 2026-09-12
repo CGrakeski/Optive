@@ -300,7 +300,7 @@ fn high_allocation_then_gc() {
     let src = r"
 var i = 0
 loop (4000) {
-  let a = []
+  var a = []
   a.append(a)
   i = i + 1
 }

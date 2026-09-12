@@ -13,9 +13,9 @@ use crate::traceback;
 use crate::type_registry;
 use crate::types::{self, type_value_display};
 use crate::value::{
-    values_identical, BuiltinFn, ChannelInner, DictMap, DispatchTable, GeneratorTryFrame,
-    IteratorKind, IteratorState, ModuleObject, MutexInner, Num, TaskInner, TaskState, Value,
-    ValueKey,
+    values_identical, BuiltinFn, ChannelInner, DictMap, DispatchTable, FrozenValue,
+    GeneratorTryFrame, IteratorKind, IteratorState, ModuleObject, MutexInner, Num, TaskInner,
+    TaskState, Value, ValueKey,
 };
 use crate::Result;
 
@@ -68,6 +68,15 @@ impl Default for OutputSink {
 pub struct DepPackage {
     pub path: std::path::PathBuf,
     pub id: String,
+}
+
+/// A user module's runtime identity. Import spelling and aliases deliberately do
+/// not participate: the same file in the same resolved package is initialized
+/// once, while files from different package versions can never collide.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ModuleId {
+    pub package_id: String,
+    pub path: std::path::PathBuf,
 }
 
 /// 操作数栈紧凑槽：Int/Bool/Empty 内联存储，其余装箱；比完整 [Value] 更省拷贝与空间。
@@ -441,7 +450,7 @@ pub struct Vm {
     pub(crate) const_names: FxHashSet<String>,
     /// 已声明但尚未执行到对应 store 的 const 名（允许先引用后赋值）。
     pub(crate) pending_const: FxHashSet<String>,
-    pub module_cache: FxHashMap<String, Shared<ModuleObject>>,
+    pub module_cache: FxHashMap<ModuleId, Shared<ModuleObject>>,
     pub builtin_modules: FxHashMap<String, Shared<ModuleObject>>,
     pub module_init_exports: Option<Shared<HashMap<String, Value>>>,
     macro_eval_scopes: Vec<EvalSnapshot>,
@@ -458,6 +467,8 @@ pub struct Vm {
     pub current_package_id: String,
     /// 当前包根目录（依赖包内模块解析用）
     pub package_root: Option<std::path::PathBuf>,
+    /// Precompiled modules from a `.tivb`, if this VM is executing one.
+    pub bundle: Option<std::sync::Arc<crate::compiler::bundle::BundleImage>>,
     pub overload_tables: SharedTable<Vec<Arc<FunctionObject>>>,
     pub(crate) primitive_methods: FxHashMap<String, FxHashMap<String, BuiltinFn>>,
     user_call_frames: Vec<UserCallFrame>,
@@ -950,6 +961,7 @@ impl Vm {
             dep_map: std::collections::HashMap::new(),
             current_package_id: "__root__".into(),
             package_root: None,
+            bundle: None,
             overload_tables: SharedTable::new(),
             primitive_methods: FxHashMap::default(),
             user_call_frames: Vec::new(),
@@ -1040,6 +1052,7 @@ impl Vm {
         vm.mn_parallel = workers > 1;
         builtins::install_globals(&mut vm);
         type_registry::install_core_types(&mut vm);
+        crate::enum_variant::install_standard_variants(&mut vm);
         module::install_std(&mut vm);
         if vm.mn_parallel {
             let started = vm.spawn_helper_workers();
@@ -1674,7 +1687,7 @@ impl Vm {
 
     /// 清掉顶层 `const` 绑定并回到入口，使同一已加载程序可再跑一遍。
     ///
-    /// 保留 M:N worker 池。`reset_execution` 不够：`const let` 仍在 `const_names` 里。
+    /// 保留 M:N worker 池。`reset_execution` 不够：`const` 仍在 `const_names` 里。
     pub fn reset_script_bindings(&mut self) {
         self.reset_execution();
         self.const_names.clear();
@@ -4525,14 +4538,10 @@ impl Vm {
                 let val = self
                     .pop()
                     .map_err(|_| RuntimeError::msg("internal: BindFast with empty stack"))?;
-                if self.locals_stack.is_empty() {
-                    return Err(RuntimeError::type_err(
-                        "internal: BindFast requires an active local frame",
-                    ));
-                }
-                let frame = self.locals_stack.len() - 1;
                 self.local_set(slot, val);
-                self.scope_name_map_mut(frame).insert(name.clone(), slot);
+                if let Some(frame) = self.locals_stack.len().checked_sub(1) {
+                    self.scope_name_map_mut(frame).insert(name.clone(), slot);
+                }
                 if is_const {
                     self.const_names.insert(name);
                     self.has_const_names = true;
@@ -4999,13 +5008,22 @@ impl Vm {
             }
             StepAction::IsList => {
                 let v = self.pop()?;
-                self.push_bool(matches!(v, Value::List(_) | Value::Tuple(_)));
+                let is_list = match &v {
+                    Value::List(_) | Value::Tuple(_) => true,
+                    Value::Frozen(f) => matches!(f.as_ref(), FrozenValue::List(_)),
+                    _ => false,
+                };
+                self.push_bool(is_list);
             }
             StepAction::ListLen => {
                 let v = self.pop()?;
                 let n = match &v {
                     Value::List(lst) => lst.borrow().len(),
                     Value::Tuple(t) => t.len(),
+                    Value::Frozen(f) => match f.as_ref() {
+                        FrozenValue::List(items) => items.len(),
+                        _ => return Err(RuntimeError::type_err("ListLen requires list or tuple")),
+                    },
                     _ => return Err(RuntimeError::type_err("ListLen requires list or tuple")),
                 };
                 self.push_int(n as i64);
@@ -5445,12 +5463,14 @@ impl Vm {
     /// 拒绝向以 `const` 绑定的槽执行 `StoreFast`（热/冷路径共用）。
     #[inline(always)]
     fn reject_const_fast_store(&self, slot: usize) -> Result<()> {
-        if !self.has_const_names {
+        if !self.has_const_names && !self.has_pending_const {
             return Ok(());
         }
         if let Some(map) = self.name_to_slot.last().and_then(|m| m.as_ref()) {
             for (name, &s) in map {
-                if s == slot && self.const_names.contains(name) {
+                if s == slot
+                    && (self.const_names.contains(name) || self.pending_const.contains(name))
+                {
                     return Err(RuntimeError::msg(format!(
                         "cannot assign to const binding: {name}"
                     )));
@@ -5461,11 +5481,6 @@ impl Vm {
     }
 
     fn store_name(&mut self, name: &str, val: Value) -> Result<()> {
-        if self.const_names.contains(name) {
-            return Err(RuntimeError::msg(format!(
-                "cannot assign to const binding: {name}"
-            )));
-        }
         for i in (0..self.name_to_slot.len()).rev() {
             if let Some(map) = &self.name_to_slot[i] {
                 if let Some(slot) = map.get(name) {
@@ -5483,6 +5498,13 @@ impl Vm {
                     return Ok(());
                 }
             }
+        }
+        // Local bindings may shadow immutable globals. Resolve locals before
+        // applying the module/global immutability guard.
+        if self.const_names.contains(name) {
+            return Err(RuntimeError::msg(format!(
+                "cannot assign to const binding: {name}"
+            )));
         }
         self.store_global_by_name(name, val);
         self.finalize_const_init(name);
@@ -8071,6 +8093,7 @@ impl Vm {
             dep_map: self.dep_map.clone(),
             current_package_id: self.current_package_id.clone(),
             package_root: self.package_root.clone(),
+            bundle: self.bundle.clone(),
             overload_tables: self.overload_tables.clone(),
             primitive_methods: self.primitive_methods.clone(),
             user_call_frames: Vec::new(),
@@ -9710,6 +9733,18 @@ fn index_value(vm: &mut Vm, obj: &Value, idx: &Value) -> Result<Value> {
             }
             Ok(t[idx as usize].clone())
         }
+        (Value::Frozen(frozen), Value::Num(n)) => match frozen.as_ref() {
+            FrozenValue::List(items) => {
+                let i = num_to_isize(n)?;
+                let len = items.len() as isize;
+                let index = if i < 0 { len + i } else { i };
+                if index < 0 || index >= len {
+                    return Err(RuntimeError::index_err("index out of range"));
+                }
+                Ok(items[index as usize].clone())
+            }
+            _ => Err(RuntimeError::unsupported("unsupported index operation")),
+        },
         (Value::Bytes(b), Value::Num(n)) => {
             let i = num_to_isize(n)?;
             let len = b.len() as isize;
@@ -9736,6 +9771,17 @@ fn index_value(vm: &mut Vm, obj: &Value, idx: &Value) -> Result<Value> {
                 .cloned()
                 .ok_or_else(|| RuntimeError::key_err("key not found"))
         }
+        (Value::Frozen(frozen), key) => match frozen.as_ref() {
+            FrozenValue::Dict(items) => {
+                let key = ValueKey::from_value(key)?;
+                items
+                    .iter()
+                    .find(|(candidate, _)| candidate == &key)
+                    .map(|(_, value)| value.clone())
+                    .ok_or_else(|| RuntimeError::key_err("key not found"))
+            }
+            _ => Err(RuntimeError::unsupported("unsupported index operation")),
+        },
         (Value::Struct(_), _) => vm.call_struct_method(obj, "__getitem__", vec![idx.clone()]),
         (Value::GenericFunction(template), idx) => {
             let type_args = type_args_from_runtime_index(idx)?;
@@ -9793,6 +9839,14 @@ fn slice_get(vm: &mut Vm, obj: &Value, start: &Value, end: &Value, step: &Value)
             let out: Vec<Value> = indices.into_iter().map(|i| t[i].clone()).collect();
             Ok(Value::Tuple(out.into()))
         }
+        Value::Frozen(frozen) => match frozen.as_ref() {
+            FrozenValue::List(items) => {
+                let indices = compute_slice_indices(items.len() as isize, start, end, step)?;
+                let out: Vec<Value> = indices.into_iter().map(|i| items[i].clone()).collect();
+                Ok(Value::Frozen(Arc::new(FrozenValue::List(out.into()))))
+            }
+            _ => Err(RuntimeError::unsupported("unsupported slice operation")),
+        },
         Value::Bytes(b) => {
             let len = b.len() as isize;
             let indices = compute_slice_indices(len, start, end, step)?;

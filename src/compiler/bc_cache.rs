@@ -16,7 +16,7 @@ use crate::ast::FuncParam;
 use crate::hot_code::HotCode;
 use crate::opcode::{CompiledProgram, FuncFlags, FunctionObject, Instruction, ModuleGlobalEnv};
 use crate::shared::SyncCell;
-use crate::value::{Num, Value};
+use crate::value::{value_key_to_value, FrozenValue, Num, Value, ValueKey};
 use crate::Result;
 
 const MAGIC: &[u8; 4] = b"TIVC";
@@ -26,6 +26,8 @@ const MAX_CACHE_BLOB: u32 = 16 * 1024 * 1024;
 /// 整文件上限。
 const MAX_CACHE_FILE: usize = 32 * 1024 * 1024;
 const MAX_CACHE_ITEMS: u32 = 1_000_000;
+/// Limit recursive constants such as nested tuples in untrusted cache files.
+const MAX_VALUE_DEPTH: usize = 128;
 
 static STORES: AtomicU64 = AtomicU64::new(0);
 static HITS: AtomicU64 = AtomicU64::new(0);
@@ -93,6 +95,14 @@ pub fn load(path: &Path) -> Option<CompiledProgram> {
         return None;
     }
     decode(&bytes).ok()
+}
+
+pub fn encode_program(prog: &CompiledProgram) -> Result<Vec<u8>> {
+    encode(prog)
+}
+
+pub fn decode_program(bytes: &[u8]) -> Result<CompiledProgram> {
+    decode(bytes)
 }
 
 pub fn store(path: &Path, prog: &CompiledProgram) -> bool {
@@ -349,6 +359,15 @@ fn read_ins_vec(r: &mut Cursor<&[u8]>) -> Result<Vec<Instruction>> {
 }
 
 fn encode_value(w: &mut Vec<u8>, v: &Value) -> Result<()> {
+    encode_value_at_depth(w, v, 0)
+}
+
+fn encode_value_at_depth(w: &mut Vec<u8>, v: &Value, depth: usize) -> Result<()> {
+    if depth > MAX_VALUE_DEPTH {
+        return Err(crate::error::RuntimeError::msg(
+            "cached constant nesting is too deep",
+        ));
+    }
     match v {
         Value::None => w.push(0),
         Value::Bool(b) => {
@@ -376,6 +395,41 @@ fn encode_value(w: &mut Vec<u8>, v: &Value) -> Result<()> {
             w.push(6);
             write_func(w, &f.name, f)?;
         }
+        Value::Num(n) => {
+            w.push(7);
+            write_str(w, &n.to_string());
+        }
+        Value::Tuple(items) => {
+            w.push(8);
+            write_u32(w, items.len() as u32);
+            for item in items.iter() {
+                encode_value_at_depth(w, item, depth + 1)?;
+            }
+        }
+        Value::Frozen(frozen) => match frozen.as_ref() {
+            FrozenValue::List(items) => {
+                w.push(9);
+                write_u32(w, items.len() as u32);
+                for item in items.iter() {
+                    encode_value_at_depth(w, item, depth + 1)?;
+                }
+            }
+            FrozenValue::Dict(items) => {
+                w.push(10);
+                write_u32(w, items.len() as u32);
+                for (key, value) in items.iter() {
+                    encode_value_at_depth(w, &value_key_to_value(key), depth + 1)?;
+                    encode_value_at_depth(w, value, depth + 1)?;
+                }
+            }
+            FrozenValue::Set(items) => {
+                w.push(11);
+                write_u32(w, items.len() as u32);
+                for key in items.iter() {
+                    encode_value_at_depth(w, &value_key_to_value(key), depth + 1)?;
+                }
+            }
+        },
         _ => {
             return Err(crate::error::RuntimeError::msg(
                 "uncacheable constant value",
@@ -386,6 +440,15 @@ fn encode_value(w: &mut Vec<u8>, v: &Value) -> Result<()> {
 }
 
 fn decode_value(r: &mut Cursor<&[u8]>) -> Result<Value> {
+    decode_value_at_depth(r, 0)
+}
+
+fn decode_value_at_depth(r: &mut Cursor<&[u8]>, depth: usize) -> Result<Value> {
+    if depth > MAX_VALUE_DEPTH {
+        return Err(crate::error::RuntimeError::msg(
+            "cached constant nesting is too deep",
+        ));
+    }
     match read_u8(r)? {
         0 => Ok(Value::None),
         1 => Ok(Value::Bool(read_u8(r)? != 0)),
@@ -402,6 +465,41 @@ fn decode_value(r: &mut Cursor<&[u8]>) -> Result<Value> {
         6 => {
             let (_name, f) = read_func(r)?;
             Ok(Value::Function(Arc::new(f)))
+        }
+        7 => Ok(Value::Num(Num::from_literal(&read_str(r)?)?)),
+        8 => {
+            let len = read_counted_len(r, MAX_CACHE_ITEMS)?;
+            let mut items = Vec::with_capacity(len);
+            for _ in 0..len {
+                items.push(decode_value_at_depth(r, depth + 1)?);
+            }
+            Ok(Value::Tuple(Arc::from(items.into_boxed_slice())))
+        }
+        9 => {
+            let len = read_counted_len(r, MAX_CACHE_ITEMS)?;
+            let mut items = Vec::with_capacity(len);
+            for _ in 0..len {
+                items.push(decode_value_at_depth(r, depth + 1)?);
+            }
+            Ok(Value::Frozen(Arc::new(FrozenValue::List(items.into()))))
+        }
+        10 => {
+            let len = read_counted_len(r, MAX_CACHE_ITEMS)?;
+            let mut items = Vec::with_capacity(len);
+            for _ in 0..len {
+                let key = ValueKey::from_value(&decode_value_at_depth(r, depth + 1)?)?;
+                let value = decode_value_at_depth(r, depth + 1)?;
+                items.push((key, value));
+            }
+            Ok(Value::Frozen(Arc::new(FrozenValue::Dict(items.into()))))
+        }
+        11 => {
+            let len = read_counted_len(r, MAX_CACHE_ITEMS)?;
+            let mut items = Vec::with_capacity(len);
+            for _ in 0..len {
+                items.push(ValueKey::from_value(&decode_value_at_depth(r, depth + 1)?)?);
+            }
+            Ok(Value::Frozen(Arc::new(FrozenValue::Set(items.into()))))
         }
         _ => Err(crate::error::RuntimeError::msg("bad cached value tag")),
     }
@@ -1045,7 +1143,7 @@ mod tests {
 
     #[test]
     fn roundtrip_script_fast_locals() {
-        let src = "let sum = 0\nsum = sum + 1\nsum\n";
+        let src = "var sum = 0\nsum = sum + 1\nsum\n";
         let prog = crate::compile(src).expect("compile");
         assert!(prog.script_frame_slots > 0);
         let bytes = encode(&prog).expect("encode");
@@ -1056,6 +1154,63 @@ mod tests {
         vm.load_program(back).expect("load");
         let v = vm.run().expect("run");
         assert_eq!(v.display_string(), "1");
+    }
+
+    #[test]
+    fn roundtrip_folded_const_tuple_and_wide_numbers() {
+        let src = r#"
+const func square(x) { return x * x }
+const BIG = 123456789012345678901234567890
+const RATIO = 1 / 3
+const RESULTS = (square(12), BIG, RATIO)
+RESULTS
+"#;
+        let prog = crate::compile(src).expect("compile const program");
+        assert!(!prog.functions.contains_key("square"));
+        assert!(!prog
+            .code
+            .iter()
+            .any(|ins| matches!(ins, Instruction::Call { .. })));
+
+        let dir = std::env::temp_dir().join(format!(
+            "optive_const_tivc_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).expect("create cache test dir");
+        let path = dir.join("const-results.tivc");
+        assert!(store(&path, &prog), "folded constants must be cacheable");
+        assert!(path.is_file(), "a .tivc file must be written");
+        let back = load(&path).expect("load folded constants from .tivc");
+        let mut vm = Vm::new();
+        vm.load_program(back).expect("load");
+        let value = vm.run().expect("run cached program");
+        assert_eq!(
+            value.display_string(),
+            "(144, 123456789012345678901234567890, 1/3)"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn roundtrip_frozen_compile_time_collections() {
+        let src = r#"
+const DATA = [[1, 2], {"answer": 42}, {3, 5}]
+DATA
+"#;
+        let prog = crate::compile(src).expect("compile frozen constants");
+        let bytes = encode(&prog).expect("encode frozen constants");
+        let back = decode(&bytes).expect("decode frozen constants");
+        let mut vm = Vm::new();
+        vm.load_program(back).expect("load");
+        let value = vm.run().expect("run");
+        assert_eq!(
+            value.display_string(),
+            "frozen[frozen[1, 2], frozen{\"answer\": 42}, frozenset{3, 5}]"
+        );
     }
 
     #[test]

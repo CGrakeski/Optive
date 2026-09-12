@@ -6,7 +6,9 @@
 /// 当前语言语义版本（主.次）。
 pub const LANGUAGE_VERSION: &str = "0.2";
 /// `.tivc` 磁盘格式号。布局变了就丢缓存；0.x 不读旧格式。
-pub const BYTECODE_FORMAT_VERSION: u16 = 2;
+pub const BYTECODE_FORMAT_VERSION: u16 = 4;
+/// `.tivb` 容器格式号。不读旧格式。
+pub const BUNDLE_FORMAT_VERSION: u32 = 1;
 /// 稳定 embedding facade 版本。
 pub const EMBED_API_VERSION: u16 = 1;
 

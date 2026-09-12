@@ -231,6 +231,7 @@ impl Parser {
             | TokenKind::KwReturn
             | TokenKind::KwBreak
             | TokenKind::KwContinue
+            | TokenKind::KwDefer
             | TokenKind::KwThrow
             | TokenKind::KwTry
             | TokenKind::KwStruct
@@ -337,10 +338,10 @@ impl Parser {
             decorators.extend(self.parse_decorator_prefix()?);
             self.expect(TokenKind::KwMake, "expected 'make' after with")?;
             if self.match_kind(TokenKind::KwFunc) {
-                return self.parse_func_decl(vis, decorators, false);
+                return self.parse_func_decl(vis, decorators, false, false);
             }
             if self.match_kind(TokenKind::KwGen) {
-                return self.parse_func_decl(vis, decorators, true);
+                return self.parse_func_decl(vis, decorators, true, false);
             }
             if self.check(TokenKind::KwDo) {
                 let loc = self.loc_here();
@@ -352,22 +353,19 @@ impl Parser {
             }
             return Err(self.error("expected 'func', 'gen', or 'do' after with make"));
         }
-        if self.match_kind(TokenKind::KwFunc) {
-            return self.parse_func_decl(vis, decorators, false);
+        if !is_const && self.match_kind(TokenKind::KwFunc) {
+            return self.parse_func_decl(vis, decorators, false, false);
         }
-        if self.match_kind(TokenKind::KwGen) {
-            return self.parse_func_decl(vis, decorators, true);
+        if !is_const && self.match_kind(TokenKind::KwGen) {
+            return self.parse_func_decl(vis, decorators, true, false);
         }
 
         if is_const {
-            // `const` 只能修饰 let/var；否则静默落到赋值会得到错误语义。
-            if self.match_kind(TokenKind::KwLet) {
-                return self.parse_var_or_destruct_decl(vis, true, false);
+            if self.match_kind(TokenKind::KwFunc) {
+                return self.parse_func_decl(vis, decorators, false, true);
             }
-            if self.match_kind(TokenKind::KwVar) {
-                return self.parse_var_or_destruct_decl(vis, true, true);
-            }
-            return Err(self.error("expected 'let' or 'var' after 'const'"));
+            // 常量声明是 `const NAME = expr`，不再接受冗余的 `const let/var`。
+            return self.parse_var_decl(vis, true, false);
         }
         if self.match_kind(TokenKind::KwLet) {
             return self.parse_var_or_destruct_decl(vis, false, false);
@@ -487,6 +485,9 @@ impl Parser {
         }
         if self.match_kind(TokenKind::KwContinue) {
             return Ok(Stmt::Continue);
+        }
+        if self.match_kind(TokenKind::KwDefer) {
+            return Ok(Stmt::Defer(self.parse_block()?));
         }
         if self.match_kind(TokenKind::KwThrow) {
             return Ok(Stmt::Throw(self.parse_expr()?));
@@ -1024,6 +1025,7 @@ impl Parser {
         visibility: Visibility,
         decorators: Vec<Expr>,
         is_generator: bool,
+        is_const: bool,
     ) -> Result<Stmt, ParseError> {
         let name = self
             .expect(TokenKind::Identifier, "expected function name")?
@@ -1043,6 +1045,7 @@ impl Parser {
         let body = self.parse_block()?;
         Ok(Stmt::FuncDecl {
             visibility,
+            is_const,
             decorators,
             name,
             type_params,
@@ -2799,6 +2802,14 @@ impl Parser {
                         }
                     }
                 }
+            } else if self.match_kind(TokenKind::Question) {
+                let loc = expr.loc;
+                expr = Expr::new(
+                    loc,
+                    ExprKind::TryPropagate {
+                        operand: Box::new(expr),
+                    },
+                );
             } else {
                 break;
             }

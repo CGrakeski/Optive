@@ -91,9 +91,6 @@ pub enum ResolveError {
         prev: String,
         id: String,
     },
-    LocalDepsConflict {
-        name: Option<String>,
-    },
     CorruptLock {
         name: String,
         package_id: String,
@@ -121,14 +118,6 @@ impl std::fmt::Display for ResolveError {
             } => write!(
                 f,
                 "dependency conflict: ({parent}, {name}) maps to both {prev} and {id}"
-            ),
-            Self::LocalDepsConflict { name: Some(n) } => write!(
-                f,
-                "OPTIVE_USE_LOCAL_DEPS cannot express two versions of `{n}`; unset the env and use CAS"
-            ),
-            Self::LocalDepsConflict { name: None } => write!(
-                f,
-                "OPTIVE_USE_LOCAL_DEPS cannot express two versions; unset env"
             ),
             Self::CorruptLock {
                 name,
@@ -275,13 +264,6 @@ fn ensure_from_queue(
             // dry-run 不落盘，但给出 pack「将会占用」的真实 CAS 路径（由 id 决定，无需克隆）。
             (home::pack_dir().join(&id), None)
         } else if home::use_local_deps() {
-            if let Some(prev) = local_name_ids.get(&name) {
-                if prev != &id {
-                    return Err(ResolveError::LocalDepsConflict {
-                        name: Some(name.clone()),
-                    });
-                }
-            }
             local_name_ids.insert(name.clone(), id.clone());
             let pack =
                 store::ensure_local_pack(&project.deps_dir(), &name, &source, &commit, None)?;
@@ -429,11 +411,6 @@ fn ensure_from_lock(
             content_digest: &edge.content_digest,
         };
         let path = if home::use_local_deps() {
-            if let Some(prev) = local_name_ids.get(&edge.name) {
-                if prev != &edge.package_id {
-                    return Err(ResolveError::LocalDepsConflict { name: None });
-                }
-            }
             local_name_ids.insert(edge.name.clone(), edge.package_id.clone());
             let pack = store::ensure_local_pack(
                 &project.deps_dir(),
@@ -553,11 +530,6 @@ fn materialize_lock_subtree(
         let path = if dry {
             home::pack_dir().join(&edge.package_id)
         } else if home::use_local_deps() {
-            if let Some(prev) = local_name_ids.get(&edge.name) {
-                if prev != &edge.package_id {
-                    return Err(ResolveError::LocalDepsConflict { name: None });
-                }
-            }
             local_name_ids.insert(edge.name.clone(), edge.package_id.clone());
             let pack = store::ensure_local_pack(
                 &project.deps_dir(),

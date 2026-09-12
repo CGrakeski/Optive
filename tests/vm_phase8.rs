@@ -26,7 +26,7 @@ add(5)
 fn closure_capture_is_shared_mutable() {
     assert_num(
         r"
-let n = 1
+var n = 1
 let get = do() { return n }
 n = 5
 get()
@@ -39,7 +39,7 @@ get()
 fn closure_mutates_outer_binding() {
     assert_num(
         r"
-let n = 1
+var n = 1
 let inc = do() { n = n + 1 }
 inc()
 n
@@ -53,7 +53,7 @@ fn closure_captures_function_local() {
     assert_num(
         r"
 func outer() {
-    let x = 1
+    var x = 1
     let inner = do() { return x }
     x = 2
     return inner()
@@ -69,7 +69,7 @@ fn nested_func_captures_outer_local() {
     assert_num(
         r"
 func outer() {
-    let x = 1
+    var x = 1
     func inner() {
         return x
     }

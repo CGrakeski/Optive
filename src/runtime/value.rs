@@ -11,7 +11,7 @@ use crate::opcode::FunctionObject;
 use crate::opcode::MacroObject;
 use crate::runtime_ast::RuntimeAstNode;
 use crate::shared::{Shared, SyncCell};
-use crate::{error, Result};
+use crate::Result;
 
 /// `Num::{floor,ceil,trunc,round}_num`：整数原样，有理数走 `BigRational` 对应方法。
 macro_rules! num_rat_round {
@@ -337,16 +337,6 @@ impl ModuleObject {
             Value::Cell(c) => c.borrow().clone(),
             other => other,
         })
-    }
-
-    fn make_visible(&self, name: &str) -> Result<Value> {
-        if self.all_attrs.contains_key(name) {
-            Ok(self.all_attrs.get(name).unwrap().clone())
-        } else {
-            Err(error::RuntimeError::attr_err(
-                format!("No attr named `{}` found in `{}`", name, self.name)
-            ))
-        }
     }
 }
 
@@ -809,6 +799,54 @@ pub enum SyncGuardInner {
     Write { mu: Shared<SyncInner> },
 }
 
+/// Deeply immutable collection produced by compile-time execution. It keeps
+/// list/dict/set behaviour without exposing the shared mutable cells used by
+/// their runtime counterparts.
+#[derive(Clone)]
+pub enum FrozenValue {
+    List(Arc<[Value]>),
+    Dict(Arc<[(ValueKey, Value)]>),
+    Set(Arc<[ValueKey]>),
+}
+
+impl FrozenValue {
+    fn type_name(&self) -> &'static str {
+        match self {
+            Self::List(_) => "frozenlist",
+            Self::Dict(_) => "frozendict",
+            Self::Set(_) => "frozenset",
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::List(v) => v.is_empty(),
+            Self::Dict(v) => v.is_empty(),
+            Self::Set(v) => v.is_empty(),
+        }
+    }
+
+    fn display_string(&self) -> String {
+        match self {
+            Self::List(v) => {
+                let parts: Vec<_> = v.iter().map(Value::display_string).collect();
+                format!("frozen[{}]", parts.join(", "))
+            }
+            Self::Dict(v) => {
+                let parts: Vec<_> = v
+                    .iter()
+                    .map(|(k, v)| format!("{}: {}", key_display(k), v.display_string()))
+                    .collect();
+                format!("frozen{{{}}}", parts.join(", "))
+            }
+            Self::Set(v) => {
+                let parts: Vec<_> = v.iter().map(key_display).collect();
+                format!("frozenset{{{}}}", parts.join(", "))
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub enum Value {
     None,
@@ -827,6 +865,7 @@ pub enum Value {
     Dict(Shared<DictMap>),
     /// 可哈希值的有序集合。空集展示为 `{,}`（`{}` 仍是空字典）。
     Set(Shared<SetMap>),
+    Frozen(Arc<FrozenValue>),
     /// 不可变定长序列。空元组为 `()`。
     Tuple(Arc<[Self]>),
     /// 原始字节缓冲（非 Unicode 文本）。
@@ -1038,6 +1077,7 @@ impl Value {
             Self::List(_) => "list",
             Self::Dict(_) => "dict",
             Self::Set(_) => "set",
+            Self::Frozen(v) => v.type_name(),
             Self::Tuple(_) => "tuple",
             Self::Bytes(_) => "bytes",
             Self::Iterator(_) => "iterator",
@@ -1095,6 +1135,7 @@ impl Value {
             Self::List(v) => !v.borrow().is_empty(),
             Self::Dict(d) => !d.borrow().is_empty(),
             Self::Set(s) => !s.borrow().is_empty(),
+            Self::Frozen(v) => !v.is_empty(),
             Self::Tuple(t) => !t.is_empty(),
             Self::Bytes(b) => !b.is_empty(),
             Self::Cell(c) => c.borrow().is_truthy(),
@@ -1133,6 +1174,7 @@ impl Value {
                     format!("{{{}}}", parts.join(", "))
                 }
             }
+            Self::Frozen(v) => v.display_string(),
             Self::Tuple(t) => {
                 let parts: Vec<_> = t.iter().map(Self::display_string).collect();
                 if t.len() == 1 {
@@ -1338,6 +1380,7 @@ impl Value {
                 }
                 Ok(true)
             }
+            (Self::Frozen(a), Self::Frozen(b)) => frozen_values_equal(a, b),
             (Self::Dict(a), Self::Dict(b)) => {
                 let aa = a.borrow();
                 let bb = b.borrow();
@@ -1420,6 +1463,7 @@ pub fn values_identical(a: &Value, b: &Value) -> bool {
         (Value::Dict(x), Value::Dict(y)) => Shared::ptr_eq(x, y),
         (Value::Set(x), Value::Set(y)) => Shared::ptr_eq(x, y),
         (Value::Tuple(x), Value::Tuple(y)) => Arc::ptr_eq(x, y),
+        (Value::Frozen(x), Value::Frozen(y)) => Arc::ptr_eq(x, y),
         (Value::Bytes(x), Value::Bytes(y)) => Arc::ptr_eq(x, y),
         (Value::Struct(x), Value::Struct(y)) => Arc::ptr_eq(x, y),
         (Value::Iterator(x), Value::Iterator(y)) => Shared::ptr_eq(x, y),
@@ -1443,6 +1487,40 @@ pub fn values_identical(a: &Value, b: &Value) -> bool {
         (Value::Variant(x), Value::Variant(y)) => Arc::ptr_eq(x, y),
         (Value::Layout(x), Value::Layout(y)) => Arc::ptr_eq(x, y),
         _ => false,
+    }
+}
+
+fn frozen_values_equal(a: &FrozenValue, b: &FrozenValue) -> Result<bool> {
+    match (a, b) {
+        (FrozenValue::List(a), FrozenValue::List(b)) => {
+            if a.len() != b.len() {
+                return Ok(false);
+            }
+            for (left, right) in a.iter().zip(b.iter()) {
+                if !left.eq(right)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        (FrozenValue::Dict(a), FrozenValue::Dict(b)) => {
+            if a.len() != b.len() {
+                return Ok(false);
+            }
+            for (key, left) in a.iter() {
+                let Some((_, right)) = b.iter().find(|(candidate, _)| candidate == key) else {
+                    return Ok(false);
+                };
+                if !left.eq(right)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        (FrozenValue::Set(a), FrozenValue::Set(b)) => {
+            Ok(a.len() == b.len() && a.iter().all(|key| b.contains(key)))
+        }
+        _ => Ok(false),
     }
 }
 
@@ -1915,6 +1993,22 @@ pub fn value_to_iterable(v: &Value) -> crate::Result<IteratorState> {
         Value::Iterator(it) => Ok(it.borrow().clone()),
         Value::List(list) => Ok(IteratorState::from_list(list.borrow().clone())),
         Value::Tuple(t) => Ok(IteratorState::from_list(t.to_vec())),
+        Value::Frozen(frozen) => match frozen.as_ref() {
+            FrozenValue::List(items) => Ok(IteratorState::from_list(items.to_vec())),
+            FrozenValue::Set(items) => Ok(IteratorState::from_list(
+                items.iter().map(value_key_to_value).collect(),
+            )),
+            FrozenValue::Dict(items) => Ok(IteratorState::from_list(
+                items
+                    .iter()
+                    .map(|(key, value)| {
+                        Value::Frozen(Arc::new(FrozenValue::List(
+                            vec![value_key_to_value(key), value.clone()].into(),
+                        )))
+                    })
+                    .collect(),
+            )),
+        },
         Value::Set(s) => {
             let items: Vec<Value> = s.borrow().iter().map(value_key_to_value).collect();
             Ok(IteratorState::from_list(items))
@@ -2004,6 +2098,31 @@ pub fn hash_value(v: &Value) -> crate::Result<i64> {
             let mut h: i64 = 0x9e37_79b9;
             for elem in t.iter() {
                 h = h.wrapping_mul(31).wrapping_add(hash_value(elem)?);
+            }
+            Ok(h)
+        }
+        Value::Frozen(frozen) => {
+            let mut h: i64 = 0x517c_c1b7;
+            match frozen.as_ref() {
+                FrozenValue::List(items) => {
+                    for value in items.iter() {
+                        h = h.wrapping_mul(31).wrapping_add(hash_value(value)?);
+                    }
+                }
+                FrozenValue::Dict(items) => {
+                    for (key, value) in items.iter() {
+                        h = h
+                            .wrapping_mul(31)
+                            .wrapping_add(hash_value(&value_key_to_value(key))?)
+                            .wrapping_mul(31)
+                            .wrapping_add(hash_value(value)?);
+                    }
+                }
+                FrozenValue::Set(items) => {
+                    for key in items.iter() {
+                        h ^= hash_value(&value_key_to_value(key))?;
+                    }
+                }
             }
             Ok(h)
         }

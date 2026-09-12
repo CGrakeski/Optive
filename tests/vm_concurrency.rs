@@ -247,10 +247,10 @@ n
 fn once_do_runs_once() {
     assert_num(
         r"
-let o = Once()
-let counter = Mutex(0)
+var o = Once()
+var counter = Mutex(0)
 func bump() {
-  let g = counter.lock()
+  var g = counter.lock()
   g.set(g.get() + 1)
   let v = g.get()
   g.unlock()
@@ -258,7 +258,7 @@ func bump() {
 }
 let a = o.run(bump)
 let b = o.run(bump)
-let g = counter.lock()
+var g = counter.lock()
 let n = g.get()
 g.unlock()
 a + b + n

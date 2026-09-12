@@ -276,7 +276,7 @@ struct Count {
 }
 var s = 0
 for (x in Count(0, 4)) { s = s + x }
-let hit = 0
+var hit = 0
 if (2 in Count(0, 3)) { hit = 100 }
 s + hit
 "#,

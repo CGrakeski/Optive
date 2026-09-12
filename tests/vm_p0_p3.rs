@@ -51,7 +51,7 @@ fn p0_range_returns_iterator() {
 fn p0_for_in_iterator() {
     assert_num(
         r"
-let total = 0
+var total = 0
 for (x in std.math.range(3)) { total = total + x }
 total
 ",
@@ -95,7 +95,7 @@ hash("ab")
 fn p0_traceback_on_throw() {
     let v = value(
         r#"
-let tb = none
+var tb = none
 try {
     throw ValueError("boom")
 } catch (e) {
@@ -111,7 +111,7 @@ type(tb)
 fn p1_parallel_for() {
     assert_num(
         r"
-let total = 0
+var total = 0
 for (x in [1, 2], y in [10, 20]) { total = total + x + y }
 total
 ",
@@ -302,14 +302,18 @@ fn p3_repl_continuation_detection() {
     assert!(repl_needs_continuation(r#"f"value {x}"#));
     assert!(repl_needs_continuation(r#"b"bytes"#));
     assert!(repl_needs_continuation(r#""""triple"#));
+    assert!(repl_needs_continuation("let x ="));
+    assert!(repl_needs_continuation("1 +"));
+    assert!(repl_needs_continuation("func f()"));
     assert!(!repl_needs_continuation("/* block */"));
     assert!(!repl_needs_continuation("1 + 2"));
+    assert!(!repl_needs_continuation("let = 1"));
 }
 
 #[test]
 fn p3_repl_persistent_globals() {
     let mut vm = Vm::new();
-    run_source_in_vm(&mut vm, "let acc = 0", "<repl>").unwrap();
+    run_source_in_vm(&mut vm, "var acc = 0", "<repl>").unwrap();
     run_source_in_vm(&mut vm, "acc = acc + 5", "<repl>").unwrap();
     let v = run_source_in_vm(&mut vm, "acc", "<repl>").unwrap();
     assert_eq!(v.display_string(), "5");
@@ -357,7 +361,7 @@ assert_raises(do() { return 1 }, ValueError)
 fn complete_traceback_has_source_line() {
     let v = value(
         r#"
-let tb = none
+var tb = none
 try {
     throw ValueError("bad")
 } catch (e: ValueError) {

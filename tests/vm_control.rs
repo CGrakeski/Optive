@@ -40,8 +40,8 @@ fn nested_if() {
 fn while_sum() {
     assert_num(
         r"
-let sum = 0
-let i = 0
+var sum = 0
+var i = 0
 while (i < 5) {
     sum = sum + i
     i = i + 1
@@ -68,7 +68,7 @@ x
 fn loop_counted() {
     assert_num(
         r"
-let n = 0
+var n = 0
 loop (5) { n = n + 1 }
 n
 ",
@@ -80,7 +80,7 @@ n
 fn loop_zero() {
     assert_num(
         r"
-let n = 0
+var n = 0
 loop (0) { n = n + 1 }
 n
 ",
@@ -92,7 +92,7 @@ n
 fn loop_break() {
     assert_num(
         r"
-let n = 0
+var n = 0
 loop {
     n = n + 1
     if (n == 3) { break }
@@ -107,7 +107,7 @@ n
 fn loop_counted_break() {
     assert_num(
         r"
-let n = 0
+var n = 0
 loop (10) {
     n = n + 1
     if (n == 3) { break }
@@ -122,8 +122,8 @@ n
 fn loop_continue() {
     assert_num(
         r"
-let sum = 0
-let i = 0
+var sum = 0
+var i = 0
 loop (5) {
     i = i + 1
     if (i == 3) { continue }
@@ -155,7 +155,7 @@ f()
 fn nested_counted_loops() {
     assert_num(
         r"
-let n = 0
+var n = 0
 loop (3) {
     loop (4) {
         n = n + 1
@@ -171,7 +171,7 @@ n
 fn for_in_list() {
     assert_num(
         r"
-let sum = 0
+var sum = 0
 for (x in [1, 2, 3, 4]) { sum = sum + x }
 sum
 ",
@@ -183,7 +183,7 @@ sum
 fn for_in_text() {
     assert_num(
         r#"
-let n = 0
+var n = 0
 for (c in "abc") { n = n + 1 }
 n
 "#,

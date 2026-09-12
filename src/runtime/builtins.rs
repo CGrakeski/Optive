@@ -65,10 +65,57 @@ pub fn install_globals(vm: &mut Vm) {
         ("__variant_payload__", builtin_variant_payload),
         ("__struct_slot__", builtin_struct_slot),
         ("__finalize_enum__", builtin_finalize_enum),
+        ("__try_failed__", builtin_try_failed),
+        ("__try_unwrap__", builtin_try_unwrap),
     ];
     for (name, f) in builtins {
         vm.globals.insert(name.into(), Value::builtin_fn(name, f));
     }
+}
+
+fn standard_try_case(value: &Value) -> Option<(&str, &Value)> {
+    let Value::Struct(instance) = value else {
+        return None;
+    };
+    let (variant, case) = instance.def.name.split_once('\u{1f}')?;
+    matches!(variant, "std.variants.Result" | "std.variants.Option").then_some((case, value))
+}
+
+fn builtin_try_failed(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(crate::error::RuntimeError::type_err("internal ? arity"));
+    }
+    let Some((case, _)) = standard_try_case(&args[0]) else {
+        return Err(crate::error::RuntimeError::type_err(
+            "? expects std.variants.Result or std.variants.Option",
+        ));
+    };
+    Ok(Value::Bool(matches!(case, "Err" | "None")))
+}
+
+fn builtin_try_unwrap(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(crate::error::RuntimeError::type_err("internal ? arity"));
+    }
+    let Some((case, value)) = standard_try_case(&args[0]) else {
+        return Err(crate::error::RuntimeError::type_err(
+            "? expects std.variants.Result or std.variants.Option",
+        ));
+    };
+    if !matches!(case, "Ok" | "Some") {
+        return Err(crate::error::RuntimeError::type_err(
+            "internal: attempted to unwrap a failed ? value",
+        ));
+    }
+    let Value::Struct(instance) = value else {
+        unreachable!()
+    };
+    Ok(instance
+        .slots
+        .borrow()
+        .first()
+        .cloned()
+        .unwrap_or(Value::None))
 }
 fn builtin_print(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let out = crate::value::args_join_space(args);

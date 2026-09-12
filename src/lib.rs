@@ -19,7 +19,8 @@ pub mod stdlib;
 pub mod versions;
 
 pub use compiler::{
-    bc_cache, codegen, free_vars, hot_code, monomorph, opcode, protocol, specialize, stack_effect,
+    bc_cache, bundle, codegen, const_effect, const_eval, const_imports, free_vars, hot_code,
+    module_interface, module_resolve, monomorph, opcode, protocol, specialize, stack_effect,
 };
 pub use frontend::{ast, diagnostics, error, fmt, lexer, parser, token};
 pub use runtime::{
@@ -53,6 +54,28 @@ pub fn compile(source: &str) -> Result<opcode::CompiledProgram> {
     Generator::new().compile(&program)
 }
 
+pub fn compile_with_const_values(
+    source: &str,
+    values: std::collections::HashMap<String, value::Value>,
+) -> Result<opcode::CompiledProgram> {
+    compile_with_const_imports(
+        source,
+        const_eval::ConstImports {
+            values,
+            modules: Default::default(),
+        },
+    )
+}
+
+pub fn compile_with_const_imports(
+    source: &str,
+    imports: const_eval::ConstImports,
+) -> Result<opcode::CompiledProgram> {
+    let program = P::parse(source)
+        .map_err(|e| RuntimeError::msg(diagnostics::format_parse_error(source, "<compile>", &e)))?;
+    Generator::new().compile_with_const_imports(&program, imports)
+}
+
 /// 使用运行时上下文编译源码，并在装载前补齐调试与覆盖率元数据。
 ///
 /// 调用方仍负责设置 `Vm` 的当前源码上下文，并决定何时 `load_program`。
@@ -61,6 +84,10 @@ pub fn compile_with_context(
     source: &str,
     file: &str,
 ) -> Result<opcode::CompiledProgram> {
+    let program = P::parse(source)
+        .map_err(|e| RuntimeError::msg(diagnostics::format_parse_error(source, file, &e)))?;
+    let imports = const_imports::collect(&program, &VmConstSource(vm), &mut Default::default())
+        .map_err(RuntimeError::msg)?;
     let mut compiled = if bc_cache::should_use(file) && !vm.caps.fs_restricted() {
         let mut dep_ids: Vec<String> = vm.dep_map.values().map(|d| d.id.clone()).collect();
         dep_ids.sort();
@@ -68,30 +95,70 @@ pub fn compile_with_context(
             &crate::versions::bytecode_cache_version(),
             file,
             source,
-            &dep_ids.join(","),
+            &format!(
+                "{}\0{}",
+                dep_ids.join(","),
+                const_imports::fingerprint(&imports)
+            ),
         );
         let path = crate::bc_cache::cache_dir().join(format!("{key}.tivc"));
         if let Some(cached) = bc_cache::load(&path) {
             crate::bc_cache::note_hit();
             cached
         } else {
-            let program = P::parse(source).map_err(|e| {
-                RuntimeError::msg(diagnostics::format_parse_error(source, file, &e))
-            })?;
-            let compiled = Generator::new().compile(&program)?;
+            let compiled = Generator::new().compile_with_const_imports(&program, imports)?;
             if crate::bc_cache::store(&path, &compiled) {
                 crate::bc_cache::note_store();
             }
             compiled
         }
     } else {
-        let program = P::parse(source)
-            .map_err(|e| RuntimeError::msg(diagnostics::format_parse_error(source, file, &e)))?;
-        Generator::new().compile(&program)?
+        Generator::new().compile_with_const_imports(&program, imports)?
     };
     diagnostics::attach_function_sources(&mut compiled, source, file);
     crate::coverage::note_compiled(vm, file, &compiled);
     Ok(compiled)
+}
+
+struct VmConstSource<'a>(&'a vm::Vm);
+
+impl const_imports::ConstImportSource for VmConstSource<'_> {
+    fn package_id(&self) -> &str {
+        &self.0.current_package_id
+    }
+
+    fn package_root(&self) -> Option<&std::path::Path> {
+        self.0.package_root.as_deref()
+    }
+
+    fn import_base(&self) -> &std::path::Path {
+        &self.0.import_base
+    }
+
+    fn is_builtin(&self, name: &str) -> bool {
+        module_resolve::is_builtin_or_host_root(name, self.0.builtin_modules.keys())
+    }
+
+    fn dep(&self, parent: &str, name: &str) -> Option<(std::path::PathBuf, String)> {
+        self.0
+            .dep_map
+            .get(&(parent.to_string(), name.to_string()))
+            .map(|binding| (binding.path.clone(), binding.id.clone()))
+    }
+
+    fn is_file(&self, path: &std::path::Path) -> bool {
+        self.0
+            .caps
+            .lookup_is_file("const import", path)
+            .unwrap_or(false)
+    }
+
+    fn read(&self, path: &std::path::Path) -> std::result::Result<String, String> {
+        self.0
+            .caps
+            .read_to_string("const import", path)
+            .map_err(|error| error.to_string())
+    }
 }
 
 pub fn run_source(source: &str) -> Result<value::Value> {
@@ -153,7 +220,31 @@ fn format_runtime_error(
 /// REPL 辅助：复用 lexer 的 incomplete-input 状态。
 #[must_use]
 pub fn repl_needs_continuation(source: &str) -> bool {
-    lexer::input_status(source).is_incomplete()
+    if lexer::input_status(source).is_incomplete() {
+        return true;
+    }
+    let Err(ParseError::Message {
+        line,
+        column,
+        message,
+    }) = parser::Parser::parse(source)
+    else {
+        return false;
+    };
+    // A parser error at the end of the current cell usually means the user has
+    // entered a valid prefix (`1 +`, `let x =`, `func f()`) and should receive
+    // a continuation prompt instead of an immediate error. Errors before EOF
+    // remain complete so malformed input is reported without trapping the REPL.
+    let end_line = source.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let end_column = source
+        .rsplit_once('\n')
+        .map_or(source, |(_, tail)| tail)
+        .chars()
+        .count()
+        + 1;
+    line == end_line
+        && column >= end_column
+        && (message.starts_with("expected ") || message.contains("unterminated"))
 }
 
 /// 运行源码并返回数值结果字符串（测试用）。

@@ -81,11 +81,11 @@ fn dual_sleep_source(ms: u32) -> String {
     format!(
         r#"
 use std.language.{{ C }}
-let h = C.frompath({path})
+var h = C.frompath({path})
 extern(h, "sleep_ms_a") func sleep_a(implicit ms: C.types.uint32_t) ...
 extern(h, "sleep_ms_b") func sleep_b(implicit ms: C.types.uint32_t) ...
-let t1 = go sleep_a({ms})
-let t2 = go sleep_b({ms})
+var t1 = go sleep_a({ms})
+var t2 = go sleep_b({ms})
 await t1
 await t2
 1
@@ -167,7 +167,7 @@ fn offload_pool_lets_other_fibers_progress() {
     let src = format!(
         r#"
 use std.language.{{ C }}
-let h = C.frompath({path})
+var h = C.frompath({path})
 extern(h, "sleep_ms") func sleep_ms(implicit ms: C.types.uint32_t) ...
 var progressed = 0
 let sleeper = go sleep_ms(300)

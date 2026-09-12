@@ -200,7 +200,7 @@ fn const_local_still_rejects_assign() {
     common::run_err(
         r"
 func f() {
-  const let x = 1
+  const x = 1
   x = 2
   return x
 }
@@ -226,7 +226,7 @@ x + 1
 fn script_unescaped_arith_fuses_add_imm_store() {
     let prog = compile(
         r"
-let sum = 0
+var sum = 0
 loop (10) {
     sum = sum + 1
 }
@@ -236,7 +236,7 @@ sum
     .expect("compile");
     assert!(
         prog.script_frame_slots > 0,
-        "unescaped script let should open a script frame"
+        "unescaped script var should open a script frame"
     );
     assert!(
         prog.code
@@ -252,8 +252,8 @@ sum
 fn script_add_store_fuses_two_fast_locals() {
     let prog = compile(
         r"
-let a = 1
-let b = 2
+var a = 1
+var b = 2
 a = a + b
 a
 ",
@@ -272,7 +272,7 @@ a
 fn escaped_script_name_stays_global() {
     let prog = compile(
         r"
-let n = 1
+var n = 1
 func f() { return n }
 n = 2
 f()
