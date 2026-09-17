@@ -8,9 +8,9 @@ on:
       - "docs/**"
       - "LICENSE"
   pull_request:
-  schedule:
+  #schedule:
     # 可选 nightly：concurrent GC 正确性（不改默认模式）
-    - cron: "0 6 * * *"
+    #- cron: "0 6 * * *"
   workflow_dispatch:
 
 env:
