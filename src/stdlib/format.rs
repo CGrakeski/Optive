@@ -71,12 +71,37 @@ pub(super) fn format_join(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         ));
     }
     let sep = expect_text("join", args, 0)?;
+    if let Value::List(items) = &args[1] {
+        let items = items.borrow();
+        let estimated = items
+            .iter()
+            .map(|item| match item {
+                Value::Text(text) => text.len(),
+                _ => 0,
+            })
+            .sum::<usize>()
+            .saturating_add(sep.len().saturating_mul(items.len().saturating_sub(1)));
+        let mut output = String::with_capacity(estimated);
+        for (index, item) in items.iter().enumerate() {
+            if index != 0 {
+                output.push_str(&sep);
+            }
+            match item {
+                Value::Text(text) => output.push_str(text),
+                other => output.push_str(&other.print_string()),
+            }
+        }
+        return Ok(Value::Text(output));
+    }
     let items = value_to_list(&args[1])?;
-    let parts: Vec<String> = items
-        .iter()
-        .map(crate::runtime::value::Value::print_string)
-        .collect();
-    Ok(Value::Text(parts.join(&sep)))
+    let mut output = String::new();
+    for (index, item) in items.iter().enumerate() {
+        if index != 0 {
+            output.push_str(&sep);
+        }
+        output.push_str(&item.print_string());
+    }
+    Ok(Value::Text(output))
 }
 
 pub(super) fn format_format_num(_vm: &mut Vm, args: &[Value]) -> Result<Value> {

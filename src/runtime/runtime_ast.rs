@@ -424,31 +424,36 @@ pub fn ast_from_stmt(stmt: &Stmt) -> RuntimeAstNode {
             node.stmts = std::mem::take(&mut elif_stmts);
             node
         }
-        Stmt::While { cond, body } => RuntimeAstNode {
+        Stmt::While { label, cond, body } => RuntimeAstNode {
             kind: AstNodeKind::WhileStmt,
+            text: label.clone().unwrap_or_default(),
             slot_a: Some(Box::new(ast_from_expr(cond))),
             slot_b: Some(Box::new(ast_from_block(body))),
             ..default_node()
         },
-        Stmt::For { items, body } => RuntimeAstNode {
+        Stmt::For { label, items, body } => RuntimeAstNode {
             kind: AstNodeKind::ForStmt,
             slot_a: items.first().map(|i| Box::new(ast_from_expr(&i.iterable))),
             text: items.first().map(|i| i.name.clone()).unwrap_or_default(),
+            binding_names: label.iter().cloned().collect(),
             slot_b: Some(Box::new(ast_from_block(body))),
             ..default_node()
         },
-        Stmt::Loop { count, body } => RuntimeAstNode {
+        Stmt::Loop { label, count, body } => RuntimeAstNode {
             kind: AstNodeKind::LoopStmt,
+            text: label.clone().unwrap_or_default(),
             slot_a: count.as_ref().map(|e| Box::new(ast_from_expr(e))),
             slot_b: Some(Box::new(ast_from_block(body))),
             ..default_node()
         },
-        Stmt::Break => RuntimeAstNode {
+        Stmt::Break(label) => RuntimeAstNode {
             kind: AstNodeKind::BreakStmt,
+            text: label.clone().unwrap_or_default(),
             ..default_node()
         },
-        Stmt::Continue => RuntimeAstNode {
+        Stmt::Continue(label) => RuntimeAstNode {
             kind: AstNodeKind::ContinueStmt,
+            text: label.clone().unwrap_or_default(),
             ..default_node()
         },
         Stmt::Throw(e) => RuntimeAstNode {
@@ -1150,6 +1155,7 @@ fn ast_to_stmt(node: &RuntimeAstNode) -> Result<Stmt> {
             })
         }
         AstNodeKind::WhileStmt => Ok(Stmt::While {
+            label: (!node.text.is_empty()).then(|| node.text.clone()),
             cond: ast_to_expr(
                 node.slot_a
                     .as_deref()
@@ -1162,6 +1168,7 @@ fn ast_to_stmt(node: &RuntimeAstNode) -> Result<Stmt> {
             )?,
         }),
         AstNodeKind::ForStmt => Ok(Stmt::For {
+            label: node.binding_names.first().cloned(),
             items: vec![ForItem {
                 name: node.text.clone(),
                 iterable: ast_to_expr(
@@ -1177,6 +1184,7 @@ fn ast_to_stmt(node: &RuntimeAstNode) -> Result<Stmt> {
             )?,
         }),
         AstNodeKind::LoopStmt => Ok(Stmt::Loop {
+            label: (!node.text.is_empty()).then(|| node.text.clone()),
             count: node.slot_a.as_ref().map(|s| ast_to_expr(s)).transpose()?,
             body: ast_to_block(
                 node.slot_b
@@ -1184,8 +1192,12 @@ fn ast_to_stmt(node: &RuntimeAstNode) -> Result<Stmt> {
                     .ok_or_else(|| RuntimeError::msg("loop missing body"))?,
             )?,
         }),
-        AstNodeKind::BreakStmt => Ok(Stmt::Break),
-        AstNodeKind::ContinueStmt => Ok(Stmt::Continue),
+        AstNodeKind::BreakStmt => Ok(Stmt::Break(
+            (!node.text.is_empty()).then(|| node.text.clone()),
+        )),
+        AstNodeKind::ContinueStmt => Ok(Stmt::Continue(
+            (!node.text.is_empty()).then(|| node.text.clone()),
+        )),
         AstNodeKind::ThrowStmt => Ok(Stmt::Throw(ast_to_expr(
             node.slot_a
                 .as_deref()

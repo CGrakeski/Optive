@@ -244,15 +244,18 @@ fn substitute_stmt_body(stmt: &Stmt, type_names: &HashMap<String, String>) -> St
                 .collect(),
             else_block: else_block.as_ref().map(|b| substitute_block(b, type_names)),
         },
-        Stmt::While { cond, body } => Stmt::While {
+        Stmt::While { label, cond, body } => Stmt::While {
+            label: label.clone(),
             cond: substitute_expr(cond, type_names),
             body: substitute_block(body, type_names),
         },
-        Stmt::Loop { count, body } => Stmt::Loop {
+        Stmt::Loop { label, count, body } => Stmt::Loop {
+            label: label.clone(),
             count: count.as_ref().map(|c| substitute_expr(c, type_names)),
             body: substitute_block(body, type_names),
         },
-        Stmt::For { items, body } => Stmt::For {
+        Stmt::For { label, items, body } => Stmt::For {
+            label: label.clone(),
             items: items
                 .iter()
                 .map(|it| ForItem {

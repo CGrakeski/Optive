@@ -47,3 +47,26 @@ JIT/AOT is **not** in this release train. Revisit only if this baseline plus `OP
 ```bash
 OPTIVE_METRICS=1 cargo run --release --bin Optive -- -c "loop (100000) { }"
 ```
+# Language comparison
+
+`cargo bench --bench language_compare` measures precompiled Optive programs on a
+reused single-worker VM. Run `python tools/python-language-compare.py` for the
+matching precompiled CPython workloads. Compare medians from the same machine;
+these are implementation benchmarks, not claims about every program.
+
+The suite covers arithmetic and nested loops, calls, recursive `fib(25)` and
+`fib(30)`, comprehensions/list construction, dictionary update and lookup,
+string conversion/join, JSON round-trips, and exception handling. The
+`lifecycle/*` Criterion group separately measures compilation and a fresh VM
+compile/load/run cycle.
+
+Real process startup is intentionally outside Criterion:
+
+```powershell
+cargo build --release --bin Optive
+python .\tools\startup-language-compare.py
+```
+
+You can pass a non-default executable as the first argument. Startup figures
+include OS process creation, CLI initialization, compilation, and execution;
+antivirus and filesystem cache can materially affect them.

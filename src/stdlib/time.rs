@@ -28,8 +28,55 @@ pub(super) fn build_time_module() -> Shared<ModuleObject> {
             ("utc_parts", builtin(time_utc_parts)),
             ("parts", builtin(time_parts)),
             ("local_offset", builtin(time_local_offset)),
+            ("duration", builtin(time_duration)),
+            ("add", builtin(time_add)),
+            ("diff", builtin(time_diff)),
         ],
     )
+}
+
+fn time_duration(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    expect_arity("time.duration", args, 1)?;
+    let total = expect_int("time.duration", args, 0)?;
+    let sign = if total < 0 { -1 } else { 1 };
+    let mut remaining = total.unsigned_abs();
+    let days = remaining / 86_400;
+    remaining %= 86_400;
+    let hours = remaining / 3_600;
+    remaining %= 3_600;
+    let minutes = remaining / 60;
+    let seconds = remaining % 60;
+    let mut out = DictMap::new();
+    for (name, value) in [
+        ("total_seconds", total),
+        ("days", sign * days as i64),
+        ("hours", sign * hours as i64),
+        ("minutes", sign * minutes as i64),
+        ("seconds", sign * seconds as i64),
+    ] {
+        out.insert(ValueKey::Text(name.into()), Value::Num(Num::Small(value)));
+    }
+    Ok(Value::Dict(Shared::new(out)))
+}
+
+fn time_add(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    expect_arity("time.add", args, 2)?;
+    let timestamp = expect_int("time.add", args, 0)?;
+    let seconds = expect_int("time.add", args, 1)?;
+    timestamp
+        .checked_add(seconds)
+        .map(|value| Value::Num(Num::Small(value)))
+        .ok_or_else(|| RuntimeError::value_err("time.add overflow"))
+}
+
+fn time_diff(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    expect_arity("time.diff", args, 2)?;
+    let later = expect_int("time.diff", args, 0)?;
+    let earlier = expect_int("time.diff", args, 1)?;
+    later
+        .checked_sub(earlier)
+        .map(|value| Value::Num(Num::Small(value)))
+        .ok_or_else(|| RuntimeError::value_err("time.diff overflow"))
 }
 
 pub(super) fn time_now(_vm: &mut Vm, _args: &[Value]) -> Result<Value> {

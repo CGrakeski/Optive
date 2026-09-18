@@ -73,6 +73,16 @@ func add(a, b) {
 }
 
 #[test]
+fn fmt_keeps_decorators_on_the_declaration_line() {
+    let out = format_source("deco2 deco1 func f() { return 1 }\n").expect("fmt");
+    assert!(
+        out.starts_with("deco2 deco1 func f()"),
+        "decorators must stay on the declaration line, got:\n{out}"
+    );
+    parse_ok(&out);
+}
+
+#[test]
 fn fmt_preserves_multiline_call() {
     let src = "\
 foo(

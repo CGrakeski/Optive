@@ -9,6 +9,7 @@ use crate::Result;
 use crate::shared::{Shared, SyncCell};
 pub(crate) use crate::value::value_key_to_value;
 
+mod archive;
 mod collections;
 mod dict;
 mod encoding;
@@ -22,6 +23,7 @@ mod log;
 mod math;
 mod net;
 mod os;
+mod productivity;
 mod random;
 mod serde_val;
 mod sqlite;
@@ -218,6 +220,7 @@ pub fn build_std_module() -> Shared<ModuleObject> {
         "collections".into(),
         collections::build_collections_module(),
     );
+    std_children.insert("archive".into(), archive::build_archive_module());
     std_children.insert("time".into(), build_time_module());
     std_children.insert("sync".into(), build_sync_module());
     std_children.insert("async".into(), build_async_module());
@@ -230,6 +233,9 @@ pub fn build_std_module() -> Shared<ModuleObject> {
     std_children.insert("test".into(), test::build_test_module());
     std_children.insert("debug".into(), build_debug_module());
     std_children.insert("random".into(), random::build_random_module());
+    for (name, module) in productivity::build_productivity_modules() {
+        std_children.insert(name, module);
+    }
     std_children.insert("re".into(), build_re_module());
     std_children.insert("hash".into(), build_hash_module());
     std_children.insert("exceptions".into(), build_exceptions_module());

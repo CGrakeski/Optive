@@ -74,6 +74,26 @@ rows[0]["n"]
 }
 
 #[test]
+fn sqlite_explicit_transactions_and_batch() {
+    let v = value(
+        r#"
+let db = std.sqlite.open(":memory:")
+db.execute_batch("CREATE TABLE t (n INTEGER); INSERT INTO t VALUES (1);")
+db.begin()
+db.execute("INSERT INTO t VALUES (2)")
+let active = db.in_transaction()
+db.rollback()
+let rows = db.query("SELECT n FROM t ORDER BY n")
+str(active) + "|" + str(len(rows)) + "|" + str(rows[0]["n"])
+"#,
+    );
+    match v {
+        Value::Text(s) => assert_eq!(s, "true|1|1"),
+        other => panic!("{}", other.display_string()),
+    }
+}
+
+#[test]
 fn sqlite_sandbox_blocks_file() {
     let caps = Capabilities::sandbox(vec![std::env::current_dir().unwrap()]);
     let err = run_with_caps(r#"std.sqlite.open("../escape.db")"#, caps).expect_err("sandbox");

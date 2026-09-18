@@ -10,10 +10,11 @@ impl Vm {
     }
 
     pub(crate) fn current_column(&self) -> usize {
+        let column_map = self.current_column_map();
         if self.pc == 0 {
-            return self.active_column_map.first().copied().unwrap_or(1);
+            return column_map.first().copied().unwrap_or(1);
         }
-        self.active_column_map
+        column_map
             .get(self.pc.saturating_sub(1))
             .copied()
             .unwrap_or(1)
@@ -53,8 +54,19 @@ impl Vm {
             frames.push(ErrorStackFrame {
                 func,
                 file,
-                line: Self::line_from_map(&ucf.saved_line_map, ucf.saved_pc),
-                column: Self::line_from_map(&ucf.saved_column_map, ucf.saved_pc).max(1),
+                line: Self::line_from_map(
+                    ucf.saved_line_map
+                        .as_deref()
+                        .unwrap_or(ucf.func.line_map.as_ref()),
+                    ucf.saved_pc,
+                ),
+                column: Self::line_from_map(
+                    ucf.saved_column_map
+                        .as_deref()
+                        .unwrap_or(ucf.func.column_map.as_ref()),
+                    ucf.saved_pc,
+                )
+                .max(1),
                 source,
             });
         }

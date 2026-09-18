@@ -176,6 +176,33 @@ x + y
 }
 
 #[test]
+fn destruct_assignment_swaps_from_one_rhs_snapshot() {
+    assert_num(
+        r"
+var a = 2
+var b = 7
+(a, b) = (b, a)
+a * 10 + b
+",
+        "72",
+    );
+}
+
+#[test]
+fn nested_destruct_assignment_with_rest() {
+    assert_num(
+        r"
+var head = 0
+var middle = []
+var tail = 0
+[head, *middle, tail] = [1, 2, 3, 4]
+head * 100 + middle[0] * 10 + tail
+",
+        "124",
+    );
+}
+
+#[test]
 fn destruct_discard() {
     assert_num(
         r"

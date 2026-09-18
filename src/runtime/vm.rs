@@ -14,8 +14,8 @@ use crate::type_registry;
 use crate::types::{self, type_value_display};
 use crate::value::{
     values_identical, BuiltinFn, ChannelInner, DictMap, DispatchTable, FrozenValue,
-    GeneratorTryFrame, IteratorKind, IteratorState, ModuleObject, MutexInner, Num, TaskInner,
-    TaskState, Value, ValueKey,
+    GeneratorTryFrame, IteratorKind, IteratorState, LocalConstState, ModuleObject, MutexInner, Num,
+    TaskInner, TaskState, Value, ValueKey,
 };
 use crate::Result;
 
@@ -152,6 +152,7 @@ pub(crate) struct TaskFiber {
     stack: Vec<StackVal>,
     locals_stack: Vec<Vec<Value>>,
     name_to_slot: Vec<Option<FxHashMap<String, usize>>>,
+    local_consts: Vec<LocalConstState>,
     user_call_frames: Vec<UserCallFrame>,
     func_stack: Vec<Arc<FunctionObject>>,
     func_frames: Vec<FuncFrame>,
@@ -315,9 +316,9 @@ fn validate_function_hot(func: &crate::opcode::FunctionObject) -> Result<()> {
 
 fn validate_hot_bytecode(hot: &crate::hot_code::HotCode) -> Result<()> {
     use crate::hot_code::{
-        H_CALL, H_CALL_GLOBAL, H_CALL_SELF, H_GOTO, H_GOTO_IF, H_GOTO_IF_NOT, H_LOAD_FAST,
-        H_LOAD_FAST_LE_IMM, H_LOAD_FAST_SUB_IMM, H_LOAD_GLOBAL, H_LOOP_COUNTDOWN, H_RET_FAST,
-        H_STORE_FAST, H_STORE_GLOBAL,
+        H_CALL, H_CALL_GLOBAL, H_CALL_SELF, H_GOTO, H_GOTO_IF, H_GOTO_IF_NOT,
+        H_GOTO_IF_NOT_FAST_LT_IMM, H_LOAD_FAST, H_LOAD_FAST_LE_IMM, H_LOAD_FAST_SUB_IMM,
+        H_LOAD_GLOBAL, H_LOOP_COUNTDOWN, H_RET_FAST, H_STORE_FAST, H_STORE_GLOBAL,
     };
     let n = hot.ops.len();
     if hot.args.len() != n {
@@ -337,6 +338,18 @@ fn validate_hot_bytecode(hot: &crate::hot_code::HotCode) -> Result<()> {
             if target < 0 || (target as usize) >= n {
                 return Err(RuntimeError::msg(format!(
                     "internal: hot bytecode jump at pc={pc} targets out-of-range {target} (len={n})"
+                )));
+            }
+        }
+        if op == H_GOTO_IF_NOT_FAST_LT_IMM {
+            let Some(&target) = hot.args.get(pc + 1) else {
+                return Err(RuntimeError::msg(format!(
+                    "internal: fused branch at pc={pc} has no target slot"
+                )));
+            };
+            if target < 0 || (target as usize) >= n {
+                return Err(RuntimeError::msg(format!(
+                    "internal: fused branch at pc={pc} targets out-of-range {target} (len={n})"
                 )));
             }
         }
@@ -389,12 +402,14 @@ struct GeneratorRunFrame {
 
 #[derive(Clone)]
 struct UserCallFrame {
-    saved_code: Arc<Vec<Instruction>>,
-    saved_hot_ops: Arc<[u8]>,
-    saved_hot_args: Arc<[i64]>,
+    saved_code: Option<Arc<Vec<Instruction>>>,
+    saved_hot_ops: Option<Arc<[u8]>>,
+    saved_hot_args: Option<Arc<[i64]>>,
     saved_pc: usize,
-    saved_line_map: Arc<Vec<usize>>,
-    saved_column_map: Arc<Vec<usize>>,
+    saved_line_map: Option<Arc<Vec<usize>>>,
+    saved_column_map: Option<Arc<Vec<usize>>>,
+    /// 轻量调用不再逐个切换 code/hot/maps 的 Arc；只保存前一个函数所有者。
+    saved_lightweight_func: Option<Arc<FunctionObject>>,
     func: Arc<FunctionObject>,
     pushed_func_stack: bool,
     /// 本帧是否压了 `locals_stack` / `name_to_slot`（轻量叶调用为 false）。
@@ -434,6 +449,7 @@ pub struct Vm {
     pub globals: SharedMap,
     pub locals_stack: Vec<Vec<Value>>,
     pub name_to_slot: Vec<Option<FxHashMap<String, usize>>>,
+    local_consts: Vec<LocalConstState>,
     pub func_stack: Vec<Arc<FunctionObject>>,
     pub func_frames: Vec<FuncFrame>,
     pub pc: usize,
@@ -472,6 +488,9 @@ pub struct Vm {
     pub overload_tables: SharedTable<Vec<Arc<FunctionObject>>>,
     pub(crate) primitive_methods: FxHashMap<String, FxHashMap<String, BuiltinFn>>,
     user_call_frames: Vec<UserCallFrame>,
+    /// 活动轻量函数的单一所有者；为 Some 时其代码/热码/行表覆盖模块字段。
+    /// 放在冷调用状态区，避免扰动 Vm 顶部热字段的布局。
+    active_lightweight_func: Option<Arc<FunctionObject>>,
     user_call_deferred: bool,
     /// 嵌套 `call_user_function` 已把任务纤程挂起；外层 Call 不得把 dummy None 当返回值。
     pub(crate) nested_user_call_suspended: bool,
@@ -620,6 +639,7 @@ pub(crate) struct EvalSnapshot {
     pub(crate) globals: SharedMap,
     pub(crate) locals_stack: Vec<Vec<Value>>,
     pub(crate) name_to_slot: Vec<Option<FxHashMap<String, usize>>>,
+    local_consts: Vec<LocalConstState>,
     code: Arc<Vec<Instruction>>,
     hot_ops: Arc<[u8]>,
     hot_args: Arc<[i64]>,
@@ -929,11 +949,13 @@ impl Vm {
             code: Arc::new(Vec::new()),
             hot_ops: Arc::from([]),
             hot_args: Arc::from([]),
+            active_lightweight_func: None,
             stack: Vec::with_capacity(STACK_INIT_CAP),
             stack_sp: 0,
             globals: SharedMap::new(),
             locals_stack: Vec::new(),
             name_to_slot: Vec::new(),
+            local_consts: Vec::new(),
             func_stack: Vec::new(),
             func_frames: Vec::new(),
             pc: 0,
@@ -1509,7 +1531,9 @@ impl Vm {
         self.op_clear();
         self.locals_stack.clear();
         self.name_to_slot.clear();
+        self.local_consts.clear();
         self.func_stack.clear();
+        self.active_lightweight_func = None;
         self.func_frames.clear();
         self.active_line_map = Arc::new(Vec::new());
         self.active_column_map = Arc::new(Vec::new());
@@ -1566,7 +1590,9 @@ impl Vm {
         self.op_clear();
         self.locals_stack.clear();
         self.name_to_slot.clear();
+        self.local_consts.clear();
         self.func_stack.clear();
+        self.active_lightweight_func = None;
         self.func_frames.clear();
         self.active_line_map = Arc::new(Vec::new());
         self.active_column_map = Arc::new(Vec::new());
@@ -1618,6 +1644,7 @@ impl Vm {
         self.func_frames.clear();
         self.locals_stack.clear();
         self.name_to_slot.clear();
+        self.local_consts.clear();
         self.try_stack.clear();
         self.active_exception = None;
         self.user_call_deferred = false;
@@ -1663,6 +1690,7 @@ impl Vm {
         self.op_clear();
         self.locals_stack.clear();
         self.name_to_slot.clear();
+        self.local_consts.clear();
         self.user_call_frames.clear();
         self.func_stack.clear();
         self.func_frames.clear();
@@ -2175,10 +2203,11 @@ impl Vm {
 
     /// `target == code.len()` 视为隐式返回；越界则失败关闭。
     fn jump_or_halt(&mut self, target: usize) -> Result<()> {
-        if target > self.code.len() {
+        let code_len = self.current_code().len();
+        if target > code_len {
             return Err(RuntimeError::msg(format!(
                 "internal: goto target {target} out of range (code len {})",
-                self.code.len()
+                code_len
             )));
         }
         self.jump_to_pc(target);
@@ -2784,13 +2813,14 @@ impl Vm {
     #[inline(always)]
     fn dispatch_hot_u8(&mut self, ops: &[u8], hot_args: &[i64], pc: usize) -> HotFlow {
         use crate::hot_code::{
-            H_ADD_LIST, H_ADD_NUM, H_ADD_TEXT, H_CALL, H_CALL_GLOBAL, H_CALL_SELF, H_DIV_NUM, H_EQ,
-            H_GE, H_GOTO, H_GOTO_IF, H_GOTO_IF_NOT, H_GT, H_LABEL, H_LE, H_LOAD_FAST,
-            H_LOAD_FAST_ADD_IMM_STORE, H_LOAD_FAST_ADD_STORE, H_LOAD_FAST_EQ_IMM,
-            H_LOAD_FAST_GT_IMM, H_LOAD_FAST_LE_IMM, H_LOAD_FAST_LT_IMM, H_LOAD_FAST_MOD_EQ0,
-            H_LOAD_FAST_SQR_GT, H_LOAD_FAST_SUB_IMM, H_LOAD_GLOBAL, H_LOOP_COUNTDOWN, H_LT,
-            H_MOD_NUM, H_MUL_NUM, H_NE, H_PUSH_BOOL, H_PUSH_SMALL, H_RET, H_RET_FAST, H_RET_LEAVE,
-            H_STORE_FAST, H_STORE_GLOBAL, H_SUB_NUM,
+            H_ADD_LIST, H_ADD_NUM, H_ADD_NUM_RET, H_ADD_TEXT, H_CALL, H_CALL_GLOBAL, H_CALL_SELF,
+            H_CALL_SELF_FAST_SUB_IMM, H_DIV_NUM, H_EQ, H_GE, H_GOTO, H_GOTO_IF, H_GOTO_IF_NOT,
+            H_GOTO_IF_NOT_FAST_LT_IMM, H_GT, H_LABEL, H_LE, H_LOAD_FAST, H_LOAD_FAST_ADD_IMM_STORE,
+            H_LOAD_FAST_ADD_STORE, H_LOAD_FAST_EQ_IMM, H_LOAD_FAST_GT_IMM, H_LOAD_FAST_LE_IMM,
+            H_LOAD_FAST_LT_IMM, H_LOAD_FAST_MOD_EQ0, H_LOAD_FAST_SQR_GT, H_LOAD_FAST_SUB_IMM,
+            H_LOAD_GLOBAL, H_LOOP_COUNTDOWN, H_LT, H_MOD_NUM, H_MUL_NUM, H_NE, H_PUSH_BOOL,
+            H_PUSH_SMALL, H_RET, H_RET_FAST, H_RET_FAST_IF_LT_IMM, H_RET_LEAVE, H_STORE_FAST,
+            H_STORE_GLOBAL, H_SUB_NUM,
         };
         // SAFETY（已由外层 `'hot` 循环 `if pc >= code_len { break }` 保证）：
         // 进入本函数时 `pc < ops.len()`，且 `HotCode::encode` 保证 `ops.len() == hot_args.len()`。
@@ -3000,6 +3030,22 @@ impl Vm {
                     return HotFlow::Fail;
                 }
                 HotFlow::Cont
+            }
+            H_ADD_NUM_RET => {
+                if !self.binop_ints_inplace(|x, y| x.checked_add(y)) {
+                    return HotFlow::Cold;
+                }
+                self.pc = pc + 2;
+                if let Some(ret_pc) = self.pop_fast_ret() {
+                    // The result already occupies the caller's operand stack.
+                    self.pop_lightweight_frame();
+                    self.pc = ret_pc;
+                    HotFlow::Cont
+                } else {
+                    let result = self.op_pop();
+                    self.pending_ret = Some((false, result));
+                    HotFlow::PendingRet
+                }
             }
             H_SUB_NUM => {
                 self.pc = pc + 1;
@@ -3251,6 +3297,19 @@ impl Vm {
                 }
                 HotFlow::Cont
             }
+            H_GOTO_IF_NOT_FAST_LT_IMM => {
+                let (slot, imm) = crate::hot_code::decode_slot_imm(arg);
+                let Some(value) = self.lw_slot_int(slot) else {
+                    return HotFlow::Cold;
+                };
+                if value < imm {
+                    self.pc = pc + 2;
+                } else {
+                    // Encoding guarantees a following slot containing the branch target.
+                    self.pc = unsafe { *hot_args.get_unchecked(pc + 1) as usize };
+                }
+                HotFlow::Cont
+            }
             H_GOTO_IF => {
                 self.pc = pc + 1;
                 let sp = self.stack_sp;
@@ -3313,6 +3372,22 @@ impl Vm {
                 }
                 HotFlow::Cont
             }
+            H_CALL_SELF_FAST_SUB_IMM => {
+                let (slot, imm) = crate::hot_code::decode_slot_imm(arg);
+                let Some(value) = self.lw_slot_int(slot) else {
+                    return HotFlow::Cold;
+                };
+                let Some(value) = value.checked_sub(imm) else {
+                    return HotFlow::Cold;
+                };
+                self.pc = pc + 2;
+                self.call_self_lw1_int(self.lw_entry_pc, value);
+                if self.hot_failed {
+                    HotFlow::Fail
+                } else {
+                    HotFlow::Cont
+                }
+            }
             H_RET | H_RET_LEAVE => {
                 let leave = op == H_RET_LEAVE;
                 self.pc = pc + 1;
@@ -3343,6 +3418,28 @@ impl Vm {
                 } else {
                     let result_sv = self.load_fast_sv(arg as usize);
                     self.pending_ret = Some((false, result_sv));
+                    HotFlow::PendingRet
+                }
+            }
+            H_RET_FAST_IF_LT_IMM => {
+                let (compare_slot, imm) = crate::hot_code::decode_slot_imm(arg);
+                let Some(value) = self.lw_slot_int(compare_slot) else {
+                    return HotFlow::Cold;
+                };
+                if value >= imm {
+                    self.pc = pc + 3;
+                    return HotFlow::Cont;
+                }
+                let return_slot = unsafe { *hot_args.get_unchecked(pc + 1) as usize };
+                if let Some(ret_pc) = self.pop_fast_ret() {
+                    let result = self.load_fast_sv(return_slot);
+                    self.pop_lightweight_frame();
+                    self.pc = ret_pc;
+                    self.op_push(result);
+                    HotFlow::Cont
+                } else {
+                    let result = self.load_fast_sv(return_slot);
+                    self.pending_ret = Some((false, result));
                     HotFlow::PendingRet
                 }
             }
@@ -3637,6 +3734,12 @@ impl Vm {
 
     #[inline(always)]
     fn call_self_lw1(&mut self, entry_pc: usize) {
+        let value = self.pop_hot();
+        self.call_self_lw1_value(entry_pc, value);
+    }
+
+    #[inline(always)]
+    fn call_self_lw1_value(&mut self, entry_pc: usize, value: StackVal) {
         if self.lw_depth >= self.cached_max_depth {
             self.set_hot_error(RuntimeError::recursion_err(
                 "maximum recursion depth exceeded",
@@ -3651,7 +3754,34 @@ impl Vm {
         if base >= self.lw_slots.len() {
             self.lw_slots.resize(base + 1, StackVal::Empty);
         }
-        self.lw_slots[base] = self.pop_hot();
+        self.lw_slots[base] = value;
+        self.lw_sp = base + 1;
+        self.pc = entry_pc;
+    }
+
+    /// Integer-specialized one-argument self call used by fused arithmetic
+    /// opcodes. Keeping the payload as an i64 avoids constructing and then
+    /// moving/dropping a general StackVal on every recursive edge.
+    #[inline(always)]
+    fn call_self_lw1_int(&mut self, entry_pc: usize, value: i64) {
+        if self.lw_depth >= self.cached_max_depth {
+            self.set_hot_error(RuntimeError::recursion_err(
+                "maximum recursion depth exceeded",
+            ));
+            return;
+        }
+        self.push_fast_ret(self.pc);
+        let base = self.lw_sp;
+        self.push_lw_base(base);
+        self.lw_base = base;
+        self.lw_depth += 1;
+        if base >= self.lw_slots.len() {
+            self.lw_slots.resize(base + 1, StackVal::Empty);
+        }
+        // SAFETY: the resize above guarantees base < len.
+        unsafe {
+            *self.lw_slots.get_unchecked_mut(base) = StackVal::Int(value);
+        }
         self.lw_sp = base + 1;
         self.pc = entry_pc;
     }
@@ -3740,11 +3870,18 @@ impl Vm {
     fn run_interpreter(&mut self, until_depth: Option<usize>) -> Result<InterpreterResult> {
         self.ensure_op_stack(256);
         'outer: loop {
-            // 仅在外层刷新切片；CallSelf/Cont 热路径不碰 Rc / ptr_eq。
-            let hot_ops = Arc::clone(&self.hot_ops);
-            let hot_args = Arc::clone(&self.hot_args);
-            let ops = hot_ops.as_ref();
-            let args = hot_args.as_ref();
+            // A lightweight call owns all execution arrays through one
+            // FunctionObject Arc. Module/heavy code keeps the legacy pair.
+            let lightweight_owner = self.active_lightweight_func.clone();
+            let module_hot = lightweight_owner
+                .is_none()
+                .then(|| (Arc::clone(&self.hot_ops), Arc::clone(&self.hot_args)));
+            let (ops, args) = if let Some(func) = lightweight_owner.as_ref() {
+                (func.hot.ops.as_ref(), func.hot.args.as_ref())
+            } else {
+                let (hot_ops, hot_args) = module_hot.as_ref().expect("module hot owners");
+                (hot_ops.as_ref(), hot_args.as_ref())
+            };
             let code_len = ops.len();
 
             'hot: loop {
@@ -3830,8 +3967,6 @@ impl Vm {
                         continue 'outer;
                     }
                     HotFlow::Cold => {
-                        let ops_ptr = Arc::as_ptr(&self.hot_ops).cast::<u8>();
-                        let args_ptr = Arc::as_ptr(&self.hot_args).cast::<i64>();
                         if let Err(e) = self.step() {
                             if self.handle_or_promote_error(&e)? {
                                 continue 'outer;
@@ -3858,9 +3993,20 @@ impl Vm {
                         if let Some(v) = self.pending_gen_yield.take() {
                             return Ok(InterpreterResult::Yielded(v));
                         }
-                        if std::ptr::eq(Arc::as_ptr(&self.hot_ops).cast::<u8>(), ops_ptr)
-                            && std::ptr::eq(Arc::as_ptr(&self.hot_args).cast::<i64>(), args_ptr)
-                        {
+                        let same_code = match (
+                            lightweight_owner.as_ref(),
+                            self.active_lightweight_func.as_ref(),
+                        ) {
+                            (Some(before), Some(after)) => Arc::ptr_eq(before, after),
+                            (None, None) => {
+                                let (before_ops, before_args) =
+                                    module_hot.as_ref().expect("module hot owners");
+                                Arc::ptr_eq(before_ops, &self.hot_ops)
+                                    && Arc::ptr_eq(before_args, &self.hot_args)
+                            }
+                            _ => false,
+                        };
+                        if same_code {
                             continue 'hot;
                         }
                         continue 'outer;
@@ -4164,16 +4310,42 @@ impl Vm {
         }
     }
 
+    #[inline(always)]
+    fn current_code(&self) -> &[Instruction] {
+        self.active_lightweight_func
+            .as_ref()
+            .map_or(self.code.as_slice(), |func| func.body.as_slice())
+    }
+
+    #[inline(always)]
+    fn current_line_map(&self) -> &[usize] {
+        self.active_lightweight_func
+            .as_ref()
+            .map_or(self.active_line_map.as_slice(), |func| {
+                func.line_map.as_slice()
+            })
+    }
+
+    #[inline(always)]
+    pub(super) fn current_column_map(&self) -> &[usize] {
+        self.active_lightweight_func
+            .as_ref()
+            .map_or(self.active_column_map.as_slice(), |func| {
+                func.column_map.as_slice()
+            })
+    }
+
     fn step(&mut self) -> Result<()> {
         let pc = self.pc;
-        if pc >= self.code.len() {
+        let code_len = self.current_code().len();
+        if pc >= code_len {
             return Err(RuntimeError::msg(format!(
                 "internal: pc {pc} out of range (code len {})",
-                self.code.len()
+                code_len
             )));
         }
         self.pc += 1;
-        let action = Self::decode_step_action(&self.code[pc]);
+        let action = Self::decode_step_action(&self.current_code()[pc]);
         self.run_step_action(action)
     }
 
@@ -4429,7 +4601,7 @@ impl Vm {
                     Value::List(l) => {
                         self.check_list_element_write(&l, &val)?;
                         l.borrow_mut().push(val);
-                        self.push_value(Value::List(l));
+                        self.op_push(StackVal::from_value(Value::List(l)));
                     }
                     _ => return Err(RuntimeError::type_err("ListAppend requires list")),
                 }
@@ -4444,7 +4616,7 @@ impl Vm {
                             self.check_list_element_write(&l, item)?;
                         }
                         l.borrow_mut().extend(items);
-                        self.push_value(Value::List(l));
+                        self.op_push(StackVal::from_value(Value::List(l)));
                     }
                     _ => return Err(RuntimeError::type_err("ListExtend requires lists")),
                 }
@@ -4458,7 +4630,7 @@ impl Vm {
                         self.check_dict_write(&d, &key, &val)?;
                         let vk = ValueKey::from_value(&key)?;
                         d.borrow_mut().insert(vk, val);
-                        self.push_value(Value::Dict(d));
+                        self.op_push(StackVal::from_value(Value::Dict(d)));
                     }
                     _ => return Err(RuntimeError::type_err("DictSet requires dict")),
                 }
@@ -4471,7 +4643,7 @@ impl Vm {
                         self.check_set_element_write(&s, &val)?;
                         let vk = ValueKey::from_value(&val)?;
                         s.borrow_mut().insert(vk);
-                        self.push_value(Value::Set(s));
+                        self.op_push(StackVal::from_value(Value::Set(s)));
                     }
                     _ => return Err(RuntimeError::type_err("SetAdd requires set")),
                 }
@@ -4494,20 +4666,25 @@ impl Vm {
                 self.exec_store_global(idx, val)?;
             }
             StepAction::NewVar { name, is_const } => {
-                if is_const {
-                    self.has_pending_const = true;
-                    self.pending_const.insert(name.clone());
-                }
                 if self.locals_stack.is_empty() {
+                    if is_const {
+                        self.has_pending_const = true;
+                        self.pending_const.insert(name.clone());
+                    }
                     if !self.globals.contains_key(name.as_str()) {
                         self.globals.insert(name, Value::None);
                     }
                 } else {
                     let frame = self.locals_stack.len() - 1;
+                    // New lexical names append after the frame's existing slots.
+                    let next_slot = self.locals_stack[frame].len();
                     let names = self.scope_name_map_mut(frame);
                     if !names.contains_key(name.as_str()) {
-                        let slot = names.len();
-                        names.insert(name, slot);
+                        let slot = next_slot;
+                        names.insert(name.clone(), slot);
+                        if is_const {
+                            self.local_consts[frame].pending_slots.insert(slot);
+                        }
                         if self.locals_stack[frame].len() <= slot {
                             self.locals_stack[frame].resize(slot + 1, Value::None);
                         }
@@ -4523,12 +4700,14 @@ impl Vm {
             StepAction::EnterScope => {
                 self.locals_stack.push(Vec::new());
                 self.name_to_slot.push(None);
+                self.local_consts.push(LocalConstState::default());
             }
             StepAction::LeaveScope => {
                 if let Some(frame) = self.locals_stack.pop() {
                     self.recycle_local_frame(frame);
                 }
                 self.name_to_slot.pop();
+                self.local_consts.pop();
             }
             StepAction::BindFast {
                 slot,
@@ -4540,11 +4719,11 @@ impl Vm {
                     .map_err(|_| RuntimeError::msg("internal: BindFast with empty stack"))?;
                 self.local_set(slot, val);
                 if let Some(frame) = self.locals_stack.len().checked_sub(1) {
-                    self.scope_name_map_mut(frame).insert(name.clone(), slot);
-                }
-                if is_const {
-                    self.const_names.insert(name);
-                    self.has_const_names = true;
+                    let names = self.scope_name_map_mut(frame);
+                    names.insert(name.clone(), slot);
+                    if is_const {
+                        self.local_consts[frame].const_slots.insert(slot);
+                    }
                 }
             }
             StepAction::LoadFast(slot) => {
@@ -5336,12 +5515,14 @@ impl Vm {
     fn enter_scope(&mut self) {
         self.locals_stack.push(Vec::new());
         self.name_to_slot.push(None);
+        self.local_consts.push(LocalConstState::default());
     }
 
     fn leave_scope(&mut self) {
         if let Some(frame) = self.locals_stack.pop() {
             self.recycle_local_frame(frame);
             self.name_to_slot.pop();
+            self.local_consts.pop();
         }
     }
 
@@ -5463,19 +5644,18 @@ impl Vm {
     /// 拒绝向以 `const` 绑定的槽执行 `StoreFast`（热/冷路径共用）。
     #[inline(always)]
     fn reject_const_fast_store(&self, slot: usize) -> Result<()> {
-        if !self.has_const_names && !self.has_pending_const {
+        // Lightweight frames live in `lw_slots`; nested lexical scopes live in
+        // `locals_stack` and may reuse the same numeric slot. Their const markers
+        // must never reject a store aimed at the lightweight frame.
+        if self.lw_depth != 0 {
             return Ok(());
         }
-        if let Some(map) = self.name_to_slot.last().and_then(|m| m.as_ref()) {
-            for (name, &s) in map {
-                if s == slot
-                    && (self.const_names.contains(name) || self.pending_const.contains(name))
-                {
-                    return Err(RuntimeError::msg(format!(
-                        "cannot assign to const binding: {name}"
-                    )));
-                }
-            }
+        if self
+            .local_consts
+            .last()
+            .is_some_and(|state| state.const_slots.contains(&slot))
+        {
+            return Err(RuntimeError::msg("cannot assign to const binding"));
         }
         Ok(())
     }
@@ -5485,16 +5665,23 @@ impl Vm {
             if let Some(map) = &self.name_to_slot[i] {
                 if let Some(slot) = map.get(name) {
                     let slot = *slot;
+                    if self.local_consts[i].const_slots.contains(&slot) {
+                        return Err(RuntimeError::msg(format!(
+                            "cannot assign to const binding: {name}"
+                        )));
+                    }
+                    let finishes_local_const = self.local_consts[i].pending_slots.remove(&slot);
+                    if finishes_local_const {
+                        self.local_consts[i].const_slots.insert(slot);
+                    }
                     if let Some(Value::Cell(cell)) = self.locals_stack[i].get(slot) {
                         *cell.borrow_mut() = val;
-                        self.finalize_const_init(name);
                         return Ok(());
                     }
                     if slot >= self.locals_stack[i].len() {
                         self.locals_stack[i].resize(slot + 1, Value::None);
                     }
                     self.locals_stack[i][slot] = val;
-                    self.finalize_const_init(name);
                     return Ok(());
                 }
             }
@@ -5512,18 +5699,24 @@ impl Vm {
     }
 
     fn delete_name(&mut self, name: &str) -> Result<()> {
-        if self.const_names.contains(name) {
-            return Err(RuntimeError::msg("cannot delete const binding"));
-        }
         for i in (0..self.name_to_slot.len()).rev() {
             if let Some(map) = &mut self.name_to_slot[i] {
+                if let Some(&slot) = map.get(name) {
+                    if self.local_consts[i].const_slots.contains(&slot) {
+                        return Err(RuntimeError::msg("cannot delete const binding"));
+                    }
+                }
                 if let Some(slot) = map.remove(name) {
+                    self.local_consts[i].pending_slots.remove(&slot);
                     if slot < self.locals_stack[i].len() {
                         self.locals_stack[i][slot] = Value::None;
                     }
                     return Ok(());
                 }
             }
+        }
+        if self.const_names.contains(name) {
+            return Err(RuntimeError::msg("cannot delete const binding"));
         }
         // BindFast 在热路径里编成 H_STORE_FAST，不会写入 name_to_slot。
         // `del` 仍按函数体里的槽位清掉局部（含轻量帧）。
@@ -6168,16 +6361,20 @@ impl Vm {
     }
 
     pub(crate) fn get_or_create_convert(&mut self, type_name: &str) -> Shared<DispatchTable> {
-        let key = format!("__convert__:{type_name}");
+        // Conversion is a very hot operation.  Looking up by the public type
+        // name avoids allocating and formatting `__convert__:<type>` on every
+        // successful lookup; the decorated name is only needed when a table is
+        // first created (and for diagnostics).
+        if let Some(table) = self.convert_tables.get(type_name) {
+            return table.clone();
+        }
+        let table = Shared::new(DispatchTable {
+            name: format!("__convert__:{type_name}"),
+            handlers: Shared::new(Vec::new()),
+        });
         self.convert_tables
-            .entry(key.clone())
-            .or_insert_with(|| {
-                Shared::new(DispatchTable {
-                    name: key,
-                    handlers: Shared::new(Vec::new()),
-                })
-            })
-            .clone()
+            .insert(type_name.to_string(), table.clone());
+        table
     }
 
     fn call_dispatch(&mut self, table: &Shared<DispatchTable>, args: Vec<Value>) -> Result<Value> {
@@ -6186,25 +6383,31 @@ impl Vm {
             Builtin(Arc<crate::value::BuiltinObject>),
         }
 
-        let handlers = table.borrow().handlers.borrow().clone();
         let mut best: Option<(usize, usize, DispatchTarget)> = None;
-        for (idx, handler_val) in handlers.iter().enumerate() {
-            let (score, target) = match handler_val {
-                Value::Function(func) => {
-                    let func = self.ensure_func_types_resolved(func.clone())?;
-                    let Some(score) = types::dispatch_match_score(self, &func, &args) else {
-                        continue;
-                    };
-                    (score, DispatchTarget::Function(func))
-                }
-                Value::Builtin(b) => (usize::MAX, DispatchTarget::Builtin(b.clone())),
-                _ => continue,
-            };
-            match &best {
-                None => best = Some((score, idx, target)),
-                Some((best_score, best_idx, _)) => {
-                    if score < *best_score || (score == *best_score && idx < *best_idx) {
-                        best = Some((score, idx, target));
+        {
+            // Keep the handler array borrowed while selecting a target and
+            // clone only that target.  Previously every dispatch cloned every
+            // handler, even though exactly one can be called.
+            let table_ref = table.borrow();
+            let handlers = table_ref.handlers.borrow();
+            for (idx, handler_val) in handlers.iter().enumerate() {
+                let (score, target) = match handler_val {
+                    Value::Function(func) => {
+                        let func = self.ensure_func_types_resolved(func.clone())?;
+                        let Some(score) = types::dispatch_match_score(self, &func, &args) else {
+                            continue;
+                        };
+                        (score, DispatchTarget::Function(func))
+                    }
+                    Value::Builtin(b) => (usize::MAX, DispatchTarget::Builtin(b.clone())),
+                    _ => continue,
+                };
+                match &best {
+                    None => best = Some((score, idx, target)),
+                    Some((best_score, best_idx, _)) => {
+                        if score < *best_score || (score == *best_score && idx < *best_idx) {
+                            best = Some((score, idx, target));
+                        }
                     }
                 }
             }
@@ -6252,6 +6455,21 @@ impl Vm {
             return result;
         }
         let table = self.get_or_create_convert(&type_name);
+        // The standard primitive conversion tables start with one fallback
+        // builtin.  If no user handler has been registered, call the same
+        // primitive implementation directly and avoid allocating an argument
+        // vector and running the generic multimethod matcher.  As soon as a
+        // custom handler exists, the normal dispatch path remains authoritative.
+        let has_only_builtin_fallback = {
+            let table_ref = table.borrow();
+            let handlers = table_ref.handlers.borrow();
+            matches!(handlers.as_slice(), [Value::Builtin(_)])
+        };
+        if has_only_builtin_fallback {
+            if let Some(result) = type_registry::call_primitive_convert(self, &type_name, &value) {
+                return result;
+            }
+        }
         let args = vec![Value::type_ref(type_name.clone()), value];
         self.call_dispatch(&table, args)
     }
@@ -6265,6 +6483,7 @@ impl Vm {
             globals: self.globals.clone(),
             locals_stack: self.locals_stack.clone(),
             name_to_slot: self.name_to_slot.clone(),
+            local_consts: self.local_consts.clone(),
             code: self.code.clone(),
             hot_ops: self.hot_ops.clone(),
             hot_args: self.hot_args.clone(),
@@ -6294,6 +6513,7 @@ impl Vm {
         self.globals = snap.globals;
         self.locals_stack = snap.locals_stack;
         self.name_to_slot = snap.name_to_slot;
+        self.local_consts = snap.local_consts;
         self.code = snap.code;
         self.hot_ops = snap.hot_ops;
         self.hot_args = snap.hot_args;
@@ -6395,10 +6615,11 @@ impl Vm {
     }
 
     pub(crate) fn current_line(&self) -> usize {
+        let line_map = self.current_line_map();
         if self.pc == 0 {
-            return self.active_line_map.first().copied().unwrap_or(0);
+            return line_map.first().copied().unwrap_or(0);
         }
-        self.active_line_map
+        line_map
             .get(self.pc.saturating_sub(1))
             .copied()
             .unwrap_or(0)
@@ -6662,6 +6883,7 @@ impl Vm {
         } else {
             self.name_to_slot.push(None);
         }
+        self.local_consts.push(LocalConstState::default());
 
         let captured_len = func
             .captured
@@ -6730,12 +6952,13 @@ impl Vm {
         // 脚本未逃逸局部占用 lw 帧；重函数的 LoadFast 走 locals_stack，须暂时摘掉。
         self.lw_depth = 0;
         self.user_call_frames.push(UserCallFrame {
-            saved_code: self.code.clone(),
-            saved_hot_ops: self.hot_ops.clone(),
-            saved_hot_args: self.hot_args.clone(),
+            saved_code: Some(self.code.clone()),
+            saved_hot_ops: Some(self.hot_ops.clone()),
+            saved_hot_args: Some(self.hot_args.clone()),
             saved_pc: self.pc,
-            saved_line_map: self.active_line_map.clone(),
-            saved_column_map: self.active_column_map.clone(),
+            saved_line_map: Some(self.active_line_map.clone()),
+            saved_column_map: Some(self.active_column_map.clone()),
+            saved_lightweight_func: self.active_lightweight_func.take(),
             func: func.clone(),
             pushed_func_stack: !reenter,
             pushed_name_frame: true,
@@ -6793,15 +7016,16 @@ impl Vm {
         let saved_lw_depth = self.lw_depth;
         let saved_lw_base = self.lw_base;
         self.user_call_frames.push(UserCallFrame {
-            saved_code: std::mem::replace(&mut self.code, func.body.clone()),
-            saved_hot_ops: std::mem::replace(&mut self.hot_ops, func.hot.ops.clone()),
-            saved_hot_args: std::mem::replace(&mut self.hot_args, func.hot.args.clone()),
+            // Lightweight code is selected through `active_lightweight_func`;
+            // keep module/heavy-function component Arcs in place instead of
+            // cloning and swapping five independent owners per call.
+            saved_code: None,
+            saved_hot_ops: None,
+            saved_hot_args: None,
             saved_pc: self.pc,
-            saved_line_map: std::mem::replace(&mut self.active_line_map, func.line_map.clone()),
-            saved_column_map: std::mem::replace(
-                &mut self.active_column_map,
-                func.column_map.clone(),
-            ),
+            saved_line_map: None,
+            saved_column_map: None,
+            saved_lightweight_func: self.active_lightweight_func.replace(func.clone()),
             func,
             pushed_func_stack: true,
             pushed_name_frame: false,
@@ -6830,12 +7054,18 @@ impl Vm {
     }
 
     fn restore_user_call_frame(&mut self, frame: UserCallFrame) {
-        self.code = frame.saved_code;
-        self.hot_ops = frame.saved_hot_ops;
-        self.hot_args = frame.saved_hot_args;
+        let was_lightweight = !frame.pushed_name_frame;
+        if !was_lightweight {
+            self.code = frame.saved_code.expect("heavy frame saves code");
+            self.hot_ops = frame.saved_hot_ops.expect("heavy frame saves hot ops");
+            self.hot_args = frame.saved_hot_args.expect("heavy frame saves hot args");
+            self.active_line_map = frame.saved_line_map.expect("heavy frame saves line map");
+            self.active_column_map = frame
+                .saved_column_map
+                .expect("heavy frame saves column map");
+        }
+        self.active_lightweight_func = frame.saved_lightweight_func;
         self.pc = frame.saved_pc;
-        self.active_line_map = frame.saved_line_map;
-        self.active_column_map = frame.saved_column_map;
         self.lw_depth = frame.saved_lw_depth;
         self.lw_base = frame.saved_lw_base;
     }
@@ -6964,8 +7194,19 @@ impl Vm {
             frames.push(ErrorStackFrame {
                 func,
                 file,
-                line: Self::line_from_map(&ucf.saved_line_map, ucf.saved_pc),
-                column: Self::line_from_map(&ucf.saved_column_map, ucf.saved_pc).max(1),
+                line: Self::line_from_map(
+                    ucf.saved_line_map
+                        .as_deref()
+                        .unwrap_or(ucf.func.line_map.as_ref()),
+                    ucf.saved_pc,
+                ),
+                column: Self::line_from_map(
+                    ucf.saved_column_map
+                        .as_deref()
+                        .unwrap_or(ucf.func.column_map.as_ref()),
+                    ucf.saved_pc,
+                )
+                .max(1),
                 source,
             });
         }
@@ -7669,6 +7910,7 @@ impl Vm {
                 func,
                 locals,
                 name_map,
+                local_consts: LocalConstState::default(),
                 pc: 0,
                 exhausted: false,
                 yield_from: None,
@@ -7684,12 +7926,13 @@ impl Vm {
         // 消费者取消时，生成器在下一 yield/恢复点协作退出。
         self.fail_if_current_task_cancelled()?;
         loop {
-            let (func, locals, name_map, pc, exhausted, yield_from) = {
+            let (func, locals, name_map, local_consts, pc, exhausted, yield_from) = {
                 let st = state.borrow();
                 let IteratorKind::Generator {
                     func,
                     locals,
                     name_map,
+                    local_consts,
                     pc,
                     exhausted,
                     yield_from,
@@ -7704,6 +7947,7 @@ impl Vm {
                     func.clone(),
                     locals.clone(),
                     name_map.clone(),
+                    local_consts.clone(),
                     *pc,
                     *exhausted,
                     yield_from.clone(),
@@ -7746,16 +7990,18 @@ impl Vm {
             self.func_stack.push(func.clone());
             self.name_to_slot.push(name_map);
             self.locals_stack.push(locals);
+            self.local_consts.push(local_consts);
             let saved_lw_depth = self.lw_depth;
             let saved_lw_base = self.lw_base;
             self.lw_depth = 0;
             self.user_call_frames.push(UserCallFrame {
-                saved_code: self.code.clone(),
-                saved_hot_ops: self.hot_ops.clone(),
-                saved_hot_args: self.hot_args.clone(),
+                saved_code: Some(self.code.clone()),
+                saved_hot_ops: Some(self.hot_ops.clone()),
+                saved_hot_args: Some(self.hot_args.clone()),
                 saved_pc: self.pc,
-                saved_line_map: self.active_line_map.clone(),
-                saved_column_map: self.active_column_map.clone(),
+                saved_line_map: Some(self.active_line_map.clone()),
+                saved_column_map: Some(self.active_column_map.clone()),
+                saved_lightweight_func: self.active_lightweight_func.take(),
                 func: func.clone(),
                 pushed_func_stack: true,
                 pushed_name_frame: true,
@@ -7886,6 +8132,7 @@ impl Vm {
             .cloned()
             .ok_or_else(|| RuntimeError::msg("internal: generator missing locals"))?;
         let name_map = self.name_to_slot.last().cloned().flatten();
+        let local_consts = self.local_consts.last().cloned().unwrap_or_default();
         let pc = self.pc;
 
         let mut paused_try = Vec::new();
@@ -7923,6 +8170,7 @@ impl Vm {
         if let IteratorKind::Generator {
             locals: l,
             name_map: nm,
+            local_consts: lc,
             pc: p,
             paused_try: pt,
             paused_iters: pi,
@@ -7932,6 +8180,7 @@ impl Vm {
         {
             *l = locals;
             *nm = name_map;
+            *lc = local_consts;
             *p = pc;
             *pt = paused_try;
             *pi = paused_iters;
@@ -7944,6 +8193,7 @@ impl Vm {
             .ok_or_else(|| RuntimeError::msg("internal: generator missing call frame"))?;
         self.locals_stack.pop();
         self.name_to_slot.pop();
+        self.local_consts.pop();
         if frame.pushed_func_stack {
             self.func_stack.pop();
         }
@@ -8061,11 +8311,13 @@ impl Vm {
             code: Arc::new(Vec::new()),
             hot_ops: Arc::from([]),
             hot_args: Arc::from([]),
+            active_lightweight_func: None,
             stack: Vec::with_capacity(STACK_INIT_CAP),
             stack_sp: 0,
             globals: self.globals.clone(),
             locals_stack: Vec::new(),
             name_to_slot: Vec::new(),
+            local_consts: Vec::new(),
             func_stack: Vec::new(),
             func_frames: Vec::new(),
             pc: 0,
@@ -8387,6 +8639,7 @@ impl Vm {
         }
         let locals_stack = split_at_or_empty(&mut self.locals_stack, ctx.stop_locals);
         let name_to_slot = split_at_or_empty(&mut self.name_to_slot, ctx.stop_nts);
+        let local_consts = split_at_or_empty(&mut self.local_consts, ctx.stop_nts);
         let user_call_frames = split_at_or_empty(&mut self.user_call_frames, ctx.stop_ucf);
         let func_stack = split_at_or_empty(&mut self.func_stack, ctx.stop_func_stack);
         let func_frames = split_at_or_empty(&mut self.func_frames, ctx.stop_func_frames);
@@ -8439,6 +8692,7 @@ impl Vm {
             stack,
             locals_stack,
             name_to_slot,
+            local_consts,
             user_call_frames,
             func_stack,
             func_frames,
@@ -8480,12 +8734,12 @@ impl Vm {
         // 纤程可能从其它 worker 迁来：最底帧的 saved_* 仍是旧宿主（helper 上常为空）。
         // 改写为当前宿主，这样任务 return 时 restore_user_call_frame 不会清掉主模块代码。
         if let Some(frame) = fiber.user_call_frames.first_mut() {
-            frame.saved_code = self.code.clone();
-            frame.saved_hot_ops = self.hot_ops.clone();
-            frame.saved_hot_args = self.hot_args.clone();
+            frame.saved_code = Some(self.code.clone());
+            frame.saved_hot_ops = Some(self.hot_ops.clone());
+            frame.saved_hot_args = Some(self.hot_args.clone());
             frame.saved_pc = self.pc;
-            frame.saved_line_map = self.active_line_map.clone();
-            frame.saved_column_map = self.active_column_map.clone();
+            frame.saved_line_map = Some(self.active_line_map.clone());
+            frame.saved_column_map = Some(self.active_column_map.clone());
             // 与 saved_code 相同：底帧的 lw 水位属于当前宿主，不是旧 worker。
             frame.saved_lw_depth = self.lw_depth;
             frame.saved_lw_base = self.lw_base;
@@ -8503,6 +8757,7 @@ impl Vm {
         }
         self.locals_stack.append(&mut fiber.locals_stack);
         self.name_to_slot.append(&mut fiber.name_to_slot);
+        self.local_consts.append(&mut fiber.local_consts);
         self.user_call_frames.append(&mut fiber.user_call_frames);
         self.func_stack.append(&mut fiber.func_stack);
         self.func_frames.append(&mut fiber.func_frames);

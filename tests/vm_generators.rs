@@ -53,6 +53,22 @@ next(g)
 }
 
 #[test]
+fn generator_preserves_local_const_across_yield() {
+    run_err(
+        r"
+gen values() {
+  const x = 1
+  yield x
+  x = 2
+}
+let g = values()
+next(g)
+next(g)
+",
+    );
+}
+
+#[test]
 fn generator_for_in() {
     assert_num(
         r"

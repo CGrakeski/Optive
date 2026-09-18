@@ -252,7 +252,7 @@ fn check_immutable_block(
             | Stmt::With { body, .. }
             | Stmt::Block(body)
             | Stmt::Defer(body) => check_immutable_block(body, &visible, diags),
-            Stmt::For { items, body } => {
+            Stmt::For { items, body, .. } => {
                 let mut inner = visible.clone();
                 for item in items {
                     inner.insert(item.name.clone(), false);
@@ -500,8 +500,8 @@ fn check_control_flow(
                 Stmt::Return(_)
                     | Stmt::Yield(_)
                     | Stmt::YieldFrom(_)
-                    | Stmt::Break
-                    | Stmt::Continue
+                    | Stmt::Break(_)
+                    | Stmt::Continue(_)
             );
         if invalid_defer_exit {
             diags.push((
@@ -522,7 +522,7 @@ fn check_control_flow(
                 located.column,
                 "yield is only valid inside a function".into(),
             )),
-            Stmt::Break | Stmt::Continue if loop_depth == 0 => diags.push((
+            Stmt::Break(_) | Stmt::Continue(_) if loop_depth == 0 => diags.push((
                 located.line,
                 located.column,
                 "loop control is only valid inside a loop".into(),
@@ -658,17 +658,17 @@ fn check_try_block(
                     check_try_block(body, return_channel, generator, diags);
                 }
             }
-            Stmt::While { cond, body } => {
+            Stmt::While { cond, body, .. } => {
                 check_try_expr(cond, return_channel, generator, diags);
                 check_try_block(body, return_channel, generator, diags);
             }
-            Stmt::Loop { count, body } => {
+            Stmt::Loop { count, body, .. } => {
                 if let Some(count) = count {
                     check_try_expr(count, return_channel, generator, diags);
                 }
                 check_try_block(body, return_channel, generator, diags);
             }
-            Stmt::For { items, body } => {
+            Stmt::For { items, body, .. } => {
                 for item in items {
                     check_try_expr(&item.iterable, return_channel, generator, diags);
                 }
@@ -1130,17 +1130,17 @@ fn walk_stmt_uses(stmt: &Stmt, used: &mut HashSet<String>) {
                 walk_block_uses(b, used);
             }
         }
-        Stmt::While { cond, body } => {
+        Stmt::While { cond, body, .. } => {
             walk_expr_uses(cond, used);
             walk_block_uses(body, used);
         }
-        Stmt::Loop { count, body } => {
+        Stmt::Loop { count, body, .. } => {
             if let Some(c) = count {
                 walk_expr_uses(c, used);
             }
             walk_block_uses(body, used);
         }
-        Stmt::For { items, body } => {
+        Stmt::For { items, body, .. } => {
             for it in items {
                 walk_expr_uses(&it.iterable, used);
             }
@@ -1234,8 +1234,8 @@ fn walk_stmt_uses(stmt: &Stmt, used: &mut HashSet<String>) {
         Stmt::Import { .. }
         | Stmt::Use { .. }
         | Stmt::ProtocolDecl { .. }
-        | Stmt::Break
-        | Stmt::Continue
+        | Stmt::Break(_)
+        | Stmt::Continue(_)
         | Stmt::Comment { .. } => {}
     }
 }
@@ -1450,7 +1450,7 @@ fn unreachable_in_block(stmts: &Block, diags: &mut Vec<Diagnostic>) {
             continue;
         }
         match &st.stmt {
-            Stmt::Return(_) | Stmt::Throw(_) | Stmt::Break | Stmt::Continue => dead = true,
+            Stmt::Return(_) | Stmt::Throw(_) | Stmt::Break(_) | Stmt::Continue(_) => dead = true,
             Stmt::If {
                 then_block,
                 elifs,
@@ -1518,7 +1518,7 @@ fn unreachable_in_block(stmts: &Block, diags: &mut Vec<Diagnostic>) {
 
 fn stmt_definitely_exits(stmt: &Stmt) -> bool {
     match stmt {
-        Stmt::Return(_) | Stmt::Throw(_) | Stmt::Break | Stmt::Continue => true,
+        Stmt::Return(_) | Stmt::Throw(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
         Stmt::Block(body) => block_definitely_exits(body),
         Stmt::If {
             then_block,
@@ -1755,17 +1755,17 @@ fn walk_stmt_extra(
                 walk_block_extra(b, scope, types, diags);
             }
         }
-        Stmt::While { cond, body } => {
+        Stmt::While { cond, body, .. } => {
             walk_expr_extra(cond, scope, types, diags);
             walk_block_extra(body, scope, types, diags);
         }
-        Stmt::Loop { count, body } => {
+        Stmt::Loop { count, body, .. } => {
             if let Some(c) = count {
                 walk_expr_extra(c, scope, types, diags);
             }
             walk_block_extra(body, scope, types, diags);
         }
-        Stmt::For { items, body } => {
+        Stmt::For { items, body, .. } => {
             let mut inner = scope.clone();
             for item in items {
                 walk_expr_extra(&item.iterable, scope, types, diags);
@@ -1813,10 +1813,11 @@ fn walk_stmt_extra(
             walk_expr_extra(context, scope, types, diags);
             let mut inner = scope.clone();
             if let Stmt::With {
-                alias: Some(alias), ..
+                alias: Some(pattern),
+                ..
             } = &st.stmt
             {
-                inner.insert(alias.clone());
+                inner.extend(destruct_binding_names(pattern));
             }
             walk_block_extra(body, &inner, types, diags);
         }

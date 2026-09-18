@@ -201,12 +201,36 @@ fn text_join(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         ));
     }
     let sep = expect_text("join", args, 0)?;
+    if let Value::List(parts) = &args[1] {
+        let parts = parts.borrow();
+        let estimated = parts
+            .iter()
+            .map(|part| match part {
+                Value::Text(text) => text.len(),
+                _ => 0,
+            })
+            .sum::<usize>()
+            .saturating_add(sep.len().saturating_mul(parts.len().saturating_sub(1)));
+        let mut joined = String::with_capacity(estimated);
+        for (index, part) in parts.iter().enumerate() {
+            if index != 0 {
+                joined.push_str(&sep);
+            }
+            match part {
+                Value::Text(text) => joined.push_str(text),
+                other => joined.push_str(&other.print_string()),
+            }
+        }
+        return Ok(Value::Text(joined));
+    }
     let parts = value_to_list(&args[1])?;
-    let joined = parts
-        .iter()
-        .map(Value::print_string)
-        .collect::<Vec<_>>()
-        .join(&sep);
+    let mut joined = String::new();
+    for (index, part) in parts.iter().enumerate() {
+        if index != 0 {
+            joined.push_str(&sep);
+        }
+        joined.push_str(&part.print_string());
+    }
     Ok(Value::Text(joined))
 }
 

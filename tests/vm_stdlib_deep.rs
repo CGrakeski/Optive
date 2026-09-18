@@ -69,6 +69,24 @@ join(",", parts) + "|" + join(",", ws) + "|" + substring("hello", 1, 4) + "|" + 
 }
 
 #[test]
+fn join_keeps_mixed_values_and_empty_parts() {
+    assert_text(
+        r#"
+use std.text.{ join }
+join("-", ["a", 2, "", true])
+"#,
+        "a-2--true",
+    );
+    assert_text(
+        r#"
+use std.text.{ join }
+join("-", [])
+"#,
+        "",
+    );
+}
+
+#[test]
 fn std_json_object() {
     assert_num(
         r#"

@@ -400,17 +400,17 @@ fn walk_stmt(st: &LocatedStmt, cx: &mut Cx) {
                 walk_block(b, cx);
             }
         }
-        Stmt::While { cond, body } => {
+        Stmt::While { cond, body, .. } => {
             walk_expr(cond, cx);
             walk_block(body, cx);
         }
-        Stmt::Loop { count, body } => {
+        Stmt::Loop { count, body, .. } => {
             if let Some(c) = count {
                 walk_expr(c, cx);
             }
             walk_block(body, cx);
         }
-        Stmt::For { items, body } => {
+        Stmt::For { items, body, .. } => {
             for it in items {
                 walk_expr(&it.iterable, cx);
             }
@@ -466,8 +466,10 @@ fn walk_stmt(st: &LocatedStmt, cx: &mut Cx) {
         } => {
             walk_expr(context, cx);
             cx.push();
-            if let Some(a) = alias {
-                cx.define(a.clone());
+            if let Some(pattern) = alias {
+                for name in destruct_names(pattern) {
+                    cx.define(name);
+                }
             }
             walk_block(body, cx);
             cx.pop();
@@ -496,8 +498,8 @@ fn walk_stmt(st: &LocatedStmt, cx: &mut Cx) {
         Stmt::ProtocolDecl { .. }
         | Stmt::Import { .. }
         | Stmt::Use { .. }
-        | Stmt::Break
-        | Stmt::Continue
+        | Stmt::Break(_)
+        | Stmt::Continue(_)
         | Stmt::Comment { .. } => {}
     }
 }

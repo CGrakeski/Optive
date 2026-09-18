@@ -41,7 +41,7 @@ enum CompKind {
 #[derive(Clone)]
 enum OpenHandler {
     Try,
-    With { ctx: String },
+    With { ctx: String, runtime_scope: bool },
     Defer { body: Block },
 }
 
@@ -50,10 +50,14 @@ pub struct Generator {
     program: CompiledProgram,
     loop_break_labels: Vec<usize>,
     loop_continue_labels: Vec<usize>,
+    /// Source labels for active loops, aligned with the loop jump stacks.
+    loop_names: Vec<Option<String>>,
     /// 进入循环时 `handler_stack.len()`，break/continue 只清到该深度。
     loop_handler_depths: Vec<usize>,
     /// 与 break/continue 标签对齐：计数 `loop` 在栈上压了倒计时器。
     loop_owns_stack_counter: Vec<bool>,
+    /// `for` keeps an iterator frame on the VM stack until its end label.
+    loop_owns_iterator: Vec<bool>,
     /// 当前词法位置仍打开的 try/with（innermost last）。
     handler_stack: Vec<OpenHandler>,
     type_env: Vec<HashMap<String, (Expr, bool)>>,
@@ -86,6 +90,22 @@ struct CompileFnExtras<'a> {
 }
 
 impl Generator {
+    fn loop_index(&self, label: Option<&str>, keyword: &str) -> Result<usize> {
+        if let Some(label) = label {
+            self.loop_names
+                .iter()
+                .rposition(|name| name.as_deref() == Some(label))
+                .ok_or_else(|| {
+                    RuntimeError::msg(format!("unknown loop label '{label}' for {keyword}"))
+                })
+        } else {
+            self.loop_names
+                .len()
+                .checked_sub(1)
+                .ok_or_else(|| RuntimeError::msg(format!("{keyword} outside loop")))
+        }
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -93,8 +113,10 @@ impl Generator {
             program: CompiledProgram::new(),
             loop_break_labels: Vec::new(),
             loop_continue_labels: Vec::new(),
+            loop_names: Vec::new(),
             loop_handler_depths: Vec::new(),
             loop_owns_stack_counter: Vec::new(),
+            loop_owns_iterator: Vec::new(),
             handler_stack: Vec::new(),
             type_env: vec![HashMap::new()],
             macro_depth: 0,
@@ -1058,7 +1080,7 @@ impl Generator {
             } => {
                 self.gen_if(cond, then_block, elifs, else_block.as_ref(), top_level)?;
             }
-            Stmt::While { cond, body } => {
+            Stmt::While { label, cond, body } => {
                 let start = self.codegen.fresh_label();
                 let end = self.codegen.fresh_label();
                 self.codegen.mark_label(start);
@@ -1066,18 +1088,22 @@ impl Generator {
                 let jmp = self.codegen.emit(Instruction::GotoIfNot(end));
                 self.loop_break_labels.push(end);
                 self.loop_continue_labels.push(start);
+                self.loop_names.push(label.clone());
                 self.loop_handler_depths.push(self.handler_stack.len());
                 self.loop_owns_stack_counter.push(false);
+                self.loop_owns_iterator.push(false);
                 self.gen_block(body, false)?;
                 self.loop_break_labels.pop();
                 self.loop_continue_labels.pop();
+                self.loop_names.pop();
                 self.loop_handler_depths.pop();
                 self.loop_owns_stack_counter.pop();
+                self.loop_owns_iterator.pop();
                 self.codegen.emit(Instruction::Goto(start));
                 self.codegen.mark_label(end);
                 let _ = jmp;
             }
-            Stmt::Loop { count, body } => {
+            Stmt::Loop { label, count, body } => {
                 let start = self.codegen.fresh_label();
                 let end = self.codegen.fresh_label();
                 let owns_counter = count.is_some();
@@ -1090,13 +1116,17 @@ impl Generator {
                     self.codegen.emit(Instruction::LoopCountdown(done));
                     self.loop_break_labels.push(end);
                     self.loop_continue_labels.push(start);
+                    self.loop_names.push(label.clone());
                     self.loop_handler_depths.push(self.handler_stack.len());
                     self.loop_owns_stack_counter.push(true);
+                    self.loop_owns_iterator.push(false);
                     self.gen_block(body, false)?;
                     self.loop_break_labels.pop();
                     self.loop_continue_labels.pop();
+                    self.loop_names.pop();
                     self.loop_handler_depths.pop();
                     self.loop_owns_stack_counter.pop();
+                    self.loop_owns_iterator.pop();
                     self.codegen.emit(Instruction::Goto(start));
                     self.codegen.mark_label(done);
                     // break 跳向 `end`；与 `done` 同 PC，否则 patch_labels 报 undefined label。
@@ -1104,49 +1134,56 @@ impl Generator {
                 } else {
                     self.loop_break_labels.push(end);
                     self.loop_continue_labels.push(start);
+                    self.loop_names.push(label.clone());
                     self.loop_handler_depths.push(self.handler_stack.len());
                     self.loop_owns_stack_counter.push(false);
+                    self.loop_owns_iterator.push(false);
                     self.gen_block(body, false)?;
                     self.loop_break_labels.pop();
                     self.loop_continue_labels.pop();
+                    self.loop_names.pop();
                     self.loop_handler_depths.pop();
                     self.loop_owns_stack_counter.pop();
+                    self.loop_owns_iterator.pop();
                     self.codegen.emit(Instruction::Goto(start));
                     self.codegen.mark_label(end);
                 }
             }
-            Stmt::For { items, body } => {
-                self.gen_for(items, body)?;
+            Stmt::For { label, items, body } => {
+                self.gen_for(label.as_deref(), items, body)?;
             }
-            Stmt::Break => {
-                let lbl = *self
-                    .loop_break_labels
-                    .last()
-                    .ok_or_else(|| RuntimeError::msg("break outside loop"))?;
-                let depth = *self
-                    .loop_handler_depths
-                    .last()
-                    .ok_or_else(|| RuntimeError::msg("break outside loop"))?;
-                let owns_counter = *self
-                    .loop_owns_stack_counter
-                    .last()
-                    .ok_or_else(|| RuntimeError::msg("break outside loop"))?;
+            Stmt::Break(label) => {
+                let index = self.loop_index(label.as_deref(), "break")?;
+                let lbl = self.loop_break_labels[index];
+                let depth = self.loop_handler_depths[index];
                 self.emit_handler_exit_cleanups(depth);
-                if owns_counter {
+                // Discard inner loop frames from innermost to outermost. The target
+                // `for` frame is retained because its end label performs IterEnd.
+                for nested in (index + 1..self.loop_names.len()).rev() {
+                    if self.loop_owns_stack_counter[nested] {
+                        self.codegen.emit(Instruction::Pop);
+                    } else if self.loop_owns_iterator[nested] {
+                        self.codegen.emit(Instruction::IterEnd);
+                    }
+                }
+                if self.loop_owns_stack_counter[index] {
                     self.codegen.emit(Instruction::Pop);
                 }
                 self.codegen.emit(Instruction::Goto(lbl));
             }
-            Stmt::Continue => {
-                let lbl = *self
-                    .loop_continue_labels
-                    .last()
-                    .ok_or_else(|| RuntimeError::msg("continue outside loop"))?;
-                let depth = *self
-                    .loop_handler_depths
-                    .last()
-                    .ok_or_else(|| RuntimeError::msg("continue outside loop"))?;
+            Stmt::Continue(label) => {
+                let index = self.loop_index(label.as_deref(), "continue")?;
+                let lbl = self.loop_continue_labels[index];
+                let depth = self.loop_handler_depths[index];
                 self.emit_handler_exit_cleanups(depth);
+                // Preserve the target loop's own counter, discard nested ones.
+                for nested in (index + 1..self.loop_names.len()).rev() {
+                    if self.loop_owns_stack_counter[nested] {
+                        self.codegen.emit(Instruction::Pop);
+                    } else if self.loop_owns_iterator[nested] {
+                        self.codegen.emit(Instruction::IterEnd);
+                    }
+                }
                 self.codegen.emit(Instruction::Goto(lbl));
             }
             Stmt::Defer(_) => {
@@ -1383,7 +1420,7 @@ impl Generator {
                 alias,
                 body,
             } => {
-                self.gen_with(context, alias.as_deref(), body, top_level)?;
+                self.gen_with(context, alias.as_ref(), body, top_level)?;
             }
             Stmt::Comment { .. } => {
                 // 注释不生成任何指令。
@@ -1403,35 +1440,57 @@ impl Generator {
     fn gen_with(
         &mut self,
         context: &Expr,
-        alias: Option<&str>,
+        alias: Option<&DestructPattern>,
         body: &Block,
         as_value: bool,
     ) -> Result<()> {
+        let runtime_scope = self.current_func.is_none();
         let ctx = self.codegen.fresh_temp("__with_ctx");
         let exc = self.codegen.fresh_temp("__with_exc");
+        let entered = self.codegen.fresh_temp("__with_entered");
         self.gen_expr(context)?;
         self.emit_store_temp(&ctx);
         self.emit_load_temp(&ctx);
         self.codegen.emit(Instruction::GetAttr("__enter__".into()));
         self.codegen.emit(Instruction::Call { argc: 0 });
-        if let Some(name) = alias {
-            self.emit_bind_name(name);
-        } else {
-            self.codegen.emit(Instruction::Pop);
-        }
-
+        self.emit_store_temp(&entered);
         let catch_dispatch = self.codegen.fresh_label();
         let success_cleanup = self.codegen.fresh_label();
+        let suppressed = self.codegen.fresh_label();
         let try_end = self.codegen.fresh_label();
+        // The catch path must keep the exception after leaving the with scope.
+        // Declare its temporary outside that scope; the catch later only stores it.
+        if runtime_scope {
+            self.codegen.emit(Instruction::Push(Value::None));
+            self.emit_store_temp(&exc);
+        }
         // else_label → 成功清理；EndTry 会 PopTry 后再跳过来。
         self.codegen.emit(Instruction::EnterTry {
             catch_label: catch_dispatch,
             else_label: success_cleanup,
             end_label: try_end,
         });
-        self.handler_stack
-            .push(OpenHandler::With { ctx: ctx.clone() });
+        self.handler_stack.push(OpenHandler::With {
+            ctx: ctx.clone(),
+            runtime_scope,
+        });
+        if runtime_scope {
+            self.codegen.emit(Instruction::EnterScope);
+            self.block_depth += 1;
+            self.block_shadows.push(HashSet::new());
+        }
+        // Install cleanup before binding: destructuring failure after a successful
+        // __enter__ must still invoke __exit__.
+        if let Some(pattern) = alias {
+            self.emit_load_temp(&entered);
+            self.gen_destruct_bind(pattern, true, true)?;
+        }
         self.gen_block(body, as_value)?;
+        if runtime_scope {
+            self.block_shadows.pop();
+            self.block_depth -= 1;
+            self.codegen.emit(Instruction::LeaveScope);
+        }
         self.codegen.emit(Instruction::EndTry);
         self.handler_stack.pop();
 
@@ -1448,13 +1507,23 @@ impl Generator {
         self.emit_store_temp(&exc);
         // 先弹出本层 try，再调 __exit__ / 重抛，避免重抛再次落入同一 catch 死循环。
         self.codegen.emit(Instruction::PopTry);
+        if runtime_scope {
+            self.codegen.emit(Instruction::LeaveScope);
+        }
         self.emit_load_temp(&ctx);
         self.emit_load_temp(&exc);
         self.codegen.emit(Instruction::Load("__with_exit__".into()));
         self.codegen.emit(Instruction::Call { argc: 2 });
-        self.codegen.emit(Instruction::Pop);
+        // Python context-manager semantics: a truthy __exit__ result suppresses
+        // the active exception; falsy results rethrow it.
+        self.codegen.emit(Instruction::GotoIf(suppressed));
         self.emit_load_temp(&exc);
         self.codegen.emit(Instruction::Throw);
+
+        self.codegen.mark_label(suppressed);
+        if as_value {
+            self.codegen.emit(Instruction::Push(Value::None));
+        }
 
         self.codegen.mark_label(try_end);
         Ok(())
@@ -2155,8 +2224,8 @@ impl Generator {
         fn invalid(stmt: &Stmt) -> bool {
             match stmt {
                 Stmt::Return(_)
-                | Stmt::Break
-                | Stmt::Continue
+                | Stmt::Break(_)
+                | Stmt::Continue(_)
                 | Stmt::Yield(_)
                 | Stmt::YieldFrom(_) => true,
                 Stmt::If {
@@ -2459,8 +2528,10 @@ impl Generator {
             program: self.fresh_subprogram(),
             loop_break_labels: Vec::new(),
             loop_continue_labels: Vec::new(),
+            loop_names: Vec::new(),
             loop_handler_depths: Vec::new(),
             loop_owns_stack_counter: Vec::new(),
+            loop_owns_iterator: Vec::new(),
             handler_stack: Vec::new(),
             type_env: vec![HashMap::new()],
             macro_depth: self.macro_depth,
@@ -2537,6 +2608,7 @@ impl Generator {
                 track_frames,
                 return_strong,
             );
+        let needs_arg_checks = params.iter().any(|p| p.type_strong || p.implicit);
         let hot = crate::hot_code::HotCode::encode(&body);
         let variadic_param_index = params.iter().position(|p| p.is_variadic);
         let kwvariadic_param_index = params.iter().position(|p| p.is_kwvariadic);
@@ -2556,7 +2628,6 @@ impl Generator {
             }))
         };
         let lw = lightweight && !is_generator;
-        let needs_arg_checks = params.iter().any(|p| p.type_strong || p.implicit);
         let has_defaults = defaults.iter().any(std::option::Option::is_some);
         let hot_call_argc = FunctionObject::compute_hot_call_argc(
             lw,
@@ -2612,8 +2683,11 @@ impl Generator {
                 OpenHandler::Try => {
                     self.codegen.emit(Instruction::PopTry);
                 }
-                OpenHandler::With { ctx } => {
+                OpenHandler::With { ctx, runtime_scope } => {
                     self.codegen.emit(Instruction::PopTry);
+                    if runtime_scope {
+                        self.codegen.emit(Instruction::LeaveScope);
+                    }
                     self.emit_load_temp(&ctx);
                     self.codegen.emit(Instruction::Push(Value::None));
                     self.codegen.emit(Instruction::Load("__with_exit__".into()));
@@ -2716,8 +2790,10 @@ impl Generator {
             program: self.fresh_subprogram(),
             loop_break_labels: Vec::new(),
             loop_continue_labels: Vec::new(),
+            loop_names: Vec::new(),
             loop_handler_depths: Vec::new(),
             loop_owns_stack_counter: Vec::new(),
+            loop_owns_iterator: Vec::new(),
             handler_stack: Vec::new(),
             type_env: vec![HashMap::new()],
             macro_depth: self.macro_depth + 1,
@@ -3786,7 +3862,10 @@ impl Generator {
                 self.codegen.emit(Instruction::DictSet);
             }
         }
-        self.emit_store_temp(&result_name);
+        // ListAppend/SetAdd/DictSet mutate the shared result container in place.
+        // Their stack result is the same binding already held in `result_name`;
+        // storing it again on every iteration only adds a name/slot write.
+        self.codegen.emit(Instruction::Pop);
 
         self.codegen.emit(Instruction::Goto(start));
         self.codegen.mark_label(end);
@@ -3907,27 +3986,54 @@ impl Generator {
         Ok(())
     }
 
-    fn gen_for(&mut self, items: &[ForItem], body: &Block) -> Result<()> {
+    fn gen_for(&mut self, label: Option<&str>, items: &[ForItem], body: &Block) -> Result<()> {
         if items.is_empty() {
             return Err(RuntimeError::type_err("for requires at least one iterator"));
         }
         self.gen_for_iter_setup(items)?;
         let start = self.codegen.fresh_label();
+        let continue_cleanup = self.codegen.fresh_label();
+        let break_cleanup = self.codegen.fresh_label();
         let end = self.codegen.fresh_label();
         self.codegen.mark_label(start);
         self.codegen.emit(Instruction::IterNext);
         self.codegen.emit(Instruction::GotoIfNot(end));
+        // A loop body is a fresh lexical scope on every iteration. Besides making
+        // the iterator binding local, this lets immutable declarations in the body
+        // be initialized again on the next iteration without becoming globals.
+        let runtime_scope = self.current_func.is_none();
+        if runtime_scope {
+            self.codegen.emit(Instruction::EnterScope);
+            self.block_depth += 1;
+            self.block_shadows.push(HashSet::new());
+        }
         self.gen_for_iter_bind(items);
-        self.loop_break_labels.push(end);
-        self.loop_continue_labels.push(start);
+        self.loop_break_labels.push(break_cleanup);
+        self.loop_continue_labels.push(continue_cleanup);
+        self.loop_names.push(label.map(str::to_owned));
         self.loop_handler_depths.push(self.handler_stack.len());
         self.loop_owns_stack_counter.push(false);
+        self.loop_owns_iterator.push(true);
         self.gen_block(body, false)?;
         self.loop_break_labels.pop();
         self.loop_continue_labels.pop();
+        self.loop_names.pop();
         self.loop_handler_depths.pop();
         self.loop_owns_stack_counter.pop();
+        self.loop_owns_iterator.pop();
+        if runtime_scope {
+            self.block_shadows.pop();
+            self.block_depth -= 1;
+        }
+        self.codegen.mark_label(continue_cleanup);
+        if runtime_scope {
+            self.codegen.emit(Instruction::LeaveScope);
+        }
         self.codegen.emit(Instruction::Goto(start));
+        self.codegen.mark_label(break_cleanup);
+        if runtime_scope {
+            self.codegen.emit(Instruction::LeaveScope);
+        }
         self.codegen.mark_label(end);
         self.codegen.emit(Instruction::IterEnd);
         Ok(())

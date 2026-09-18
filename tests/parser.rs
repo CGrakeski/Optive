@@ -189,6 +189,37 @@ fn parse_func_no_params() {
 }
 
 #[test]
+fn decorators_only_bind_on_the_same_line() {
+    let same_line = parse_program("deco2 deco1 func f() {}").expect("same-line decorators");
+    assert_eq!(same_line.stmts.len(), 1);
+    match &same_line.stmts[0].stmt {
+        optive::ast::Stmt::FuncDecl { decorators, .. } => assert_eq!(decorators.len(), 2),
+        other => panic!("expected decorated FuncDecl, got {other:?}"),
+    }
+
+    let split_line = parse_program("deco\nfunc f() {}").expect("two separate statements");
+    assert_eq!(split_line.stmts.len(), 2);
+    match &split_line.stmts[1].stmt {
+        optive::ast::Stmt::FuncDecl { decorators, .. } => assert!(decorators.is_empty()),
+        other => panic!("expected undecorated FuncDecl, got {other:?}"),
+    }
+}
+
+#[test]
+fn decorator_prefix_accepts_arbitrary_expressions() {
+    let program = parse_program("do (a) { a() } func b() {}")
+        .expect("do expression should be accepted as a decorator");
+    assert_eq!(program.stmts.len(), 1);
+    match &program.stmts[0].stmt {
+        optive::ast::Stmt::FuncDecl { decorators, .. } => assert_eq!(decorators.len(), 1),
+        other => panic!("expected decorated FuncDecl, got {other:?}"),
+    }
+
+    parse_ok("(do(a) { a }) func identity() { 42 }");
+    parse_ok("choose(true) or fallback func load() {}");
+}
+
+#[test]
 fn parse_func_return_type_arrow() {
     parse_ok("func f() -> num { return 1 }");
 }
@@ -262,6 +293,13 @@ fn parse_for_in() {
 #[test]
 fn parse_break_continue() {
     parse_ok("loop { break\ncontinue }");
+}
+
+#[test]
+fn parse_labeled_loop_control_without_colon() {
+    parse_ok("outer for (row in rows) { for (cell in row) { break outer } }");
+    parse_ok("outer while (true) { continue outer }");
+    parse_ok("outer loop { break outer }");
 }
 
 #[test]
@@ -531,6 +569,11 @@ func f(stats) {
 }
 ",
     );
+}
+
+#[test]
+fn parse_with_destructuring_pattern() {
+    parse_ok("with (resource as (head, [item, *rest])) { item }");
 }
 
 #[test]

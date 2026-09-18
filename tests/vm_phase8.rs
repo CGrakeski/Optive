@@ -97,6 +97,17 @@ inc(20)
 }
 
 #[test]
+fn arbitrary_expression_decorator_on_func() {
+    assert_num(
+        r"
+(do(f) { f }) func answer() { return 42 }
+answer()
+",
+        "42",
+    );
+}
+
+#[test]
 fn with_context_manager() {
     assert_num(
         r"
@@ -117,6 +128,88 @@ with (b as v) {
 }
 ",
         "1",
+    );
+}
+
+#[test]
+fn with_destructures_enter_value() {
+    assert_num(
+        r"
+struct Ctx {
+    func __enter__(self) { return (2, [3, 4, 5]) }
+    func __exit__(self, exc_type, exc_val, exc_tb) { return false }
+}
+with (Ctx() as (a, [b, *rest])) {
+    a + b + rest[0] + rest[1]
+}
+",
+        "14",
+    );
+}
+
+#[test]
+fn with_truthy_exit_suppresses_exception() {
+    assert_num(
+        r#"
+struct Ctx {
+    var exits
+    func __enter__(self) { return self }
+    func __exit__(self, exc_type, exc_val, exc_tb) {
+        self.exits = self.exits + 1
+        return exc_val != none
+    }
+}
+
+let ctx = Ctx(0)
+with (ctx as entered) {
+    throw "boom"
+}
+ctx.exits
+"#,
+        "1",
+    );
+}
+
+#[test]
+fn with_exit_runs_when_enter_value_destructuring_fails() {
+    assert_num(
+        r"
+struct Ctx {
+    var exits
+    func __enter__(self) { return [1] }
+    func __exit__(self, exc_type, exc_val, exc_tb) {
+        self.exits = self.exits + 1
+        return true
+    }
+}
+let ctx = Ctx(0)
+with (ctx as [a, b]) { none }
+ctx.exits
+",
+        "1",
+    );
+}
+
+#[test]
+fn with_exit_runs_before_return() {
+    assert_num(
+        r"
+struct Ctx {
+    var exits
+    func __enter__(self) { return (8, 9) }
+    func __exit__(self, exc_type, exc_val, exc_tb) {
+        self.exits = self.exits + 1
+        return false
+    }
+}
+func consume(ctx) {
+    with (ctx as (a, b)) { return a + b }
+}
+let ctx = Ctx(0)
+let result = consume(ctx)
+result + ctx.exits
+",
+        "18",
     );
 }
 

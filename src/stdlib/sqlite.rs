@@ -82,6 +82,11 @@ fn wrap_db(conn: Connection) -> Value {
     let inner = Arc::new(Mutex::new(Some(conn)));
     let exec_h = inner.clone();
     let query_h = inner.clone();
+    let batch_h = inner.clone();
+    let begin_h = inner.clone();
+    let commit_h = inner.clone();
+    let rollback_h = inner.clone();
+    let state_h = inner.clone();
     let close_h = inner;
     Value::Module(Shared::new(ModuleObject {
         name: "SqliteDb".into(),
@@ -157,6 +162,52 @@ fn wrap_db(conn: Connection) -> Value {
                 }),
             ),
             (
+                "execute_batch",
+                Value::builtin("execute_batch", move |_vm, args| {
+                    expect_arity("execute_batch", args, 1)?;
+                    let sql = expect_text("execute_batch", args, 0)?;
+                    let mut guard = batch_h.lock();
+                    guard
+                        .as_mut()
+                        .ok_or_else(|| RuntimeError::io_err("execute_batch: database is closed"))?
+                        .execute_batch(&sql)
+                        .map_err(|e| RuntimeError::io_err(format!("execute_batch: {e}")))?;
+                    Ok(Value::None)
+                }),
+            ),
+            (
+                "begin",
+                Value::builtin("begin", move |_vm, args| {
+                    expect_arity("begin", args, 0)?;
+                    sqlite_control(&begin_h, "BEGIN", "begin")
+                }),
+            ),
+            (
+                "commit",
+                Value::builtin("commit", move |_vm, args| {
+                    expect_arity("commit", args, 0)?;
+                    sqlite_control(&commit_h, "COMMIT", "commit")
+                }),
+            ),
+            (
+                "rollback",
+                Value::builtin("rollback", move |_vm, args| {
+                    expect_arity("rollback", args, 0)?;
+                    sqlite_control(&rollback_h, "ROLLBACK", "rollback")
+                }),
+            ),
+            (
+                "in_transaction",
+                Value::builtin("in_transaction", move |_vm, args| {
+                    expect_arity("in_transaction", args, 0)?;
+                    let guard = state_h.lock();
+                    let db = guard.as_ref().ok_or_else(|| {
+                        RuntimeError::io_err("in_transaction: database is closed")
+                    })?;
+                    Ok(Value::Bool(!db.is_autocommit()))
+                }),
+            ),
+            (
                 "close",
                 Value::builtin("close", move |_vm, _| {
                     let _ = close_h.lock().take();
@@ -169,6 +220,20 @@ fn wrap_db(conn: Connection) -> Value {
         live_globals: None,
         ..Default::default()
     }))
+}
+
+fn sqlite_control(
+    handle: &Arc<Mutex<Option<Connection>>>,
+    sql: &str,
+    operation: &str,
+) -> Result<Value> {
+    let mut guard = handle.lock();
+    guard
+        .as_mut()
+        .ok_or_else(|| RuntimeError::io_err(format!("{operation}: database is closed")))?
+        .execute_batch(sql)
+        .map_err(|e| RuntimeError::io_err(format!("{operation}: {e}")))?;
+    Ok(Value::None)
 }
 
 fn sql_params(v: &Value) -> Result<Vec<rusqlite::types::Value>> {

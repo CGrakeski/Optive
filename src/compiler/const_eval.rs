@@ -91,8 +91,8 @@ struct MemoKey {
 enum Flow {
     Normal,
     Return(Value),
-    Break,
-    LoopContinue,
+    Break(Option<String>),
+    LoopContinue(Option<String>),
 }
 
 enum ConstValue {
@@ -519,7 +519,7 @@ impl ConstContext {
         let result = match self.exec_block(&function.body, &mut call_locals, state) {
             Ok(Flow::Return(value)) => Ok(value),
             Ok(Flow::Normal) => Ok(Value::None),
-            Ok(Flow::Break | Flow::LoopContinue) => {
+            Ok(Flow::Break(_) | Flow::LoopContinue(_)) => {
                 Err(state.error(function.loc, "loop control escaped const func"))
             }
             Err(error) => Err(error),
@@ -612,16 +612,18 @@ impl ConstContext {
                         }
                     }
                 }
-                Stmt::While { cond, body } => {
+                Stmt::While { label, cond, body } => {
                     while truthy(&self.eval_required(cond, locals, state)?) {
                         match self.exec_block(body, locals, state)? {
                             flow @ Flow::Return(_) => return Ok(flow),
-                            Flow::Break => break,
-                            Flow::Normal | Flow::LoopContinue => {}
+                            Flow::Break(target) if target.is_none() || target == *label => break,
+                            Flow::LoopContinue(target) if target.is_none() || target == *label => {}
+                            flow @ (Flow::Break(_) | Flow::LoopContinue(_)) => return Ok(flow),
+                            Flow::Normal => {}
                         }
                     }
                 }
-                Stmt::Loop { count, body } => {
+                Stmt::Loop { label, count, body } => {
                     let count = match count {
                         Some(expr) => match self.eval_required(expr, locals, state)? {
                             Value::Num(n) => n.to_i64().ok_or_else(|| {
@@ -637,19 +639,21 @@ impl ConstContext {
                     for _ in 0..count {
                         match self.exec_block(body, locals, state)? {
                             flow @ Flow::Return(_) => return Ok(flow),
-                            Flow::Break => break,
-                            Flow::Normal | Flow::LoopContinue => {}
+                            Flow::Break(target) if target.is_none() || target == *label => break,
+                            Flow::LoopContinue(target) if target.is_none() || target == *label => {}
+                            flow @ (Flow::Break(_) | Flow::LoopContinue(_)) => return Ok(flow),
+                            Flow::Normal => {}
                         }
                     }
                 }
-                Stmt::For { items, body } => {
-                    match self.exec_for(items, body, locals, state, loc)? {
+                Stmt::For { label, items, body } => {
+                    match self.exec_for(label.as_deref(), items, body, locals, state, loc)? {
                         Flow::Normal => {}
                         flow => return Ok(flow),
                     }
                 }
-                Stmt::Break => return Ok(Flow::Break),
-                Stmt::Continue => return Ok(Flow::LoopContinue),
+                Stmt::Break(label) => return Ok(Flow::Break(label.clone())),
+                Stmt::Continue(label) => return Ok(Flow::LoopContinue(label.clone())),
                 Stmt::Expr(expr) => {
                     self.eval_required(expr, locals, state)?;
                 }
@@ -663,6 +667,7 @@ impl ConstContext {
 
     fn exec_for(
         &self,
+        label: Option<&str>,
         items: &[ForItem],
         body: &Block,
         locals: &mut EvalLocals,
@@ -693,8 +698,15 @@ impl ConstContext {
             }
             match self.exec_block(body, locals, state)? {
                 flow @ Flow::Return(_) => return Ok(flow),
-                Flow::Break => break,
-                Flow::Normal | Flow::LoopContinue => {}
+                Flow::Break(target)
+                    if target.as_deref().is_none() || target.as_deref() == label =>
+                {
+                    break
+                }
+                Flow::LoopContinue(target)
+                    if target.as_deref().is_none() || target.as_deref() == label => {}
+                flow @ (Flow::Break(_) | Flow::LoopContinue(_)) => return Ok(flow),
+                Flow::Normal => {}
             }
         }
         Ok(Flow::Normal)
@@ -734,23 +746,23 @@ impl ConstContext {
                         self.validate_block(body)?;
                     }
                 }
-                Stmt::While { cond, body } => {
+                Stmt::While { cond, body, .. } => {
                     self.validate_expr(cond)?;
                     self.validate_block(body)?;
                 }
-                Stmt::Loop { count, body } => {
+                Stmt::Loop { count, body, .. } => {
                     if let Some(count) = count {
                         self.validate_expr(count)?;
                     }
                     self.validate_block(body)?;
                 }
-                Stmt::For { items, body } => {
+                Stmt::For { items, body, .. } => {
                     for item in items {
                         self.validate_expr(&item.iterable)?;
                     }
                     self.validate_block(body)?;
                 }
-                Stmt::Break | Stmt::Continue => {}
+                Stmt::Break(_) | Stmt::Continue(_) => {}
                 _ => return Err(RuntimeError::msg("statement is not compile-time pure")),
             }
         }

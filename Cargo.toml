@@ -39,8 +39,8 @@ sha2 = "0.10"
 hex = "0.4"
 digest = "0.10"
 hmac = "0.12"
-gix = { version = "0.85", features = ["blocking-network-client", "worktree-mutation", "blocking-http-transport-reqwest-rust-tls", "merge"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "charset", "http2", "system-proxy"] }
+gix = { version = "0.85", features = ["blocking-network-client", "worktree-mutation", "blocking-http-transport-reqwest", "merge"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "blocking", "charset", "http2", "system-proxy"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 rustls-native-certs = "0.8"
 rustls-pemfile = "2"
@@ -64,6 +64,9 @@ num_cpus = "1"
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-bundle-always"] }
 cap-std = "4.0.3"
 unicode-width = "0.2"
+ring = "0.17"
+zip = { version = "2", default-features = false, features = ["deflate-flate2", "flate2"] }
+tar = { version = "0.4", default-features = false }
 
 ## Android 交叉编不拉 libffi-sys：其 build 在 Windows 宿主上走 MSVC/`cl.exe`，
 ## 无法为 `aarch64-linux-android` 编 libffi。该目标上 `extern`/`C.callback` 运行时报错。
@@ -78,6 +81,11 @@ rcgen = "0.13"
 name = "optive"
 harness = false
 path = "benches/optive.rs"
+
+[[bench]]
+name = "language_compare"
+harness = false
+path = "benches/language_compare.rs"
 
 [[example]]
 name = "embed"

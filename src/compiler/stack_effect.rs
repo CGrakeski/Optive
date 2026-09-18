@@ -163,9 +163,15 @@ impl Instruction {
             | Self::TypeCheck
             | Self::ResolveFuncTypes
             | Self::RegisterExport(_)
-            | Self::Suspend
-            | Self::IterEnd => Adjust {
+            | Self::Suspend => Adjust {
                 pop: 0,
+                push: 0,
+                alt_push: None,
+            },
+            // IterNew keeps one abstract iterator-frame slot. The runtime stores
+            // that frame in `Vm::iterators`, but the verifier must still retire it.
+            Self::IterEnd => Adjust {
+                pop: 1,
                 push: 0,
                 alt_push: None,
             },

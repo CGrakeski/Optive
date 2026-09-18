@@ -435,11 +435,11 @@ fn walk_stmt(st: &LocatedStmt, lo: usize, hi: usize, idx: &mut FileIndex) {
         Stmt::Import { .. } => walk_import(st, lo, hi, idx),
         Stmt::Use { .. } => walk_use(st, lo, hi, idx),
         Stmt::If { .. } => walk_if(st, hi, idx),
-        Stmt::While { cond, body } => {
+        Stmt::While { cond, body, .. } => {
             walk_expr(cond, idx);
             walk_block(body, st.line, block_hi(body, hi), idx);
         }
-        Stmt::Loop { count, body } => {
+        Stmt::Loop { count, body, .. } => {
             if let Some(c) = count {
                 walk_expr(c, idx);
             }
@@ -462,7 +462,7 @@ fn walk_stmt(st: &LocatedStmt, lo: usize, hi: usize, idx: &mut FileIndex) {
         Stmt::DestructAssign { value, .. } => walk_expr(value, idx),
         Stmt::Del(t) => walk_del(t, idx),
         Stmt::Block(b) | Stmt::Defer(b) => walk_block(b, st.line, block_hi(b, hi), idx),
-        Stmt::Break | Stmt::Continue | Stmt::Comment { .. } => {}
+        Stmt::Break(_) | Stmt::Continue(_) | Stmt::Comment { .. } => {}
     }
 }
 
@@ -985,7 +985,7 @@ fn walk_if(st: &LocatedStmt, hi: usize, idx: &mut FileIndex) {
 }
 
 fn walk_for(st: &LocatedStmt, hi: usize, idx: &mut FileIndex) {
-    let Stmt::For { items, body } = &st.stmt else {
+    let Stmt::For { items, body, .. } = &st.stmt else {
         return;
     };
 
@@ -1086,18 +1086,20 @@ fn walk_with(st: &LocatedStmt, hi: usize, idx: &mut FileIndex) {
 
     walk_expr(context, idx);
     let inner_hi = block_hi(body, hi);
-    if let Some(a) = alias {
-        push_sym(
-            idx,
-            a.clone(),
-            KIND_VAR,
-            format!("with {a}"),
-            st.line,
-            st.column,
-            st.line,
-            inner_hi,
-            None,
-        );
+    if let Some(pattern) = alias {
+        for name in destruct_names(pattern) {
+            push_sym(
+                idx,
+                name.clone(),
+                KIND_VAR,
+                format!("with {name}"),
+                st.line,
+                st.column,
+                st.line,
+                inner_hi,
+                None,
+            );
+        }
     }
     walk_block(body, st.line, inner_hi, idx);
 }

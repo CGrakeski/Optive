@@ -207,19 +207,22 @@ pub enum Stmt {
         else_block: Option<Block>,
     },
     While {
+        label: Option<String>,
         cond: Expr,
         body: Block,
     },
     Loop {
+        label: Option<String>,
         count: Option<Expr>,
         body: Block,
     },
     For {
+        label: Option<String>,
         items: Vec<ForItem>,
         body: Block,
     },
-    Break,
-    Continue,
+    Break(Option<String>),
+    Continue(Option<String>),
     /// 在离开当前词法块时按后进先出顺序执行。
     Defer(Block),
     Try {
@@ -235,7 +238,7 @@ pub enum Stmt {
     Del(DelTarget),
     With {
         context: Expr,
-        alias: Option<String>,
+        alias: Option<DestructPattern>,
         body: Block,
     },
     Import {

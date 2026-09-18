@@ -136,6 +136,57 @@ sum
 }
 
 #[test]
+fn labeled_break_exits_outer_for() {
+    assert_num(
+        r"
+var seen = 0
+outer for (row in [[1, 2], [3, 4]]) {
+    for (cell in row) {
+        seen = seen + 1
+        if (cell == 2) { break outer }
+    }
+}
+seen
+",
+        "2",
+    );
+}
+
+#[test]
+fn labeled_continue_advances_outer_for() {
+    assert_num(
+        r"
+var total = 0
+outer for (row in [[1, 2], [3, 4]]) {
+    for (cell in row) {
+        if (cell == 1 or cell == 3) { continue outer }
+        total = total + cell
+    }
+}
+total
+",
+        "0",
+    );
+}
+
+#[test]
+fn labeled_break_cleans_nested_counted_loop() {
+    assert_num(
+        r"
+var n = 0
+outer loop (4) {
+    loop (3) {
+        n = n + 1
+        break outer
+    }
+}
+n
+",
+        "1",
+    );
+}
+
+#[test]
 fn loop_return_inside_counted() {
     assert_num(
         r"
@@ -200,6 +251,68 @@ for (x in []) { n = 0 }
 n
 ",
         "99",
+    );
+}
+
+#[test]
+fn for_body_let_is_fresh_on_every_iteration() {
+    assert_num(
+        r#"
+var total = 0
+for (x in [1, 2, 3]) {
+    let key = text.(x)
+    total = total + len(key)
+}
+total
+"#,
+        "3",
+    );
+}
+
+#[test]
+fn for_multiple_const_locals_keep_their_own_slots() {
+    assert_num(
+        r#"
+var total = 0
+for (x in [1, 2, 3]) {
+    let a = x + 1
+    let b = a + 1
+    total = total + b
+}
+total
+"#,
+        "12",
+    );
+}
+
+#[test]
+fn for_bindings_do_not_leak_or_overwrite_outer_bindings() {
+    assert_num(
+        r"
+let x = 40
+for (x in [1, 2]) {
+    let local = x + 10
+}
+x
+",
+        "40",
+    );
+}
+
+#[test]
+fn for_iteration_scope_is_left_on_continue_and_break() {
+    assert_num(
+        r"
+var total = 0
+for (x in [1, 2, 3, 4]) {
+    let local = x
+    if (x == 1) { continue }
+    total = total + local
+    if (x == 3) { break }
+}
+total
+",
+        "5",
     );
 }
 

@@ -418,6 +418,7 @@ pub enum IteratorKind {
         func: Arc<FunctionObject>,
         locals: Vec<Value>,
         name_map: Option<FxHashMap<String, usize>>,
+        local_consts: LocalConstState,
         pc: usize,
         exhausted: bool,
         yield_from: Option<Shared<IteratorState>>,
@@ -426,6 +427,13 @@ pub enum IteratorKind {
         paused_iters: Vec<Shared<IteratorState>>,
         paused_fast_ret: Vec<usize>,
     },
+}
+
+/// Const metadata for one lexical local frame, indexed by fast-local slot.
+#[derive(Clone, Default)]
+pub struct LocalConstState {
+    pub const_slots: FxHashSet<usize>,
+    pub pending_slots: FxHashSet<usize>,
 }
 
 /// 与 VM `TryFrame` 对齐，存在生成器暂停状态里以免 `value`/`vm` 循环依赖。
@@ -514,10 +522,15 @@ impl DictMap {
     }
 
     pub fn insert(&mut self, key: ValueKey, val: Value) {
-        if !self.map.contains_key(&key) {
-            self.order.push(key.clone());
+        match self.map.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(val);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                self.order.push(entry.key().clone());
+                entry.insert(val);
+            }
         }
-        self.map.insert(key, val);
     }
 
     #[must_use]

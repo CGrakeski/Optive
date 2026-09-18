@@ -1,4 +1,4 @@
-use super::{builtin, expect_function, expect_text, submodule, value_to_list};
+use super::{builtin, expect_function, expect_num_f64, expect_text, submodule, value_to_list};
 use crate::shared::Shared;
 use crate::value::{ModuleObject, Value};
 use crate::vm::Vm;
@@ -10,11 +10,99 @@ pub(super) fn build_test_module() -> Shared<ModuleObject> {
         &[
             ("assert_eq", builtin(test_assert_eq)),
             ("assert_true", builtin(test_assert_true)),
+            ("assert_false", builtin(test_assert_false)),
+            ("assert_ne", builtin(test_assert_ne)),
+            ("assert_contains", builtin(test_assert_contains)),
+            ("assert_approx", builtin(test_assert_approx)),
             ("assert_raises", builtin(test_assert_raises)),
             ("each", builtin(test_each)),
             ("tmp_dir", builtin(test_tmp_dir)),
         ],
     )
+}
+
+fn assertion_error(vm: &mut Vm, message: String) -> Result<Value> {
+    let exc = crate::exceptions::make_exception(vm, "AssertionError", message)?;
+    vm.throw_value(exc)?;
+    Ok(Value::None)
+}
+
+fn test_assert_false(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(crate::error::RuntimeError::type_err(
+            "assert_false requires 1 argument",
+        ));
+    }
+    if args[0].is_truthy() {
+        return assertion_error(vm, format!("expected falsy value, got {}", args[0]));
+    }
+    Ok(Value::None)
+}
+
+fn test_assert_ne(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(crate::error::RuntimeError::type_err(
+            "assert_ne requires 2 arguments",
+        ));
+    }
+    if args[0].print_string() == args[1].print_string() {
+        return assertion_error(vm, format!("{} == {}", args[0], args[1]));
+    }
+    Ok(Value::None)
+}
+
+fn test_assert_contains(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(crate::error::RuntimeError::type_err(
+            "assert_contains requires (container, value)",
+        ));
+    }
+    let found = match &args[0] {
+        Value::Text(text) => text.contains(&args[1].print_string()),
+        other => value_to_list(other)?
+            .iter()
+            .any(|v| v.print_string() == args[1].print_string()),
+    };
+    if !found {
+        return assertion_error(vm, format!("{} does not contain {}", args[0], args[1]));
+    }
+    Ok(Value::None)
+}
+
+fn test_assert_approx(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if !(2..=3).contains(&args.len()) {
+        return Err(crate::error::RuntimeError::type_err(
+            "assert_approx requires (actual, expected, tolerance?)",
+        ));
+    }
+    let actual = expect_num_f64("assert_approx", args, 0)?;
+    let expected = expect_num_f64("assert_approx", args, 1)?;
+    let tolerance = if let Some(value) = args.get(2) {
+        match value {
+            Value::Num(n) => n.to_f64_checked().map_err(|_| {
+                crate::error::RuntimeError::value_err("tolerance is outside f64 range")
+            })?,
+            _ => {
+                return Err(crate::error::RuntimeError::type_err(
+                    "tolerance must be numeric",
+                ))
+            }
+        }
+    } else {
+        1e-9
+    };
+    if tolerance < 0.0 {
+        return Err(crate::error::RuntimeError::value_err(
+            "tolerance must be non-negative",
+        ));
+    }
+    if (actual - expected).abs() > tolerance {
+        return assertion_error(
+            vm,
+            format!("{actual} is not within {tolerance} of {expected}"),
+        );
+    }
+    Ok(Value::None)
 }
 
 fn test_each(vm: &mut Vm, args: &[Value]) -> Result<Value> {

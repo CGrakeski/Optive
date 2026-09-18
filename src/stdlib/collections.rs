@@ -1,4 +1,5 @@
 use num_bigint::BigInt;
+use std::sync::Arc;
 
 use super::{builtin, expect_arity, expect_function, expect_int, materialize_iter, submodule};
 use crate::shared::Shared;
@@ -25,8 +26,80 @@ pub(super) fn build_collections_module() -> Shared<ModuleObject> {
             ("chunk", builtin(coll_chunk)),
             ("count", builtin(coll_count)),
             ("group_by", builtin(coll_group_by)),
+            ("counter", builtin(coll_counter)),
+            ("partition", builtin(coll_partition)),
+            ("window", builtin(coll_window)),
         ],
     )
+}
+
+fn coll_counter(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    expect_arity("counter", args, 1)?;
+    let mut out = DictMap::new();
+    for item in materialize_iter(vm, &args[0])? {
+        let key = ValueKey::from_value(&item)?;
+        let next = match out.get(&key) {
+            Some(Value::Num(n)) => n.to_i64().unwrap_or(0) + 1,
+            _ => 1,
+        };
+        out.insert(key, Value::Num(Num::Small(next)));
+    }
+    Ok(Value::Dict(Shared::new(out)))
+}
+
+fn coll_partition(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(crate::error::RuntimeError::type_err(
+            "partition requires (items, predicate)",
+        ));
+    }
+    let predicate = expect_function("partition", args, 1)?;
+    let mut yes = Vec::new();
+    let mut no = Vec::new();
+    for item in materialize_iter(vm, &args[0])? {
+        if vm
+            .call_user_function(predicate.clone(), vec![item.clone()])?
+            .is_truthy()
+        {
+            yes.push(item);
+        } else {
+            no.push(item);
+        }
+    }
+    Ok(Value::Tuple(Arc::from(vec![
+        Value::List(Shared::new(yes)),
+        Value::List(Shared::new(no)),
+    ])))
+}
+
+fn coll_window(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if !(2..=3).contains(&args.len()) {
+        return Err(crate::error::RuntimeError::type_err(
+            "window requires (items, size, step?)",
+        ));
+    }
+    let items = materialize_iter(vm, &args[0])?;
+    let size = expect_int("window", args, 1)?;
+    let step = if args.len() == 3 {
+        expect_int("window", args, 2)?
+    } else {
+        1
+    };
+    if size <= 0 || step <= 0 {
+        return Err(crate::error::RuntimeError::value_err(
+            "window size and step must be positive",
+        ));
+    }
+    let (size, step) = (size as usize, step as usize);
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start + size <= items.len() {
+        out.push(Value::List(Shared::new(
+            items[start..start + size].to_vec(),
+        )));
+        start += step;
+    }
+    Ok(Value::List(Shared::new(out)))
 }
 
 fn coll_sorted(vm: &mut Vm, args: &[Value]) -> Result<Value> {

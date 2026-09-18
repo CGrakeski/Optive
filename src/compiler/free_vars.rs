@@ -137,17 +137,17 @@ fn collect_stmt_scoped(stmt: &Stmt, locals: &mut HashMap<String, ()>, free: &mut
                 collect_block(b, locals, free);
             }
         }
-        Stmt::While { cond, body } => {
+        Stmt::While { cond, body, .. } => {
             collect_expr(cond, locals, free);
             collect_block(body, locals, free);
         }
-        Stmt::Loop { count, body } => {
+        Stmt::Loop { count, body, .. } => {
             if let Some(c) = count {
                 collect_expr(c, locals, free);
             }
             collect_block(body, locals, free);
         }
-        Stmt::For { items, body } => {
+        Stmt::For { items, body, .. } => {
             let mut scoped = locals.clone();
             for item in items {
                 collect_expr(&item.iterable, locals, free);
@@ -157,7 +157,7 @@ fn collect_stmt_scoped(stmt: &Stmt, locals: &mut HashMap<String, ()>, free: &mut
                 collect_stmt_scoped(&located.stmt, &mut scoped, free);
             }
         }
-        Stmt::Break | Stmt::Continue => {}
+        Stmt::Break(_) | Stmt::Continue(_) => {}
         Stmt::Defer(body) => collect_block(body, locals, free),
         Stmt::Comment { .. } => {}
         Stmt::Try {
@@ -201,8 +201,8 @@ fn collect_stmt_scoped(stmt: &Stmt, locals: &mut HashMap<String, ()>, free: &mut
         } => {
             collect_expr(context, locals, free);
             let mut scoped = locals.clone();
-            if let Some(a) = alias {
-                scoped.insert(a.clone(), ());
+            if let Some(pattern) = alias {
+                bind_destruct_pattern(pattern, &mut scoped);
             }
             collect_block(body, &mut scoped, free);
         }
@@ -673,17 +673,17 @@ fn walk_stmt_callables(stmt: &Stmt, free: &mut HashSet<String>) {
                 walk_block_callables(b, free);
             }
         }
-        Stmt::While { cond, body } => {
+        Stmt::While { cond, body, .. } => {
             walk_expr_callables(cond, free);
             walk_block_callables(body, free);
         }
-        Stmt::Loop { count, body } => {
+        Stmt::Loop { count, body, .. } => {
             if let Some(c) = count {
                 walk_expr_callables(c, free);
             }
             walk_block_callables(body, free);
         }
-        Stmt::For { items, body } => {
+        Stmt::For { items, body, .. } => {
             for item in items {
                 walk_expr_callables(&item.iterable, free);
             }
@@ -738,8 +738,8 @@ fn walk_stmt_callables(stmt: &Stmt, free: &mut HashSet<String>) {
         }
         Stmt::Block(body) | Stmt::Defer(body) => walk_block_callables(body, free),
         Stmt::ProtocolDecl { .. }
-        | Stmt::Break
-        | Stmt::Continue
+        | Stmt::Break(_)
+        | Stmt::Continue(_)
         | Stmt::Import { .. }
         | Stmt::Use { .. }
         | Stmt::VariantDecl { .. }

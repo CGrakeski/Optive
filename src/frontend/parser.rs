@@ -20,6 +20,8 @@ pub struct Parser {
     /// 仅在管道右侧与返回包装器中为 true；其余位置的 `_` 在解析期报错。
     allow_placeholder: bool,
     next_pipe_id: usize,
+    /// 解析任意表达式装饰器时禁止 `parse_pipeline` 递归探测装饰器前缀。
+    parsing_decorator_expr: bool,
 }
 
 impl Parser {
@@ -33,6 +35,7 @@ impl Parser {
             brace_depth: 0,
             allow_placeholder: false,
             next_pipe_id: 0,
+            parsing_decorator_expr: false,
         };
         let mut stmts = Vec::new();
         p.skip_newlines_only();
@@ -57,6 +60,7 @@ impl Parser {
             brace_depth: 0,
             allow_placeholder: false,
             next_pipe_id: 0,
+            parsing_decorator_expr: false,
         };
         let expr = p.parse_expr()?;
         if !p.is_at_end() {
@@ -458,12 +462,29 @@ impl Parser {
             self.pos = saved;
             return Ok(Stmt::Expr(self.parse_expr()?));
         }
+        let loop_label = if self.check(TokenKind::Identifier)
+            && matches!(
+                self.tokens.get(self.pos + 1).map(|t| t.kind),
+                Some(TokenKind::KwWhile | TokenKind::KwLoop | TokenKind::KwFor)
+            )
+            && self.tokens[self.pos + 1].line == self.current().line
+        {
+            let label = self.current().value.clone();
+            self.advance();
+            Some(label)
+        } else {
+            None
+        };
         if self.match_kind(TokenKind::KwWhile) {
             self.expect(TokenKind::LParen, "expected '(' after while")?;
             let cond = self.parse_expr()?;
             self.expect(TokenKind::RParen, "expected ')'")?;
             let body = self.parse_block()?;
-            return Ok(Stmt::While { cond, body });
+            return Ok(Stmt::While {
+                label: loop_label,
+                cond,
+                body,
+            });
         }
         if self.match_kind(TokenKind::KwLoop) {
             let count = if self.check(TokenKind::LParen) {
@@ -475,16 +496,38 @@ impl Parser {
                 None
             };
             let body = self.parse_block()?;
-            return Ok(Stmt::Loop { count, body });
+            return Ok(Stmt::Loop {
+                label: loop_label,
+                count,
+                body,
+            });
         }
         if self.match_kind(TokenKind::KwFor) {
-            return self.parse_for();
+            return self.parse_for(loop_label);
         }
         if self.match_kind(TokenKind::KwBreak) {
-            return Ok(Stmt::Break);
+            let keyword_line = self.tokens[self.pos - 1].line;
+            let label = if self.check(TokenKind::Identifier) && self.current().line == keyword_line
+            {
+                let value = self.current().value.clone();
+                self.advance();
+                Some(value)
+            } else {
+                None
+            };
+            return Ok(Stmt::Break(label));
         }
         if self.match_kind(TokenKind::KwContinue) {
-            return Ok(Stmt::Continue);
+            let keyword_line = self.tokens[self.pos - 1].line;
+            let label = if self.check(TokenKind::Identifier) && self.current().line == keyword_line
+            {
+                let value = self.current().value.clone();
+                self.advance();
+                Some(value)
+            } else {
+                None
+            };
+            return Ok(Stmt::Continue(label));
         }
         if self.match_kind(TokenKind::KwDefer) {
             return Ok(Stmt::Defer(self.parse_block()?));
@@ -720,202 +763,53 @@ impl Parser {
         self.parse_postfix_no_macro()
     }
 
-    fn parse_decorator_expr(&mut self) -> Result<Expr, ParseError> {
-        let loc = self.loc_here();
-        let name = self
-            .expect(TokenKind::Identifier, "expected decorator name")?
-            .value;
-        let mut expr = Expr::new(loc, ExprKind::Var(name));
-        loop {
-            self.skip_newlines();
-            if self.match_kind(TokenKind::LParen) {
-                let args = self.parse_call_args(true)?;
-                self.expect(TokenKind::RParen, "expected ')' after decorator arguments")?;
-                let call_loc = expr.loc;
-                expr = Expr::new(
-                    call_loc,
-                    ExprKind::Call {
-                        callee: Box::new(expr),
-                        args,
-                    },
-                );
-            } else if self.check(TokenKind::Dot) {
-                // `Name.(value)` 是类型转换，不是装饰器属性链；留给表达式解析。
-                if self.tokens.get(self.pos + 1).map(|t| t.kind) == Some(TokenKind::LParen) {
-                    break;
-                }
-                self.advance();
-                let field = self.parse_member_name()?;
-                let mem_loc = expr.loc;
-                expr = Expr::new(
-                    mem_loc,
-                    ExprKind::Member {
-                        object: Box::new(expr),
-                        field,
-                    },
-                );
-            } else {
-                break;
-            }
-        }
-        Ok(expr)
-    }
-
     fn parse_decorator_prefix(&mut self) -> Result<Vec<Expr>, ParseError> {
+        if self.parsing_decorator_expr {
+            return Ok(Vec::new());
+        }
+        let start = self.pos;
         let mut decos = Vec::new();
         loop {
-            let pos = self.pos;
-            if !self.check(TokenKind::Identifier) || self.is_stmt_keyword_at_decorator_boundary() {
-                break;
+            if !decos.is_empty() && self.decorator_target_here() {
+                return Ok(decos);
             }
-            let deco = self.parse_decorator_expr()?;
-            let after_deco = self.pos;
-            self.skip_newlines();
-            // 仅当后续确实是装饰器链并落到 func/do/with 时才提交；
-            // 避免 `foo()\nbar.(1)` 把上一行表达式误判为装饰器。
-            if !self.decorator_chain_leads_to_target() {
-                self.pos = pos;
-                break;
+
+            let expr_start = self.pos;
+            self.parsing_decorator_expr = true;
+            let parsed = self.parse_expr();
+            self.parsing_decorator_expr = false;
+            let Ok(deco) = parsed else {
+                self.pos = start;
+                return Ok(Vec::new());
+            };
+            if self.pos == expr_start {
+                self.pos = start;
+                return Ok(Vec::new());
             }
-            self.pos = after_deco;
-            self.skip_newlines();
+
+            let previous_line = self.tokens[self.pos - 1].line;
+            if self.current().line != previous_line {
+                self.pos = start;
+                return Ok(Vec::new());
+            }
             decos.push(deco);
-        }
-        Ok(decos)
-    }
 
-    /// 从当前位置起，能否看到 `decorator* (func|do|with)`（允许装饰器间换行）。
-    fn decorator_chain_leads_to_target(&self) -> bool {
-        let mut i = self.pos;
-        while matches!(
-            self.tokens.get(i).map(|t| t.kind),
-            Some(TokenKind::Newline | TokenKind::LineComment | TokenKind::BlockComment)
-        ) {
-            i += 1;
-        }
-        loop {
-            match self.tokens.get(i).map(|t| t.kind) {
-                Some(TokenKind::KwFunc | TokenKind::KwDo) => return true,
-                Some(TokenKind::KwWith) => {
-                    // 仅 `with make` 是装饰器目标；`with (` 是 with 语句。
-                    let mut j = i + 1;
-                    while matches!(
-                        self.tokens.get(j).map(|t| t.kind),
-                        Some(TokenKind::Newline | TokenKind::LineComment | TokenKind::BlockComment)
-                    ) {
-                        j += 1;
-                    }
-                    return self.tokens.get(j).map(|t| t.kind) == Some(TokenKind::KwMake);
-                }
-                Some(TokenKind::Identifier) => {
-                    if self.is_stmt_keyword_token_at(i) {
-                        return false;
-                    }
-                    i += 1;
-                    loop {
-                        while matches!(
-                            self.tokens.get(i).map(|t| t.kind),
-                            Some(
-                                TokenKind::Newline
-                                    | TokenKind::LineComment
-                                    | TokenKind::BlockComment
-                            )
-                        ) {
-                            i += 1;
-                        }
-                        match self.tokens.get(i).map(|t| t.kind) {
-                            Some(TokenKind::Dot) => {
-                                if self.tokens.get(i + 1).map(|t| t.kind) == Some(TokenKind::LParen)
-                                {
-                                    // `Name.(...)` 是类型转换，不是装饰器。
-                                    return false;
-                                }
-                                i += 1;
-                                if self.tokens.get(i).map(|t| t.kind) != Some(TokenKind::Identifier)
-                                {
-                                    return false;
-                                }
-                                i += 1;
-                            }
-                            Some(TokenKind::LParen) => match Self::skip_balanced_tokens(
-                                &self.tokens,
-                                i,
-                                TokenKind::LParen,
-                                TokenKind::RParen,
-                            ) {
-                                Some(next) => i = next,
-                                None => return false,
-                            },
-                            _ => break,
-                        }
-                    }
-                }
-                _ => return false,
+            if self.decorator_target_here() {
+                return Ok(decos);
+            }
+            if !self.is_expr_start() {
+                self.pos = start;
+                return Ok(Vec::new());
             }
         }
     }
 
-    fn is_stmt_keyword_token_at(&self, index: usize) -> bool {
+    fn decorator_target_here(&self) -> bool {
         matches!(
-            self.tokens.get(index).map(|t| t.kind),
-            Some(
-                TokenKind::KwFunc
-                    | TokenKind::KwMacro
-                    | TokenKind::KwFriend
-                    | TokenKind::KwStruct
-                    | TokenKind::KwProtocol
-                    | TokenKind::KwTyped
-                    | TokenKind::KwDo
-                    | TokenKind::KwWith
-                    | TokenKind::KwLet
-                    | TokenKind::KwVar
-                    | TokenKind::KwReturn
-                    | TokenKind::KwIf
-                    | TokenKind::KwWhile
-                    | TokenKind::KwFor
-                    | TokenKind::KwLoop
-                    | TokenKind::KwBreak
-                    | TokenKind::KwContinue
-                    | TokenKind::KwThrow
-                    | TokenKind::KwTry
-                    | TokenKind::KwMatch
-                    | TokenKind::KwDel
-                    | TokenKind::KwImport
-                    | TokenKind::KwUse
-            )
-        )
-    }
-
-    fn skip_balanced_tokens(
-        tokens: &[Token],
-        start: usize,
-        open: TokenKind,
-        close: TokenKind,
-    ) -> Option<usize> {
-        if tokens.get(start).map(|t| t.kind) != Some(open) {
-            return None;
-        }
-        let mut depth = 0usize;
-        let mut i = start;
-        while i < tokens.len() {
-            let kind = tokens[i].kind;
-            if kind == open {
-                depth += 1;
-            } else if kind == close {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i + 1);
-                }
-            } else if kind == TokenKind::End {
-                return None;
-            }
-            i += 1;
-        }
-        None
-    }
-
-    fn is_stmt_keyword_at_decorator_boundary(&self) -> bool {
-        self.is_stmt_keyword_token_at(self.pos)
+            self.current().kind,
+            TokenKind::KwFunc | TokenKind::KwGen | TokenKind::KwDo
+        ) || (self.current().kind == TokenKind::KwWith
+            && self.tokens.get(self.pos + 1).map(|t| t.kind) == Some(TokenKind::KwMake))
     }
 
     fn apply_decorators_to_expr(decorators: Vec<Expr>, inner: Expr) -> Expr {
@@ -986,10 +880,7 @@ impl Parser {
         let context = self.parse_expr()?;
         let mut alias = None;
         if self.match_kind(TokenKind::KwAs) {
-            alias = Some(
-                self.expect(TokenKind::Identifier, "expected name after as")?
-                    .value,
-            );
+            alias = Some(self.parse_destruct_pattern()?);
         }
         self.skip_newlines();
         self.expect(TokenKind::RParen, "expected ')'")?;
@@ -1460,10 +1351,10 @@ impl Parser {
         Ok(items)
     }
 
-    fn parse_for(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_for(&mut self, label: Option<String>) -> Result<Stmt, ParseError> {
         let items = self.parse_for_items_in_parens()?;
         let body = self.parse_block()?;
-        Ok(Stmt::For { items, body })
+        Ok(Stmt::For { label, items, body })
     }
 
     /// `par { expr; expr; ... }`：块内仅允许表达式语句。
@@ -2207,16 +2098,18 @@ impl Parser {
     }
 
     fn parse_pipeline(&mut self) -> Result<Expr, ParseError> {
-        let pos = self.pos;
-        let decos = self.parse_decorator_prefix()?;
-        if self.check(TokenKind::KwDo) {
-            let loc = self.loc_here();
-            self.advance();
-            let inner = self.parse_do_func_expr(loc)?;
-            return Ok(Self::apply_decorators_to_expr(decos, inner));
-        }
-        if !decos.is_empty() {
-            self.pos = pos;
+        if !self.parsing_decorator_expr {
+            let pos = self.pos;
+            let decos = self.parse_decorator_prefix()?;
+            if self.check(TokenKind::KwDo) {
+                let loc = self.loc_here();
+                self.advance();
+                let inner = self.parse_do_func_expr(loc)?;
+                return Ok(Self::apply_decorators_to_expr(decos, inner));
+            }
+            if !decos.is_empty() {
+                self.pos = pos;
+            }
         }
         let mut expr = self.parse_or()?;
         while self.match_kind(TokenKind::Pipe) {

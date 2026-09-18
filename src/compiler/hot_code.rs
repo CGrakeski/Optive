@@ -44,6 +44,15 @@ pub const H_LOAD_FAST_ADD_IMM_STORE: u8 = 35;
 pub const H_LOAD_FAST_SQR_GT: u8 = 36;
 pub const H_LOAD_FAST_MOD_EQ0: u8 = 37;
 pub const H_LOAD_FAST_ADD_STORE: u8 = 38;
+/// `CallSelf(1)` whose sole argument is `local[slot] - imm`.
+/// The following hot slot is skipped, preserving the one-to-one cold-code map.
+pub const H_CALL_SELF_FAST_SUB_IMM: u8 = 39;
+/// `local[slot] < imm` followed by `GotoIfNot`; the skipped slot stores target.
+pub const H_GOTO_IF_NOT_FAST_LT_IMM: u8 = 40;
+/// Guard clause: `local[slot] < imm`, then return a fast local when true.
+pub const H_RET_FAST_IF_LT_IMM: u8 = 41;
+/// Numeric addition immediately returned by the current function.
+pub const H_ADD_NUM_RET: u8 = 42;
 pub const H_COLD: u8 = 255;
 
 #[derive(Clone, Default)]
@@ -69,7 +78,84 @@ impl HotCode {
         // (notably __make_closure__ upgrading an enclosing local to a shared Cell).
         // Encoding it as H_STORE_FAST would silently skip that semantic side effect.
         let uses_name_map = crate::opcode::function_uses_name_map(code);
-        for ins in code {
+        for (index, ins) in code.iter().enumerate() {
+            if matches!(ins, Instruction::Add | Instruction::AddNumNum)
+                && matches!(code.get(index + 1), Some(Instruction::Ret))
+            {
+                ops.push(H_ADD_NUM_RET);
+                args.push(0);
+                continue;
+            }
+            if let Instruction::LoadFastSubImm { slot, imm } = ins {
+                if matches!(code.get(index + 1), Some(Instruction::CallSelf { argc: 1 })) {
+                    ops.push(H_CALL_SELF_FAST_SUB_IMM);
+                    args.push(encode_slot_imm(*slot, *imm));
+                    continue;
+                }
+            }
+            if let Instruction::LoadFastLtImm { slot, imm } = ins {
+                if let (Some(Instruction::GotoIfNot(target)), Some(Instruction::RetFast(_))) =
+                    (code.get(index + 1), code.get(index + 2))
+                {
+                    if *target == index + 3 {
+                        ops.push(H_RET_FAST_IF_LT_IMM);
+                        args.push(encode_slot_imm(*slot, *imm));
+                        continue;
+                    }
+                }
+                if matches!(code.get(index + 1), Some(Instruction::GotoIfNot(_))) {
+                    ops.push(H_GOTO_IF_NOT_FAST_LT_IMM);
+                    args.push(encode_slot_imm(*slot, *imm));
+                    continue;
+                }
+            }
+            // The preceding fused instruction advances over this source instruction.
+            if matches!(ins, Instruction::CallSelf { argc: 1 })
+                && matches!(
+                    code.get(index.wrapping_sub(1)),
+                    Some(Instruction::LoadFastSubImm { .. })
+                )
+            {
+                ops.push(H_COLD);
+                args.push(0);
+                continue;
+            }
+            if let Instruction::GotoIfNot(target) = ins {
+                if let (
+                    Some(Instruction::LoadFastLtImm { .. }),
+                    Some(Instruction::RetFast(return_slot)),
+                ) = (code.get(index.wrapping_sub(1)), code.get(index + 1))
+                {
+                    if *target == index + 2 {
+                        ops.push(H_COLD);
+                        args.push(*return_slot as i64);
+                        continue;
+                    }
+                }
+                if matches!(
+                    code.get(index.wrapping_sub(1)),
+                    Some(Instruction::LoadFastLtImm { .. })
+                ) {
+                    ops.push(H_COLD);
+                    args.push(*target as i64);
+                    continue;
+                }
+            }
+            if matches!(ins, Instruction::RetFast(_)) {
+                if let (
+                    Some(Instruction::LoadFastLtImm { .. }),
+                    Some(Instruction::GotoIfNot(target)),
+                ) = (
+                    code.get(index.wrapping_sub(2)),
+                    code.get(index.wrapping_sub(1)),
+                ) {
+                    if *target == index + 1 {
+                        ops.push(H_COLD);
+                        args.push(0);
+                        continue;
+                    }
+                }
+            }
             let (op, arg) = match ins {
                 Instruction::PushSmall(n) => (H_PUSH_SMALL, *n),
                 Instruction::LoadFast(s) => (H_LOAD_FAST, *s as i64),
@@ -210,5 +296,50 @@ mod tests {
 
         let hot = HotCode::encode(&code);
         assert_eq!(hot.ops[0], H_STORE_FAST);
+    }
+
+    #[test]
+    fn fuses_fast_sub_into_one_argument_self_call() {
+        let code = [
+            Instruction::LoadFastSubImm { slot: 3, imm: 2 },
+            Instruction::CallSelf { argc: 1 },
+        ];
+        let hot = HotCode::encode(&code);
+        assert_eq!(hot.ops.as_ref(), [H_CALL_SELF_FAST_SUB_IMM, H_COLD]);
+        assert_eq!(decode_slot_imm(hot.args[0]), (3, 2));
+    }
+
+    #[test]
+    fn fuses_fast_lt_into_conditional_branch() {
+        let code = [
+            Instruction::LoadFastLtImm { slot: 1, imm: 7 },
+            Instruction::GotoIfNot(9),
+        ];
+        let hot = HotCode::encode(&code);
+        assert_eq!(hot.ops.as_ref(), [H_GOTO_IF_NOT_FAST_LT_IMM, H_COLD]);
+        assert_eq!(decode_slot_imm(hot.args[0]), (1, 7));
+        assert_eq!(hot.args[1], 9);
+    }
+
+    #[test]
+    fn fuses_fast_lt_guard_return() {
+        let code = [
+            Instruction::LoadFastLtImm { slot: 0, imm: 2 },
+            Instruction::GotoIfNot(3),
+            Instruction::RetFast(0),
+            Instruction::PushSmall(9),
+        ];
+        let hot = HotCode::encode(&code);
+        assert_eq!(hot.ops[0], H_RET_FAST_IF_LT_IMM);
+        assert_eq!(decode_slot_imm(hot.args[0]), (0, 2));
+        assert_eq!(hot.args[1], 0);
+        assert_eq!(hot.ops[2], H_COLD);
+    }
+
+    #[test]
+    fn fuses_numeric_add_then_return() {
+        let code = [Instruction::AddNumNum, Instruction::Ret];
+        let hot = HotCode::encode(&code);
+        assert_eq!(hot.ops.as_ref(), [H_ADD_NUM_RET, H_RET]);
     }
 }

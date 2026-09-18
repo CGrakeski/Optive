@@ -1013,17 +1013,17 @@ fn walk_stmt_calls(
                 collect_call_hints(b, uri, docs, idx, out);
             }
         }
-        Stmt::While { cond, body } => {
+        Stmt::While { cond, body, .. } => {
             walk_expr_calls(cond, uri, docs, idx, out);
             collect_call_hints(body, uri, docs, idx, out);
         }
-        Stmt::Loop { count, body } => {
+        Stmt::Loop { count, body, .. } => {
             if let Some(c) = count {
                 walk_expr_calls(c, uri, docs, idx, out);
             }
             collect_call_hints(body, uri, docs, idx, out);
         }
-        Stmt::For { items, body } => {
+        Stmt::For { items, body, .. } => {
             for it in items {
                 walk_expr_calls(&it.iterable, uri, docs, idx, out);
             }
@@ -1080,8 +1080,8 @@ fn walk_stmt_calls(
         | Stmt::Use { .. }
         | Stmt::ProtocolDecl { .. }
         | Stmt::VariantDecl { .. }
-        | Stmt::Break
-        | Stmt::Continue
+        | Stmt::Break(_)
+        | Stmt::Continue(_)
         | Stmt::Comment { .. } => {}
     }
 }

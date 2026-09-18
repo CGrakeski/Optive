@@ -181,8 +181,7 @@ impl Formatter {
             } => {
                 for d in decorators {
                     self.emit_expr(d, depth);
-                    self.buf.push('\n');
-                    self.indent(depth);
+                    self.buf.push(' ');
                 }
                 self.emit_visibility(*visibility);
                 if *is_const {
@@ -279,13 +278,21 @@ impl Formatter {
                     self.emit_block(b, depth);
                 }
             }
-            Stmt::While { cond, body } => {
+            Stmt::While { label, cond, body } => {
+                if let Some(label) = label {
+                    self.buf.push_str(label);
+                    self.buf.push(' ');
+                }
                 self.buf.push_str("while (");
                 self.emit_expr(cond, depth);
                 self.buf.push_str(") ");
                 self.emit_block(body, depth);
             }
-            Stmt::Loop { count, body } => {
+            Stmt::Loop { label, count, body } => {
+                if let Some(label) = label {
+                    self.buf.push_str(label);
+                    self.buf.push(' ');
+                }
                 self.buf.push_str("loop");
                 if let Some(c) = count {
                     self.buf.push_str(" (");
@@ -295,7 +302,11 @@ impl Formatter {
                 self.buf.push(' ');
                 self.emit_block(body, depth);
             }
-            Stmt::For { items, body } => {
+            Stmt::For { label, items, body } => {
+                if let Some(label) = label {
+                    self.buf.push_str(label);
+                    self.buf.push(' ');
+                }
                 self.buf.push_str("for (");
                 for (i, it) in items.iter().enumerate() {
                     if i > 0 {
@@ -308,8 +319,20 @@ impl Formatter {
                 self.buf.push_str(") ");
                 self.emit_block(body, depth);
             }
-            Stmt::Break => self.buf.push_str("break"),
-            Stmt::Continue => self.buf.push_str("continue"),
+            Stmt::Break(label) => {
+                self.buf.push_str("break");
+                if let Some(label) = label {
+                    self.buf.push(' ');
+                    self.buf.push_str(label);
+                }
+            }
+            Stmt::Continue(label) => {
+                self.buf.push_str("continue");
+                if let Some(label) = label {
+                    self.buf.push(' ');
+                    self.buf.push_str(label);
+                }
+            }
             Stmt::Defer(body) => {
                 self.buf.push_str("defer ");
                 self.emit_block(body, depth);
@@ -394,7 +417,7 @@ impl Formatter {
                 self.buf.push(')');
                 if let Some(a) = alias {
                     self.buf.push_str(" as ");
-                    self.buf.push_str(a);
+                    self.emit_destruct(a);
                 }
                 self.buf.push(' ');
                 self.emit_block(body, depth);

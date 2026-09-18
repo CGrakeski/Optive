@@ -8,7 +8,7 @@ use crate::Result;
 
 use crate::shared::Shared;
 
-use super::{builtin, expect_text, float_from_f64, submodule, value_key_to_value};
+use super::{builtin, expect_text, float_from_f64, submodule};
 
 const JSON_MAX_DEPTH: usize = 64;
 
@@ -315,53 +315,73 @@ impl JsonParser {
 }
 
 pub(super) fn json_stringify_value(v: &Value, depth: usize) -> Result<String> {
+    let mut output = String::with_capacity(128);
+    write_json_value(v, depth, &mut output)?;
+    Ok(output)
+}
+
+fn write_json_value(v: &Value, depth: usize, output: &mut String) -> Result<()> {
     if depth >= JSON_MAX_DEPTH {
         return Err(crate::error::RuntimeError::value_err(
             "json.stringify: nesting exceeds maximum depth",
         ));
     }
-    Ok(match v {
-        Value::None => "null".into(),
-        Value::Bool(b) => b.to_string(),
-        Value::Num(n) => n.to_string(),
-        Value::Text(s) => json_escape_string(s),
+    match v {
+        Value::None => output.push_str("null"),
+        Value::Bool(true) => output.push_str("true"),
+        Value::Bool(false) => output.push_str("false"),
+        Value::Num(n) => {
+            use std::fmt::Write as _;
+            let _ = write!(output, "{n}");
+        }
+        Value::Text(s) => write_json_string(s, output),
         Value::List(l) => {
-            let parts: Result<Vec<_>> = l
-                .borrow()
-                .iter()
-                .map(|item| json_stringify_value(item, depth + 1))
-                .collect();
-            format!("[{}]", parts?.join(","))
+            output.push('[');
+            for (index, item) in l.borrow().iter().enumerate() {
+                if index != 0 {
+                    output.push(',');
+                }
+                write_json_value(item, depth + 1, output)?;
+            }
+            output.push(']');
         }
         Value::Dict(d) => {
-            let mut parts = Vec::new();
-            for (k, val) in d.borrow().iter() {
-                let key = match value_key_to_value(k) {
-                    Value::Text(s) => s,
-                    other => other.print_string(),
+            output.push('{');
+            for (index, (k, val)) in d.borrow().iter().enumerate() {
+                if index != 0 {
+                    output.push(',');
+                }
+                match k {
+                    ValueKey::Text(text) => write_json_string(text, output),
+                    ValueKey::Bool(value) => {
+                        write_json_string(if *value { "true" } else { "false" }, output);
+                    }
+                    ValueKey::NumInt(value) => write_json_string(&value.to_string(), output),
                 };
-                parts.push(format!(
-                    "{}:{}",
-                    json_escape_string(&key),
-                    json_stringify_value(val, depth + 1)?
-                ));
+                output.push(':');
+                write_json_value(val, depth + 1, output)?;
             }
-            format!("{{{}}}", parts.join(","))
+            output.push('}');
         }
         Value::Set(s) => {
-            let parts: Result<Vec<_>> = s
-                .borrow()
-                .iter()
-                .map(|k| json_stringify_value(&value_key_to_value(k), depth + 1))
-                .collect();
-            format!("[{}]", parts?.join(","))
+            output.push('[');
+            for (index, key) in s.borrow().iter().enumerate() {
+                if index != 0 {
+                    output.push(',');
+                }
+                write_json_value_key(key, output);
+            }
+            output.push(']');
         }
         Value::Tuple(t) => {
-            let parts: Result<Vec<_>> = t
-                .iter()
-                .map(|item| json_stringify_value(item, depth + 1))
-                .collect();
-            format!("[{}]", parts?.join(","))
+            output.push('[');
+            for (index, item) in t.iter().enumerate() {
+                if index != 0 {
+                    output.push(',');
+                }
+                write_json_value(item, depth + 1, output)?;
+            }
+            output.push(']');
         }
         other => {
             return Err(crate::error::RuntimeError::type_err(format!(
@@ -369,11 +389,26 @@ pub(super) fn json_stringify_value(v: &Value, depth: usize) -> Result<String> {
                 other.type_name()
             )));
         }
-    })
+    }
+    Ok(())
 }
 
-pub(super) fn json_escape_string(s: &str) -> String {
-    let mut out = String::from("\"");
+fn write_json_value_key(key: &ValueKey, output: &mut String) {
+    use std::fmt::Write as _;
+
+    match key {
+        ValueKey::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+        ValueKey::NumInt(value) => {
+            let _ = write!(output, "{value}");
+        }
+        ValueKey::Text(text) => write_json_string(text, output),
+    }
+}
+
+fn write_json_string(s: &str, out: &mut String) {
+    use std::fmt::Write as _;
+
+    out.push('"');
     for c in s.chars() {
         match c {
             '"' => out.push_str("\\\""),
@@ -381,10 +416,11 @@ pub(super) fn json_escape_string(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if c.is_control() => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
             c => out.push(c),
         }
     }
     out.push('"');
-    out
 }
