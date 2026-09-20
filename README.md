@@ -32,7 +32,7 @@ Optive run
 | 场景 | 命令 |
 | --- | --- |
 | 运行 | `Optive`、`Optive <file.tive>`、`Optive -c <code>` |
-| 项目 | `new`、`run`、`build`、`up`、`test`、`check` |
+| 项目 | `new`、`init`、`run`、`build`、`up`、`test`、`check` |
 | 依赖 | `add`、`remove`、`update`、`deps`、`search`、`index` |
 | 工具 | `fmt`、`debug`、`lsp`、`dap` |
 

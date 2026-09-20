@@ -2371,6 +2371,19 @@ impl Vm {
         self.maybe_auto_gc();
     }
 
+    /// Push a returned value without involving the object tracker when the
+    /// value is represented entirely inline. Heap-backed values retain the
+    /// normal tracking and automatic-GC path.
+    #[inline]
+    fn push_return_value(&mut self, v: Value) {
+        match v {
+            Value::None => self.op_push(StackVal::Empty),
+            Value::Bool(b) => self.op_push_bool(b),
+            Value::Num(Num::Small(n)) => self.op_push_int(n),
+            other => self.push_value(other),
+        }
+    }
+
     #[inline(always)]
     fn push_int(&mut self, n: i64) {
         self.op_push_int(n);
@@ -2523,6 +2536,28 @@ impl Vm {
         }
     }
 
+    /// Complete a lightweight return sourced from a local slot. Keeping this
+    /// out of the opcode dispatcher avoids inflating its instruction-cache
+    /// footprint while preserving the inline integer representation.
+    #[inline(never)]
+    fn finish_lightweight_fast_return(
+        &mut self,
+        slot: usize,
+        ret_pc: usize,
+        known_int: Option<i64>,
+    ) {
+        if let Some(n) = known_int.or_else(|| self.lw_slot_int(slot)) {
+            self.pop_lightweight_frame();
+            self.pc = ret_pc;
+            self.op_push_int(n);
+        } else {
+            let result = self.load_fast_sv(slot);
+            self.pop_lightweight_frame();
+            self.pc = ret_pc;
+            self.op_push(result);
+        }
+    }
+
     fn push_fast_cmp_imm(
         &mut self,
         slot: usize,
@@ -2589,7 +2624,7 @@ impl Vm {
         // SAFETY: n < lw_bases_sp（旧值）<= lw_bases.len()。
         let base = self.lw_bases[n];
         // 只清理 Heap 槽（防止 Rc/Box 延迟释放）；Int/Bool/Empty 无析构，
-        // 下次 call_self 会覆盖，跳过可省去 ~2.7M 次/帧的空写。
+        // 下次 call_self 会覆盖，跳过可省去大量空写。
         for i in base..self.lw_sp {
             if matches!(self.lw_slots[i], StackVal::Heap(_) | StackVal::Func(_)) {
                 self.lw_slots[i] = StackVal::Empty;
@@ -3409,11 +3444,7 @@ impl Vm {
             H_RET_FAST => {
                 self.pc = pc + 1;
                 if let Some(ret_pc) = self.pop_fast_ret() {
-                    // 从局部取返回值压栈，再拆帧（拆帧不碰操作数栈）。
-                    let result_sv = self.load_fast_sv(arg as usize);
-                    self.pop_lightweight_frame();
-                    self.pc = ret_pc;
-                    self.op_push(result_sv);
+                    self.finish_lightweight_fast_return(arg as usize, ret_pc, None);
                     HotFlow::Cont
                 } else {
                     let result_sv = self.load_fast_sv(arg as usize);
@@ -3432,10 +3463,8 @@ impl Vm {
                 }
                 let return_slot = unsafe { *hot_args.get_unchecked(pc + 1) as usize };
                 if let Some(ret_pc) = self.pop_fast_ret() {
-                    let result = self.load_fast_sv(return_slot);
-                    self.pop_lightweight_frame();
-                    self.pc = ret_pc;
-                    self.op_push(result);
+                    let known_int = (return_slot == compare_slot).then_some(value);
+                    self.finish_lightweight_fast_return(return_slot, ret_pc, known_int);
                     HotFlow::Cont
                 } else {
                     let result = self.load_fast_sv(return_slot);
@@ -3873,9 +3902,11 @@ impl Vm {
             // A lightweight call owns all execution arrays through one
             // FunctionObject Arc. Module/heavy code keeps the legacy pair.
             let lightweight_owner = self.active_lightweight_func.clone();
-            let module_hot = lightweight_owner
-                .is_none()
-                .then(|| (Arc::clone(&self.hot_ops), Arc::clone(&self.hot_args)));
+            let module_hot = if lightweight_owner.is_none() {
+                Some((Arc::clone(&self.hot_ops), Arc::clone(&self.hot_args)))
+            } else {
+                None
+            };
             let (ops, args) = if let Some(func) = lightweight_owner.as_ref() {
                 (func.hot.ops.as_ref(), func.hot.args.as_ref())
             } else {
@@ -7016,9 +7047,9 @@ impl Vm {
         let saved_lw_depth = self.lw_depth;
         let saved_lw_base = self.lw_base;
         self.user_call_frames.push(UserCallFrame {
-            // Lightweight code is selected through `active_lightweight_func`;
-            // keep module/heavy-function component Arcs in place instead of
-            // cloning and swapping five independent owners per call.
+            // Lightweight code is selected through this stack-top frame; keep
+            // module/heavy-function component Arcs in place instead of cloning
+            // and swapping five independent owners per call.
             saved_code: None,
             saved_hot_ops: None,
             saved_hot_args: None,
@@ -7105,9 +7136,8 @@ impl Vm {
             .user_call_frames
             .pop()
             .expect("user_call_frames non-empty on return (theoretically unreachable)");
-        let func = frame.func.clone();
-        if func.return_strong() {
-            if let Some(ref ty) = func.return_type_value {
+        if frame.func.return_strong() {
+            if let Some(ref ty) = frame.func.return_type_value {
                 if let Some(detail) = types::type_check_error(self, &result, ty) {
                     let msg = format!("return: {detail}");
                     if frame.pushed_name_frame {
@@ -7138,7 +7168,7 @@ impl Vm {
             self.func_stack.pop();
         }
         self.restore_user_call_frame(frame);
-        self.push_value(result);
+        self.push_return_value(result);
         Ok(None)
     }
 

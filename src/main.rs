@@ -302,6 +302,17 @@ fn main() {
                 }
                 return;
             }
+            "init" => {
+                if args.len() != 2 {
+                    color::eprint_error("usage: Optive init");
+                    process::exit(2);
+                }
+                if let Err(e) = cmd_init() {
+                    color::eprint_error(format!("Error: {e}"));
+                    process::exit(1);
+                }
+                return;
+            }
             "cache" => {
                 if let Err(e) = cmd_cache(&args[2..]) {
                     color::eprint_error(format!("Error: {e}"));
@@ -474,6 +485,19 @@ fn cmd_new(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("Next:");
     println!("  cd {}", name.trim());
+    println!("  Optive run");
+    Ok(())
+}
+
+fn cmd_init() -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let (root, name) = cli::new_project::init_project(&cwd)?;
+    color::status_line(&format!("Initialized project {name} in {}", root.display()));
+    println!("  Optive.toml");
+    println!("  src/main.tive");
+    println!("  .gitignore");
+    println!();
+    println!("Next:");
     println!("  Optive run");
     Ok(())
 }
@@ -931,6 +955,7 @@ fn print_help() {
     println!("{}", t_cli(CliMsg::HelpRunScript));
     println!("{}", t_cli(CliMsg::HelpRunCode));
     println!("{}", t_cli(CliMsg::HelpNew));
+    println!("{}", t_cli(CliMsg::HelpInit));
     println!("{}", t_cli(CliMsg::HelpRun));
     println!(
         "  Optive build [path] [--explain] [--clean] [--bundle|--exe] [--target TARGET] [--output PATH] [--all-modules] [--jobs N] [--emit bytecode|interface|all]"

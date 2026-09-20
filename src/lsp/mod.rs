@@ -2152,6 +2152,41 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_report_hard_call_flow_and_missing_return_paths() {
+        let src = r#"
+func consume(value:: num) { value }
+let wrong = "text"
+consume(wrong)
+func choose(flag) => num {
+    if (flag) { return 1 }
+}
+"#;
+        let found = diagnostics(src, "x.tive");
+        let messages: Vec<_> = found
+            .iter()
+            .map(|(_, _, message)| message.as_str())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("hard parameter requires num")),
+            "{messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("not all paths return a value")),
+            "{messages:?}"
+        );
+        let codes: Vec<_> = found
+            .iter()
+            .map(|(_, _, message)| crate::semantic::diagnostic_metadata(message).code)
+            .collect();
+        assert!(codes.contains(&"E4003"), "{codes:?}");
+        assert!(codes.contains(&"E4004"), "{codes:?}");
+    }
+
+    #[test]
     fn workspace_symbol_finds_indexed_func() {
         workspace::upsert_index("file:///tmp/ws/lib.tive", "func greet(name) { name }\n");
         let items = workspace_symbol("greet");

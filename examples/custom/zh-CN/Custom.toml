@@ -15,6 +15,7 @@ format_version = 1
 "cli.help.run_script" = { text = "  Optive <script.tive>           运行脚本" }
 "cli.help.run_code" = { text = "  Optive -c <code>               运行命令行代码（可多行）" }
 "cli.help.new" = { text = "  Optive new <ProjectName>       新建项目" }
+"cli.help.init" = { text = "  Optive init                    在当前空目录中初始化项目" }
 "cli.help.run" = { text = "  Optive run [path] [-- args…]   按 lock 确保依赖并运行入口" }
 "cli.help.up" = { text = "  Optive up [path] [-- args…]    update + run" }
 "cli.help.add" = { text = "  Optive add <git-url> […]       添加依赖（默认钉死 tip commit）" }

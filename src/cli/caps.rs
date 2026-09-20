@@ -2,7 +2,7 @@
 //!
 //! 这些标志在 `Optive <script>` / `-c` / `run` / `up` / `debug` / `test` 等运行路径上生效，
 //! 构造 [`optive::caps::Capabilities`] 注入 VM，让不可信脚本 / 依赖在受控边界内运行。
-//! 其它子命令（`fmt` / `new` / `add` …）不运行用户代码，故不消费这些标志。
+//! 其它子命令（`fmt` / `new` / `init` / `add` …）不运行用户代码，故不消费这些标志。
 
 use std::path::PathBuf;
 

@@ -87,6 +87,18 @@ pub fn diagnostic_metadata(message: &str) -> DiagnosticMetadata {
             "E3003",
             Some("rename or remove the duplicate declaration"),
         )
+    } else if message.contains("hard parameter requires") {
+        (
+            Severity::Error,
+            "E4003",
+            Some("pass a value compatible with the parameter's strong type"),
+        )
+    } else if message.starts_with("not all paths return a value") {
+        (
+            Severity::Error,
+            "E4004",
+            Some("return a compatible value on every path or add a tail expression"),
+        )
     } else if message.contains("hard type") || message.contains("hard variable") {
         (Severity::Error, "E4001", Some("use a compatible value"))
     } else if message.contains("immutable binding") {
@@ -1697,7 +1709,7 @@ fn walk_stmt_extra(
             unused_in_function(params, body, diags);
             if *return_strong {
                 if let Some(rt) = return_type {
-                    check_hard_returns(rt, body, diags);
+                    check_hard_returns(rt, body, st.line, st.column, diags);
                 }
             }
             walk_block_extra(body, &inner, types, diags);
@@ -1706,6 +1718,7 @@ fn walk_stmt_extra(
             params: Some(params),
             body,
             return_type,
+            return_strong,
             return_wrapper,
             ..
         } => {
@@ -1725,6 +1738,11 @@ fn walk_stmt_extra(
                 walk_expr_extra(return_wrapper, scope, types, diags);
             }
             if let Some(body) = body {
+                if *return_strong {
+                    if let Some(return_type) = return_type {
+                        check_hard_returns(return_type, body, st.line, st.column, diags);
+                    }
+                }
                 let mut inner = scope.clone();
                 for param in params {
                     inner.insert(param.name.clone());
@@ -1862,6 +1880,11 @@ fn walk_stmt_extra(
                     walk_expr_extra(type_expr, scope, types, diags);
                 }
                 if let Some(default) = &field.default_expr {
+                    if field.type_strong {
+                        if let Some(type_expr) = &field.type_expr {
+                            check_hard_assign(type_expr, default, diags);
+                        }
+                    }
                     walk_expr_extra(default, scope, types, diags);
                 }
             }
@@ -1883,6 +1906,11 @@ fn walk_stmt_extra(
                 }
                 if let Some(return_wrapper) = &m.return_wrapper {
                     walk_expr_extra(return_wrapper, scope, types, diags);
+                }
+                if m.return_strong {
+                    if let Some(return_type) = &m.return_type {
+                        check_hard_returns(return_type, &m.body, st.line, st.column, diags);
+                    }
                 }
                 walk_block_extra(&m.body, &inner, types, diags);
             }
@@ -2153,6 +2181,24 @@ fn check_parameter_list(
         }
         variadic += usize::from(param.is_variadic);
         kw_variadic += usize::from(param.is_kwvariadic);
+        if param.type_strong {
+            if let (Some(type_expr), Some(default)) = (&param.type_expr, &param.default_expr) {
+                let expected = type_ann_name(type_expr);
+                let actual = literal_type_name(default);
+                if let (Some(expected), Some(actual)) = (expected, actual) {
+                    if !types_compatible(&expected, actual) {
+                        diags.push((
+                            default.loc.line,
+                            default.loc.column,
+                            format!(
+                                "default value for parameter `{}` has type {actual}; hard parameter requires {expected}",
+                                param.name
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
     }
     if variadic > 1 {
         diags.push((
@@ -2273,9 +2319,44 @@ fn check_hard_assign(ty: &Expr, init: &Expr, diags: &mut Vec<Diagnostic>) {
     }
 }
 
-fn check_hard_returns(ty: &Expr, body: &Block, diags: &mut Vec<Diagnostic>) {
+fn check_hard_returns(
+    ty: &Expr,
+    body: &Block,
+    declaration_line: usize,
+    declaration_column: usize,
+    diags: &mut Vec<Diagnostic>,
+) {
     let Some(ann) = type_ann_name(ty) else { return };
     check_hard_returns_in_block(&ann, body, diags);
+    let tail = body
+        .iter()
+        .rev()
+        .find(|located| !matches!(located.stmt, Stmt::Comment { .. }));
+    if let Some(LocatedStmt {
+        stmt: Stmt::Expr(expr),
+        ..
+    }) = tail
+    {
+        if let Some(actual) = literal_type_name(expr) {
+            if !types_compatible(&ann, actual) {
+                diags.push((
+                    expr.loc.line,
+                    expr.loc.column,
+                    format!("cannot return {actual} from hard type {ann}"),
+                ));
+            }
+        }
+        return;
+    }
+    if !types_compatible(&ann, "nonetype")
+        && !tail.is_some_and(|located| stmt_definitely_exits(&located.stmt))
+    {
+        diags.push((
+            declaration_line,
+            declaration_column,
+            format!("not all paths return a value for hard return type {ann}"),
+        ));
+    }
 }
 
 fn check_hard_returns_in_block(ann: &str, body: &Block, diags: &mut Vec<Diagnostic>) {
@@ -2396,6 +2477,7 @@ fn walk_expr_extra(
             body,
             params,
             return_type,
+            return_strong,
             return_wrapper,
             ..
         } => {
@@ -2415,6 +2497,11 @@ fn walk_expr_extra(
             }
             if let Some(return_wrapper) = return_wrapper {
                 walk_expr_extra(return_wrapper, scope, types, diags);
+            }
+            if *return_strong {
+                if let Some(return_type) = return_type {
+                    check_hard_returns(return_type, body, expr.loc.line, expr.loc.column, diags);
+                }
             }
             walk_block_extra(body, &inner, types, diags);
         }
@@ -2849,6 +2936,124 @@ mod tests {
                 .iter()
                 .any(|m| m.contains("bare return is incompatible")),
             "{bare_return:?}"
+        );
+    }
+
+    #[test]
+    fn hard_returns_require_a_value_on_every_path_and_check_tail_expression() {
+        let missing = msgs("func choose(flag) => num { if (flag) { return 1 } }\n");
+        assert!(
+            missing
+                .iter()
+                .any(|message| message.contains("not all paths return a value")),
+            "{missing:?}"
+        );
+
+        let complete =
+            msgs("func choose(flag) => num { if (flag) { return 1 } else { return 2 } }\n");
+        assert!(
+            !complete
+                .iter()
+                .any(|message| message.contains("not all paths return a value")),
+            "{complete:?}"
+        );
+
+        let bad_tail = msgs("func label() => num { \"wrong\" }\n");
+        assert!(
+            bad_tail
+                .iter()
+                .any(|message| message.contains("cannot return text from hard type num")),
+            "{bad_tail:?}"
+        );
+
+        let good_tail = msgs("func answer() => num { 42 }\n");
+        assert!(
+            !good_tail
+                .iter()
+                .any(|message| message.contains("hard type")),
+            "{good_tail:?}"
+        );
+    }
+
+    #[test]
+    fn user_calls_check_literal_arguments_for_hard_parameters() {
+        let positional = msgs("func takes(x:: num) { x }\ntakes(\"bad\")\n");
+        assert!(
+            positional
+                .iter()
+                .any(|message| message.contains("hard parameter requires num")),
+            "{positional:?}"
+        );
+
+        let named = msgs("func takes(x:: num) { x }\ntakes(x = false)\n");
+        assert!(
+            named.iter().any(|message| message.contains("argument `x`")
+                && message.contains("hard parameter requires num")),
+            "{named:?}"
+        );
+
+        let valid = msgs("func takes(x:: num) { x }\ntakes(1)\n");
+        assert!(
+            !valid
+                .iter()
+                .any(|message| message.contains("hard parameter requires")),
+            "{valid:?}"
+        );
+
+        let soft = msgs("func takes(x: num) { x }\ntakes(\"documented, not enforced\")\n");
+        assert!(
+            !soft
+                .iter()
+                .any(|message| message.contains("hard parameter requires")),
+            "{soft:?}"
+        );
+
+        let immutable_flow =
+            msgs("func takes(x:: num) { x }\nlet text_value = \"bad\"\ntakes(text_value)\n");
+        assert!(
+            immutable_flow
+                .iter()
+                .any(|message| message.contains("has type text")
+                    && message.contains("hard parameter requires num")),
+            "{immutable_flow:?}"
+        );
+
+        let strong_flow =
+            msgs("func takes(x:: num) { x }\nfunc relay(value:: text) { takes(value) }\n");
+        assert!(
+            strong_flow
+                .iter()
+                .any(|message| message.contains("has type text")
+                    && message.contains("hard parameter requires num")),
+            "{strong_flow:?}"
+        );
+
+        let converted = msgs("func takes(x:: num) { x }\nlet value = num.(\"42\")\ntakes(value)\n");
+        assert!(
+            !converted
+                .iter()
+                .any(|message| message.contains("hard parameter requires")),
+            "{converted:?}"
+        );
+    }
+
+    #[test]
+    fn hard_defaults_are_checked_at_the_declaration() {
+        let parameter = msgs("func f(value:: num = \"bad\") { value }\n");
+        assert!(
+            parameter.iter().any(
+                |message| message.contains("default value for parameter `value`")
+                    && message.contains("hard parameter requires num")
+            ),
+            "{parameter:?}"
+        );
+
+        let field = msgs("struct Config { let retries:: num = \"many\" }\n");
+        assert!(
+            field
+                .iter()
+                .any(|message| message.contains("cannot assign `text` to hard type `num`")),
+            "{field:?}"
         );
     }
 

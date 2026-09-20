@@ -52,12 +52,15 @@ fn run_optive_env(
     );
     let mut cmd = Command::new(&bin);
     cmd.args(args).current_dir(cwd);
+    // 隔离全局 home，避免污染开发者机器
+    let home = env
+        .iter()
+        .find_map(|(key, value)| (*key == "OPTIVE_HOME").then(|| PathBuf::from(value)))
+        .unwrap_or_else(|| cwd.join(".optive_home"));
+    let _ = fs::create_dir_all(&home);
     for (k, v) in env {
         cmd.env(k, v);
     }
-    // 隔离全局 home，避免污染开发者机器
-    let home = cwd.join(".optive_home");
-    let _ = fs::create_dir_all(&home);
     cmd.env("OPTIVE_HOME", &home);
     let out = cmd.output().expect("spawn Optive");
     let code = out.status.code().unwrap_or(1);
@@ -886,6 +889,43 @@ fn new_rejects_existing_dir() {
 }
 
 #[test]
+fn init_creates_project_in_empty_current_directory() {
+    let parent = tempfile_project("init_parent");
+    let root = parent.join("InitDemo");
+    fs::create_dir(&root).unwrap();
+    let home = parent.join(".optive_home").to_string_lossy().into_owned();
+
+    let (code, stdout, stderr) =
+        run_optive_env(&["init"], &root, &[("OPTIVE_HOME", home.as_str())]);
+    assert_eq!(code, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(root.join("Optive.toml").is_file());
+    assert!(root.join("src/main.tive").is_file());
+    assert!(root.join(".gitignore").is_file());
+    let manifest = fs::read_to_string(root.join("Optive.toml")).unwrap();
+    assert!(manifest.contains("name = \"InitDemo\""), "{manifest}");
+
+    let (code, _stdout, stderr) =
+        run_optive_env(&["init"], &root, &[("OPTIVE_HOME", home.as_str())]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("already initialized"), "{stderr}");
+}
+
+#[test]
+fn init_refuses_nonempty_directory_without_overwriting_it() {
+    let root = tempfile_project("init_nonempty");
+    fs::write(root.join("notes.txt"), "keep me").unwrap();
+
+    let (code, _stdout, stderr) = run_optive(&["init"], &root);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("not empty"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(root.join("notes.txt")).unwrap(),
+        "keep me"
+    );
+    assert!(!root.join("Optive.toml").exists());
+}
+
+#[test]
 fn import_declared_local_dep() {
     let root = tempfile_project("demo_import_dep");
     fs::write(
@@ -1166,6 +1206,10 @@ fn help_lists_test_and_index_sync() {
     assert!(
         stdout.contains("Optive test"),
         "help should mention test:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Optive init"),
+        "help should mention init:\n{stdout}"
     );
     assert!(
         stdout.contains("Optive dap"),

@@ -21,6 +21,7 @@ pub fn analyze_program(program: &Program) -> Vec<Diag> {
         user_signatures: vec![HashMap::new()],
         std_bindings: vec![HashMap::new()],
         user_bindings: vec![HashSet::new()],
+        known_types: vec![HashMap::new()],
         diags: Vec::new(),
     };
     walk_block(&program.stmts, &mut cx);
@@ -42,8 +43,15 @@ enum StdBinding {
 }
 
 #[derive(Clone)]
+struct ParameterSignature {
+    name: String,
+    required: bool,
+    hard_type: Option<String>,
+}
+
+#[derive(Clone)]
 struct UserSignature {
-    parameters: Vec<(String, bool)>,
+    parameters: Vec<ParameterSignature>,
     variadic: bool,
     keyword_variadic: bool,
 }
@@ -55,6 +63,9 @@ struct Cx {
     std_bindings: Vec<HashMap<String, StdBinding>>,
     /// 各词法作用域内由用户声明的名字；arity 检查据此跳过 builtin 表。
     user_bindings: Vec<HashSet<String>>,
+    /// Flow-safe local knowledge: strong bindings/parameters and immutable
+    /// bindings whose initializer type is statically obvious.
+    known_types: Vec<HashMap<String, String>>,
     diags: Vec<Diag>,
 }
 
@@ -82,6 +93,7 @@ impl Cx {
         self.user_signatures.push(HashMap::new());
         self.user_bindings.push(HashSet::new());
         self.std_bindings.push(HashMap::new());
+        self.known_types.push(HashMap::new());
     }
 
     fn pop(&mut self) {
@@ -89,6 +101,7 @@ impl Cx {
         self.user_signatures.pop();
         self.user_bindings.pop();
         self.std_bindings.pop();
+        self.known_types.pop();
     }
 
     fn define_user_signature(&mut self, name: &str, params: &[crate::ast::FuncParam]) {
@@ -96,7 +109,14 @@ impl Cx {
             parameters: params
                 .iter()
                 .filter(|param| !param.is_variadic && !param.is_kwvariadic)
-                .map(|param| (param.name.clone(), param.default_expr.is_none()))
+                .map(|param| ParameterSignature {
+                    name: param.name.clone(),
+                    required: param.default_expr.is_none(),
+                    hard_type: param
+                        .type_strong
+                        .then(|| param.type_expr.as_ref().and_then(type_name))
+                        .flatten(),
+                })
                 .collect(),
             variadic: params.iter().any(|param| param.is_variadic),
             keyword_variadic: params.iter().any(|param| param.is_kwvariadic),
@@ -132,6 +152,19 @@ impl Cx {
         if let Some(scope) = self.std_bindings.last_mut() {
             scope.insert(name, binding);
         }
+    }
+
+    fn define_known_type(&mut self, name: &str, ty: Option<String>) {
+        if let (Some(scope), Some(ty)) = (self.known_types.last_mut(), ty) {
+            scope.insert(name.to_string(), ty);
+        }
+    }
+
+    fn known_type(&self, name: &str) -> Option<&str> {
+        self.known_types
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).map(String::as_str))
     }
 
     /// 把调用路径解析为 `(std 模块, 导出)`，供 arity 检查。
@@ -239,6 +272,8 @@ fn walk_stmt(st: &LocatedStmt, cx: &mut Cx) {
         Stmt::VarDecl {
             name,
             type_expr,
+            type_strong,
+            is_var,
             init,
             ..
         } => {
@@ -249,6 +284,14 @@ fn walk_stmt(st: &LocatedStmt, cx: &mut Cx) {
                 walk_expr(e, cx);
             }
             cx.define_user(name.clone());
+            let known = if *type_strong {
+                type_expr.as_ref().and_then(type_name)
+            } else if !*is_var {
+                init.as_ref().and_then(|expr| expr_type_name(expr, cx))
+            } else {
+                None
+            };
+            cx.define_known_type(name, known);
         }
         Stmt::DestructDecl { pattern, init, .. } => {
             walk_expr(init, cx);
@@ -272,6 +315,9 @@ fn walk_stmt(st: &LocatedStmt, cx: &mut Cx) {
             bind_type_params(type_params, cx);
             for p in params {
                 cx.define_user(p.name.clone());
+                if p.type_strong {
+                    cx.define_known_type(&p.name, p.type_expr.as_ref().and_then(type_name));
+                }
                 if let Some(t) = &p.type_expr {
                     walk_expr(t, cx);
                 }
@@ -299,6 +345,9 @@ fn walk_stmt(st: &LocatedStmt, cx: &mut Cx) {
             if let Some(ps) = params {
                 for p in ps {
                     cx.define_user(p.name.clone());
+                    if p.type_strong {
+                        cx.define_known_type(&p.name, p.type_expr.as_ref().and_then(type_name));
+                    }
                     if let Some(t) = &p.type_expr {
                         walk_expr(t, cx);
                     }
@@ -340,6 +389,9 @@ fn walk_stmt(st: &LocatedStmt, cx: &mut Cx) {
                 cx.define("self");
                 for p in &m.params {
                     cx.define_user(p.name.clone());
+                    if p.type_strong {
+                        cx.define_known_type(&p.name, p.type_expr.as_ref().and_then(type_name));
+                    }
                     if let Some(t) = &p.type_expr {
                         walk_expr(t, cx);
                     }
@@ -365,6 +417,9 @@ fn walk_stmt(st: &LocatedStmt, cx: &mut Cx) {
                 cx.define("self");
                 for p in &m.params {
                     cx.define_user(p.name.clone());
+                    if p.type_strong {
+                        cx.define_known_type(&p.name, p.type_expr.as_ref().and_then(type_name));
+                    }
                 }
                 walk_block(&m.body, cx);
                 cx.pop();
@@ -577,6 +632,9 @@ fn walk_expr(expr: &Expr, cx: &mut Cx) {
             cx.push();
             for p in params {
                 cx.define_user(p.name.clone());
+                if p.type_strong {
+                    cx.define_known_type(&p.name, p.type_expr.as_ref().and_then(type_name));
+                }
                 if let Some(t) = &p.type_expr {
                     walk_expr(t, cx);
                 }
@@ -852,7 +910,7 @@ fn walk_pattern_exprs(p: &Pattern, cx: &mut Cx) {
 
 fn check_call_signature(path: &str, args: &[CallArg], line: usize, col: usize, cx: &mut Cx) {
     if let Some(signature) = cx.user_signature(path).cloned() {
-        check_user_call(path, args, line, col, &signature, &mut cx.diags);
+        check_user_call(path, args, line, col, &signature, cx);
         return;
     }
     let range = if cx.is_user_bound_path(path) {
@@ -874,14 +932,14 @@ fn check_user_call(
     line: usize,
     col: usize,
     signature: &UserSignature,
-    diags: &mut Vec<Diag>,
+    cx: &mut Cx,
 ) {
     if args.iter().all(|argument| argument.name.is_none()) {
         if !signature.variadic && args.len() > signature.parameters.len() {
             let min = signature
                 .parameters
                 .iter()
-                .filter(|(_, required)| *required)
+                .filter(|parameter| parameter.required)
                 .count();
             emit_arity(
                 path,
@@ -890,17 +948,20 @@ fn check_user_call(
                 Some(signature.parameters.len()),
                 line,
                 col,
-                diags,
+                &mut cx.diags,
             );
         }
-        for (index, (name, required)) in signature.parameters.iter().enumerate() {
-            if *required && index >= args.len() {
-                diags.push((
+        for (index, parameter) in signature.parameters.iter().enumerate() {
+            if parameter.required && index >= args.len() {
+                cx.diags.push((
                     line,
                     col,
-                    format!("`{path}` is missing required argument `{name}`"),
+                    format!("`{path}` is missing required argument `{}`", parameter.name),
                 ));
             }
+        }
+        for (argument, parameter) in args.iter().zip(&signature.parameters) {
+            check_hard_argument(path, argument, parameter, cx);
         }
         return;
     }
@@ -928,7 +989,7 @@ fn check_user_call(
             Some(signature.parameters.len()),
             line,
             col,
-            diags,
+            &mut cx.diags,
         );
     }
 
@@ -938,17 +999,20 @@ fn check_user_call(
         let parameter_index = signature
             .parameters
             .iter()
-            .position(|(parameter, _)| parameter == name);
+            .position(|parameter| parameter.name == name);
         match parameter_index {
-            Some(index) if index < positional => diags.push((
+            Some(index) if index < positional => cx.diags.push((
                 argument.value.loc.line,
                 argument.value.loc.column,
                 format!("`{path}` receives multiple values for argument `{name}`"),
             )),
             Some(_) => {
                 supplied_named.insert(name);
+                if let Some(parameter) = parameter_index.map(|index| &signature.parameters[index]) {
+                    check_hard_argument(path, argument, parameter, cx);
+                }
             }
-            None if !signature.keyword_variadic => diags.push((
+            None if !signature.keyword_variadic => cx.diags.push((
                 argument.value.loc.line,
                 argument.value.loc.column,
                 format!("`{path}` has no named argument `{name}`"),
@@ -957,15 +1021,87 @@ fn check_user_call(
         }
     }
 
-    for (index, (name, required)) in signature.parameters.iter().enumerate() {
-        if *required && index >= positional && !supplied_named.contains(name.as_str()) {
-            diags.push((
+    for (index, parameter) in signature.parameters.iter().enumerate() {
+        if parameter.required
+            && index >= positional
+            && !supplied_named.contains(parameter.name.as_str())
+        {
+            cx.diags.push((
                 line,
                 col,
-                format!("`{path}` is missing required argument `{name}`"),
+                format!("`{path}` is missing required argument `{}`", parameter.name),
             ));
         }
     }
+    for (argument, parameter) in args.iter().take(positional).zip(&signature.parameters) {
+        check_hard_argument(path, argument, parameter, cx);
+    }
+}
+
+fn check_hard_argument(
+    path: &str,
+    argument: &CallArg,
+    parameter: &ParameterSignature,
+    cx: &mut Cx,
+) {
+    if argument.is_splat || argument.is_kwsplat {
+        return;
+    }
+    let actual = expr_type_name(&argument.value, cx);
+    let (Some(expected), Some(actual)) = (parameter.hard_type.as_deref(), actual.as_deref()) else {
+        return;
+    };
+    if !types_compatible(expected, actual) {
+        cx.diags.push((
+            argument.value.loc.line,
+            argument.value.loc.column,
+            format!(
+                "argument `{}` of `{path}` has type {actual}; hard parameter requires {expected}",
+                parameter.name
+            ),
+        ));
+    }
+}
+
+fn type_name(expr: &Expr) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Var(name) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+fn literal_type_name(expr: &Expr) -> Option<&'static str> {
+    match &expr.kind {
+        ExprKind::Number(_) => Some("num"),
+        ExprKind::String(_) | ExprKind::FString(_) => Some("text"),
+        ExprKind::Bool(_) => Some("bool"),
+        ExprKind::None => Some("nonetype"),
+        ExprKind::Bytes(_) => Some("bytes"),
+        ExprKind::List(_) => Some("list"),
+        ExprKind::Dict(_) => Some("dict"),
+        ExprKind::Set(_) => Some("set"),
+        ExprKind::Tuple(_) => Some("tuple"),
+        _ => None,
+    }
+}
+
+fn expr_type_name(expr: &Expr, cx: &Cx) -> Option<String> {
+    if let Some(literal) = literal_type_name(expr) {
+        return Some(literal.to_string());
+    }
+    match &expr.kind {
+        ExprKind::Var(name) => cx.known_type(name).map(str::to_string),
+        ExprKind::TypeConvert { type_expr, .. } => type_name(type_expr),
+        _ => None,
+    }
+}
+
+fn types_compatible(expected: &str, actual: &str) -> bool {
+    expected == actual
+        || matches!(
+            (expected, actual),
+            ("none", "nonetype") | ("nonetype", "none")
+        )
 }
 
 fn emit_arity(
