@@ -172,7 +172,10 @@ fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
     if ver != env!("CARGO_PKG_VERSION") {
         return Err(crate::error::RuntimeError::msg("bytecode cache version"));
     }
-    let hot = read_hot(&mut r)?;
+    // Parse the serialized hot stream for format compatibility, but never
+    // trust it: cache and bundle files are inputs, while hot dispatch contains
+    // unchecked reads. Rebuild it deterministically from the cold instructions.
+    let _serialized_hot = read_hot(&mut r)?;
     let line_map = read_usizes(&mut r)?;
     let column_map = read_usizes(&mut r)?;
     let global_names = read_strs(&mut r)?;
@@ -193,7 +196,7 @@ fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
     }
     let mut prog = CompiledProgram::new();
     prog.code = code;
-    prog.hot = hot;
+    prog.hot = HotCode::encode(&prog.code);
     prog.line_map = line_map;
     prog.column_map = column_map;
     prog.global_names = global_names;
@@ -267,8 +270,9 @@ fn read_func(r: &mut Cursor<&[u8]>) -> Result<(String, FunctionObject)> {
             default_expr: None,
         });
     }
-    let hot = read_hot(r)?;
+    let _serialized_hot = read_hot(r)?;
     let body = read_ins_vec(r)?;
+    let hot = HotCode::encode(&body);
     let line_map = read_usizes(r)?;
     let column_map = read_usizes(r)?;
     let variadic_param_index = read_opt_u32(r)?;
@@ -1139,6 +1143,20 @@ mod tests {
         vm.load_program(back).expect("load");
         let v = vm.run().expect("run");
         assert_eq!(v.display_string(), "3");
+    }
+
+    #[test]
+    fn decode_rebuilds_untrusted_hot_bytecode() {
+        let mut prog = crate::compile("1 + 2\n").expect("compile");
+        let expected = HotCode::encode(&prog.code);
+        let mut forged_ops = prog.hot.ops.to_vec();
+        forged_ops[0] = crate::hot_code::H_RET_FAST_IF_LT_IMM;
+        prog.hot.ops = Arc::from(forged_ops);
+
+        let bytes = encode(&prog).expect("encode forged cache fixture");
+        let back = decode(&bytes).expect("decode");
+        assert_eq!(back.hot.ops.as_ref(), expected.ops.as_ref());
+        assert_eq!(back.hot.args.as_ref(), expected.args.as_ref());
     }
 
     #[test]

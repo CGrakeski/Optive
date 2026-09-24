@@ -32,6 +32,29 @@ fn completion_offers_keywords() {
     assert!(labels.contains(&"let"));
     assert!(labels.contains(&"std"));
     assert!(labels.contains(&"print"));
+    assert!(labels.contains(&"__package__"));
+}
+
+#[test]
+fn package_global_has_diagnostics_completion_and_hover_support() {
+    let source = "print(__package__)\n";
+    assert!(diagnostics(source, "t.tive").is_empty());
+
+    let items = completion("__pack", 0, 6);
+    let package = items
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["label"] == "__package__")
+        .expect("__package__ completion");
+    assert_eq!(package["kind"], 6, "predefined value must be a variable");
+
+    let hovered = hover(source, 0, 8);
+    assert_eq!(hovered["contents"]["kind"], "plaintext");
+    assert!(hovered["contents"]["value"]
+        .as_str()
+        .unwrap()
+        .contains("current package name"));
 }
 
 #[test]
@@ -142,6 +165,29 @@ fn signature_help_highlights_second_param() {
         .unwrap() as usize;
     let chars: Vec<char> = label.chars().collect();
     assert_eq!(chars[start..end].iter().collect::<String>(), "b");
+}
+
+#[test]
+fn signature_help_shows_types_return_type_and_tracks_nested_commas() {
+    let src = concat!(
+        "func calculate(values: list, scale :: int = 2) -> int { return scale }\n",
+        "calculate([1, 2], \n",
+    );
+    let sh = signature_help(src, 1, 18);
+    assert_eq!(
+        sh["signatures"][0]["label"],
+        "func calculate(values: list, scale :: int = 2) -> int"
+    );
+    assert_eq!(sh["activeParameter"], 1);
+
+    let label = sh["signatures"][0]["label"].as_str().unwrap();
+    let range = &sh["signatures"][0]["parameters"][1]["label"];
+    let start = range[0].as_u64().unwrap() as usize;
+    let end = range[1].as_u64().unwrap() as usize;
+    assert_eq!(
+        label.encode_utf16().collect::<Vec<_>>()[start..end].to_vec(),
+        "scale :: int = 2".encode_utf16().collect::<Vec<_>>()
+    );
 }
 
 #[test]

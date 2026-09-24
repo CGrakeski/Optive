@@ -302,16 +302,249 @@ impl StackVal {
 
 /// 加载期一次性校验热字节码结构。畸形字节码在此干净报错，
 /// 让主循环的安全索引（`ops[pc]` 等）有了显式边界保证。
-fn validate_function_hot(func: &crate::opcode::FunctionObject) -> Result<()> {
-    if func.body.len() != func.hot.ops.len() {
+fn validate_function_hot(
+    func: &crate::opcode::FunctionObject,
+    fallback_global_count: usize,
+) -> Result<()> {
+    if func.frame_slots > MAX_BYTECODE_OPERAND
+        || func.fast_locals > MAX_BYTECODE_OPERAND
+        || func.params.len() > MAX_BYTECODE_OPERAND
+    {
         return Err(RuntimeError::msg(format!(
-            "internal: function `{}` code/hot length mismatch ({} != {})",
-            func.name,
-            func.body.len(),
-            func.hot.ops.len()
+            "invalid bytecode: function `{}` metadata exceeds resource limit",
+            func.name
         )));
     }
-    validate_hot_bytecode(&func.hot)
+    if func.entry_pc > func.body.len() {
+        return Err(RuntimeError::msg(format!(
+            "invalid bytecode: function `{}` entry pc {} exceeds code length {}",
+            func.name,
+            func.entry_pc,
+            func.body.len()
+        )));
+    }
+    if func.fast_locals > func.frame_slots {
+        return Err(RuntimeError::msg(format!(
+            "invalid bytecode: function `{}` has {} fast locals but only {} frame slots",
+            func.name, func.fast_locals, func.frame_slots
+        )));
+    }
+    let global_count = func
+        .module_env
+        .as_ref()
+        .map_or(fallback_global_count, |env| env.global_names.len());
+    validate_code_block(
+        &format!("function `{}`", func.name),
+        &func.body,
+        &func.hot,
+        func.frame_slots,
+        global_count,
+    )
+}
+
+const MAX_BYTECODE_OPERAND: usize = 1_000_000;
+
+fn validate_code_block(
+    what: &str,
+    code: &[Instruction],
+    hot: &crate::hot_code::HotCode,
+    frame_slots: usize,
+    global_count: usize,
+) -> Result<()> {
+    if code.len() != hot.ops.len() {
+        return Err(RuntimeError::msg(format!(
+            "invalid bytecode: {what} code/hot length mismatch ({} != {})",
+            code.len(),
+            hot.ops.len()
+        )));
+    }
+    validate_hot_bytecode(hot)?;
+
+    // Hot code is serialized for startup speed, but may come from a bundle or
+    // a tampered cache. It must be the exact deterministic encoding of the
+    // cold instructions before the interpreter uses unchecked hot-path reads.
+    let expected = crate::hot_code::HotCode::encode(code);
+    if expected.ops.as_ref() != hot.ops.as_ref() || expected.args.as_ref() != hot.args.as_ref() {
+        let first_mismatch = expected
+            .ops
+            .iter()
+            .zip(hot.ops.iter())
+            .position(|(expected, actual)| expected != actual)
+            .or_else(|| {
+                expected
+                    .args
+                    .iter()
+                    .zip(hot.args.iter())
+                    .position(|(expected, actual)| expected != actual)
+            })
+            .unwrap_or_else(|| expected.ops.len().min(hot.ops.len()));
+        return Err(RuntimeError::msg(format!(
+            "invalid bytecode: {what} hot encoding does not match instructions at pc={first_mismatch} (expected op/arg {:?}/{:?}, got {:?}/{:?})",
+            expected.ops.get(first_mismatch),
+            expected.args.get(first_mismatch),
+            hot.ops.get(first_mismatch),
+            hot.args.get(first_mismatch)
+        )));
+    }
+
+    for (pc, instruction) in code.iter().enumerate() {
+        validate_instruction_operands(
+            what,
+            pc,
+            instruction,
+            code.len(),
+            frame_slots,
+            global_count,
+        )?;
+    }
+    crate::stack_effect::verify_compiled(what, code)
+}
+
+fn validate_instruction_operands(
+    what: &str,
+    pc: usize,
+    instruction: &Instruction,
+    code_len: usize,
+    frame_slots: usize,
+    global_count: usize,
+) -> Result<()> {
+    use Instruction::{
+        BindFast, Call, CallGlobal, CallSelf, DictNew, EnterTry, GoCall, Goto, GotoIf, GotoIfNot,
+        LoadFast, LoadFastAddImmStore, LoadFastAddStore, LoadFastEqImm, LoadFastGtImm,
+        LoadFastLeImm, LoadFastLtImm, LoadFastModEq0, LoadFastSqrGt, LoadFastSubImm, LoadGlobal,
+        LoopCountdown, MacroCall, RetFast, SelectBegin, SelectIdle, SetNew, StoreFast, StoreGlobal,
+        StructNew, TupleNew, UnpackExact, UnpackRest, VecNew,
+    };
+
+    let too_large = |value: usize, field: &str| {
+        (value > MAX_BYTECODE_OPERAND).then(|| {
+            RuntimeError::msg(format!(
+                "invalid bytecode: {what} {field}={value} exceeds resource limit at pc={pc}"
+            ))
+        })
+    };
+    let bad_jump = |target: usize, field: &str| {
+        (target > code_len).then(|| {
+            RuntimeError::msg(format!(
+                "invalid bytecode: {what} {field}={target} exceeds code length {code_len} at pc={pc}"
+            ))
+        })
+    };
+    let bad_slot = |slot: usize, field: &str| {
+        (slot >= frame_slots).then(|| {
+            RuntimeError::msg(format!(
+                "invalid bytecode: {what} {field}={slot} exceeds frame size {frame_slots} at pc={pc}"
+            ))
+        })
+    };
+    let bad_global = |index: usize, field: &str| {
+        (index >= global_count).then(|| {
+            RuntimeError::msg(format!(
+                "invalid bytecode: {what} {field}={index} exceeds global table size {global_count} at pc={pc}"
+            ))
+        })
+    };
+
+    let resource_error = match instruction {
+        LoadFast(slot)
+        | StoreFast(slot)
+        | RetFast(slot)
+        | LoadFastSubImm { slot, .. }
+        | LoadFastLeImm { slot, .. }
+        | LoadFastLtImm { slot, .. }
+        | LoadFastGtImm { slot, .. }
+        | LoadFastEqImm { slot, .. }
+        | LoadFastAddImmStore { slot, .. }
+        | BindFast { slot, .. } => too_large(*slot, "slot"),
+        LoadFastAddStore { dst, src } => {
+            too_large(*dst, "destination slot").or_else(|| too_large(*src, "source slot"))
+        }
+        LoadFastSqrGt { sqr_slot, rhs_slot } => {
+            too_large(*sqr_slot, "square slot").or_else(|| too_large(*rhs_slot, "right slot"))
+        }
+        LoadFastModEq0 { lhs_slot, rhs_slot } => {
+            too_large(*lhs_slot, "left slot").or_else(|| too_large(*rhs_slot, "right slot"))
+        }
+        Call { argc }
+        | CallSelf { argc }
+        | MacroCall { argc }
+        | GoCall(argc)
+        | VecNew(argc)
+        | DictNew(argc)
+        | SetNew(argc)
+        | TupleNew(argc)
+        | UnpackExact(argc)
+        | SelectIdle(argc)
+        | SelectBegin(argc)
+        | StructNew { argc, .. } => too_large(*argc, "count"),
+        CallGlobal { global_idx, argc } => {
+            too_large(*global_idx, "global index").or_else(|| too_large(*argc, "argument count"))
+        }
+        UnpackRest { before, after } => {
+            too_large(*before, "leading count").or_else(|| too_large(*after, "trailing count"))
+        }
+        _ => None,
+    };
+    if let Some(error) = resource_error {
+        return Err(error);
+    }
+
+    let slot_error = match instruction {
+        LoadFast(slot)
+        | StoreFast(slot)
+        | RetFast(slot)
+        | LoadFastSubImm { slot, .. }
+        | LoadFastLeImm { slot, .. }
+        | LoadFastLtImm { slot, .. }
+        | LoadFastGtImm { slot, .. }
+        | LoadFastEqImm { slot, .. }
+        | LoadFastAddImmStore { slot, .. }
+        | BindFast { slot, .. } => bad_slot(*slot, "slot"),
+        LoadFastAddStore { dst, src } => {
+            bad_slot(*dst, "destination slot").or_else(|| bad_slot(*src, "source slot"))
+        }
+        LoadFastSqrGt { sqr_slot, rhs_slot } => {
+            bad_slot(*sqr_slot, "square slot").or_else(|| bad_slot(*rhs_slot, "right slot"))
+        }
+        LoadFastModEq0 { lhs_slot, rhs_slot } => {
+            bad_slot(*lhs_slot, "left slot").or_else(|| bad_slot(*rhs_slot, "right slot"))
+        }
+        _ => None,
+    };
+    if let Some(error) = slot_error {
+        return Err(error);
+    }
+
+    let global_error = match instruction {
+        LoadGlobal(index) | StoreGlobal(index) => bad_global(*index, "global index"),
+        CallGlobal { global_idx, .. } => bad_global(*global_idx, "global index"),
+        _ => None,
+    };
+    if let Some(error) = global_error {
+        return Err(error);
+    }
+
+    let jump_error = match instruction {
+        Goto(target) | GotoIf(target) | GotoIfNot(target) | LoopCountdown(target) => {
+            bad_jump(*target, "jump target")
+        }
+        EnterTry {
+            catch_label,
+            else_label,
+            end_label,
+        } => bad_jump(*catch_label, "catch target")
+            .or_else(|| {
+                (*else_label != 0)
+                    .then_some(*else_label)
+                    .and_then(|v| bad_jump(v, "else target"))
+            })
+            .or_else(|| bad_jump(*end_label, "end target")),
+        _ => None,
+    };
+    if let Some(error) = jump_error {
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn validate_hot_bytecode(hot: &crate::hot_code::HotCode) -> Result<()> {
@@ -1620,20 +1853,32 @@ impl Vm {
     pub fn load_program(&mut self, program: CompiledProgram) -> Result<()> {
         // 先做一次性结构校验：畸形字节码在进入主循环前就干净报错，
         // 让热路径的安全索引有了显式保证（纵深防御）。
-        if program.code.len() != program.hot.ops.len() {
+        if program.script_frame_slots > MAX_BYTECODE_OPERAND {
             return Err(RuntimeError::msg(format!(
-                "internal: program code/hot length mismatch ({} != {})",
-                program.code.len(),
-                program.hot.ops.len()
+                "invalid bytecode: script frame size {} exceeds resource limit",
+                program.script_frame_slots
             )));
         }
-        validate_hot_bytecode(&program.hot)?;
+        for &(local, global) in &program.script_local_to_global {
+            if local >= program.script_frame_slots || global >= program.global_names.len() {
+                return Err(RuntimeError::msg(format!(
+                    "invalid bytecode: script local/global mapping ({local}, {global}) is out of range"
+                )));
+            }
+        }
+        validate_code_block(
+            "program",
+            &program.code,
+            &program.hot,
+            program.script_frame_slots,
+            program.global_names.len(),
+        )?;
         for f in program.functions.values() {
-            validate_function_hot(f)?;
+            validate_function_hot(f, program.global_names.len())?;
         }
         for overloads in program.overload_tables.values() {
             for f in overloads {
-                validate_function_hot(f)?;
+                validate_function_hot(f, program.global_names.len())?;
             }
         }
         // 每个代码块使用全新操作数栈与调用状态——REPL 复用同一 Vm，
@@ -6997,7 +7242,7 @@ impl Vm {
             saved_lw_base,
         });
         self.code = func.body.clone();
-        validate_function_hot(&func)?;
+        validate_function_hot(&func, self.script_global_names.len())?;
         self.hot_ops = func.hot.ops.clone();
         self.hot_args = func.hot.args.clone();
         self.active_line_map = func.line_map.clone();
@@ -8039,7 +8284,7 @@ impl Vm {
                 saved_lw_base,
             });
             self.code = func.body.clone();
-            validate_function_hot(&func)?;
+            validate_function_hot(&func, self.script_global_names.len())?;
             self.hot_ops = func.hot.ops.clone();
             self.hot_args = func.hot.args.clone();
             self.active_line_map = func.line_map.clone();
@@ -10880,5 +11125,42 @@ fn type_args_from_runtime_index(idx: &Value) -> Result<Vec<Value>> {
 impl Default for Vm {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod bytecode_validation_tests {
+    use super::*;
+
+    #[test]
+    fn load_program_rejects_forged_hot_bytecode() {
+        let mut program = crate::compile("1\n").expect("test program should compile");
+        let mut ops = program.hot.ops.to_vec();
+        assert!(!ops.is_empty());
+        ops[0] = crate::hot_code::H_RET_FAST_IF_LT_IMM;
+        program.hot.ops = std::sync::Arc::from(ops);
+
+        let error = Vm::new().load_program(program).unwrap_err();
+        assert!(error.to_string().contains("hot encoding does not match"));
+    }
+
+    #[test]
+    fn load_program_rejects_unreasonable_frame_sizes() {
+        let mut program = crate::compile("1\n").expect("test program should compile");
+        program.script_frame_slots = MAX_BYTECODE_OPERAND + 1;
+
+        let error = Vm::new().load_program(program).unwrap_err();
+        assert!(error.to_string().contains("resource limit"));
+    }
+
+    #[test]
+    fn load_program_rejects_fast_slots_outside_the_declared_frame() {
+        let mut program = crate::compile("1\n").expect("test program should compile");
+        program.code[0] = Instruction::LoadFast(0);
+        program.hot = crate::hot_code::HotCode::encode(&program.code);
+        program.script_frame_slots = 0;
+
+        let error = Vm::new().load_program(program).unwrap_err();
+        assert!(error.to_string().contains("exceeds frame size"));
     }
 }

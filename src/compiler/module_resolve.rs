@@ -65,11 +65,46 @@ pub fn declared_package_entry(manifest_text: &str) -> Result<Option<String>, Str
     let document: toml::Value = manifest_text
         .parse()
         .map_err(|error| format!("invalid Optive.toml: {error}"))?;
-    Ok(document
+    let Some(entry) = document
         .get("package")
         .and_then(|package| package.get("entry"))
-        .and_then(toml::Value::as_str)
-        .map(str::to_string))
+    else {
+        return Ok(None);
+    };
+    let entry = entry
+        .as_str()
+        .ok_or_else(|| "invalid [package].entry: expected a string".to_string())?;
+    validate_package_entry(entry)?;
+    Ok(Some(entry.to_string()))
+}
+
+fn validate_package_entry(entry: &str) -> Result<(), String> {
+    use std::path::Component;
+
+    if entry.is_empty() || entry.contains('\0') {
+        return Err("invalid [package].entry: expected a non-empty relative path".to_string());
+    }
+    let path = Path::new(entry);
+    // Treat both separators and Windows drive prefixes as unsafe on every host,
+    // so a manifest cannot become an escape after moving between platforms.
+    let bytes = entry.as_bytes();
+    let portable_escape = matches!(bytes.first(), Some(b'/') | Some(b'\\'))
+        || bytes.get(1) == Some(&b':')
+        || entry.split(['/', '\\']).any(|part| part == "..");
+    if portable_escape
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::Prefix(_) | Component::RootDir | Component::ParentDir
+            )
+        })
+    {
+        return Err(
+            "invalid [package].entry: path must stay inside the package directory".to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Relative file imports: the path as written, then `.tive` if it has no extension.
@@ -155,5 +190,26 @@ mod tests {
     fn file_import_adds_tive_when_missing() {
         let paths = file_import_candidates(Path::new("src"), "helper");
         assert!(paths.iter().any(|path| path.ends_with("helper.tive")));
+    }
+
+    #[test]
+    fn package_entry_must_be_a_safe_relative_path() {
+        assert_eq!(
+            declared_package_entry("[package]\nentry = \"src/main.tive\"\n").unwrap(),
+            Some("src/main.tive".to_string())
+        );
+        for entry in ["../outside.tive", "/outside.tive", r"C:\outside.tive"] {
+            let manifest = format!("[package]\nentry = {entry:?}\n");
+            assert!(
+                declared_package_entry(&manifest).is_err(),
+                "unsafe entry was accepted: {entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn package_entry_rejects_non_string_values() {
+        let error = declared_package_entry("[package]\nentry = 42\n").unwrap_err();
+        assert!(error.contains("expected a string"));
     }
 }

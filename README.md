@@ -25,6 +25,8 @@ cd my_app
 Optive run
 ```
 
+如果已经位于一个空目录中，运行 `Optive init` 会直接在当前目录初始化，并以目录名作为项目名。
+
 第一次使用请继续阅读[上手教程](docs/user/tutorial.md)；按主题查阅时从[文档中心](docs/README.md)开始。
 
 ## 常用命令
@@ -36,13 +38,15 @@ Optive run
 | 依赖 | `add`、`remove`、`update`、`deps`、`search`、`index` |
 | 工具 | `fmt`、`debug`、`lsp`、`dap` |
 
-运行用户代码的命令支持 `--sandbox`、`--no-network`、`--no-ffi`、`--allow-ffi` 和 `--allow-path` 等能力选项。完整参数以 `Optive --help` 为准，概念和示例见[包与能力](docs/user/packages.md)。
+运行用户代码的命令支持 `--sandbox`、`--no-network`、`--no-ffi`、`--allow-ffi` 和 `--allow-path` 等能力选项。完整参数以 `Optive --help` 为准；集中示例见[命令行手册](docs/user/cli.md)，权限模型见[包与能力](docs/user/packages.md)。
 
 ## 文档导航
 
 - [语言用户指南](docs/user/README.md)：教程、语法、模块、包、并发、调试与编辑器集成；
+- [标准库手册](docs/user/stdlib.md)：按数据、文件、网络、并发、测试等任务查找 API；
 - [设计沿革](docs/design-history.md)：项目起源、命名变化和主要语言取舍；
 - [解释器开发手册](docs/architecture.md)：前端、编译器、VM、GC、调度器和扩展流程；
+- [安全与故障排查](docs/security.md)：运行第三方代码的边界、常见错误与恢复办法；
 - [贡献与测试](docs/contributing.md)：开发工作流、测试选择和提交前检查；
 - [工具说明](tools/README.md)：仓库内辅助工具。
 

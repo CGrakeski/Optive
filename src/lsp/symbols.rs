@@ -399,14 +399,38 @@ fn format_params(params: &[crate::ast::FuncParam]) -> String {
                 s.push('*');
             }
             s.push_str(&p.name);
-            if let Some(ty) = p.type_expr.as_ref().and_then(ty_from_ann) {
-                s.push_str(": ");
-                s.push_str(&ty.label());
+            if let Some(ty) = &p.type_expr {
+                s.push_str(if p.type_strong { " :: " } else { ": " });
+                s.push_str(&crate::fmt::format_expr(ty));
+            }
+            if let Some(default) = &p.default_expr {
+                s.push_str(" = ");
+                s.push_str(&crate::fmt::format_expr(default));
             }
             s
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn format_func_signature(
+    name: &str,
+    params: &[crate::ast::FuncParam],
+    return_type: Option<&Expr>,
+    return_strong: bool,
+    return_wrapper: Option<&Expr>,
+) -> String {
+    let mut signature = format!("func {name}({})", format_params(params));
+    if let Some(return_type) = return_type {
+        signature.push_str(if return_strong { " => " } else { " -> " });
+        signature.push_str(&crate::fmt::format_expr(return_type));
+    }
+    if let Some(wrapper) = return_wrapper {
+        signature.push_str(" : ");
+        signature
+            .push_str(&crate::fmt::format_expr(wrapper).replace(crate::ast::RET_WRAPPER_VAL, "_"));
+    }
+    signature
 }
 
 fn last_sym(idx: &mut FileIndex) -> Option<&mut Symbol> {
@@ -544,13 +568,22 @@ fn walk_func(st: &LocatedStmt, lo: usize, hi: usize, idx: &mut FileIndex) {
         params,
         body,
         decorators,
+        return_type,
+        return_strong,
+        return_wrapper,
         ..
     } = &st.stmt
     else {
         return;
     };
 
-    let sig = format!("func {name}({})", format_params(params));
+    let sig = format_func_signature(
+        name,
+        params,
+        return_type.as_ref(),
+        *return_strong,
+        return_wrapper.as_ref(),
+    );
     push_sym(
         idx,
         name.clone(),
@@ -604,7 +637,9 @@ fn walk_friend_func(st: &LocatedStmt, lo: usize, hi: usize, idx: &mut FileIndex)
         name,
         params,
         body,
-        ..
+        return_type,
+        return_strong,
+        return_wrapper,
     } = &st.stmt
     else {
         return;
@@ -615,7 +650,13 @@ fn walk_friend_func(st: &LocatedStmt, lo: usize, hi: usize, idx: &mut FileIndex)
         idx,
         name.clone(),
         KIND_FUNC,
-        format!("func {name}({})", format_params(ps)),
+        format_func_signature(
+            name,
+            ps,
+            return_type.as_ref(),
+            *return_strong,
+            return_wrapper.as_ref(),
+        ),
         st.line,
         st.column,
         lo,
@@ -702,7 +743,13 @@ fn walk_struct(st: &LocatedStmt, lo: usize, hi: usize, idx: &mut FileIndex) {
             idx,
             m.name.clone(),
             KIND_METHOD,
-            format!("func {}({})", m.name, format_params(&m.params)),
+            format_func_signature(
+                &m.name,
+                &m.params,
+                m.return_type.as_ref(),
+                m.return_strong,
+                m.return_wrapper.as_ref(),
+            ),
             st.line,
             st.column,
             lo,

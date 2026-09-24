@@ -3,6 +3,12 @@
 //! LSP 补全、签名和静态 arity 检查只从这里读取；运行时双向同步测试保证
 //! 所有公开全局内建与 `std` 导出都在 registry 中且没有幽灵条目。
 
+/// 由 VM 为每个程序或模块注入、但不是可调用 builtin 的全局值。
+pub const PREDEFINED_GLOBALS: &[(&str, &str)] = &[(
+    "__package__",
+    "str __package__ — current package name (`\"__main__\"` for the entry program)",
+)];
+
 pub const BUILTINS: &[(&str, &str)] = &[
     ("true", "bool true"),
     ("false", "bool false"),

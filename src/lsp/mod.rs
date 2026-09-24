@@ -18,13 +18,14 @@ use crate::token::{Token, TokenKind};
 
 use crate::api_registry::{
     handle_member_sig, handle_members, is_std_export, is_std_spec, split_std_spec, std_export_doc,
-    std_export_sig, std_module, std_module_doc, BUILTINS, SNIPPETS, STD_EXPORTS, STD_MODULES,
+    std_export_sig, std_module, std_module_doc, BUILTINS, PREDEFINED_GLOBALS, SNIPPETS,
+    STD_EXPORTS, STD_MODULES,
 };
 use crate::token::KEYWORDS;
 use symbols::{
     import_path_for_name, index_program, index_source, infer_receiver_from_index, parse_for_lsp,
     FileIndex, KIND_CLASS, KIND_FIELD, KIND_FUNC, KIND_KEYWORD, KIND_METHOD, KIND_MODULE,
-    KIND_SNIPPET,
+    KIND_SNIPPET, KIND_VAR,
 };
 use workspace::{
     find_export, load_index, load_module, path_to_uri, resolve_doc, resolve_import_file,
@@ -388,6 +389,9 @@ pub fn completion_in(
     for (name, doc) in BUILTINS {
         push(name, KIND_FUNC, doc, "1", None);
     }
+    for (name, doc) in PREDEFINED_GLOBALS {
+        push(name, KIND_VAR, doc, "1", None);
+    }
     for kw in KEYWORDS {
         push(kw, KIND_KEYWORD, "keyword", "2", None);
     }
@@ -438,6 +442,9 @@ pub fn hover_in(
         }
     }
     if let Some((_, doc)) = BUILTINS.iter().find(|(n, _)| *n == typed) {
+        return hover_md(doc);
+    }
+    if let Some((_, doc)) = PREDEFINED_GLOBALS.iter().find(|(n, _)| *n == typed) {
         return hover_md(doc);
     }
     let (idx, line_1) = source_index(source, lsp_line);
@@ -818,23 +825,61 @@ fn params_from_label(label: &str) -> Vec<Json> {
     let Some(byte_start) = label.find('(') else {
         return Vec::new();
     };
-    let Some(byte_end) = label.rfind(')') else {
-        return Vec::new();
-    };
-    if byte_end <= byte_start + 1 {
-        return Vec::new();
-    }
     let mut params = Vec::new();
-    let mut offset = byte_start + 1;
-    for part in label[byte_start + 1..byte_end].split(',') {
-        let trimmed = part.trim();
-        if !trimmed.is_empty() && trimmed != "..." {
-            let rel = part.find(trimmed).unwrap_or(0);
-            let a = utf16_len(&label[..offset + rel]);
-            let b = a + utf16_len(trimmed);
-            params.push(json!({ "label": [a, b] }));
+    let body_start = byte_start + 1;
+    let mut part_start = body_start;
+    let mut paren = 0u32;
+    let mut bracket = 0u32;
+    let mut brace = 0u32;
+    let mut quote = None;
+    let mut escaped = false;
+
+    let mut push_part = |start: usize, end: usize| {
+        let raw = &label[start..end];
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed == "..." {
+            return;
         }
-        offset += part.len() + 1;
+        let trimmed_start = start + raw.len().saturating_sub(raw.trim_start().len());
+        let trimmed_end = trimmed_start + trimmed.len();
+        params.push(json!({
+            "label": [
+                utf16_len(&label[..trimmed_start]),
+                utf16_len(&label[..trimmed_end])
+            ]
+        }));
+    };
+
+    for (relative, ch) in label[body_start..].char_indices() {
+        let offset = body_start + relative;
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '(' => paren += 1,
+            ')' if paren > 0 => paren -= 1,
+            ')' if bracket == 0 && brace == 0 => {
+                push_part(part_start, offset);
+                return params;
+            }
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            ',' if paren == 0 && bracket == 0 && brace == 0 => {
+                push_part(part_start, offset);
+                part_start = offset + ch.len_utf8();
+            }
+            _ => {}
+        }
     }
     params
 }
@@ -874,28 +919,59 @@ fn call_context(source: &str, lsp_line: usize, lsp_col: usize) -> Option<(String
     let tokens = Lexer::new(source).tokenize().ok()?;
     let line_1 = lsp_line.saturating_add(1);
     let col_1 = lsp_col.saturating_add(1);
-    let mut depth = 0i32;
-    let mut commas = 0u32;
-    let mut i = tokens.len();
-    while i > 0 {
-        i -= 1;
-        let t = &tokens[i];
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Delimiter {
+        Paren,
+        Bracket,
+        Brace,
+    }
+    struct Frame {
+        delimiter: Delimiter,
+        callee: Option<String>,
+        commas: u32,
+    }
+
+    let mut stack: Vec<Frame> = Vec::new();
+    for (i, t) in tokens.iter().enumerate() {
         if t.line > line_1 || (t.line == line_1 && t.column > col_1) {
             continue;
         }
         match t.kind {
-            TokenKind::RParen => depth += 1,
             TokenKind::LParen => {
-                if depth == 0 {
-                    return callee_before_paren(&tokens, i).map(|n| (n, commas));
-                }
-                depth -= 1;
+                stack.push(Frame {
+                    delimiter: Delimiter::Paren,
+                    callee: callee_before_paren(&tokens, i),
+                    commas: 0,
+                });
             }
-            TokenKind::Comma if depth == 0 => commas += 1,
+            TokenKind::LBracket => stack.push(Frame {
+                delimiter: Delimiter::Bracket,
+                callee: None,
+                commas: 0,
+            }),
+            TokenKind::LBrace => stack.push(Frame {
+                delimiter: Delimiter::Brace,
+                callee: None,
+                commas: 0,
+            }),
+            TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                stack.pop();
+            }
+            TokenKind::Comma => {
+                if let Some(frame) = stack.last_mut() {
+                    if frame.delimiter == Delimiter::Paren {
+                        frame.commas = frame.commas.saturating_add(1);
+                    }
+                }
+            }
             _ => {}
         }
     }
-    None
+
+    stack
+        .into_iter()
+        .rev()
+        .find_map(|frame| frame.callee.map(|callee| (callee, frame.commas)))
 }
 
 fn callee_before_paren(tokens: &[Token], paren_i: usize) -> Option<String> {

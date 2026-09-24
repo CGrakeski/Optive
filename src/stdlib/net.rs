@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::Mutex;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 
@@ -291,17 +292,13 @@ pub(super) fn load_server_config(cert_file: File, key_file: File) -> Result<Arc<
 }
 
 fn load_certs(file: File) -> Result<Vec<CertificateDer<'static>>> {
-    let mut r = BufReader::new(file);
-    rustls_pemfile::certs(&mut r)
+    CertificateDer::pem_reader_iter(BufReader::new(file))
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| io_map("tls cert", e))
 }
 
 fn load_key(file: File) -> Result<PrivateKeyDer<'static>> {
-    let mut r = BufReader::new(file);
-    rustls_pemfile::private_key(&mut r)
-        .map_err(|e| io_map("tls key", e))?
-        .ok_or_else(|| RuntimeError::io_err("tls key: no private key"))
+    PrivateKeyDer::from_pem_reader(BufReader::new(file)).map_err(|e| io_map("tls key", e))
 }
 
 pub(super) fn accept_tls(tcp: TcpStream, config: &Arc<ServerConfig>) -> Result<ConnInner> {

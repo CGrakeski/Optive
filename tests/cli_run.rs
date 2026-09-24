@@ -1559,7 +1559,7 @@ entry = "src/main.tive"
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(
         root.join("src/main.tive"),
-        "use \"helper.tive\".{ answer }\nprint(answer)\n",
+        "use \"helper.tive\".{ answer }\nprint(answer)\nprint(__package__)\n",
     )
     .unwrap();
     fs::write(root.join("src/helper.tive"), "export const answer = 1\n").unwrap();

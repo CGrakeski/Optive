@@ -10,7 +10,7 @@ use crate::type_registry;
 
 use crate::api_registry::{
     builtin_arity, known_std_export, known_std_module, split_std_spec, std_arity, std_module,
-    std_root_item, StdRootItem, BUILTINS,
+    std_root_item, StdRootItem, BUILTINS, PREDEFINED_GLOBALS,
 };
 
 pub type Diag = (usize, usize, String);
@@ -194,6 +194,9 @@ impl Cx {
 fn global_names() -> HashSet<String> {
     let mut s = HashSet::new();
     for (n, _) in BUILTINS {
+        s.insert((*n).to_string());
+    }
+    for (n, _) in PREDEFINED_GLOBALS {
         s.insert((*n).to_string());
     }
     for n in type_registry::global_type_names() {
@@ -1191,6 +1194,7 @@ mod tests {
         assert!(diags("func add(a, b) { a + b }\nadd(1, 2)\n").is_empty());
         assert!(diags("use std.math.{ sin }\nprint(sin(0))\n").is_empty());
         assert!(diags("std.math.sin(0)\n").is_empty());
+        assert!(diags("print(__package__)\n").is_empty());
     }
 
     #[test]

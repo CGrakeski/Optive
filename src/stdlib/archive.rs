@@ -77,7 +77,7 @@ fn input_entries(name: &str, value: &Value) -> Result<Vec<(String, Vec<u8>)>> {
 }
 
 fn checked_limit(args: &[Value], index: usize, name: &str) -> Result<usize> {
-    if let Some(_) = args.get(index) {
+    if args.get(index).is_some() {
         let limit = expect_int(name, args, index)?;
         if limit < 0 {
             return Err(RuntimeError::value_err(format!(
