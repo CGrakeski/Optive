@@ -90,6 +90,14 @@ jobs:
           "TMP=$ciTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "TEMP=$ciTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "OPTIVE_TEST_TMP=$ciTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Use a stable macOS temp directory
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          ci_temp="$GITHUB_WORKSPACE/.ci-tmp"
+          mkdir -p "$ci_temp"
+          echo "TMPDIR=$ci_temp" >> "$GITHUB_ENV"
+          echo "OPTIVE_TEST_TMP=$ci_temp" >> "$GITHUB_ENV"
       - name: Free disk space
         if: runner.os == 'Linux'
         run: |

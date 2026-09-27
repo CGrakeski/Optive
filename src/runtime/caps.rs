@@ -791,13 +791,29 @@ fn lexical_relative_under(path: &Path, root: &Path) -> Option<PathBuf> {
 
 /// Return the root spelling and relative path used for capability traversal.
 ///
-/// Windows may expose one directory through a DOS 8.3 alias (`RUNNER~1`) and a
-/// long canonical name (`runneradmin`). First preserve the ordinary lexical
-/// path so reparse-point checks still see the path the caller supplied. Only
-/// when that fails do we canonicalize existing paths to compare host aliases.
+/// Host platforms may expose one directory through multiple spellings: Windows
+/// has DOS 8.3 aliases (`RUNNER~1`), while macOS maps `/var` to `/private/var`.
+/// First preserve the ordinary lexical path so reparse-point checks still see
+/// the path the caller supplied. If that fails, also accept a path already
+/// written below the canonical spelling of the trusted root. Windows needs one
+/// final path canonicalization because either side may carry the 8.3 alias.
 fn relative_under_host_aliases(path: &Path, root: &Path) -> Option<(PathBuf, PathBuf)> {
     if let Some(relative) = lexical_relative_under(path, root) {
         return Some((root.to_path_buf(), relative));
+    }
+
+    let canonical_root = std::fs::canonicalize(root).ok().map(|path| {
+        #[cfg(windows)]
+        {
+            strip_windows_verbatim_path(path)
+        }
+        #[cfg(not(windows))]
+        {
+            path
+        }
+    })?;
+    if let Some(relative) = lexical_relative_under(path, &canonical_root) {
+        return Some((canonical_root, relative));
     }
 
     #[cfg(windows)]
@@ -805,11 +821,8 @@ fn relative_under_host_aliases(path: &Path, root: &Path) -> Option<(PathBuf, Pat
         let path = std::fs::canonicalize(path)
             .ok()
             .map(strip_windows_verbatim_path)?;
-        let root = std::fs::canonicalize(root)
-            .ok()
-            .map(strip_windows_verbatim_path)?;
-        let relative = lexical_relative_under(&path, &root)?;
-        Some((root, relative))
+        let relative = lexical_relative_under(&path, &canonical_root)?;
+        Some((canonical_root, relative))
     }
 
     #[cfg(not(windows))]
@@ -994,5 +1007,29 @@ mod tests {
         assert!(err.message().contains("symbolic link"), "{}", err.message());
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_result_remains_allowed_under_an_aliased_root() {
+        use std::os::unix::fs::symlink;
+
+        let pid = std::process::id();
+        let parent = std::env::temp_dir().join(format!("optive_root_alias_{pid}"));
+        let real = parent.join("real");
+        let alias = parent.join("alias");
+        let _ = std::fs::remove_dir_all(&parent);
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("Optive.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        symlink(&real, &alias).unwrap();
+
+        let caps = Capabilities::sandbox(vec![alias.clone()]);
+        let canonical = caps
+            .resolve_fs_path("package entry", alias.join("Optive.toml"), FsAccess::Read)
+            .unwrap();
+        assert!(canonical.starts_with(real.canonicalize().unwrap()));
+        assert!(caps.is_file("package manifest", canonical).unwrap());
+
+        let _ = std::fs::remove_dir_all(&parent);
     }
 }
