@@ -564,6 +564,7 @@ impl Generator {
         let env = Arc::new(crate::opcode::ModuleGlobalEnv {
             global_names: self.program.global_names.clone(),
             globals: std::sync::Arc::new(crate::shared::SyncCell::new(HashMap::new())),
+            package_id: String::new(),
             finalized: false,
         });
         let updated: HashMap<String, Arc<FunctionObject>> = self
@@ -2624,6 +2625,7 @@ impl Generator {
             Some(Arc::new(crate::opcode::ModuleGlobalEnv {
                 global_names: func_global_names,
                 globals: std::sync::Arc::new(crate::shared::SyncCell::new(HashMap::new())),
+                package_id: String::new(),
                 finalized: false,
             }))
         };

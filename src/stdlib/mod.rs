@@ -274,12 +274,12 @@ fn build_package_module() -> Shared<ModuleObject> {
 
 fn package_id(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     expect_arity("package.id", args, 0)?;
-    Ok(Value::Text(vm.current_package_id.clone()))
+    Ok(Value::Text(vm.active_package_id().to_string()))
 }
 
 fn package_dir(vm: &mut Vm, args: &[Value], kind: &str) -> Result<Value> {
     expect_arity(&format!("package.{kind}_dir"), args, 0)?;
-    let path = crate::caps::package_state_dir(&vm.current_package_id, kind);
+    let path = crate::caps::package_state_dir(vm.active_package_id(), kind);
     std::fs::create_dir_all(&path).map_err(|e| {
         crate::error::RuntimeError::io_err(format!(
             "cannot create package {kind} directory {}: {e}",

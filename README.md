@@ -29,6 +29,8 @@ Optive run
 
 第一次使用请继续阅读[上手教程](docs/user/tutorial.md)；按主题查阅时从[文档中心](docs/README.md)开始。
 
+需要完整项目时，可运行 [example-packs](example-packs/README.md)：其中包含 custom pack、本地 Git 依赖、包索引与同名依赖多版本隔离的离线示例。
+
 ## 常用命令
 
 | 场景 | 命令 |

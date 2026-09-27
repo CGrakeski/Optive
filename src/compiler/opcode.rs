@@ -826,6 +826,9 @@ impl MacroObject {
 pub struct ModuleGlobalEnv {
     pub global_names: Vec<String>,
     pub globals: Arc<SyncCell<HashMap<String, Value>>>,
+    /// Exact package identity that owned the module when its globals were finalized.
+    /// Empty on compile/cache placeholders; module loading replaces those placeholders.
+    pub package_id: String,
     pub finalized: bool,
 }
 

@@ -133,3 +133,22 @@ fn package_state_directories_are_separated_by_exact_package_id() {
     assert_ne!(a, b);
     assert_ne!(a, cache);
 }
+
+#[test]
+fn exported_function_observes_its_defining_package_id() {
+    let temp = TestDir::new("function-package-id");
+    let dep = package(
+        temp.path(),
+        "dep",
+        r#"
+import std.package as package
+export func identity() { return package.id() }
+"#,
+    );
+
+    let mut vm = Vm::new();
+    bind(&mut vm, "__root__", "dep", "dep-exact-id", dep);
+    let value =
+        optive::run_source_in_vm(&mut vm, "import dep\ndep.identity()\n", "<script>").unwrap();
+    assert_eq!(value.display_string(), "\"dep-exact-id\"");
+}

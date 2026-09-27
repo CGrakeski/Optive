@@ -1991,8 +1991,23 @@ impl Vm {
         ModuleGlobalEnv {
             global_names: self.script_global_names.clone(),
             globals: std::sync::Arc::new(crate::shared::SyncCell::new(map.into_iter().collect())),
+            package_id: self.current_package_id.clone(),
             finalized: true,
         }
+    }
+
+    /// Package owning the currently executing user function. Module functions keep
+    /// their defining package identity even when called by the root program or by a
+    /// function from another package. Compile/cache placeholder environments have an
+    /// empty identity and deliberately fall back to the ambient module context.
+    pub(crate) fn active_package_id(&self) -> &str {
+        self.user_call_frames
+            .iter()
+            .rev()
+            .filter_map(|frame| frame.func.module_env.as_deref())
+            .map(|env| env.package_id.as_str())
+            .find(|id| !id.is_empty())
+            .unwrap_or(self.current_package_id.as_str())
     }
 
     /// 将平行槽刷回 SharedMap（M:1 热 `StoreGlobal` 可延迟同步；调度其它纤程前必须刷）。

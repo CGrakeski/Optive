@@ -573,8 +573,8 @@ impl Capabilities {
             let absolute = absolute_lexical(path)?;
             for root in &self.immutable_roots {
                 let root = absolute_lexical(root)?;
-                if lexical_relative_under(&absolute, &root).is_some()
-                    || lexical_relative_under(&root, &absolute).is_some()
+                if relative_under_host_aliases(&absolute, &root).is_some()
+                    || relative_under_host_aliases(&root, &absolute).is_some()
                 {
                     return Err(path_error(
                         op,
@@ -619,7 +619,7 @@ impl Capabilities {
             let root_abs = absolute_lexical(root)?;
             if access == FsAccess::Write
                 && !writable
-                && lexical_relative_under(&root_abs, &absolute).is_some()
+                && relative_under_host_aliases(&root_abs, &absolute).is_some()
             {
                 return Err(path_error(
                     op,
@@ -627,8 +627,10 @@ impl Capabilities {
                     "path contains a read-only dependency root",
                 ));
             }
-            if let Some(relative) = lexical_relative_under(&absolute, &root_abs) {
-                let specificity = root_abs.components().count();
+            if let Some((matched_root, relative)) =
+                relative_under_host_aliases(&absolute, &root_abs)
+            {
+                let specificity = matched_root.components().count();
                 let replace = best
                     .as_ref()
                     .is_none_or(|(current, current_writable, _, _)| {
@@ -636,7 +638,7 @@ impl Capabilities {
                             || (specificity == *current && !writable && *current_writable)
                     });
                 if replace {
-                    best = Some((specificity, writable, root_abs, relative));
+                    best = Some((specificity, writable, matched_root, relative));
                 }
             }
         }
@@ -785,6 +787,35 @@ fn ambient_absolute_lexical(path: &Path) -> std::io::Result<PathBuf> {
 #[cfg(not(windows))]
 fn lexical_relative_under(path: &Path, root: &Path) -> Option<PathBuf> {
     path.strip_prefix(root).ok().map(Path::to_path_buf)
+}
+
+/// Return the root spelling and relative path used for capability traversal.
+///
+/// Windows may expose one directory through a DOS 8.3 alias (`RUNNER~1`) and a
+/// long canonical name (`runneradmin`). First preserve the ordinary lexical
+/// path so reparse-point checks still see the path the caller supplied. Only
+/// when that fails do we canonicalize existing paths to compare host aliases.
+fn relative_under_host_aliases(path: &Path, root: &Path) -> Option<(PathBuf, PathBuf)> {
+    if let Some(relative) = lexical_relative_under(path, root) {
+        return Some((root.to_path_buf(), relative));
+    }
+
+    #[cfg(windows)]
+    {
+        let path = std::fs::canonicalize(path)
+            .ok()
+            .map(strip_windows_verbatim_path)?;
+        let root = std::fs::canonicalize(root)
+            .ok()
+            .map(strip_windows_verbatim_path)?;
+        let relative = lexical_relative_under(&path, &root)?;
+        Some((root, relative))
+    }
+
+    #[cfg(not(windows))]
+    {
+        None
+    }
 }
 
 #[cfg(windows)]
