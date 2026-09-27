@@ -802,16 +802,12 @@ fn relative_under_host_aliases(path: &Path, root: &Path) -> Option<(PathBuf, Pat
         return Some((root.to_path_buf(), relative));
     }
 
-    let canonical_root = std::fs::canonicalize(root).ok().map(|path| {
-        #[cfg(windows)]
-        {
-            strip_windows_verbatim_path(path)
-        }
-        #[cfg(not(windows))]
-        {
-            path
-        }
-    })?;
+    #[cfg(windows)]
+    let canonical_root = std::fs::canonicalize(root)
+        .ok()
+        .map(strip_windows_verbatim_path)?;
+    #[cfg(not(windows))]
+    let canonical_root = std::fs::canonicalize(root).ok()?;
     if let Some(relative) = lexical_relative_under(path, &canonical_root) {
         return Some((canonical_root, relative));
     }
