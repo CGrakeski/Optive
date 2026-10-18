@@ -4,7 +4,7 @@
 
 Optive 是一门动态、表达式优先的脚本语言，使用 `.tive` 作为源文件扩展名，解释器以 Rust 实现。当前版本为 **0.2.0**。
 
-语言提供渐进式类型、精确数值、支持继承的 `struct`、`variant`、宏、模块与 Git 包依赖；并发使用 `go` / `await`，标准库包含 HTTP、网络和 SQLite 等模块。`struct` 承担类的角色，但语言不使用 `class` 关键字，也没有 `async func` 语法。
+语言提供渐进式类型、精确数值、支持继承的 `struct`、`variant`、宏、模块与 Git 包依赖；并发使用 `go` / `await`，标准库包含 HTTP、网络和 SQLite 等模块。对象解构通过 `__unpack__` 协议统一字典与结构体，循环支持无冒号标签和 `for ... else`，函数签名支持 `outside(n)`、`display_as(text)` 描述符，以及供任务自行响应取消的 `cancel_flag{a}` 描述符宏。`struct` 承担类的角色，但语言不使用 `class` 关键字，也没有 `async func` 语法。
 
 ## 快速开始
 

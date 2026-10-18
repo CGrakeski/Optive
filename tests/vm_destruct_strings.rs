@@ -8,7 +8,7 @@
 )]
 mod common;
 
-use common::{assert_list, assert_num, assert_text, run_err};
+use common::{assert_bool, assert_list, assert_num, assert_text, run_err};
 
 #[test]
 fn multiline_string() {
@@ -220,6 +220,109 @@ fn destruct_length_mismatch() {
 let (a, b) = [1]
 a
 ",
+    );
+}
+
+#[test]
+fn object_destruct_maps_keys_to_explicit_bindings_and_rest() {
+    assert_num(
+        r#"
+let { x = left, y = top, **rest } = {"x": 2, "y": 3, "z": 4}
+left * 100 + top * 10 + rest["z"]
+"#,
+        "234",
+    );
+}
+
+#[test]
+fn object_destruct_assignment_updates_existing_bindings() {
+    assert_num(
+        r#"
+var left = 0
+var top = 0
+{ x = left, y = top } = {"x": 5, "y": 8}
+left * 10 + top
+"#,
+        "58",
+    );
+}
+
+#[test]
+fn object_destruct_uses_default_only_for_a_missing_key() {
+    assert_num(
+        r#"
+let { x = left, retries = 3 } = {"x": 7}
+left * 10 + retries
+"#,
+        "73",
+    );
+}
+
+#[test]
+fn object_destruct_default_does_not_replace_present_none() {
+    assert_bool(
+        r#"
+let { x = 3 } = {"x": none}
+x is none
+"#,
+        true,
+    );
+}
+
+#[test]
+fn object_destruct_accepts_a_compile_time_frozen_dict() {
+    assert_num(
+        r#"
+const OPTIONS = {"x": 6, "y": 2}
+let { x = left, y = top } = OPTIONS
+left * 10 + top
+"#,
+        "62",
+    );
+}
+
+#[test]
+fn object_destruct_uses_default_struct_unpacking() {
+    assert_num(
+        r#"
+struct Point { let x let y }
+let { x = left, y = top } = Point(4, 9)
+left * 10 + top
+"#,
+        "49",
+    );
+}
+
+#[test]
+fn object_destruct_calls_custom_unpack_once() {
+    assert_num(
+        r#"
+var calls = 0
+struct Point {
+    let x
+    let y
+    func __unpack__(self) {
+        calls = calls + 1
+        return {"x": self.y, "y": self.x}
+    }
+}
+let { x = left, y = top } = Point(4, 9)
+calls * 100 + left * 10 + top
+"#,
+        "194",
+    );
+}
+
+#[test]
+fn object_destruct_rejects_non_dict_unpack_result() {
+    run_err(
+        r#"
+struct Bad {
+    func __unpack__(self) { return 1 }
+}
+let { x = value } = Bad()
+value
+"#,
     );
 }
 

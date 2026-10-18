@@ -12,6 +12,7 @@ pub mod ffi;
 pub mod ffi_extra;
 pub mod ffi_pool;
 pub mod gc;
+pub(crate) mod io_pool;
 pub mod metrics;
 pub mod module;
 pub mod ptr_registry;

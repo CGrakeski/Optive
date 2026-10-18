@@ -230,8 +230,23 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
         SyncInner::TaskGroup { .. } => "TaskGroup",
         SyncInner::TimeoutCtx { .. } => "TimeoutCtx",
         SyncInner::Atomic { .. } => "Atomic",
+        SyncInner::CancelFlag { .. } => "CancelFlag",
     };
     match (kind, field) {
+        ("CancelFlag", "requested") => method!(field, s, _vm, |args| {
+            if !args.is_empty() {
+                return Err(RuntimeError::type_err(
+                    "CancelFlag.requested takes no arguments",
+                ));
+            }
+            let inner = s.borrow();
+            let SyncInner::CancelFlag { signal } = &*inner else {
+                unreachable!()
+            };
+            Ok(Value::Bool(
+                signal.load(std::sync::atomic::Ordering::Acquire),
+            ))
+        }),
         // --- RWMutex ---
         ("RWMutex", "read") => method!(field, s, vm, |args| {
             if !args.is_empty() {
@@ -502,9 +517,27 @@ pub fn get_sync_method(s: &Shared<SyncInner>, field: &str) -> Result<Value> {
     }
 }
 
-/// `Task.cancel` / `cancelled` / `done`。
+/// `Task.cancel` / `cancelled` / `done` / `value`。
 pub fn get_task_method(task: &Shared<crate::value::TaskInner>, field: &str) -> Result<Value> {
     match field {
+        "value" => method!(field, task, vm, |args| {
+            if !args.is_empty() {
+                return Err(RuntimeError::type_err("Task.value takes no arguments"));
+            }
+            use crate::value::TaskState;
+            let completed = matches!(
+                task.borrow().state,
+                TaskState::Done(_) | TaskState::Failed(_)
+            );
+            if !completed {
+                return Err(RuntimeError::msg(
+                    "Task.value requires a completed task; use await to wait for its result",
+                ));
+            }
+            // Reuse await's exception propagation without scheduling or holding
+            // a Task borrow across the VM call. Completed results are repeatable.
+            vm.await_value(Value::Task(task.clone()))
+        }),
         "cancel" => method!(field, task, vm, |args| {
             if !args.is_empty() {
                 return Err(RuntimeError::type_err("Task.cancel takes no arguments"));

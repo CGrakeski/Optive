@@ -423,9 +423,18 @@ pub fn list_fibers(vm: &Vm) -> Vec<FiberInfo> {
         }
         let st = task.borrow().state.clone();
         let (name, detail) = match &st {
-            TaskState::Pending { callable, args } => (
+            TaskState::Pending {
+                callable,
+                args,
+                kwargs,
+            } => (
                 "pending".into(),
-                format!("{} argc={}", callable_name(callable), args.len()),
+                format!(
+                    "{} argc={} kwargs={}",
+                    callable_name(callable),
+                    args.len(),
+                    kwargs.len()
+                ),
             ),
             TaskState::Running => ("running".into(), String::new()),
             TaskState::Suspended => ("suspended".into(), String::new()),

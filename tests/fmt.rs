@@ -158,6 +158,29 @@ fn fmt_forces_if_parens_and_braces() {
 }
 
 #[test]
+fn fmt_roundtrips_object_destructuring_and_for_else() {
+    let source = r#"
+let { x = left, retries = 3, **rest } = point
+for (x in xs) { print(x) } else { print("done") }
+"#;
+    let out = format_source(source).expect("fmt");
+    assert!(out.contains("let {x = left, retries = 3, **rest} = point"));
+    assert!(out.contains("} else {"));
+    parse_ok(&out);
+}
+
+#[test]
+fn fmt_roundtrips_function_descriptors_in_signature_order() {
+    let source = r#"func worker(x) outside(1) display_as("background worker") -> int { return x }
+"#;
+    let formatted = format_source(source).expect("format descriptors");
+    assert!(
+        formatted.contains("func worker(x) outside(1) display_as(\"background worker\") -> int")
+    );
+    optive::parse_program(&formatted).expect("formatted descriptors parse");
+}
+
+#[test]
 fn fmt_preserves_export_and_intern() {
     let src = "\
 export func a() {

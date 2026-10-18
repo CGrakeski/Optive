@@ -803,6 +803,13 @@ fn resolve_signature(
             }
         }
         if s.kind == KIND_CLASS {
+            if s.detail.contains('(') {
+                return s
+                    .detail
+                    .strip_prefix("struct ")
+                    .unwrap_or(&s.detail)
+                    .to_string();
+            }
             let fields: Vec<&str> = idx
                 .members_of(name)
                 .into_iter()
@@ -1384,11 +1391,7 @@ pub fn formatting(source: &str) -> Json {
     }
     let line_count = source.lines().count();
     let last_line = line_count.saturating_sub(1);
-    let last_col = source
-        .lines()
-        .last()
-        .map(|l| l.chars().count())
-        .unwrap_or(0);
+    let last_col = source.lines().last().map(utf16_len).unwrap_or(0);
     let end = if source.ends_with('\n') {
         json!({ "line": line_count, "character": 0 })
     } else {
@@ -1683,31 +1686,48 @@ pub fn workspace_symbol(query: &str) -> Json {
 
 #[must_use]
 pub fn semantic_tokens(source: &str) -> Json {
-    let Ok(tokens) = Lexer::new(source).tokenize() else {
-        return json!({ "data": [] });
-    };
+    let spans = Lexer::new(source).tokenize_spans();
     let mut data = Vec::new();
     let mut prev_line = 0u32;
     let mut prev_start = 0u32;
-    for t in &tokens {
-        if matches!(t.kind, TokenKind::End) {
-            continue;
+    let mut line = 0u32;
+    let mut column = 0u32;
+    let mut cursor = 0usize;
+    for (start, end, kind) in spans {
+        for gap in source[cursor..start].split_inclusive('\n') {
+            if gap.ends_with('\n') {
+                line += 1;
+                column = 0;
+            } else {
+                column += utf16_len(gap) as u32;
+            }
         }
-        let Some(ty) = token_type_index(t.kind) else {
-            continue;
-        };
-        let line = t.line.saturating_sub(1) as u32;
-        let start = t.column.saturating_sub(1) as u32;
-        let length = utf16_len(&t.value).max(1) as u32;
-        let delta_line = line.saturating_sub(prev_line);
-        let delta_start = if delta_line == 0 {
-            start.saturating_sub(prev_start)
-        } else {
-            start
-        };
-        data.extend_from_slice(&[delta_line, delta_start, length, ty, 0]);
-        prev_line = line;
-        prev_start = start;
+        // Token values contain decoded escapes and omit literal/comment delimiters.
+        // LSP ranges must cover the original spelling, in UTF-16 units, one line at a time.
+        for part in source[start..end].split_inclusive('\n') {
+            let text = part
+                .strip_suffix('\n')
+                .map_or(part, |s| s.trim_end_matches('\r'));
+            let length = utf16_len(text) as u32;
+            if let Some(ty) = token_type_index(kind).filter(|_| length > 0) {
+                let delta_line = line - prev_line;
+                let delta_start = if delta_line == 0 {
+                    column - prev_start
+                } else {
+                    column
+                };
+                data.extend_from_slice(&[delta_line, delta_start, length, ty, 0]);
+                prev_line = line;
+                prev_start = column;
+            }
+            if part.ends_with('\n') {
+                line += 1;
+                column = 0;
+            } else {
+                column += length;
+            }
+        }
+        cursor = end;
     }
     json!({ "data": data })
 }

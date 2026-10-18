@@ -1,0 +1,132 @@
+// 前台刷新旋转指针，后台判断大整数是否为素数。
+// 运行：Optive examples/prime-spinner.tive
+// 按回车使用默认值；TIME_LIMIT_SECONDS = 0 表示不限制时间。
+// 精确试除，不使用概率素数测试。特别大的整数可能需要很长时间。
+
+const DEFAULT_NUMBER = 1000000000000037
+const TIME_LIMIT_SECONDS = 30
+const FRAME_SECONDS = 0.08
+const CANCEL_CHECK_INTERVAL = 4096
+
+struct Cycle {
+    var txt: text
+    var current: num = 0
+
+    func __init__(self, txt: text) {
+        self.txt = txt
+    }
+
+    func __next__(self) -> text {
+        let frame = self.txt[self.current]
+        self.current = (self.current + 1) % len(self.txt)
+        return frame
+    }
+}
+
+// 正常完成只返回 bool；接受取消请求时抛出 Cancelled，不占用返回值语义。
+func is_prime(n:: num) cancel_flag{stop} => bool {
+    if (stop.requested()) {
+        throw Cancelled("素数计算已取消")
+    }
+    if (n < 2) {
+        return false
+    }
+    if (n == 2 or n == 3) {
+        return true
+    }
+    if (n % 2 == 0 or n % 3 == 0) {
+        return false
+    }
+
+    // 大于 3 的素数只能是 6k-1 或 6k+1。
+    // 使用 d*d <= n，避免浮点平方根的精度问题。
+    var d = 5
+    var batch = 0
+    while (d * d <= n) {
+        if (n % d == 0 or n % (d + 2) == 0) {
+            return false
+        }
+        d = d + 6
+        batch = batch + 1
+
+        // 批量检查请求，并让出执行机会；只有一个 worker 时前台也能刷新。
+        if (batch >= CANCEL_CHECK_INTERVAL) {
+            if (stop.requested()) {
+                throw Cancelled("素数计算已取消")
+            }eeeeee
+            batch = 0
+            suspend
+        }
+    }
+    return true
+}
+
+func read_number() -> num {
+    loop {
+        var raw = input("The number is (Enter = " + str(DEFAULT_NUMBER) + "): ").strip()
+        if (raw == "") {
+            return DEFAULT_NUMBER
+        }
+
+        var n = 0
+        try {
+            n = num.(raw)
+        } catch (e) {
+            print("输入无法解析，请重新输入一个非负整数。")
+            continue
+        }
+        // num 支持精确有理数，但 % 只支持整数；不能用 n % 1 验证整数。
+        if (n < 0 or n != std.math.floor(n)) {
+            print("请输入非负整数，不接受非整数值。")
+            continue
+        }
+        return n
+    }
+}
+
+func main() {
+    let n = read_number()
+    let spinner = Cycle("/|\\-")
+    let started = std.time.monotonic()
+    let result = go is_prime(n)
+    var cancellation_sent = false
+
+    // print 总会换行，因此先留一行，之后用 ANSI 光标上移覆盖这行。
+    // 请在支持 ANSI 的终端（如 VS Code 终端 / Windows Terminal）运行。
+    print("正在计算……")
+    while (not result.done()) {
+        if (not cancellation_sent and TIME_LIMIT_SECONDS > 0 and std.time.monotonic() - started >= TIME_LIMIT_SECONDS) {
+            result.cancel()
+            cancellation_sent = true
+        }
+
+        if (cancellation_sent) {
+            print("\x1b[1A\r\x1b[2K" + spinner.__next__() + " 正在请求停止计算……")
+        } else {
+            print("\x1b[1A\r\x1b[2K" + spinner.__next__() + " 正在判断素数……")
+        }
+        suspend
+        std.time.sleep(FRAME_SECONDS)
+    }
+
+    // 清除旋转指针所在行；后台已经结束，不会留下持续运行的任务。
+    print("\x1b[1A\r\x1b[2K计算结束。")
+    try {
+        // 已确认任务结束；await 返回 bool，或传播任务的原异常。
+        let prime = await result
+        if (prime) {
+            print("是素数：", n)
+        } else {
+            print("不是素数：", n)
+        }
+    } catch (e: Cancelled) {
+        // 只处理取消；其他计算异常仍向调用方传播，不能误报为合数。
+        print("已达到时间限制，计算自行停止；尚未确定是否为素数：", n)
+    }
+    let elapsed_ms = std.math.floor((std.time.monotonic() - started) * 1000)
+    print("耗时：", elapsed_ms, "ms")
+}
+
+if (__package__ == "__main__") {
+    main()
+}

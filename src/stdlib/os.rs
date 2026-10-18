@@ -136,24 +136,27 @@ pub(super) fn os_spawn_result(
     capture: bool,
 ) -> Result<Value> {
     vm.caps.check_process("os.run")?;
-    vm.request_cooperative_yield();
     let mut cmd = std::process::Command::new(prog);
     cmd.args(args);
     if capture {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
     }
-    let output = if capture {
-        cmd.output()
-    } else {
-        cmd.status().map(|status| std::process::Output {
-            status,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-        })
-    }
-    .map_err(|e| io_map("os.run failed", e))?;
-    vm.request_cooperative_yield();
+    let Some(output) = vm.run_blocking(move || {
+        if capture {
+            cmd.output()
+        } else {
+            cmd.status().map(|status| std::process::Output {
+                status,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+        .map_err(|e| io_map("os.run failed", e))
+    })?
+    else {
+        return Ok(Value::None);
+    };
     let code = output
         .status
         .code()

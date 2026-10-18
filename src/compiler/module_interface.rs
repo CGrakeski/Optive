@@ -105,8 +105,10 @@ pub fn visibility_name(visibility: Visibility) -> &'static str {
 }
 
 pub fn exports_of(program: &Program, consts: &ConstContext) -> Result<Vec<Export>, String> {
+    let lowered = crate::frontend::function_descriptors::lower_program(program)
+        .map_err(|error| error.message().to_string())?;
     let mut result = Vec::new();
-    for located in &program.stmts {
+    for located in &lowered.stmts {
         let Some(mut export) = export_of(&located.stmt, consts)? else {
             continue;
         };
@@ -279,7 +281,11 @@ fn export_of(stmt: &Stmt, _consts: &ConstContext) -> Result<Option<Export>, Stri
 
 fn param_sig(param: &FuncParam) -> ParamSig {
     ParamSig {
-        name: param.name.clone(),
+        name: param
+            .pattern
+            .as_ref()
+            .map(crate::fmt::format_destruct)
+            .unwrap_or_else(|| param.name.clone()),
         type_name: param.type_expr.as_ref().map(type_text),
         mutable: false,
         variadic: param.is_variadic || param.is_kwvariadic,
@@ -319,10 +325,15 @@ fn protocol_fields(members: &[ProtocolMember]) -> Vec<FieldSig> {
     members
         .iter()
         .filter_map(|member| match member {
-            ProtocolMember::Field { name, mutable } => Some(FieldSig {
+            ProtocolMember::Field {
+                name,
+                mutable,
+                type_expr,
+                ..
+            } => Some(FieldSig {
                 name: name.clone(),
                 mutable: *mutable,
-                type_name: None,
+                type_name: type_expr.as_ref().map(type_text),
             }),
             ProtocolMember::Method { .. } => None,
         })
@@ -333,10 +344,15 @@ fn protocol_methods(members: &[ProtocolMember]) -> Vec<MethodSig> {
     members
         .iter()
         .filter_map(|member| match member {
-            ProtocolMember::Method { name, params } => Some(MethodSig {
+            ProtocolMember::Method {
+                name,
+                params,
+                return_type,
+                ..
+            } => Some(MethodSig {
                 name: name.clone(),
                 params: params.iter().map(param_sig).collect(),
-                return_type: None,
+                return_type: return_type.as_ref().map(type_text),
             }),
             ProtocolMember::Field { .. } => None,
         })

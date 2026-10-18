@@ -4,9 +4,10 @@
 //! - `>1` 时额外线程从全局 Injector / 彼此 Stealer 取任务，真正并行跑纤程。
 //! - 阻塞等待（channel/mutex）在无就绪任务时 `Condvar` 休眠，由 `notify` 唤醒。
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use parking_lot::{Condvar, Mutex};
@@ -17,6 +18,12 @@ use crate::value::{TaskInner, Value};
 
 /// 挂起纤程快照存于此（跨 worker 迁移）。
 pub(crate) type FiberStore = Mutex<FxHashMap<usize, crate::vm::TaskFiber>>;
+
+#[derive(Default)]
+struct SleepTimers {
+    deadlines: BTreeMap<(Instant, usize), Shared<TaskInner>>,
+    tasks: FxHashMap<usize, Instant>,
+}
 
 pub struct MnScheduler {
     pub(crate) injector: Injector<Shared<TaskInner>>,
@@ -48,6 +55,8 @@ pub struct MnScheduler {
     /// 曾入队的任务弱引用（injector 不可遍历时的根补充）。
     /// 按任务指针去重：挂起后重入队是热路径，绝不能每次 push 一条 Weak。
     pub(crate) scheduled_tasks: Mutex<FxHashMap<usize, WeakShared<TaskInner>>>,
+    sleep_timers: Mutex<SleepTimers>,
+    has_sleep_timers: AtomicBool,
 }
 
 /// `wait_brief` 单次等待时长。
@@ -74,6 +83,8 @@ impl MnScheduler {
             gc_requested: AtomicBool::new(false),
             parked_roots: Mutex::new(FxHashMap::default()),
             scheduled_tasks: Mutex::new(FxHashMap::default()),
+            sleep_timers: Mutex::new(SleepTimers::default()),
+            has_sleep_timers: AtomicBool::new(false),
         })
     }
 
@@ -203,10 +214,94 @@ impl MnScheduler {
 
     /// 无本地/全局任务时短等；有任务或关机则返回。
     pub fn wait_brief(&self) {
+        self.wait_for(Duration::from_millis(WAIT_BRIEF_MS));
+    }
+
+    pub(crate) fn wait_for(&self, timeout: Duration) {
         self.poll_safepoint();
         let mut guard = self.wake_mu.lock();
-        self.wake_cv
-            .wait_for(&mut guard, Duration::from_millis(WAIT_BRIEF_MS));
+        self.wake_cv.wait_for(&mut guard, timeout);
+    }
+
+    /// Park only the task, never the worker. Timer ownership also keeps its GC root alive.
+    pub(crate) fn park_sleep(&self, task: Shared<TaskInner>, until: Instant) {
+        let key = task.as_ptr() as usize;
+        let mut timers = self.sleep_timers.lock();
+        if let Some(old) = timers.tasks.insert(key, until) {
+            timers.deadlines.remove(&(old, key));
+        }
+        timers.deadlines.insert((until, key), task);
+        self.has_sleep_timers.store(true, Ordering::Release);
+        drop(timers);
+        self.notify_all();
+    }
+
+    pub(crate) fn remove_sleep(&self, task: &Shared<TaskInner>) {
+        if !self.has_sleep_timers.load(Ordering::Acquire) {
+            return;
+        }
+        let key = task.as_ptr() as usize;
+        let mut timers = self.sleep_timers.lock();
+        if let Some(until) = timers.tasks.remove(&key) {
+            timers.deadlines.remove(&(until, key));
+        }
+        self.has_sleep_timers
+            .store(!timers.tasks.is_empty(), Ordering::Release);
+    }
+
+    pub(crate) fn is_sleeping(&self, task: &Shared<TaskInner>) -> bool {
+        self.has_sleep_timers.load(Ordering::Acquire)
+            && self
+                .sleep_timers
+                .lock()
+                .tasks
+                .contains_key(&(task.as_ptr() as usize))
+    }
+
+    pub(crate) fn next_sleep_deadline(&self) -> Option<Instant> {
+        if !self.has_sleep_timers.load(Ordering::Acquire) {
+            return None;
+        }
+        self.sleep_timers
+            .lock()
+            .deadlines
+            .first_key_value()
+            .map(|((until, _), _)| *until)
+    }
+
+    pub(crate) fn take_due_sleepers(&self) -> Vec<Shared<TaskInner>> {
+        if !self.has_sleep_timers.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        let now = Instant::now();
+        let mut timers = self.sleep_timers.lock();
+        let mut ready = Vec::new();
+        while timers
+            .deadlines
+            .first_key_value()
+            .is_some_and(|((until, _), _)| *until <= now)
+        {
+            if let Some(((_, key), task)) = timers.deadlines.pop_first() {
+                timers.tasks.remove(&key);
+                ready.push(task);
+            }
+        }
+        self.has_sleep_timers
+            .store(!timers.tasks.is_empty(), Ordering::Release);
+        ready
+    }
+
+    pub(crate) fn sleeping_task_values(&self) -> Vec<Value> {
+        if !self.has_sleep_timers.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        self.sleep_timers
+            .lock()
+            .deadlines
+            .values()
+            .cloned()
+            .map(Value::Task)
+            .collect()
     }
 
     /// 成功取到一个任务（随 `scheduler_run_task` 配对 `note_task_done`）。

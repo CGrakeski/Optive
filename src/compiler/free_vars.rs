@@ -29,6 +29,21 @@ pub fn free_vars_in_expr(expr: &Expr, params: &HashSet<String>) -> Vec<String> {
     names
 }
 
+#[must_use]
+pub fn free_vars_in_function(params: &[FuncParam], body: &Block) -> Vec<String> {
+    let names: HashSet<String> = params.iter().flat_map(FuncParam::bound_names).collect();
+    let locals = names.iter().map(|name| (name.clone(), ())).collect();
+    let mut free: HashSet<String> = free_vars_in_block(body, &names).into_iter().collect();
+    for param in params {
+        if let Some(pattern) = &param.pattern {
+            collect_destruct_defaults(pattern, &locals, &mut free);
+        }
+    }
+    let mut free: Vec<String> = free.into_iter().collect();
+    free.sort();
+    free
+}
+
 fn collect_block(body: &Block, locals: &mut HashMap<String, ()>, free: &mut HashSet<String>) {
     let mut scoped = locals.clone();
     for located in body {
@@ -60,6 +75,7 @@ fn collect_stmt_scoped(stmt: &Stmt, locals: &mut HashMap<String, ()>, free: &mut
         }
         Stmt::DestructDecl { pattern, init, .. } => {
             collect_expr(init, locals, free);
+            collect_destruct_defaults(pattern, locals, free);
             bind_destruct_pattern(pattern, locals);
         }
         Stmt::Assign { target, value } => {
@@ -71,6 +87,7 @@ fn collect_stmt_scoped(stmt: &Stmt, locals: &mut HashMap<String, ()>, free: &mut
         }
         Stmt::DestructAssign { pattern, value } => {
             collect_expr(value, locals, free);
+            collect_destruct_defaults(pattern, locals, free);
             bind_destruct_pattern(pattern, locals);
         }
         Stmt::ProtocolDecl { .. } => {}
@@ -78,17 +95,31 @@ fn collect_stmt_scoped(stmt: &Stmt, locals: &mut HashMap<String, ()>, free: &mut
             params,
             body,
             return_type,
+            descriptors,
             ..
         } => {
+            for descriptor in descriptors {
+                if descriptor.name == "cancel_flag" {
+                    continue;
+                }
+                for arg in &descriptor.args {
+                    collect_expr(arg, locals, free);
+                }
+            }
             let mut scoped = locals.clone();
             for p in params {
+                if let Some(pattern) = &p.pattern {
+                    collect_destruct_defaults(pattern, &scoped, free);
+                }
                 if let Some(ty) = &p.type_expr {
                     collect_expr(ty, locals, free);
                 }
                 if let Some(d) = &p.default_expr {
                     collect_expr(d, locals, free);
                 }
-                scoped.insert(p.name.clone(), ());
+                for name in p.bound_names() {
+                    scoped.insert(name, ());
+                }
             }
             if let Some(rt) = return_type {
                 collect_expr(rt, locals, free);
@@ -98,7 +129,9 @@ fn collect_stmt_scoped(stmt: &Stmt, locals: &mut HashMap<String, ()>, free: &mut
         Stmt::MacroDecl { params, body, .. } => {
             let mut scoped = locals.clone();
             for p in params {
-                scoped.insert(p.name.clone(), ());
+                for name in p.bound_names() {
+                    scoped.insert(name, ());
+                }
             }
             collect_block(body, &mut scoped, free);
         }
@@ -107,7 +140,9 @@ fn collect_stmt_scoped(stmt: &Stmt, locals: &mut HashMap<String, ()>, free: &mut
                 let mut scoped = locals.clone();
                 if let Some(params) = params {
                     for p in params {
-                        scoped.insert(p.name.clone(), ());
+                        for name in p.bound_names() {
+                            scoped.insert(name, ());
+                        }
                     }
                 }
                 collect_block(b, &mut scoped, free);
@@ -147,14 +182,27 @@ fn collect_stmt_scoped(stmt: &Stmt, locals: &mut HashMap<String, ()>, free: &mut
             }
             collect_block(body, locals, free);
         }
-        Stmt::For { items, body, .. } => {
+        Stmt::For {
+            items,
+            body,
+            else_block,
+            ..
+        } => {
             let mut scoped = locals.clone();
             for item in items {
                 collect_expr(&item.iterable, locals, free);
-                scoped.insert(item.name.clone(), ());
+                if let Some(pattern) = &item.pattern {
+                    collect_destruct_defaults(pattern, &scoped, free);
+                }
+                for name in item.bound_names() {
+                    scoped.insert(name, ());
+                }
             }
             for located in body {
                 collect_stmt_scoped(&located.stmt, &mut scoped, free);
+            }
+            if let Some(else_block) = else_block {
+                collect_block(else_block, locals, free);
             }
         }
         Stmt::Break(_) | Stmt::Continue(_) => {}
@@ -215,6 +263,10 @@ fn collect_stmt_scoped(stmt: &Stmt, locals: &mut HashMap<String, ()>, free: &mut
 
 fn bind_pattern(pat: &Pattern, locals: &mut HashMap<String, ()>, free: &mut HashSet<String>) {
     match pat {
+        Pattern::Destruct(pattern) => {
+            collect_destruct_defaults(pattern, locals, free);
+            bind_destruct_pattern(pattern, locals);
+        }
         Pattern::Bind(n) => {
             locals.insert(n.clone(), ());
         }
@@ -265,6 +317,58 @@ fn bind_destruct_pattern(pat: &DestructPattern, locals: &mut HashMap<String, ()>
                 }
             }
         }
+        DestructPattern::Dict { entries, rest } => {
+            for entry in entries {
+                locals.insert(entry.binding.clone(), ());
+            }
+            if let Some(rest) = rest {
+                locals.insert(rest.clone(), ());
+            }
+        }
+    }
+}
+
+fn collect_destruct_defaults(
+    pat: &DestructPattern,
+    locals: &HashMap<String, ()>,
+    free: &mut HashSet<String>,
+) {
+    match pat {
+        DestructPattern::Dict { entries, .. } => {
+            for entry in entries {
+                if let Some(default) = &entry.default {
+                    collect_expr(default, locals, free);
+                }
+            }
+        }
+        DestructPattern::Tuple(elems) | DestructPattern::List(elems) => {
+            for elem in elems {
+                if let DestructElem::Pat(pat) = elem {
+                    collect_destruct_defaults(pat, locals, free);
+                }
+            }
+        }
+        DestructPattern::Name(_) | DestructPattern::Discard => {}
+    }
+}
+
+fn walk_destruct_default_callables(pattern: &DestructPattern, free: &mut HashSet<String>) {
+    match pattern {
+        DestructPattern::Dict { entries, .. } => {
+            for entry in entries {
+                if let Some(default) = &entry.default {
+                    walk_expr_callables(default, free);
+                }
+            }
+        }
+        DestructPattern::Tuple(items) | DestructPattern::List(items) => {
+            for item in items {
+                if let DestructElem::Pat(pattern) = item {
+                    walk_destruct_default_callables(pattern, free);
+                }
+            }
+        }
+        DestructPattern::Name(_) | DestructPattern::Discard => {}
     }
 }
 
@@ -345,7 +449,12 @@ fn collect_expr(expr: &Expr, locals: &HashMap<String, ()>, free: &mut HashSet<St
             }
             let mut scoped = locals.clone();
             for item in items {
-                scoped.insert(item.name.clone(), ());
+                if let Some(pattern) = &item.pattern {
+                    collect_destruct_defaults(pattern, &scoped, free);
+                }
+                for name in item.bound_names() {
+                    scoped.insert(name, ());
+                }
             }
             collect_expr(elem, &scoped, free);
             for guard in guards {
@@ -363,7 +472,12 @@ fn collect_expr(expr: &Expr, locals: &HashMap<String, ()>, free: &mut HashSet<St
             }
             let mut scoped = locals.clone();
             for item in items {
-                scoped.insert(item.name.clone(), ());
+                if let Some(pattern) = &item.pattern {
+                    collect_destruct_defaults(pattern, &scoped, free);
+                }
+                for name in item.bound_names() {
+                    scoped.insert(name, ());
+                }
             }
             collect_expr(key, &scoped, free);
             collect_expr(value, &scoped, free);
@@ -391,13 +505,18 @@ fn collect_expr(expr: &Expr, locals: &HashMap<String, ()>, free: &mut HashSet<St
         } => {
             let mut scoped = locals.clone();
             for p in params {
+                if let Some(pattern) = &p.pattern {
+                    collect_destruct_defaults(pattern, &scoped, free);
+                }
                 if let Some(ty) = &p.type_expr {
                     collect_expr(ty, locals, free);
                 }
                 if let Some(d) = &p.default_expr {
                     collect_expr(d, locals, free);
                 }
-                scoped.insert(p.name.clone(), ());
+                for name in p.bound_names() {
+                    scoped.insert(name, ());
+                }
             }
             if let Some(rt) = return_type {
                 collect_expr(rt, locals, free);
@@ -488,7 +607,12 @@ fn collect_expr(expr: &Expr, locals: &HashMap<String, ()>, free: &mut HashSet<St
             }
             let mut scoped = locals.clone();
             for item in items {
-                scoped.insert(item.name.clone(), ());
+                if let Some(pattern) = &item.pattern {
+                    collect_destruct_defaults(pattern, &scoped, free);
+                }
+                for name in item.bound_names() {
+                    scoped.insert(name, ());
+                }
             }
             collect_block(body, &mut scoped, free);
         }
@@ -566,7 +690,7 @@ fn nested_callable_free_names(program: &Program) -> HashSet<String> {
 }
 
 fn add_func_frees(params: &[FuncParam], body: &Block, free: &mut HashSet<String>) {
-    let param_names: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
+    let param_names: HashSet<String> = params.iter().flat_map(|p| p.bound_names()).collect();
     for p in params {
         if let Some(ty) = &p.type_expr {
             walk_expr_callables(ty, free);
@@ -581,7 +705,7 @@ fn add_func_frees(params: &[FuncParam], body: &Block, free: &mut HashSet<String>
             }
         }
     }
-    for n in free_vars_in_block(body, &param_names) {
+    for n in free_vars_in_function(params, body) {
         free.insert(n);
     }
 }
@@ -598,21 +722,36 @@ fn walk_stmt_callables(stmt: &Stmt, free: &mut HashSet<String>) {
                 walk_expr_callables(e, free);
             }
         }
-        Stmt::DestructDecl { init, .. } => walk_expr_callables(init, free),
+        Stmt::DestructDecl { pattern, init, .. } => {
+            walk_expr_callables(init, free);
+            walk_destruct_default_callables(pattern, free);
+        }
         Stmt::Assign { target, value } => {
             walk_lvalue_callables(target, free);
             walk_expr_callables(value, free);
         }
-        Stmt::DestructAssign { value, .. } => walk_expr_callables(value, free),
+        Stmt::DestructAssign { pattern, value } => {
+            walk_expr_callables(value, free);
+            walk_destruct_default_callables(pattern, free);
+        }
         Stmt::FuncDecl {
             params,
             body,
             return_type,
             decorators,
+            descriptors,
             ..
         } => {
             for d in decorators {
                 walk_expr_callables(d, free);
+            }
+            for descriptor in descriptors {
+                if descriptor.name == "cancel_flag" {
+                    continue;
+                }
+                for arg in &descriptor.args {
+                    walk_expr_callables(arg, free);
+                }
             }
             add_func_frees(params, body, free);
             for s in body {
@@ -623,7 +762,8 @@ fn walk_stmt_callables(stmt: &Stmt, free: &mut HashSet<String>) {
             }
         }
         Stmt::MacroDecl { params, body, .. } => {
-            let param_names: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
+            let param_names: HashSet<String> =
+                params.iter().flat_map(|p| p.bound_names()).collect();
             for n in free_vars_in_block(body, &param_names) {
                 free.insert(n);
             }
@@ -683,11 +823,19 @@ fn walk_stmt_callables(stmt: &Stmt, free: &mut HashSet<String>) {
             }
             walk_block_callables(body, free);
         }
-        Stmt::For { items, body, .. } => {
+        Stmt::For {
+            items,
+            body,
+            else_block,
+            ..
+        } => {
             for item in items {
                 walk_expr_callables(&item.iterable, free);
             }
             walk_block_callables(body, free);
+            if let Some(else_block) = else_block {
+                walk_block_callables(else_block, free);
+            }
         }
         Stmt::Try {
             body,
@@ -720,8 +868,18 @@ fn walk_stmt_callables(stmt: &Stmt, free: &mut HashSet<String>) {
             walk_block_callables(body, free);
         }
         Stmt::StructDecl {
-            methods, layout, ..
+            methods,
+            fields,
+            layout,
+            ..
         } => {
+            let bound: HashSet<String> = ["self".to_string()].into_iter().collect();
+            for field in fields {
+                if let Some(default) = &field.default_expr {
+                    walk_expr_callables(default, free);
+                    free.extend(free_vars_in_expr(default, &bound));
+                }
+            }
             for m in methods {
                 add_func_frees(&m.params, &m.body, free);
                 walk_block_callables(&m.body, free);
@@ -817,7 +975,7 @@ fn walk_expr_callables(expr: &Expr, free: &mut HashSet<String>) {
             }
         }
         ExprKind::ParFor { items, body } => {
-            let bound: HashSet<String> = items.iter().map(|i| i.name.clone()).collect();
+            let bound: HashSet<String> = items.iter().flat_map(ForItem::bound_names).collect();
             walk_for_items_callables(items, free);
             for n in free_vars_in_block(body, &bound) {
                 free.insert(n);
@@ -829,7 +987,7 @@ fn walk_expr_callables(expr: &Expr, free: &mut HashSet<String>) {
             items,
             guards,
         } => {
-            let bound: HashSet<String> = items.iter().map(|i| i.name.clone()).collect();
+            let bound: HashSet<String> = items.iter().flat_map(ForItem::bound_names).collect();
             walk_for_items_callables(items, free);
             for n in free_vars_in_expr(elem, &bound) {
                 free.insert(n);

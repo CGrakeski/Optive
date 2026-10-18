@@ -115,23 +115,22 @@ fn extract_timeout(opts: &Value) -> Result<Option<std::time::Duration>> {
     Ok(None)
 }
 
-fn response_to_dict(resp: reqwest::blocking::Response) -> Result<Value> {
+struct ResponseData {
+    status: u16,
+    url: String,
+    headers: Vec<(String, String)>,
+    raw: Vec<u8>,
+}
+
+fn read_response(resp: reqwest::blocking::Response) -> Result<ResponseData> {
     use std::io::Read;
     let status = resp.status().as_u16();
     let url = resp.url().to_string();
-    let mut header_map = DictMap::new();
-    let mut raw_headers = Vec::new();
-    for (k, v) in resp.headers() {
-        let val = v.to_str().unwrap_or("");
-        header_map.insert(
-            ValueKey::Text(k.as_str().to_string()),
-            Value::Text(val.to_string()),
-        );
-        raw_headers.push(Value::List(Shared::new(vec![
-            Value::Text(k.as_str().to_string()),
-            Value::Text(val.to_string()),
-        ])));
-    }
+    let headers = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
     let mut limited = resp.take(MAX_HTTP_BODY + 1);
     let mut raw = Vec::new();
     limited.read_to_end(&mut raw).map_err(|e| {
@@ -141,6 +140,30 @@ fn response_to_dict(resp: reqwest::blocking::Response) -> Result<Value> {
         return Err(crate::error::RuntimeError::io_err(format!(
             "http: response body exceeds {MAX_HTTP_BODY} bytes"
         )));
+    }
+    Ok(ResponseData {
+        status,
+        url,
+        headers,
+        raw,
+    })
+}
+
+fn response_to_dict(data: ResponseData) -> Value {
+    let ResponseData {
+        status,
+        url,
+        headers,
+        raw,
+    } = data;
+    let mut header_map = DictMap::new();
+    let mut raw_headers = Vec::new();
+    for (key, value) in headers {
+        header_map.insert(ValueKey::Text(key.clone()), Value::Text(value.clone()));
+        raw_headers.push(Value::List(Shared::new(vec![
+            Value::Text(key),
+            Value::Text(value),
+        ])));
     }
     let body = String::from_utf8_lossy(&raw).into_owned();
     let mut out = DictMap::new();
@@ -166,7 +189,7 @@ fn response_to_dict(resp: reqwest::blocking::Response) -> Result<Value> {
         Value::Bool((200..300).contains(&status)),
     );
     out.insert(ValueKey::Text("url".into()), Value::Text(url));
-    Ok(Value::Dict(Shared::new(out)))
+    Value::Dict(Shared::new(out))
 }
 
 fn build_client(opts: &Value) -> Result<reqwest::blocking::Client> {
@@ -256,17 +279,25 @@ fn send_request(
         req = req.headers(extract_headers(op, opts)?);
     }
     req = apply_auth(req, opts);
-    let resp = crate::gc::blocking_native(|| req.send())
-        .map_err(|e| crate::error::RuntimeError::io_err(format!("{op} '{url}' failed: {e}")))?;
-    let r = response_to_dict(resp);
-    if r.is_ok() {
-        vm.request_cooperative_yield();
-    }
-    r
+    let op = op.to_string();
+    let url = url.to_string();
+    let Some(data) = vm.run_blocking(move || {
+        let resp = req
+            .send()
+            .map_err(|e| crate::error::RuntimeError::io_err(format!("{op} '{url}' failed: {e}")))?;
+        read_response(resp)
+    })?
+    else {
+        return Ok(Value::None);
+    };
+    Ok(response_to_dict(data))
 }
 
 fn http_get(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     vm.caps.check_network("get")?;
+    if vm.has_native_wait() {
+        return resume_response(vm);
+    }
     let op = builtin_repr("get");
     let url = expect_text(&op, args, 0)?;
     let opts = args.get(1).cloned().unwrap_or(Value::None);
@@ -276,6 +307,9 @@ fn http_get(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn http_post(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     vm.caps.check_network("post")?;
+    if vm.has_native_wait() {
+        return resume_response(vm);
+    }
     let op = builtin_repr("post");
     let url = expect_text(&op, args, 0)?;
     let body = expect_text(&op, args, 1)?;
@@ -286,6 +320,9 @@ fn http_post(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn http_put(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     vm.caps.check_network("put")?;
+    if vm.has_native_wait() {
+        return resume_response(vm);
+    }
     let op = builtin_repr("put");
     let url = expect_text(&op, args, 0)?;
     let body = expect_text(&op, args, 1)?;
@@ -296,6 +333,9 @@ fn http_put(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn http_delete(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     vm.caps.check_network("delete")?;
+    if vm.has_native_wait() {
+        return resume_response(vm);
+    }
     let op = builtin_repr("delete");
     let url = expect_text(&op, args, 0)?;
     let opts = args.get(1).cloned().unwrap_or(Value::None);
@@ -305,6 +345,9 @@ fn http_delete(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn http_patch(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     vm.caps.check_network("patch")?;
+    if vm.has_native_wait() {
+        return resume_response(vm);
+    }
     let op = builtin_repr("patch");
     let url = expect_text(&op, args, 0)?;
     let body = expect_text(&op, args, 1)?;
@@ -315,6 +358,9 @@ fn http_patch(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn http_head(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     vm.caps.check_network("head")?;
+    if vm.has_native_wait() {
+        return resume_response(vm);
+    }
     let op = builtin_repr("head");
     let url = expect_text(&op, args, 0)?;
     let opts = args.get(1).cloned().unwrap_or(Value::None);
@@ -324,6 +370,9 @@ fn http_head(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 
 fn http_request(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     vm.caps.check_network("request")?;
+    if vm.has_native_wait() {
+        return resume_response(vm);
+    }
     let op = builtin_repr("request");
     let method = expect_text(&op, args, 0)?;
     let url = expect_text(&op, args, 1)?;
@@ -349,4 +398,10 @@ fn http_request(vm: &mut Vm, args: &[Value]) -> Result<Value> {
         }
     }
     send_request(vm, &op, &url, &opts, req_builder)
+}
+
+fn resume_response(vm: &mut Vm) -> Result<Value> {
+    Ok(vm
+        .resume_blocking::<ResponseData>()?
+        .map_or(Value::None, response_to_dict))
 }

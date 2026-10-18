@@ -1,6 +1,54 @@
 use crate::error::LexError;
 use crate::token::{keyword_or_ident, Token, TokenKind};
 
+enum StringEscape {
+    Character(char),
+    Byte(u8),
+    Octal(u16),
+    Unknown(char),
+    Continuation,
+}
+
+impl StringEscape {
+    fn append_text(self, out: &mut String, fstring: bool) {
+        let ch = match self {
+            Self::Character(ch) => ch,
+            Self::Byte(byte) => char::from(byte),
+            Self::Octal(value) => char::from_u32(u32::from(value)).unwrap_or('\u{fffd}'),
+            Self::Unknown(ch) => {
+                out.push('\\');
+                ch
+            }
+            Self::Continuation => return,
+        };
+        // A brace produced by an escape is literal text, never interpolation.
+        if fstring && matches!(ch, '{' | '}') {
+            out.push(ch);
+        }
+        out.push(ch);
+    }
+
+    fn append_bytes(self, out: &mut Vec<u8>) -> Result<(), String> {
+        match self {
+            Self::Byte(byte) => out.push(byte),
+            Self::Octal(value) => out.push(
+                u8::try_from(value).map_err(|_| "octal escape in bytes literal exceeds 255")?,
+            ),
+            Self::Character(ch) => {
+                let mut buffer = [0; 4];
+                out.extend_from_slice(ch.encode_utf8(&mut buffer).as_bytes());
+            }
+            Self::Unknown(ch) if ch.is_ascii() => {
+                out.push(b'\\');
+                out.push(ch as u8);
+            }
+            Self::Unknown(_) => return Err("non-ASCII escape in bytes literal".into()),
+            Self::Continuation => {}
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputStatus {
     Complete,
@@ -58,6 +106,7 @@ pub fn input_status(source: &str) -> InputStatus {
                 escaped,
             } => {
                 if triple
+                    && (raw || !escaped)
                     && chars[i] == '"'
                     && chars.get(i + 1) == Some(&'"')
                     && chars.get(i + 2) == Some(&'"')
@@ -169,7 +218,6 @@ impl Lexer {
                         message: "unterminated block comment".into(),
                     });
                 }
-                self.last_kind = Some(tok.kind);
                 tokens.push(tok);
                 continue;
             }
@@ -216,7 +264,6 @@ impl Lexer {
             let start = self.pos;
             if let Some(tok) = self.lex_comment(start_line, start_col) {
                 spans.push((start, self.pos, tok.kind));
-                self.last_kind = Some(tok.kind);
                 if self.unclosed_block_comment {
                     break;
                 }
@@ -551,22 +598,7 @@ impl Lexer {
             }
             if !raw && ch == '\\' {
                 self.consume_char();
-                match self.consume_char() {
-                    Some('n') => out.push('\n'),
-                    Some('t') => out.push('\t'),
-                    Some('r') => out.push('\r'),
-                    Some('"') => out.push('"'),
-                    Some('\\') => out.push('\\'),
-                    Some('x') => {
-                        let b = self.read_hex_byte_escape()?;
-                        out.push(char::from(b));
-                    }
-                    Some(c) => {
-                        out.push('\\');
-                        out.push(c);
-                    }
-                    None => return Err("unterminated escape".into()),
-                }
+                self.read_string_escape()?.append_text(&mut out, false);
                 continue;
             }
             out.push(ch);
@@ -579,17 +611,113 @@ impl Lexer {
         })
     }
 
-    /// `\xHH`：两位十六进制 → 一字节（0..=255）。
-    fn read_hex_byte_escape(&mut self) -> Result<u8, String> {
-        let hi = self.consume_char();
-        let lo = self.consume_char();
-        match (hi, lo) {
-            (Some(h), Some(l)) => match (h.to_digit(16), l.to_digit(16)) {
-                (Some(hh), Some(ll)) => Ok(((hh << 4) | ll) as u8),
-                _ => Err("invalid \\x escape".into()),
-            },
-            _ => Err("unterminated \\x escape".into()),
+    /// Decode one escape after its leading backslash. Shared by all non-raw literals.
+    fn read_string_escape(&mut self) -> Result<StringEscape, String> {
+        let marker = self.consume_char().ok_or("unterminated escape")?;
+        let character = match marker {
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            'a' => '\u{7}',
+            'b' => '\u{8}',
+            'f' => '\u{c}',
+            'v' => '\u{b}',
+            '"' => '"',
+            '\'' => '\'',
+            '\\' => '\\',
+            '{' => '{',
+            '}' => '}',
+            '\n' => return Ok(StringEscape::Continuation),
+            '\r' => {
+                if self.peek_char() == Some('\n') {
+                    self.consume_char();
+                }
+                return Ok(StringEscape::Continuation);
+            }
+            'x' => return Ok(StringEscape::Byte(self.read_escape_hex(2, "\\x")? as u8)),
+            '0'..='7' => {
+                let mut value = u16::from(marker as u8 - b'0');
+                for _ in 0..2 {
+                    if let Some(ch @ '0'..='7') = self.peek_char() {
+                        self.consume_char();
+                        value = value * 8 + u16::from(ch as u8 - b'0');
+                    } else {
+                        break;
+                    }
+                }
+                return Ok(StringEscape::Octal(value));
+            }
+            'u' | 'U' => {
+                let value = if marker == 'u' && self.peek_char() == Some('{') {
+                    self.consume_char();
+                    let mut value = 0u32;
+                    let mut digits = 0usize;
+                    loop {
+                        match self.peek_char() {
+                            Some('}') if digits > 0 => { self.consume_char(); break; }
+                            Some(ch) if ch.is_ascii_hexdigit() && digits < 6 => {
+                                self.consume_char();
+                                value = value * 16 + ch.to_digit(16).unwrap_or(0);
+                                digits += 1;
+                            }
+                            _ => return Err("invalid \\u{...} escape: expected 1 to 6 hexadecimal digits and '}'".into()),
+                        }
+                    }
+                    value
+                } else {
+                    self.read_escape_hex(
+                        if marker == 'u' { 4 } else { 8 },
+                        if marker == 'u' { "\\u" } else { "\\U" },
+                    )?
+                };
+                char::from_u32(value)
+                    .ok_or_else(|| format!("invalid Unicode scalar value U+{value:04X}"))?
+            }
+            'N' => {
+                if self.consume_char() != Some('{') {
+                    return Err("invalid \\N escape: expected '{'".into());
+                }
+                let mut name = String::new();
+                loop {
+                    match self.peek_char() {
+                        Some('}') => {
+                            self.consume_char();
+                            break;
+                        }
+                        Some(ch) if !matches!(ch, '"' | '\n' | '\r') => {
+                            name.push(ch);
+                            self.consume_char();
+                        }
+                        _ => return Err("unterminated \\N{...} escape".into()),
+                    }
+                }
+                if name.is_empty() {
+                    return Err("empty Unicode character name in \\N{...}".into());
+                }
+                unicode_names2::character(&name)
+                    .ok_or_else(|| format!("unknown Unicode character name '{name}'"))?
+            }
+            other => return Ok(StringEscape::Unknown(other)),
+        };
+        Ok(StringEscape::Character(character))
+    }
+
+    fn read_escape_hex(&mut self, digits: usize, marker: &str) -> Result<u32, String> {
+        let mut value = 0u32;
+        for _ in 0..digits {
+            match self.consume_char() {
+                Some(ch) if ch.is_ascii_hexdigit() => {
+                    value = value * 16 + ch.to_digit(16).unwrap_or(0)
+                }
+                Some(_) => {
+                    return Err(format!(
+                        "invalid {marker} escape: expected {digits} hexadecimal digits"
+                    ))
+                }
+                None => return Err(format!("unterminated {marker} escape")),
+            }
         }
+        Ok(value)
     }
 
     /// 字节字面量 `b"..."` — token 值为 Latin-1（每字节一个 char）。
@@ -616,30 +744,11 @@ impl Lexer {
             }
             if ch == '\\' {
                 self.consume_char();
-                match self.consume_char() {
-                    Some('n') => bytes.push(b'\n'),
-                    Some('t') => bytes.push(b'\t'),
-                    Some('r') => bytes.push(b'\r'),
-                    Some('"') => bytes.push(b'"'),
-                    Some('\\') => bytes.push(b'\\'),
-                    Some('x') => match self.read_hex_byte_escape() {
-                        Ok(b) => bytes.push(b),
-                        Err(msg) => {
-                            return Token::new(TokenKind::Mismatch, msg, line, col);
-                        }
-                    },
-                    Some(c) if c.is_ascii() => bytes.push(c as u8),
-                    Some(_) => {
-                        return Token::new(
-                            TokenKind::Mismatch,
-                            "non-ASCII escape in bytes literal",
-                            line,
-                            col,
-                        );
-                    }
-                    None => {
-                        return Token::new(TokenKind::Mismatch, "unterminated escape", line, col);
-                    }
+                if let Err(message) = self
+                    .read_string_escape()
+                    .and_then(|escape| escape.append_bytes(&mut bytes))
+                {
+                    return Token::new(TokenKind::Mismatch, message, line, col);
                 }
                 continue;
             }
@@ -695,23 +804,23 @@ impl Lexer {
             }
             if ch == '\\' {
                 self.consume_char();
-                match self.consume_char() {
-                    Some('n') => out.push('\n'),
-                    Some('t') => out.push('\t'),
-                    Some('r') => out.push('\r'),
-                    Some('"') => out.push('"'),
-                    Some('\\') => out.push('\\'),
-                    Some('{') => out.push('{'),
-                    Some('}') => out.push('}'),
-                    Some('x') => {
-                        let b = self.read_hex_byte_escape()?;
-                        out.push(char::from(b));
+                self.read_string_escape()?.append_text(&mut out, true);
+                continue;
+            }
+            if ch == '{' {
+                self.consume_char();
+                out.push('{');
+                if self.peek_char() == Some('{') {
+                    self.consume_char();
+                    out.push('{');
+                } else {
+                    let end = super::string_literals::interpolation_end(&self.source, self.pos)?;
+                    // Keep the expression's strings and escapes as source code.
+                    // Only the surrounding literal text is decoded in this pass.
+                    out.push_str(&self.source[self.pos..=end]);
+                    while self.pos <= end {
+                        self.consume_char();
                     }
-                    Some(c) => {
-                        out.push('\\');
-                        out.push(c);
-                    }
-                    None => return Err("unterminated escape".into()),
                 }
                 continue;
             }
@@ -928,7 +1037,7 @@ fn is_ident_start(ch: char) -> bool {
     ch == '_' || ch.is_alphabetic()
 }
 
-fn is_ident_continue(ch: char) -> bool {
+pub(super) fn is_ident_continue(ch: char) -> bool {
     ch == '_' || ch.is_alphanumeric()
 }
 

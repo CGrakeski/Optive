@@ -10,7 +10,7 @@ use crate::type_registry;
 
 use crate::api_registry::{
     builtin_arity, known_std_export, known_std_module, split_std_spec, std_arity, std_module,
-    std_root_item, StdRootItem, BUILTINS, PREDEFINED_GLOBALS,
+    std_root_item, StdRootItem, BUILTINS, BUILTIN_KEYWORDS, PREDEFINED_GLOBALS,
 };
 
 pub type Diag = (usize, usize, String);
@@ -193,6 +193,7 @@ impl Cx {
 
 fn global_names() -> HashSet<String> {
     let mut s = HashSet::new();
+    s.insert("__cancel_flag__".into());
     for (n, _) in BUILTINS {
         s.insert((*n).to_string());
     }
@@ -222,8 +223,42 @@ fn hoist_stmt(stmt: &Stmt, cx: &mut Cx) {
             cx.define_user(name.clone());
             cx.define_user_signature(name, params);
         }
+        Stmt::StructDecl {
+            name,
+            fields,
+            methods,
+            ..
+        } => {
+            cx.define_user(name.clone());
+            if let Some(initializer) = methods
+                .iter()
+                .find(|method| method.name == "__init__" && !method.overload)
+            {
+                let params: Vec<_> = initializer
+                    .params
+                    .iter()
+                    .filter(|param| param.name != "self")
+                    .cloned()
+                    .collect();
+                cx.define_user_signature(name, &params);
+            } else if !methods.iter().any(|method| method.name == "__init__") {
+                let params: Vec<_> = fields
+                    .iter()
+                    .map(|field| crate::ast::FuncParam {
+                        name: field.name.clone(),
+                        pattern: None,
+                        is_variadic: false,
+                        is_kwvariadic: false,
+                        implicit: false,
+                        type_expr: field.type_expr.clone(),
+                        type_strong: field.type_strong,
+                        default_expr: field.default_expr.clone(),
+                    })
+                    .collect();
+                cx.define_user_signature(name, &params);
+            }
+        }
         Stmt::FriendFuncDecl { name, .. }
-        | Stmt::StructDecl { name, .. }
         | Stmt::EnumDecl { name, .. }
         | Stmt::VariantDecl { name, .. }
         | Stmt::MacroDecl { name, .. } => cx.define_user(name.clone()),
@@ -298,6 +333,7 @@ fn walk_stmt(st: &LocatedStmt, cx: &mut Cx) {
         }
         Stmt::DestructDecl { pattern, init, .. } => {
             walk_expr(init, cx);
+            walk_destruct_defaults(pattern, cx);
             for n in destruct_names(pattern) {
                 cx.define_user(n);
             }
@@ -307,6 +343,7 @@ fn walk_stmt(st: &LocatedStmt, cx: &mut Cx) {
             params,
             body,
             decorators,
+            descriptors,
             return_type,
             return_wrapper,
             ..
@@ -314,10 +351,23 @@ fn walk_stmt(st: &LocatedStmt, cx: &mut Cx) {
             for d in decorators {
                 walk_expr(d, cx);
             }
+            for descriptor in descriptors {
+                if descriptor.name == "cancel_flag" {
+                    continue;
+                }
+                for arg in &descriptor.args {
+                    walk_expr(arg, cx);
+                }
+            }
             cx.push();
             bind_type_params(type_params, cx);
             for p in params {
-                cx.define_user(p.name.clone());
+                if let Some(pattern) = &p.pattern {
+                    walk_destruct_defaults(pattern, cx);
+                }
+                for name in p.bound_names() {
+                    cx.define_user(name);
+                }
                 if p.type_strong {
                     cx.define_known_type(&p.name, p.type_expr.as_ref().and_then(type_name));
                 }
@@ -347,7 +397,9 @@ fn walk_stmt(st: &LocatedStmt, cx: &mut Cx) {
             cx.push();
             if let Some(ps) = params {
                 for p in ps {
-                    cx.define_user(p.name.clone());
+                    for name in p.bound_names() {
+                        cx.define_user(name);
+                    }
                     if p.type_strong {
                         cx.define_known_type(&p.name, p.type_expr.as_ref().and_then(type_name));
                     }
@@ -384,14 +436,19 @@ fn walk_stmt(st: &LocatedStmt, cx: &mut Cx) {
                     walk_expr(t, cx);
                 }
                 if let Some(d) = &f.default_expr {
+                    cx.push();
+                    cx.define("self");
                     walk_expr(d, cx);
+                    cx.pop();
                 }
             }
             for m in methods {
                 cx.push();
                 cx.define("self");
                 for p in &m.params {
-                    cx.define_user(p.name.clone());
+                    for name in p.bound_names() {
+                        cx.define_user(name);
+                    }
                     if p.type_strong {
                         cx.define_known_type(&p.name, p.type_expr.as_ref().and_then(type_name));
                     }
@@ -419,7 +476,9 @@ fn walk_stmt(st: &LocatedStmt, cx: &mut Cx) {
                 cx.push();
                 cx.define("self");
                 for p in &m.params {
-                    cx.define_user(p.name.clone());
+                    for name in p.bound_names() {
+                        cx.define_user(name);
+                    }
                     if p.type_strong {
                         cx.define_known_type(&p.name, p.type_expr.as_ref().and_then(type_name));
                     }
@@ -468,16 +527,29 @@ fn walk_stmt(st: &LocatedStmt, cx: &mut Cx) {
             }
             walk_block(body, cx);
         }
-        Stmt::For { items, body, .. } => {
+        Stmt::For {
+            items,
+            body,
+            else_block,
+            ..
+        } => {
             for it in items {
                 walk_expr(&it.iterable, cx);
             }
             cx.push();
             for it in items {
-                cx.define(it.name.clone());
+                if let Some(pattern) = &it.pattern {
+                    walk_destruct_defaults(pattern, cx);
+                }
+                for name in it.bound_names() {
+                    cx.define(name);
+                }
             }
             walk_block(body, cx);
             cx.pop();
+            if let Some(else_block) = else_block {
+                walk_block(else_block, cx);
+            }
         }
         Stmt::Try {
             body,
@@ -542,19 +614,48 @@ fn walk_stmt(st: &LocatedStmt, cx: &mut Cx) {
             walk_lvalue(target, cx);
             walk_expr(value, cx);
         }
-        Stmt::DestructAssign { value, .. } => walk_expr(value, cx),
+        Stmt::DestructAssign { pattern, value } => {
+            walk_expr(value, cx);
+            walk_destruct_defaults(pattern, cx);
+        }
         Stmt::Del(t) => walk_del_target(t, cx),
         Stmt::Block(b) | Stmt::Defer(b) => walk_block(b, cx),
         Stmt::MacroDecl { params, body, .. } => {
             cx.push();
             for p in params {
-                cx.define_user(p.name.clone());
+                for name in p.bound_names() {
+                    cx.define_user(name);
+                }
             }
             walk_block(body, cx);
             cx.pop();
         }
-        Stmt::ProtocolDecl { .. }
-        | Stmt::Import { .. }
+        Stmt::ProtocolDecl { members, .. } => {
+            for member in members {
+                match member {
+                    crate::ast::ProtocolMember::Field { type_expr, .. } => {
+                        if let Some(annotation) = type_expr {
+                            walk_expr(annotation, cx);
+                        }
+                    }
+                    crate::ast::ProtocolMember::Method {
+                        params,
+                        return_type,
+                        ..
+                    } => {
+                        for param in params {
+                            if let Some(annotation) = &param.type_expr {
+                                walk_expr(annotation, cx);
+                            }
+                        }
+                        if let Some(annotation) = return_type {
+                            walk_expr(annotation, cx);
+                        }
+                    }
+                }
+            }
+        }
+        Stmt::Import { .. }
         | Stmt::Use { .. }
         | Stmt::Break(_)
         | Stmt::Continue(_)
@@ -634,7 +735,9 @@ fn walk_expr(expr: &Expr, cx: &mut Cx) {
         } => {
             cx.push();
             for p in params {
-                cx.define_user(p.name.clone());
+                for name in p.bound_names() {
+                    cx.define_user(name);
+                }
                 if p.type_strong {
                     cx.define_known_type(&p.name, p.type_expr.as_ref().and_then(type_name));
                 }
@@ -699,7 +802,12 @@ fn walk_expr(expr: &Expr, cx: &mut Cx) {
             }
             cx.push();
             for it in items {
-                cx.define(it.name.clone());
+                if let Some(pattern) = &it.pattern {
+                    walk_destruct_defaults(pattern, cx);
+                }
+                for name in it.bound_names() {
+                    cx.define(name);
+                }
             }
             walk_expr(elem, cx);
             for g in guards {
@@ -718,7 +826,12 @@ fn walk_expr(expr: &Expr, cx: &mut Cx) {
             }
             cx.push();
             for it in items {
-                cx.define(it.name.clone());
+                if let Some(pattern) = &it.pattern {
+                    walk_destruct_defaults(pattern, cx);
+                }
+                for name in it.bound_names() {
+                    cx.define(name);
+                }
             }
             walk_expr(key, cx);
             walk_expr(value, cx);
@@ -757,7 +870,12 @@ fn walk_expr(expr: &Expr, cx: &mut Cx) {
             }
             cx.push();
             for it in items {
-                cx.define(it.name.clone());
+                if let Some(pattern) = &it.pattern {
+                    walk_destruct_defaults(pattern, cx);
+                }
+                for name in it.bound_names() {
+                    cx.define(name);
+                }
             }
             walk_block(body, cx);
             cx.pop();
@@ -892,6 +1010,7 @@ fn walk_del_target(t: &DelTarget, cx: &mut Cx) {
 
 fn walk_pattern_exprs(p: &Pattern, cx: &mut Cx) {
     match p {
+        Pattern::Destruct(pattern) => walk_destruct_defaults(pattern, cx),
         Pattern::Bind(_) | Pattern::Struct { .. } => {}
         Pattern::Value(e) => walk_expr(e, cx),
         Pattern::List(xs) | Pattern::Tuple(xs) => {
@@ -921,6 +1040,30 @@ fn check_call_signature(path: &str, args: &[CallArg], line: usize, col: usize, c
     } else if let Some((m, e)) = cx.std_call_spec(path) {
         std_arity(m, e)
     } else {
+        if BUILTIN_KEYWORDS
+            .iter()
+            .any(|(builtin, _, _)| *builtin == path)
+        {
+            for argument in args.iter().filter(|argument| argument.name.is_some()) {
+                let name = argument.name.as_deref().unwrap_or_default();
+                if let Some((_, _, expected)) = BUILTIN_KEYWORDS
+                    .iter()
+                    .find(|(builtin, keyword, _)| *builtin == path && *keyword == name)
+                {
+                    if let Some(actual) = expr_type_name(&argument.value, cx) {
+                        if actual != *expected {
+                            cx.diags.push((argument.value.loc.line, argument.value.loc.column, format!("argument `{name}` of `{path}` has type {actual}; requires {expected}")));
+                        }
+                    }
+                } else {
+                    cx.diags.push((
+                        argument.value.loc.line,
+                        argument.value.loc.column,
+                        format!("`{path}` has no named argument `{name}`"),
+                    ));
+                }
+            }
+        }
         builtin_arity(path)
     };
     let Some((min, max)) = range else {
@@ -1138,6 +1281,31 @@ fn destruct_names(p: &DestructPattern) -> Vec<String> {
         DestructPattern::List(xs) | DestructPattern::Tuple(xs) => {
             xs.iter().flat_map(destruct_elem_names).collect()
         }
+        DestructPattern::Dict { entries, rest } => entries
+            .iter()
+            .map(|entry| entry.binding.clone())
+            .chain(rest.iter().cloned())
+            .collect(),
+    }
+}
+
+fn walk_destruct_defaults(pattern: &DestructPattern, cx: &mut Cx) {
+    match pattern {
+        DestructPattern::Dict { entries, .. } => {
+            for entry in entries {
+                if let Some(default) = &entry.default {
+                    walk_expr(default, cx);
+                }
+            }
+        }
+        DestructPattern::Tuple(items) | DestructPattern::List(items) => {
+            for item in items {
+                if let DestructElem::Pat(pattern) = item {
+                    walk_destruct_defaults(pattern, cx);
+                }
+            }
+        }
+        DestructPattern::Name(_) | DestructPattern::Discard => {}
     }
 }
 
@@ -1151,6 +1319,7 @@ fn destruct_elem_names(e: &DestructElem) -> Vec<String> {
 
 fn pattern_names(p: &Pattern) -> Vec<String> {
     match p {
+        Pattern::Destruct(pattern) => pattern.bound_names(),
         Pattern::Bind(n) => vec![n.clone()],
         Pattern::Value(_) => vec![],
         Pattern::List(xs) | Pattern::Tuple(xs) => xs

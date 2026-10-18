@@ -87,9 +87,35 @@ struct CompileFnExtras<'a> {
     return_wrapper: Option<Expr>,
     captured_names: HashSet<String>,
     is_generator: bool,
+    display_name: Option<String>,
 }
 
 impl Generator {
+    fn function_display_name(
+        &self,
+        descriptors: &[crate::ast::FunctionDescriptor],
+    ) -> Result<Option<String>> {
+        let Some(descriptor) = descriptors
+            .iter()
+            .find(|descriptor| descriptor.name == "display_as")
+        else {
+            return Ok(None);
+        };
+        let argument = descriptor.args.first().ok_or_else(|| {
+            RuntimeError::msg("function descriptor `display_as` expects 1 argument")
+        })?;
+        let value = self.const_context.try_eval(argument)?.ok_or_else(|| {
+            RuntimeError::msg("function descriptor `display_as` requires a compile-time string")
+        })?;
+        match value {
+            Value::Text(text) => Ok(Some(text)),
+            other => Err(RuntimeError::type_err(format!(
+                "function descriptor `display_as` requires text, got {}",
+                other.type_name()
+            ))),
+        }
+    }
+
     fn loop_index(&self, label: Option<&str>, keyword: &str) -> Result<usize> {
         if let Some(label) = label {
             self.loop_names
@@ -476,8 +502,9 @@ impl Generator {
     }
 
     pub fn compile(mut self, program: &Program) -> Result<CompiledProgram> {
-        self.const_context = Arc::new(crate::compiler::const_eval::ConstContext::build(program)?);
-        self.compile_prepared(program)
+        let lowered = crate::frontend::function_descriptors::lower_program(program)?;
+        self.const_context = Arc::new(crate::compiler::const_eval::ConstContext::build(&lowered)?);
+        self.compile_prepared(&lowered)
     }
 
     pub fn compile_with_const_values(
@@ -499,10 +526,14 @@ impl Generator {
         program: &Program,
         imports: crate::compiler::const_eval::ConstImports,
     ) -> Result<CompiledProgram> {
+        let lowered = crate::frontend::function_descriptors::lower_program_with_imports(
+            program,
+            imports.clone(),
+        )?;
         self.const_context = Arc::new(
-            crate::compiler::const_eval::ConstContext::build_with_imports(program, imports)?,
+            crate::compiler::const_eval::ConstContext::build_with_imports(&lowered, imports)?,
         );
-        self.compile_prepared(program)
+        self.compile_prepared(&lowered)
     }
 
     fn compile_prepared(mut self, program: &Program) -> Result<CompiledProgram> {
@@ -668,6 +699,7 @@ impl Generator {
                 return_wrapper: return_wrapper.cloned(),
                 captured_names: HashSet::new(),
                 is_generator: crate::ast::block_has_yield(body),
+                display_name: None,
             },
         )?;
         Ok(std::sync::Arc::new(func))
@@ -877,16 +909,16 @@ impl Generator {
                 decorators,
                 is_generator,
                 is_const,
+                descriptors,
             } => {
                 if *is_const {
                     return Ok(());
                 }
                 let is_gen = *is_generator;
+                let display_name = self.function_display_name(descriptors)?;
                 if type_params.is_empty() {
-                    let param_names: HashSet<String> =
-                        params.iter().map(|p| p.name.clone()).collect();
                     let free = if self.local_slots.is_some() {
-                        free_vars::free_vars_in_block(body, &param_names)
+                        free_vars::free_vars_in_function(params, body)
                             .into_iter()
                             .filter(|n| self.is_enclosing_local(n))
                             .collect()
@@ -904,6 +936,7 @@ impl Generator {
                             return_wrapper: return_wrapper.clone(),
                             captured_names: captured,
                             is_generator: is_gen,
+                            display_name: display_name.clone(),
                         },
                     )?;
                     self.program
@@ -924,6 +957,7 @@ impl Generator {
                 } else {
                     let template = Arc::new(GenericFunctionTemplate {
                         name: name.clone(),
+                        display_name,
                         type_params: type_params.clone(),
                         params: params.clone(),
                         body: body.clone(),
@@ -1011,6 +1045,7 @@ impl Generator {
                             return_wrapper: return_wrapper.clone(),
                             captured_names: HashSet::new(),
                             is_generator: false,
+                            display_name: None,
                         },
                     )?;
                     self.codegen
@@ -1150,8 +1185,13 @@ impl Generator {
                     self.codegen.mark_label(end);
                 }
             }
-            Stmt::For { label, items, body } => {
-                self.gen_for(label.as_deref(), items, body)?;
+            Stmt::For {
+                label,
+                items,
+                body,
+                else_block,
+            } => {
+                self.gen_for(label.as_deref(), items, body, else_block.as_ref())?;
             }
             Stmt::Break(label) => {
                 let index = self.loop_index(label.as_deref(), "break")?;
@@ -1243,6 +1283,7 @@ impl Generator {
                         mutable_fields: mutable.clone(),
                         typed: *typed,
                         field_types: field_types.clone(),
+                        field_defaults: Vec::new(),
                         type_params: type_params.clone(),
                         native_layout: None,
                         methods: HashMap::new(),
@@ -1260,12 +1301,49 @@ impl Generator {
                     mutable_fields: mutable,
                     typed: *typed,
                     field_types,
+                    field_defaults: Vec::new(),
                     type_params: type_params.clone(),
                     native_layout,
                     methods: HashMap::new(),
                     overloads: HashMap::new(),
                 });
                 self.program.struct_defs.insert(name.clone(), def);
+                let mut field_defaults = Vec::with_capacity(fields.len());
+                for field in fields {
+                    let initializer = if let Some(expr) = &field.default_expr {
+                        let body = vec![LocatedStmt {
+                            line: expr.loc.line,
+                            column: expr.loc.column,
+                            stmt: Stmt::Return(Some(expr.clone())),
+                        }];
+                        let params = vec![FuncParam {
+                            name: "self".into(),
+                            pattern: None,
+                            is_variadic: false,
+                            is_kwvariadic: false,
+                            implicit: false,
+                            type_expr: None,
+                            type_strong: false,
+                            default_expr: None,
+                        }];
+                        Some(Arc::new(self.compile_function(
+                            &format!("{name}.<default:{}>", field.name),
+                            &params,
+                            &body,
+                            CompileFnExtras {
+                                return_type: None,
+                                return_strong: false,
+                                return_wrapper: None,
+                                captured_names: HashSet::new(),
+                                is_generator: false,
+                                display_name: None,
+                            },
+                        )?))
+                    } else {
+                        None
+                    };
+                    field_defaults.push(initializer);
+                }
                 let mut def_methods: HashMap<String, Arc<FunctionObject>> = HashMap::new();
                 let mut def_overloads: HashMap<String, Vec<Arc<FunctionObject>>> = HashMap::new();
                 for m in methods {
@@ -1280,6 +1358,7 @@ impl Generator {
                             0,
                             FuncParam {
                                 name: "self".into(),
+                                pattern: None,
                                 is_variadic: false,
                                 is_kwvariadic: false,
                                 implicit: false,
@@ -1300,6 +1379,7 @@ impl Generator {
                             return_wrapper: m.return_wrapper.clone(),
                             captured_names: HashSet::new(),
                             is_generator: false,
+                            display_name: None,
                         },
                     )?;
                     let func_rc = Arc::new(func);
@@ -1315,6 +1395,30 @@ impl Generator {
                         def_methods.insert(m.name.clone(), func_rc);
                     }
                 }
+                if !def_methods.contains_key("__unpack__")
+                    && !def_overloads.contains_key("__unpack__")
+                {
+                    let default_unpack = FunctionObject::new(
+                        format!("{name}.__unpack__"),
+                        vec![FuncParam {
+                            name: "self".into(),
+                            pattern: None,
+                            is_variadic: false,
+                            is_kwvariadic: false,
+                            implicit: false,
+                            type_expr: None,
+                            type_strong: false,
+                            default_expr: None,
+                        }],
+                        vec![
+                            Instruction::Load("self".into()),
+                            Instruction::Load("__struct_unpack__".into()),
+                            Instruction::Call { argc: 1 },
+                            Instruction::Ret,
+                        ],
+                    );
+                    def_methods.insert("__unpack__".into(), Arc::new(default_unpack));
+                }
                 // 方法挂到类型对象；`a.b` 经 getattr 查 StructDef.methods。
                 let def = self
                     .program
@@ -1324,6 +1428,7 @@ impl Generator {
                 let def = Arc::make_mut(def);
                 def.methods = def_methods;
                 def.overloads = def_overloads;
+                def.field_defaults = field_defaults;
                 self.codegen
                     .emit(Instruction::Push(Value::type_ref(name.clone())));
                 self.codegen.emit(Instruction::NewVar {
@@ -1726,6 +1831,12 @@ impl Generator {
         fail_label: usize,
     ) -> Result<()> {
         match pattern {
+            Pattern::Destruct(pattern) => {
+                self.emit_load_match_at(temp, path);
+                let source = self.codegen.fresh_temp("__match_destruct_source");
+                self.emit_store_temp(&source);
+                self.gen_match_destruct_test(pattern, &source, temp, path, fail_label)?;
+            }
             Pattern::Value(expr) => {
                 self.emit_load_match_at(temp, path);
                 self.gen_expr(expr)?;
@@ -1760,6 +1871,140 @@ impl Generator {
             }
             Pattern::Call { type_name, args } => {
                 self.gen_match_call_pattern_test(temp, path, type_name, args, fail_label)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn match_binding_temp(temp: &str, path: &[usize], name: &str) -> String {
+        format!(
+            "{temp}__binding_{}_{}",
+            path.iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join("_"),
+            name
+        )
+    }
+
+    fn gen_match_destruct_test(
+        &mut self,
+        pattern: &DestructPattern,
+        source: &str,
+        owner: &str,
+        path: &[usize],
+        fail: usize,
+    ) -> Result<()> {
+        match pattern {
+            DestructPattern::Name(name) => {
+                self.emit_load_temp(source);
+                self.emit_store_temp(&Self::match_binding_temp(owner, path, name));
+            }
+            DestructPattern::Discard => {}
+            DestructPattern::Tuple(items) | DestructPattern::List(items) => {
+                let (before, rest, after) = split_destruct_elems(items)?;
+                self.emit_load_temp(source);
+                self.codegen.emit(Instruction::IsList);
+                self.codegen.emit(Instruction::GotoIfNot(fail));
+                self.emit_load_temp(source);
+                self.codegen.emit(Instruction::ListLen);
+                self.codegen
+                    .emit(Instruction::PushSmall((before.len() + after.len()) as i64));
+                self.codegen.emit(if rest.is_some() {
+                    Instruction::Ge
+                } else {
+                    Instruction::Eq
+                });
+                self.codegen.emit(Instruction::GotoIfNot(fail));
+                for (index, child) in before.iter().enumerate() {
+                    self.emit_load_temp(source);
+                    self.codegen.emit(Instruction::PushSmall(index as i64));
+                    self.codegen.emit(Instruction::Index);
+                    let value = self.codegen.fresh_temp("__match_child");
+                    self.emit_store_temp(&value);
+                    self.gen_match_destruct_test(child, &value, owner, path, fail)?;
+                }
+                for (index, child) in after.iter().enumerate() {
+                    self.emit_load_temp(source);
+                    self.codegen
+                        .emit(Instruction::PushSmall(-((after.len() - index) as i64)));
+                    self.codegen.emit(Instruction::Index);
+                    let value = self.codegen.fresh_temp("__match_child");
+                    self.emit_store_temp(&value);
+                    self.gen_match_destruct_test(child, &value, owner, path, fail)?;
+                }
+                if let Some(DestructElem::Rest(name)) = rest {
+                    self.emit_load_temp(source);
+                    self.codegen
+                        .emit(Instruction::PushSmall(before.len() as i64));
+                    if after.is_empty() {
+                        self.codegen.emit(Instruction::Push(Value::None));
+                    } else {
+                        self.codegen
+                            .emit(Instruction::PushSmall(-(after.len() as i64)));
+                    }
+                    self.codegen.emit(Instruction::Push(Value::None));
+                    self.codegen.emit(Instruction::SliceGet);
+                    self.codegen.emit(Instruction::Load("list".into()));
+                    self.codegen.emit(Instruction::Call { argc: 1 });
+                    self.emit_store_temp(&Self::match_binding_temp(owner, path, name));
+                }
+            }
+            DestructPattern::Dict { entries, rest } => {
+                self.emit_load_temp(source);
+                self.codegen
+                    .emit(Instruction::Load("__can_unpack__".into()));
+                self.codegen.emit(Instruction::Call { argc: 1 });
+                self.codegen.emit(Instruction::GotoIfNot(fail));
+                self.emit_load_temp(source);
+                self.codegen
+                    .emit(Instruction::Load("__unpack_view__".into()));
+                self.codegen.emit(Instruction::Call { argc: 1 });
+                let view = self.codegen.fresh_temp("__match_view");
+                self.emit_store_temp(&view);
+                for entry in entries {
+                    self.emit_load_temp(&view);
+                    self.codegen
+                        .emit(Instruction::Push(Value::Text(entry.key.clone())));
+                    self.codegen
+                        .emit(Instruction::Load("__unpack_optional__".into()));
+                    self.codegen.emit(Instruction::Call { argc: 2 });
+                    let option = self.codegen.fresh_temp("__match_option");
+                    self.emit_store_temp(&option);
+                    self.emit_load_temp(&option);
+                    self.codegen.emit(Instruction::PushSmall(0));
+                    self.codegen.emit(Instruction::Index);
+                    if let Some(default) = &entry.default {
+                        let absent = self.codegen.fresh_label();
+                        let ready = self.codegen.fresh_label();
+                        self.codegen.emit(Instruction::GotoIfNot(absent));
+                        self.emit_load_temp(&option);
+                        self.codegen.emit(Instruction::PushSmall(1));
+                        self.codegen.emit(Instruction::Index);
+                        self.codegen.emit(Instruction::Goto(ready));
+                        self.codegen.mark_label(absent);
+                        self.gen_expr(default)?;
+                        self.codegen.mark_label(ready);
+                    } else {
+                        self.codegen.emit(Instruction::GotoIfNot(fail));
+                        self.emit_load_temp(&option);
+                        self.codegen.emit(Instruction::PushSmall(1));
+                        self.codegen.emit(Instruction::Index);
+                    }
+                    self.emit_store_temp(&Self::match_binding_temp(owner, path, &entry.binding));
+                }
+                if let Some(name) = rest {
+                    self.emit_load_temp(&view);
+                    for entry in entries {
+                        self.codegen
+                            .emit(Instruction::Push(Value::Text(entry.key.clone())));
+                    }
+                    self.codegen.emit(Instruction::VecNew(entries.len()));
+                    self.codegen
+                        .emit(Instruction::Load("__unpack_rest__".into()));
+                    self.codegen.emit(Instruction::Call { argc: 2 });
+                    self.emit_store_temp(&Self::match_binding_temp(owner, path, name));
+                }
             }
         }
         Ok(())
@@ -1802,7 +2047,7 @@ impl Generator {
             self.codegen.emit(Instruction::Call { argc: 2 });
             self.codegen.emit(Instruction::GotoIfNot(fail_label));
             if let Some(inner) = args.first() {
-                let payload_temp = self.codegen.fresh_temp("__variant_payload");
+                let payload_temp = Self::match_binding_temp(temp, path, "__payload");
                 self.emit_load_match_at(temp, path);
                 self.codegen
                     .emit(Instruction::Load("__variant_payload__".into()));
@@ -1826,7 +2071,8 @@ impl Generator {
                     Pattern::Bind(_) => {}
                     other => {
                         let fname = &field_names[i];
-                        let field_temp = self.codegen.fresh_temp("__match_field");
+                        let field_temp =
+                            Self::match_binding_temp(temp, path, &format!("__field_{i}"));
                         self.emit_load_match_at(temp, path);
                         self.codegen.emit(Instruction::GetAttr(fname.clone()));
                         self.emit_store_temp(&field_temp);
@@ -1839,7 +2085,8 @@ impl Generator {
                 match arg {
                     Pattern::Bind(_) => {}
                     other => {
-                        let field_temp = self.codegen.fresh_temp("__match_slot");
+                        let field_temp =
+                            Self::match_binding_temp(temp, path, &format!("__slot_{i}"));
                         self.emit_load_match_slot(temp, path, i)?;
                         self.emit_store_temp(&field_temp);
                         self.gen_match_pattern_test(&field_temp, other, &[], fail_label)?;
@@ -1886,6 +2133,12 @@ impl Generator {
         path: &[usize],
     ) -> Result<()> {
         match pattern {
+            Pattern::Destruct(pattern) => {
+                for name in pattern.bound_names() {
+                    self.emit_load_temp(&Self::match_binding_temp(temp, path, &name));
+                    self.emit_bind_name(&name);
+                }
+            }
             Pattern::Bind(name) => {
                 self.emit_load_match_at(temp, path);
                 self.emit_bind_name(name);
@@ -1910,7 +2163,7 @@ impl Generator {
             Pattern::Call { type_name, args } => {
                 if self.program.variant_defs.contains_key(type_name) {
                     if let Some(inner) = args.first() {
-                        let payload_temp = self.codegen.fresh_temp("__variant_payload");
+                        let payload_temp = Self::match_binding_temp(temp, path, "__payload");
                         self.emit_load_match_at(temp, path);
                         self.codegen
                             .emit(Instruction::Load("__variant_payload__".into()));
@@ -1937,7 +2190,8 @@ impl Generator {
                                 self.emit_bind_name(bind_name);
                             }
                             other => {
-                                let field_temp = self.codegen.fresh_temp("__match_field");
+                                let field_temp =
+                                    Self::match_binding_temp(temp, path, &format!("__field_{i}"));
                                 self.emit_load_match_at(temp, path);
                                 self.codegen.emit(Instruction::GetAttr(fname.clone()));
                                 self.emit_store_temp(&field_temp);
@@ -1947,7 +2201,8 @@ impl Generator {
                     }
                 } else {
                     for (i, arg) in args.iter().enumerate() {
-                        let field_temp = self.codegen.fresh_temp("__match_slot");
+                        let field_temp =
+                            Self::match_binding_temp(temp, path, &format!("__slot_{i}"));
                         self.emit_load_match_slot(temp, path, i)?;
                         self.emit_store_temp(&field_temp);
                         match arg {
@@ -1991,6 +2246,7 @@ impl Generator {
                     return_wrapper: None,
                     captured_names: HashSet::new(),
                     is_generator: false,
+                    display_name: None,
                 },
             )?;
             if method.name == "__generate__" {
@@ -2245,10 +2501,17 @@ impl Generator {
                 }
                 Stmt::While { body, .. }
                 | Stmt::Loop { body, .. }
-                | Stmt::For { body, .. }
                 | Stmt::Block(body)
                 | Stmt::Defer(body)
                 | Stmt::With { body, .. } => body.iter().any(|s| invalid(&s.stmt)),
+                Stmt::For {
+                    body, else_block, ..
+                } => {
+                    body.iter().any(|s| invalid(&s.stmt))
+                        || else_block
+                            .as_ref()
+                            .is_some_and(|b| b.iter().any(|s| invalid(&s.stmt)))
+                }
                 Stmt::Try {
                     body,
                     catches,
@@ -2418,6 +2681,7 @@ impl Generator {
                 return_wrapper,
                 captured_names: HashSet::new(),
                 is_generator: template.is_generator,
+                display_name: template.display_name.clone(),
             },
         )?;
         let mut func = func;
@@ -2502,12 +2766,14 @@ impl Generator {
         body: &Block,
         extras: CompileFnExtras<'_>,
     ) -> Result<FunctionObject> {
+        let cooperative_cancel = crate::frontend::function_descriptors::has_cancel_flag(body);
         let CompileFnExtras {
             return_type,
             return_strong,
             return_wrapper,
             captured_names,
             is_generator,
+            display_name,
         } = extras;
         let mut local_slots = HashMap::new();
         for (i, p) in params.iter().enumerate() {
@@ -2554,6 +2820,10 @@ impl Generator {
         for p in params {
             if let (Some(ty), true) = (&p.type_expr, p.type_strong) {
                 sub.bind_type(&p.name, ty.clone(), true);
+            }
+            if let Some(pattern) = &p.pattern {
+                sub.emit_load_name(&p.name);
+                sub.gen_destruct_bind(pattern, true, true)?;
             }
         }
         // 隐式返回：块末尾产生值的语句（表达式 / if / match / …）留在栈上并 Ret；
@@ -2602,7 +2872,8 @@ impl Generator {
         let flexible_params = params
             .iter()
             .any(|p| p.default_expr.is_some() || p.is_variadic || p.is_kwvariadic);
-        let lightweight = !flexible_params
+        let lightweight = !cooperative_cancel
+            && !flexible_params
             && crate::opcode::function_lightweight(
                 &body,
                 uses_name_map,
@@ -2659,6 +2930,8 @@ impl Generator {
                 false,
             ),
             name: name.to_string(),
+            display_name,
+            cooperative_cancel,
             params: params.to_vec(),
             body: Arc::new(body),
             line_map: Arc::new(func_line_map),
@@ -3198,8 +3471,7 @@ impl Generator {
                 return_strong,
                 return_wrapper,
             } => {
-                let param_names: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
-                let free_all = free_vars::free_vars_in_block(body, &param_names);
+                let free_all = free_vars::free_vars_in_function(params, body);
                 // 只捕获词法局部；模块级名字留在函数内用 LoadGlobal / module_env。
                 let free: Vec<String> = free_all
                     .into_iter()
@@ -3217,6 +3489,7 @@ impl Generator {
                         return_wrapper: return_wrapper.as_ref().map(|b| *b.clone()),
                         captured_names: captured,
                         is_generator,
+                        display_name: None,
                     },
                 )?;
                 self.emit_function_value_with_defaults(params, func)?;
@@ -3383,25 +3656,12 @@ impl Generator {
                 self.codegen.emit(Instruction::Call { argc: 1 });
             }
             ExprKind::Await { operand } => {
-                if let ExprKind::Call { callee, args } = &operand.kind {
-                    let has_named = args.iter().any(|a| a.name.is_some());
-                    let has_kwsplat = args.iter().any(|a| a.is_kwsplat);
-                    let has_splat = args.iter().any(|a| a.is_splat);
-                    if !has_named && !has_kwsplat && !has_splat {
-                        for a in args {
-                            self.gen_expr(&a.value)?;
-                        }
-                        self.gen_expr(callee)?;
-                        self.codegen.emit(Instruction::GoCall(args.len()));
-                        self.codegen.emit(Instruction::Await);
-                    } else {
-                        self.gen_expr(operand)?;
-                        self.codegen.emit(Instruction::Await);
-                    }
+                if matches!(operand.kind, ExprKind::Call { .. }) {
+                    self.gen_go_operand(operand)?;
                 } else {
                     self.gen_expr(operand)?;
-                    self.codegen.emit(Instruction::Await);
                 }
+                self.codegen.emit(Instruction::Await);
             }
             ExprKind::Suspend => {
                 self.emit_suspend_expr();
@@ -3442,6 +3702,10 @@ impl Generator {
                 self.codegen.emit(Instruction::GoCall(args.len()));
                 return Ok(());
             }
+            self.gen_call_args_and_kwargs(args)?;
+            self.gen_expr(callee)?;
+            self.codegen.emit(Instruction::GoCallEx);
+            return Ok(());
         }
         // 非调用：求值后包装为已完成 Task。
         self.gen_expr(operand)?;
@@ -3457,13 +3721,14 @@ impl Generator {
                 "par for requires at least one iterator",
             ));
         }
-        let bound: HashSet<String> = items.iter().map(|i| i.name.clone()).collect();
+        let bound: HashSet<String> = items.iter().flat_map(ForItem::bound_names).collect();
         Self::check_par_no_shared_assign(body, &bound)?;
 
         let loc = items[0].iterable.loc;
         let (iterable, params, do_body) = if items.len() == 1 {
             let params = vec![FuncParam {
                 name: items[0].name.clone(),
+                pattern: items[0].pattern.clone(),
                 is_variadic: false,
                 is_kwvariadic: false,
                 implicit: false,
@@ -3495,29 +3760,41 @@ impl Generator {
                 if item.name == "_" {
                     continue;
                 }
+                let init = Expr::new(
+                    loc,
+                    ExprKind::Index {
+                        object: Box::new(Expr::new(loc, ExprKind::Var(zip_name.clone()))),
+                        index: Box::new(Expr::new(loc, ExprKind::Number(i.to_string()))),
+                    },
+                );
                 prefix.push(LocatedStmt {
                     line: loc.line,
                     column: loc.column,
-                    stmt: Stmt::VarDecl {
-                        visibility: Visibility::Default,
-                        is_const: false,
-                        is_var: false,
-                        name: item.name.clone(),
-                        type_expr: None,
-                        type_strong: false,
-                        init: Some(Expr::new(
-                            loc,
-                            ExprKind::Index {
-                                object: Box::new(Expr::new(loc, ExprKind::Var(zip_name.clone()))),
-                                index: Box::new(Expr::new(loc, ExprKind::Number(i.to_string()))),
-                            },
-                        )),
+                    stmt: if let Some(pattern) = &item.pattern {
+                        Stmt::DestructDecl {
+                            visibility: Visibility::Default,
+                            is_const: false,
+                            is_var: false,
+                            pattern: pattern.clone(),
+                            init,
+                        }
+                    } else {
+                        Stmt::VarDecl {
+                            visibility: Visibility::Default,
+                            is_const: false,
+                            is_var: false,
+                            name: item.name.clone(),
+                            type_expr: None,
+                            type_strong: false,
+                            init: Some(init),
+                        }
                     },
                 });
             }
             prefix.extend(body.iter().cloned());
             let params = vec![FuncParam {
                 name: zip_name,
+                pattern: None,
                 is_variadic: false,
                 is_kwvariadic: false,
                 implicit: false,
@@ -3827,14 +4104,21 @@ impl Generator {
         self.gen_for_iter_setup(items)?;
         let start = self.codegen.fresh_label();
         let end = self.codegen.fresh_label();
+        let next = self.codegen.fresh_label();
         self.codegen.mark_label(start);
         self.codegen.emit(Instruction::IterNext);
         self.codegen.emit(Instruction::GotoIfNot(end));
-        self.gen_for_iter_bind(items);
+        let runtime_scope = self.current_func.is_none();
+        if runtime_scope {
+            self.codegen.emit(Instruction::EnterScope);
+            self.block_depth += 1;
+            self.block_shadows.push(HashSet::new());
+        }
+        self.gen_for_iter_bind(items)?;
 
         for guard in guards {
             self.gen_expr(guard)?;
-            self.codegen.emit(Instruction::GotoIfNot(start));
+            self.codegen.emit(Instruction::GotoIfNot(next));
         }
 
         self.emit_load_temp(&result_name);
@@ -3868,7 +4152,12 @@ impl Generator {
         // Their stack result is the same binding already held in `result_name`;
         // storing it again on every iteration only adds a name/slot write.
         self.codegen.emit(Instruction::Pop);
-
+        self.codegen.mark_label(next);
+        if runtime_scope {
+            self.codegen.emit(Instruction::LeaveScope);
+            self.block_shadows.pop();
+            self.block_depth -= 1;
+        }
         self.codegen.emit(Instruction::Goto(start));
         self.codegen.mark_label(end);
         self.codegen.emit(Instruction::IterEnd);
@@ -3898,6 +4187,7 @@ impl Generator {
             .iter()
             .map(|it| FuncParam {
                 name: it.name.clone(),
+                pattern: it.pattern.clone(),
                 is_variadic: false,
                 is_kwvariadic: false,
                 implicit: false,
@@ -3906,7 +4196,7 @@ impl Generator {
                 default_expr: None,
             })
             .collect();
-        let param_names: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
+        let param_names: HashSet<String> = params.iter().flat_map(FuncParam::bound_names).collect();
 
         // 只捕获词法局部；模块级名字在内层用 LoadGlobal / module_env。
         let elem_free: Vec<String> = free_vars::free_vars_in_expr(elem, &param_names)
@@ -3928,6 +4218,7 @@ impl Generator {
                 return_wrapper: None,
                 captured_names: elem_free.iter().cloned().collect(),
                 is_generator: false,
+                display_name: None,
             },
         )?;
         self.codegen
@@ -3964,6 +4255,7 @@ impl Generator {
                     return_wrapper: None,
                     captured_names: g_free.iter().cloned().collect(),
                     is_generator: false,
+                    display_name: None,
                 },
             )?;
             self.codegen
@@ -3988,7 +4280,13 @@ impl Generator {
         Ok(())
     }
 
-    fn gen_for(&mut self, label: Option<&str>, items: &[ForItem], body: &Block) -> Result<()> {
+    fn gen_for(
+        &mut self,
+        label: Option<&str>,
+        items: &[ForItem],
+        body: &Block,
+        else_block: Option<&Block>,
+    ) -> Result<()> {
         if items.is_empty() {
             return Err(RuntimeError::type_err("for requires at least one iterator"));
         }
@@ -3996,10 +4294,11 @@ impl Generator {
         let start = self.codegen.fresh_label();
         let continue_cleanup = self.codegen.fresh_label();
         let break_cleanup = self.codegen.fresh_label();
+        let exhausted = self.codegen.fresh_label();
         let end = self.codegen.fresh_label();
         self.codegen.mark_label(start);
         self.codegen.emit(Instruction::IterNext);
-        self.codegen.emit(Instruction::GotoIfNot(end));
+        self.codegen.emit(Instruction::GotoIfNot(exhausted));
         // A loop body is a fresh lexical scope on every iteration. Besides making
         // the iterator binding local, this lets immutable declarations in the body
         // be initialized again on the next iteration without becoming globals.
@@ -4009,7 +4308,7 @@ impl Generator {
             self.block_depth += 1;
             self.block_shadows.push(HashSet::new());
         }
-        self.gen_for_iter_bind(items);
+        self.gen_for_iter_bind(items)?;
         self.loop_break_labels.push(break_cleanup);
         self.loop_continue_labels.push(continue_cleanup);
         self.loop_names.push(label.map(str::to_owned));
@@ -4036,8 +4335,14 @@ impl Generator {
         if runtime_scope {
             self.codegen.emit(Instruction::LeaveScope);
         }
-        self.codegen.mark_label(end);
         self.codegen.emit(Instruction::IterEnd);
+        self.codegen.emit(Instruction::Goto(end));
+        self.codegen.mark_label(exhausted);
+        self.codegen.emit(Instruction::IterEnd);
+        if let Some(else_block) = else_block {
+            self.gen_block(else_block, false)?;
+        }
+        self.codegen.mark_label(end);
         Ok(())
     }
 
@@ -4056,14 +4361,16 @@ impl Generator {
         Ok(())
     }
 
-    fn gen_for_iter_bind(&mut self, items: &[ForItem]) {
+    fn gen_for_iter_bind(&mut self, items: &[ForItem]) -> Result<()> {
         if items.len() == 1 {
-            if items[0].name == "_" {
+            if let Some(pattern) = &items[0].pattern {
+                self.gen_destruct_bind(pattern, true, true)?;
+            } else if items[0].name == "_" {
                 self.codegen.emit(Instruction::Pop);
             } else {
                 self.emit_bind_name(&items[0].name);
             }
-            return;
+            return Ok(());
         }
         let tuple_name = self.codegen.fresh_temp("__zip_tuple");
         self.emit_store_temp(&tuple_name);
@@ -4071,12 +4378,15 @@ impl Generator {
             self.emit_load_temp(&tuple_name);
             self.codegen.emit(Instruction::PushSmall(i as i64));
             self.codegen.emit(Instruction::Index);
-            if item.name == "_" {
+            if let Some(pattern) = &item.pattern {
+                self.gen_destruct_bind(pattern, true, true)?;
+            } else if item.name == "_" {
                 self.codegen.emit(Instruction::Pop);
             } else {
                 self.emit_bind_name(&item.name);
             }
         }
+        Ok(())
     }
 
     fn gen_slice_bound(&mut self, bound: Option<&Expr>) -> Result<()> {
@@ -4142,6 +4452,68 @@ impl Generator {
                     }
                 }
             }
+            DestructPattern::Dict { entries, rest } => {
+                // Convert the source to a dictionary once. This is important for
+                // user-defined __unpack__: it is an observable call and must not
+                // run once per extracted key.
+                self.codegen
+                    .emit(Instruction::Load("__unpack_view__".into()));
+                self.codegen.emit(Instruction::Call { argc: 1 });
+                let view = self.codegen.fresh_temp("__unpack_view");
+                self.emit_store_temp(&view);
+
+                for entry in entries {
+                    self.emit_load_temp(&view);
+                    self.codegen
+                        .emit(Instruction::Push(Value::Text(entry.key.clone())));
+                    if let Some(default) = &entry.default {
+                        self.codegen
+                            .emit(Instruction::Load("__unpack_optional__".into()));
+                        self.codegen.emit(Instruction::Call { argc: 2 });
+                        let option = self.codegen.fresh_temp("__unpack_option");
+                        self.emit_store_temp(&option);
+                        let use_default = self.codegen.fresh_label();
+                        let have_value = self.codegen.fresh_label();
+                        self.emit_load_temp(&option);
+                        self.codegen.emit(Instruction::PushSmall(0));
+                        self.codegen.emit(Instruction::Index);
+                        self.codegen.emit(Instruction::GotoIfNot(use_default));
+                        self.emit_load_temp(&option);
+                        self.codegen.emit(Instruction::PushSmall(1));
+                        self.codegen.emit(Instruction::Index);
+                        self.codegen.emit(Instruction::Goto(have_value));
+                        self.codegen.mark_label(use_default);
+                        self.gen_expr(default)?;
+                        self.codegen.mark_label(have_value);
+                    } else {
+                        self.codegen
+                            .emit(Instruction::Load("__unpack_required__".into()));
+                        self.codegen.emit(Instruction::Call { argc: 2 });
+                    }
+                    if declaring {
+                        self.emit_bind_name_flags(&entry.binding, is_const);
+                    } else {
+                        self.emit_store_name(&entry.binding);
+                    }
+                }
+
+                if let Some(rest) = rest {
+                    self.emit_load_temp(&view);
+                    for entry in entries {
+                        self.codegen
+                            .emit(Instruction::Push(Value::Text(entry.key.clone())));
+                    }
+                    self.codegen.emit(Instruction::VecNew(entries.len()));
+                    self.codegen
+                        .emit(Instruction::Load("__unpack_rest__".into()));
+                    self.codegen.emit(Instruction::Call { argc: 2 });
+                    if declaring {
+                        self.emit_bind_name_flags(rest, is_const);
+                    } else {
+                        self.emit_store_name(rest);
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -4185,6 +4557,7 @@ mod tests {
 
         let template = GenericFunctionTemplate {
             name: "id".into(),
+            display_name: None,
             type_params: Vec::new(),
             params: Vec::new(),
             body: Vec::new(),

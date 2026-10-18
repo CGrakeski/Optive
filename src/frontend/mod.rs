@@ -4,6 +4,8 @@ pub mod ast;
 pub mod diagnostics;
 pub mod error;
 pub mod fmt;
+pub mod function_descriptors;
 pub mod lexer;
 pub mod parser;
+pub(crate) mod string_literals;
 pub mod token;

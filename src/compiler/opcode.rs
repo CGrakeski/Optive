@@ -215,6 +215,8 @@ pub enum Instruction {
     RegisterExport(String),
     /// `go f(args)`：栈为 args… + callee → Task。
     GoCall(usize),
+    /// args list + kwargs dict + callee -> pending Task.
+    GoCallEx,
     /// 将栈顶值包装为已完成的 Task。
     GoValue,
     /// 若为 Task 则 join；否则原样留下。
@@ -835,6 +837,7 @@ pub struct ModuleGlobalEnv {
 #[derive(Clone)]
 pub struct GenericFunctionTemplate {
     pub name: String,
+    pub display_name: Option<String>,
     pub type_params: Vec<(String, Option<crate::ast::Expr>)>,
     pub params: Vec<FuncParam>,
     pub body: crate::ast::Block,
@@ -937,6 +940,11 @@ pub struct FunctionObject {
     pub flags: FuncFlags,
     // --- 冷路径 / 元数据 ---
     pub name: String,
+    /// Optional user-facing representation supplied by `display_as(...)`.
+    /// The stable symbol/debug identity remains `name`.
+    pub display_name: Option<String>,
+    /// Declaration macro opts this function into task-local cooperative cancellation.
+    pub cooperative_cancel: bool,
     pub params: Vec<crate::ast::FuncParam>,
     pub body: Arc<Vec<Instruction>>,
     pub line_map: Arc<Vec<usize>>,
@@ -1062,6 +1070,8 @@ impl FunctionObject {
             hot_call_argc: HOT_CALL_ARGC_NONE,
             flags,
             name: name.into(),
+            display_name: None,
+            cooperative_cancel: false,
             params,
             body: Arc::new(body),
             line_map: Arc::new(Vec::new()),

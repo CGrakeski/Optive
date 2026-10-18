@@ -15,8 +15,10 @@ pub(super) fn io_read_file(vm: &mut Vm, args: &[Value]) -> Result<Value> {
         ));
     }
     let path = expect_text("read_file", args, 0)?;
-    let content = vm.caps.read_to_string("read_file", &path)?;
-    vm.request_cooperative_yield();
+    let caps = vm.caps.clone();
+    let Some(content) = vm.run_blocking(move || caps.read_to_string("read_file", path))? else {
+        return Ok(Value::None);
+    };
     Ok(Value::Text(content))
 }
 
@@ -28,8 +30,13 @@ pub(super) fn io_write_file(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
     let path = expect_text("write_file", args, 0)?;
     let content = args[1].print_string();
-    vm.caps.write("write_file", &path, content)?;
-    vm.request_cooperative_yield();
+    let caps = vm.caps.clone();
+    if vm
+        .run_blocking(move || caps.write("write_file", path, content))?
+        .is_none()
+    {
+        return Ok(Value::None);
+    }
     Ok(Value::None)
 }
 
@@ -41,8 +48,13 @@ pub(super) fn io_append_file(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     }
     let path = expect_text("append_file", args, 0)?;
     let content = args[1].print_string();
-    vm.caps.append("append_file", &path, content.as_bytes())?;
-    vm.request_cooperative_yield();
+    let caps = vm.caps.clone();
+    if vm
+        .run_blocking(move || caps.append("append_file", path, content.as_bytes()))?
+        .is_none()
+    {
+        return Ok(Value::None);
+    }
     Ok(Value::None)
 }
 
@@ -53,8 +65,10 @@ pub(super) fn io_read_bytes(vm: &mut Vm, args: &[Value]) -> Result<Value> {
         ));
     }
     let path = expect_text("read_bytes", args, 0)?;
-    let bytes = vm.caps.read("read_bytes", &path)?;
-    vm.request_cooperative_yield();
+    let caps = vm.caps.clone();
+    let Some(bytes) = vm.run_blocking(move || caps.read("read_bytes", path))? else {
+        return Ok(Value::None);
+    };
     Ok(Value::Bytes(Arc::new(bytes)))
 }
 
@@ -74,8 +88,13 @@ pub(super) fn io_write_bytes(vm: &mut Vm, args: &[Value]) -> Result<Value> {
             ))
         }
     };
-    vm.caps.write("write_bytes", &path, bytes)?;
-    vm.request_cooperative_yield();
+    let caps = vm.caps.clone();
+    if vm
+        .run_blocking(move || caps.write("write_bytes", path, bytes))?
+        .is_none()
+    {
+        return Ok(Value::None);
+    }
     Ok(Value::None)
 }
 

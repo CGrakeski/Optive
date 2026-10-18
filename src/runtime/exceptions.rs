@@ -13,6 +13,7 @@ fn exc_def(name: &str, base: Option<&str>) -> Arc<StructDef> {
         mutable_fields: vec![true, true],
         typed: false,
         field_types: vec![FieldTypeInfo::default(), FieldTypeInfo::default()],
+        field_defaults: Vec::new(),
         type_params: Vec::new(),
         native_layout: None,
         methods: std::collections::HashMap::new(),

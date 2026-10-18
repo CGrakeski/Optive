@@ -811,6 +811,9 @@ pub fn mark_value(val: &Value, marked: &mut FxHashSet<usize>, worklist: &mut Vec
                 worklist.push(rc.borrow().clone());
             }
         }
+        Value::Builtin(builtin) => {
+            worklist.extend(builtin.roots.iter().cloned());
+        }
         Value::Struct(rc) => {
             let addr = Arc::as_ptr(rc) as usize;
             if marked.insert(addr) {
@@ -859,9 +862,14 @@ pub fn mark_value(val: &Value, marked: &mut FxHashSet<usize>, worklist: &mut Vec
             if marked.insert(addr) {
                 let inner = t.borrow();
                 match &inner.state {
-                    crate::value::TaskState::Pending { callable, args } => {
+                    crate::value::TaskState::Pending {
+                        callable,
+                        args,
+                        kwargs,
+                    } => {
                         worklist.push(callable.clone());
                         worklist.extend(args.iter().cloned());
+                        worklist.extend(kwargs.values().cloned());
                     }
                     crate::value::TaskState::Done(v) | crate::value::TaskState::Failed(v) => {
                         worklist.push(v.clone());
@@ -947,7 +955,6 @@ pub fn mark_value(val: &Value, marked: &mut FxHashSet<usize>, worklist: &mut Vec
         | Value::Bytes(_)
         | Value::GenericFunction(_)
         | Value::Macro(_)
-        | Value::Builtin(_)
         | Value::RuntimeAst(_)
         | Value::TypeSpec(_)
         | Value::EnumMember(_)
@@ -1023,7 +1030,8 @@ fn mark_sync_children(inner: &crate::value::SyncInner, worklist: &mut Vec<Value>
         | SyncInner::Semaphore { .. }
         | SyncInner::Barrier { .. }
         | SyncInner::Cond { .. }
-        | SyncInner::TimeoutCtx { .. } => {}
+        | SyncInner::TimeoutCtx { .. }
+        | SyncInner::CancelFlag { .. } => {}
         SyncInner::Atomic { value } => worklist.push(value.clone()),
         SyncInner::TaskGroup {
             first_error, tasks, ..

@@ -197,7 +197,7 @@ impl Instruction {
                 push: 1,
                 alt_push: None,
             },
-            Self::CallEx => Adjust {
+            Self::CallEx | Self::GoCallEx => Adjust {
                 pop: 3,
                 push: 1,
                 alt_push: None,

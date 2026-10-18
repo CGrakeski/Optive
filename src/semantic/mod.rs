@@ -1,4 +1,5 @@
-//! 共享静态语义检查：名字/`std.*`/arity + 硬注解、未使用、不可达、`go` 共享可变。
+//! 共享静态语义检查：名字/`std.*`/arity、硬注解、variant match、带标签控制流、
+//! 未使用、不可达与 `go` 共享可变。
 //!
 //! CLI `check` 与 LSP 诊断走同一入口，避免两套规则漂移。
 
@@ -51,6 +52,36 @@ pub fn diagnostic_metadata(message: &str) -> DiagnosticMetadata {
             Severity::Warning,
             "W2001",
             Some("use Channel, Mutex, or Atomic for shared mutation"),
+        )
+    } else if message.starts_with("non-exhaustive match") {
+        (
+            Severity::Warning,
+            "W3001",
+            Some("handle every variant case or add an else branch"),
+        )
+    } else if message.starts_with("duplicate match case") {
+        (
+            Severity::Warning,
+            "W3002",
+            Some("remove the duplicate case because an earlier branch already handles it"),
+        )
+    } else if message.starts_with("unknown variant case") {
+        (
+            Severity::Error,
+            "E5002",
+            Some("use a case declared by this variant"),
+        )
+    } else if message.starts_with("shadowed loop label") {
+        (
+            Severity::Warning,
+            "W6001",
+            Some("rename one of the active loop labels to make the target unambiguous"),
+        )
+    } else if message.starts_with("unknown loop label") {
+        (
+            Severity::Error,
+            "E6002",
+            Some("target the label of an enclosing loop"),
         )
     } else if message.starts_with("cannot resolve module") {
         (
@@ -160,12 +191,123 @@ pub fn analyze_in(
     file: &str,
     docs: &HashMap<String, String>,
 ) -> Vec<Diagnostic> {
+    let lowered = match crate::frontend::function_descriptors::lower_program(program) {
+        Ok(program) => program,
+        Err(error) => return vec![(1, 1, error.message().to_string())],
+    };
+    let program = &lowered;
     let mut diags = names::analyze_program(program);
+    if let Ok(const_context) = crate::compiler::const_eval::ConstContext::build(program) {
+        check_function_descriptors(&program.stmts, &const_context, &mut diags);
+    }
     extra_pass(program, &mut diags);
     if !file.is_empty() {
         cross_module_exports(program, file, docs, &mut diags);
     }
     diags
+}
+
+fn check_function_descriptors(
+    block: &Block,
+    const_context: &crate::compiler::const_eval::ConstContext,
+    diags: &mut Vec<Diagnostic>,
+) {
+    for located in block {
+        match &located.stmt {
+            Stmt::FuncDecl {
+                descriptors, body, ..
+            } => {
+                if let Some(descriptor) = descriptors
+                    .iter()
+                    .find(|descriptor| descriptor.name == "display_as")
+                {
+                    let valid = descriptor.args.first().is_some_and(|argument| {
+                        const_context
+                            .try_eval(argument)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|value| matches!(value, crate::value::Value::Text(_)))
+                    });
+                    if !valid {
+                        diags.push((
+                            located.line,
+                            located.column,
+                            "function descriptor `display_as` requires a compile-time string"
+                                .into(),
+                        ));
+                    }
+                }
+                check_function_descriptors(body, const_context, diags);
+            }
+            Stmt::If {
+                then_block,
+                elifs,
+                else_block,
+                ..
+            } => {
+                check_function_descriptors(then_block, const_context, diags);
+                for (_, body) in elifs {
+                    check_function_descriptors(body, const_context, diags);
+                }
+                if let Some(body) = else_block {
+                    check_function_descriptors(body, const_context, diags);
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::Loop { body, .. }
+            | Stmt::Defer(body)
+            | Stmt::With { body, .. }
+            | Stmt::Block(body)
+            | Stmt::MacroDecl { body, .. } => {
+                check_function_descriptors(body, const_context, diags);
+            }
+            Stmt::For {
+                body, else_block, ..
+            } => {
+                check_function_descriptors(body, const_context, diags);
+                if let Some(body) = else_block {
+                    check_function_descriptors(body, const_context, diags);
+                }
+            }
+            Stmt::Try {
+                body,
+                catches,
+                else_block,
+            } => {
+                check_function_descriptors(body, const_context, diags);
+                for clause in catches {
+                    check_function_descriptors(&clause.body, const_context, diags);
+                }
+                if let Some(body) = else_block {
+                    check_function_descriptors(body, const_context, diags);
+                }
+            }
+            Stmt::Match {
+                cases, else_block, ..
+            } => {
+                for case in cases {
+                    check_function_descriptors(&case.body, const_context, diags);
+                }
+                if let Some(body) = else_block {
+                    check_function_descriptors(body, const_context, diags);
+                }
+            }
+            Stmt::FriendFuncDecl {
+                body: Some(body), ..
+            } => check_function_descriptors(body, const_context, diags),
+            Stmt::StructDecl { methods, .. } => {
+                for method in methods {
+                    check_function_descriptors(&method.body, const_context, diags);
+                }
+            }
+            Stmt::EnumDecl { methods, .. } => {
+                for method in methods {
+                    check_function_descriptors(&method.body, const_context, diags);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn extra_pass(program: &Program, diags: &mut Vec<Diagnostic>) {
@@ -174,9 +316,511 @@ fn extra_pass(program: &Program, diags: &mut Vec<Diagnostic>) {
     unreachable_in_block(&program.stmts, diags);
     walk_block_extra(&program.stmts, &HashSet::new(), &declared_types, diags);
     check_try_block(&program.stmts, None, false, diags);
-    check_control_flow(&program.stmts, 0, 0, false, diags);
+    check_control_flow(&program.stmts, 0, &[], false, diags);
     check_strong_assignments(&program.stmts, &mut HashMap::new(), diags);
     check_immutable_block(&program.stmts, &HashMap::new(), diags);
+    check_variant_matches(&program.stmts, &HashMap::new(), &HashMap::new(), diags);
+}
+
+#[derive(Clone, Debug)]
+struct VariantShape {
+    cases: HashSet<String>,
+}
+
+/// Check only matches whose subject type can be established without executing
+/// user code. Unknown/dynamic patterns suppress exhaustiveness diagnostics, so
+/// this pass remains useful in a dynamic language without inventing certainty.
+fn check_variant_matches(
+    block: &Block,
+    inherited_variants: &HashMap<String, VariantShape>,
+    inherited_values: &HashMap<String, String>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let mut variants = inherited_variants.clone();
+    for located in block {
+        if let Stmt::VariantDecl { name, cases, .. } = &located.stmt {
+            variants.insert(
+                name.clone(),
+                VariantShape {
+                    cases: cases.iter().map(|case| case.name.clone()).collect(),
+                },
+            );
+        }
+    }
+
+    let mut values = inherited_values.clone();
+    for located in block {
+        match &located.stmt {
+            Stmt::VarDecl {
+                name,
+                type_expr,
+                init,
+                ..
+            } => {
+                if let Some(init) = init {
+                    check_variant_expr(init, &variants, &values, diags);
+                }
+                let inferred = type_expr
+                    .as_ref()
+                    .and_then(type_ann_name)
+                    .filter(|name| variants.contains_key(name))
+                    .or_else(|| {
+                        init.as_ref()
+                            .and_then(|expr| known_variant_type(expr, &variants, &values))
+                    });
+                if let Some(variant) = inferred {
+                    values.insert(name.clone(), variant);
+                } else {
+                    values.remove(name);
+                }
+            }
+            Stmt::Assign {
+                target: LValue::Name(name),
+                value,
+            } => {
+                check_variant_expr(value, &variants, &values, diags);
+                if let Some(variant) = known_variant_type(value, &variants, &values) {
+                    values.insert(name.clone(), variant);
+                } else {
+                    values.remove(name);
+                }
+            }
+            Stmt::FuncDecl { params, body, .. } => {
+                let mut inner = HashMap::new();
+                bind_variant_params(params, &variants, &mut inner);
+                check_variant_matches(body, &variants, &inner, diags);
+            }
+            Stmt::FriendFuncDecl {
+                params,
+                body: Some(body),
+                ..
+            } => {
+                let mut inner = HashMap::new();
+                if let Some(params) = params {
+                    bind_variant_params(params, &variants, &mut inner);
+                }
+                check_variant_matches(body, &variants, &inner, diags);
+            }
+            Stmt::Match {
+                subject,
+                cases,
+                else_block,
+            } => {
+                check_variant_expr(subject, &variants, &values, diags);
+                check_one_variant_match(
+                    subject,
+                    cases,
+                    else_block.is_some(),
+                    (located.line, located.column),
+                    &variants,
+                    &values,
+                    diags,
+                );
+                for case in cases {
+                    check_variant_matches(&case.body, &variants, &values, diags);
+                }
+                if let Some(body) = else_block {
+                    check_variant_matches(body, &variants, &values, diags);
+                }
+            }
+            Stmt::If {
+                cond,
+                then_block,
+                elifs,
+                else_block,
+            } => {
+                check_variant_expr(cond, &variants, &values, diags);
+                check_variant_matches(then_block, &variants, &values, diags);
+                for (cond, body) in elifs {
+                    check_variant_expr(cond, &variants, &values, diags);
+                    check_variant_matches(body, &variants, &values, diags);
+                }
+                if let Some(body) = else_block {
+                    check_variant_matches(body, &variants, &values, diags);
+                }
+            }
+            Stmt::While { cond, body, .. } => {
+                check_variant_expr(cond, &variants, &values, diags);
+                check_variant_matches(body, &variants, &values, diags);
+            }
+            Stmt::Loop { count, body, .. } => {
+                if let Some(count) = count {
+                    check_variant_expr(count, &variants, &values, diags);
+                }
+                check_variant_matches(body, &variants, &values, diags);
+            }
+            Stmt::For {
+                items,
+                body,
+                else_block,
+                ..
+            } => {
+                for item in items {
+                    check_variant_expr(&item.iterable, &variants, &values, diags);
+                }
+                check_variant_matches(body, &variants, &values, diags);
+                if let Some(else_block) = else_block {
+                    check_variant_matches(else_block, &variants, &values, diags);
+                }
+            }
+            Stmt::Try {
+                body,
+                catches,
+                else_block,
+            } => {
+                check_variant_matches(body, &variants, &values, diags);
+                for catch in catches {
+                    check_variant_matches(&catch.body, &variants, &values, diags);
+                }
+                if let Some(body) = else_block {
+                    check_variant_matches(body, &variants, &values, diags);
+                }
+            }
+            Stmt::With { context, body, .. } => {
+                check_variant_expr(context, &variants, &values, diags);
+                check_variant_matches(body, &variants, &values, diags);
+            }
+            Stmt::Block(body) | Stmt::Defer(body) => {
+                check_variant_matches(body, &variants, &values, diags);
+            }
+            Stmt::StructDecl { methods, .. } => {
+                for method in methods {
+                    let mut inner = HashMap::new();
+                    bind_variant_params(&method.params, &variants, &mut inner);
+                    check_variant_matches(&method.body, &variants, &inner, diags);
+                }
+            }
+            Stmt::EnumDecl { methods, .. } => {
+                for method in methods {
+                    let mut inner = HashMap::new();
+                    bind_variant_params(&method.params, &variants, &mut inner);
+                    check_variant_matches(&method.body, &variants, &inner, diags);
+                }
+            }
+            Stmt::DestructDecl { pattern, init, .. }
+            | Stmt::DestructAssign {
+                pattern,
+                value: init,
+            } => {
+                check_variant_expr(init, &variants, &values, diags);
+                visit_destruct_defaults(pattern, &mut |expr| {
+                    check_variant_expr(expr, &variants, &values, diags);
+                });
+            }
+            Stmt::Return(Some(expr))
+            | Stmt::Yield(Some(expr))
+            | Stmt::YieldFrom(expr)
+            | Stmt::Throw(expr)
+            | Stmt::Expr(expr) => {
+                check_variant_expr(expr, &variants, &values, diags);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn bind_variant_params(
+    params: &[crate::ast::FuncParam],
+    variants: &HashMap<String, VariantShape>,
+    values: &mut HashMap<String, String>,
+) {
+    for param in params {
+        if let Some(name) = param
+            .type_expr
+            .as_ref()
+            .and_then(type_ann_name)
+            .filter(|name| variants.contains_key(name))
+        {
+            values.insert(param.name.clone(), name);
+        }
+    }
+}
+
+fn known_variant_type(
+    expr: &Expr,
+    variants: &HashMap<String, VariantShape>,
+    values: &HashMap<String, String>,
+) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Var(name) => values.get(name).cloned(),
+        ExprKind::Call { callee, .. } => match &callee.kind {
+            ExprKind::Var(name) if variants.contains_key(name) => Some(name.clone()),
+            ExprKind::Member { object, field } => {
+                let ExprKind::Var(name) = &object.kind else {
+                    return None;
+                };
+                variants
+                    .get(name)
+                    .is_some_and(|shape| shape.cases.contains(field))
+                    .then(|| name.clone())
+            }
+            _ => None,
+        },
+        ExprKind::IfThenElse {
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            let left = known_variant_type(then_expr, variants, values)?;
+            (known_variant_type(else_expr, variants, values).as_deref() == Some(&left))
+                .then_some(left)
+        }
+        _ => None,
+    }
+}
+
+fn check_one_variant_match(
+    subject: &Expr,
+    cases: &[crate::ast::MatchCase],
+    has_else: bool,
+    location: (usize, usize),
+    variants: &HashMap<String, VariantShape>,
+    values: &HashMap<String, String>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let (line, column) = location;
+    let Some(variant) = known_variant_type(subject, variants, values) else {
+        return;
+    };
+    let Some(shape) = variants.get(&variant) else {
+        return;
+    };
+    let mut handled = HashSet::new();
+    let mut all_known = true;
+    for case in cases {
+        let Some(names) = variant_pattern_cases(&case.pattern, &variant) else {
+            all_known = false;
+            continue;
+        };
+        for name in names {
+            if !shape.cases.contains(&name) {
+                all_known = false;
+                diags.push((
+                    line,
+                    column,
+                    format!("unknown variant case `{variant}.{name}`"),
+                ));
+            } else if !handled.insert(name.clone()) {
+                diags.push((
+                    line,
+                    column,
+                    format!("duplicate match case `{variant}.{name}`"),
+                ));
+            }
+        }
+    }
+    if !has_else && all_known {
+        let mut missing: Vec<_> = shape.cases.difference(&handled).cloned().collect();
+        missing.sort();
+        if !missing.is_empty() {
+            diags.push((
+                line,
+                column,
+                format!(
+                    "non-exhaustive match for variant `{variant}`; missing: {}",
+                    missing.join(", ")
+                ),
+            ));
+        }
+    }
+}
+
+fn variant_pattern_cases(pattern: &crate::ast::Pattern, variant: &str) -> Option<Vec<String>> {
+    use crate::ast::Pattern;
+    match pattern {
+        Pattern::Call { type_name, .. } => type_name
+            .strip_prefix(variant)
+            .and_then(|suffix| suffix.strip_prefix('.'))
+            .filter(|suffix| !suffix.is_empty() && !suffix.contains('.'))
+            .map(|name| vec![name.to_string()]),
+        Pattern::Or(patterns) => {
+            let mut names = Vec::new();
+            for pattern in patterns {
+                names.extend(variant_pattern_cases(pattern, variant)?);
+            }
+            Some(names)
+        }
+        Pattern::Bind(_) => None,
+        _ => None,
+    }
+}
+
+fn check_variant_expr(
+    expr: &Expr,
+    variants: &HashMap<String, VariantShape>,
+    values: &HashMap<String, String>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match &expr.kind {
+        ExprKind::Match {
+            subject,
+            cases,
+            else_block,
+        } => {
+            check_one_variant_match(
+                subject,
+                cases,
+                else_block.is_some(),
+                (expr.loc.line, expr.loc.column),
+                variants,
+                values,
+                diags,
+            );
+            check_variant_expr(subject, variants, values, diags);
+            for case in cases {
+                check_variant_matches(&case.body, variants, values, diags);
+            }
+            if let Some(body) = else_block {
+                check_variant_matches(body, variants, values, diags);
+            }
+        }
+        ExprKind::Unary { operand, .. }
+        | ExprKind::Handle { operand }
+        | ExprKind::Go { operand }
+        | ExprKind::Snap { operand }
+        | ExprKind::Await { operand }
+        | ExprKind::TryPropagate { operand }
+        | ExprKind::Member {
+            object: operand, ..
+        }
+        | ExprKind::MacroCall {
+            callee: operand, ..
+        }
+        | ExprKind::NamedAssign { value: operand, .. } => {
+            check_variant_expr(operand, variants, values, diags);
+        }
+        ExprKind::Binary { left, right, .. } | ExprKind::Pipeline { left, right, .. } => {
+            check_variant_expr(left, variants, values, diags);
+            check_variant_expr(right, variants, values, diags);
+        }
+        ExprKind::Call { callee, args } => {
+            check_variant_expr(callee, variants, values, diags);
+            for arg in args {
+                check_variant_expr(&arg.value, variants, values, diags);
+            }
+        }
+        ExprKind::Index { object, index } => {
+            check_variant_expr(object, variants, values, diags);
+            check_variant_expr(index, variants, values, diags);
+        }
+        ExprKind::Slice {
+            object,
+            start,
+            end,
+            step,
+        } => {
+            check_variant_expr(object, variants, values, diags);
+            for part in [start, end, step].into_iter().flatten() {
+                check_variant_expr(part, variants, values, diags);
+            }
+        }
+        ExprKind::TypeConvert { type_expr, value } => {
+            check_variant_expr(type_expr, variants, values, diags);
+            check_variant_expr(value, variants, values, diags);
+        }
+        ExprKind::List(items)
+        | ExprKind::Tuple(items)
+        | ExprKind::Set(items)
+        | ExprKind::ParBlock { exprs: items } => {
+            for item in items {
+                check_variant_expr(item, variants, values, diags);
+            }
+        }
+        ExprKind::Dict(items) => {
+            for (key, value) in items {
+                check_variant_expr(key, variants, values, diags);
+                check_variant_expr(value, variants, values, diags);
+            }
+        }
+        ExprKind::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            check_variant_expr(cond, variants, values, diags);
+            check_variant_expr(then_expr, variants, values, diags);
+            check_variant_expr(else_expr, variants, values, diags);
+        }
+        ExprKind::ListComp {
+            elem,
+            items,
+            guards,
+        }
+        | ExprKind::SetComp {
+            elem,
+            items,
+            guards,
+        }
+        | ExprKind::GeneratorExp {
+            elem,
+            items,
+            guards,
+        } => {
+            check_variant_expr(elem, variants, values, diags);
+            for item in items {
+                check_variant_expr(&item.iterable, variants, values, diags);
+            }
+            for guard in guards {
+                check_variant_expr(guard, variants, values, diags);
+            }
+        }
+        ExprKind::DictComp {
+            key,
+            value,
+            items,
+            guards,
+        } => {
+            check_variant_expr(key, variants, values, diags);
+            check_variant_expr(value, variants, values, diags);
+            for item in items {
+                check_variant_expr(&item.iterable, variants, values, diags);
+            }
+            for guard in guards {
+                check_variant_expr(guard, variants, values, diags);
+            }
+        }
+        ExprKind::DoFunc { params, body, .. } => {
+            let mut inner = values.clone();
+            bind_variant_params(params, variants, &mut inner);
+            check_variant_matches(body, variants, &inner, diags);
+        }
+        ExprKind::ParFor { items, body } => {
+            for item in items {
+                check_variant_expr(&item.iterable, variants, values, diags);
+            }
+            check_variant_matches(body, variants, values, diags);
+        }
+        ExprKind::Select { cases, else_block } => {
+            for case in cases {
+                check_variant_expr(&case.event, variants, values, diags);
+                check_variant_matches(&case.body, variants, values, diags);
+            }
+            if let Some(body) = else_block {
+                check_variant_matches(body, variants, values, diags);
+            }
+        }
+        ExprKind::Quote { bindings, body, .. } => {
+            for binding in bindings {
+                check_variant_expr(binding, variants, values, diags);
+            }
+            check_variant_matches(body, variants, values, diags);
+        }
+        ExprKind::FString(parts) => {
+            for part in parts {
+                if let crate::ast::FStringPart::Expr(part_expr) = part {
+                    check_variant_expr(part_expr, variants, values, diags);
+                }
+            }
+        }
+        ExprKind::Placeholder
+        | ExprKind::Suspend
+        | ExprKind::Var(_)
+        | ExprKind::Number(_)
+        | ExprKind::String(_)
+        | ExprKind::Bool(_)
+        | ExprKind::None
+        | ExprKind::Bytes(_) => {}
+    }
 }
 
 fn check_immutable_block(
@@ -228,7 +872,9 @@ fn check_immutable_block(
             Stmt::FuncDecl { params, body, .. } => {
                 let mut inner = bindings.clone();
                 for param in params {
-                    inner.insert(param.name.clone(), false);
+                    for name in param.bound_names() {
+                        inner.insert(name, false);
+                    }
                 }
                 check_immutable_block(body, &inner, diags);
             }
@@ -240,7 +886,9 @@ fn check_immutable_block(
                 let mut inner = bindings.clone();
                 if let Some(params) = params {
                     for param in params {
-                        inner.insert(param.name.clone(), false);
+                        for name in param.bound_names() {
+                            inner.insert(name, false);
+                        }
                     }
                 }
                 check_immutable_block(body, &inner, diags);
@@ -264,12 +912,22 @@ fn check_immutable_block(
             | Stmt::With { body, .. }
             | Stmt::Block(body)
             | Stmt::Defer(body) => check_immutable_block(body, &visible, diags),
-            Stmt::For { items, body, .. } => {
+            Stmt::For {
+                items,
+                body,
+                else_block,
+                ..
+            } => {
                 let mut inner = visible.clone();
                 for item in items {
-                    inner.insert(item.name.clone(), false);
+                    for name in item.bound_names() {
+                        inner.insert(name, false);
+                    }
                 }
                 check_immutable_block(body, &inner, diags);
+                if let Some(else_block) = else_block {
+                    check_immutable_block(else_block, &visible, diags);
+                }
             }
             Stmt::Try {
                 body,
@@ -299,7 +957,9 @@ fn check_immutable_block(
                     let mut inner = bindings.clone();
                     inner.insert("self".into(), false);
                     for param in &method.params {
-                        inner.insert(param.name.clone(), false);
+                        for name in param.bound_names() {
+                            inner.insert(name, false);
+                        }
                     }
                     check_immutable_block(&method.body, &inner, diags);
                 }
@@ -309,7 +969,9 @@ fn check_immutable_block(
                     let mut inner = bindings.clone();
                     inner.insert("self".into(), false);
                     for param in &method.params {
-                        inner.insert(param.name.clone(), false);
+                        for name in param.bound_names() {
+                            inner.insert(name, false);
+                        }
                     }
                     check_immutable_block(&method.body, &inner, diags);
                 }
@@ -369,6 +1031,32 @@ fn destruct_binding_names(pattern: &crate::ast::DestructPattern) -> Vec<String> 
                 DestructElem::RestDiscard => Vec::new(),
             })
             .collect(),
+        DestructPattern::Dict { entries, rest } => entries
+            .iter()
+            .map(|entry| entry.binding.clone())
+            .chain(rest.iter().cloned())
+            .collect(),
+    }
+}
+
+fn visit_destruct_defaults(pattern: &crate::ast::DestructPattern, visitor: &mut impl FnMut(&Expr)) {
+    use crate::ast::{DestructElem, DestructPattern};
+    match pattern {
+        DestructPattern::Dict { entries, .. } => {
+            for entry in entries {
+                if let Some(default) = &entry.default {
+                    visitor(default);
+                }
+            }
+        }
+        DestructPattern::Tuple(items) | DestructPattern::List(items) => {
+            for item in items {
+                if let DestructElem::Pat(pattern) = item {
+                    visit_destruct_defaults(pattern, visitor);
+                }
+            }
+        }
+        DestructPattern::Name(_) | DestructPattern::Discard => {}
     }
 }
 
@@ -437,10 +1125,17 @@ fn check_strong_assignments(
             }
             Stmt::While { body, .. }
             | Stmt::Loop { body, .. }
-            | Stmt::For { body, .. }
             | Stmt::With { body, .. }
             | Stmt::Block(body)
             | Stmt::Defer(body) => check_strong_child(body, bindings, diags),
+            Stmt::For {
+                body, else_block, ..
+            } => {
+                check_strong_child(body, bindings, diags);
+                if let Some(else_block) = else_block {
+                    check_strong_child(else_block, bindings, diags);
+                }
+            }
             Stmt::Try {
                 body,
                 catches,
@@ -501,7 +1196,7 @@ fn bind_strong_params(params: &[crate::ast::FuncParam], bindings: &mut HashMap<S
 fn check_control_flow(
     block: &Block,
     function_depth: usize,
-    loop_depth: usize,
+    loop_stack: &[Option<String>],
     in_defer: bool,
     diags: &mut Vec<Diagnostic>,
 ) {
@@ -534,74 +1229,136 @@ fn check_control_flow(
                 located.column,
                 "yield is only valid inside a function".into(),
             )),
-            Stmt::Break(_) | Stmt::Continue(_) if loop_depth == 0 => diags.push((
+            Stmt::Break(None) | Stmt::Continue(None) if loop_stack.is_empty() => diags.push((
                 located.line,
                 located.column,
                 "loop control is only valid inside a loop".into(),
             )),
+            Stmt::Break(Some(label)) | Stmt::Continue(Some(label))
+                if !loop_stack
+                    .iter()
+                    .any(|active| active.as_deref() == Some(label)) =>
+            {
+                diags.push((
+                    located.line,
+                    located.column,
+                    format!("unknown loop label `{label}`"),
+                ));
+            }
             Stmt::FuncDecl { body, .. } | Stmt::MacroDecl { body, .. } => {
-                check_control_flow(body, function_depth + 1, 0, false, diags);
+                check_control_flow(body, function_depth + 1, &[], false, diags);
             }
             Stmt::FriendFuncDecl {
                 body: Some(body), ..
-            } => check_control_flow(body, function_depth + 1, 0, false, diags),
+            } => check_control_flow(body, function_depth + 1, &[], false, diags),
             Stmt::If {
                 then_block,
                 elifs,
                 else_block,
                 ..
             } => {
-                check_control_flow(then_block, function_depth, loop_depth, in_defer, diags);
+                check_control_flow(then_block, function_depth, loop_stack, in_defer, diags);
                 for (_, body) in elifs {
-                    check_control_flow(body, function_depth, loop_depth, in_defer, diags);
+                    check_control_flow(body, function_depth, loop_stack, in_defer, diags);
                 }
                 if let Some(body) = else_block {
-                    check_control_flow(body, function_depth, loop_depth, in_defer, diags);
+                    check_control_flow(body, function_depth, loop_stack, in_defer, diags);
                 }
             }
-            Stmt::While { body, .. } | Stmt::Loop { body, .. } | Stmt::For { body, .. } => {
-                check_control_flow(body, function_depth, loop_depth + 1, in_defer, diags);
+            Stmt::While { label, body, .. } | Stmt::Loop { label, body, .. } => {
+                check_loop_control_body(
+                    label,
+                    body,
+                    loop_stack,
+                    (function_depth, in_defer),
+                    (located.line, located.column),
+                    diags,
+                );
             }
-            Stmt::Defer(body) => check_control_flow(body, function_depth, loop_depth, true, diags),
+            Stmt::For {
+                label,
+                body,
+                else_block,
+                ..
+            } => {
+                check_loop_control_body(
+                    label,
+                    body,
+                    loop_stack,
+                    (function_depth, in_defer),
+                    (located.line, located.column),
+                    diags,
+                );
+                if let Some(else_block) = else_block {
+                    check_control_flow(else_block, function_depth, loop_stack, in_defer, diags);
+                }
+            }
+            Stmt::Defer(body) => check_control_flow(body, function_depth, loop_stack, true, diags),
             Stmt::Try {
                 body,
                 catches,
                 else_block,
             } => {
-                check_control_flow(body, function_depth, loop_depth, in_defer, diags);
+                check_control_flow(body, function_depth, loop_stack, in_defer, diags);
                 for catch in catches {
-                    check_control_flow(&catch.body, function_depth, loop_depth, in_defer, diags);
+                    check_control_flow(&catch.body, function_depth, loop_stack, in_defer, diags);
                 }
                 if let Some(body) = else_block {
-                    check_control_flow(body, function_depth, loop_depth, in_defer, diags);
+                    check_control_flow(body, function_depth, loop_stack, in_defer, diags);
                 }
             }
             Stmt::Match {
                 cases, else_block, ..
             } => {
                 for case in cases {
-                    check_control_flow(&case.body, function_depth, loop_depth, in_defer, diags);
+                    check_control_flow(&case.body, function_depth, loop_stack, in_defer, diags);
                 }
                 if let Some(body) = else_block {
-                    check_control_flow(body, function_depth, loop_depth, in_defer, diags);
+                    check_control_flow(body, function_depth, loop_stack, in_defer, diags);
                 }
             }
             Stmt::With { body, .. } | Stmt::Block(body) => {
-                check_control_flow(body, function_depth, loop_depth, in_defer, diags);
+                check_control_flow(body, function_depth, loop_stack, in_defer, diags);
             }
             Stmt::StructDecl { methods, .. } => {
                 for method in methods {
-                    check_control_flow(&method.body, function_depth + 1, 0, false, diags);
+                    check_control_flow(&method.body, function_depth + 1, &[], false, diags);
                 }
             }
             Stmt::EnumDecl { methods, .. } => {
                 for method in methods {
-                    check_control_flow(&method.body, function_depth + 1, 0, false, diags);
+                    check_control_flow(&method.body, function_depth + 1, &[], false, diags);
                 }
             }
             _ => {}
         }
     }
+}
+
+fn check_loop_control_body(
+    label: &Option<String>,
+    body: &Block,
+    loop_stack: &[Option<String>],
+    flow: (usize, bool),
+    location: (usize, usize),
+    diags: &mut Vec<Diagnostic>,
+) {
+    let (function_depth, in_defer) = flow;
+    if let Some(label) = label {
+        if loop_stack
+            .iter()
+            .any(|active| active.as_deref() == Some(label))
+        {
+            diags.push((
+                location.0,
+                location.1,
+                format!("shadowed loop label `{label}`"),
+            ));
+        }
+    }
+    let mut nested = loop_stack.to_vec();
+    nested.push(label.clone());
+    check_control_flow(body, function_depth, &nested, in_defer, diags);
 }
 
 fn check_try_block(
@@ -633,13 +1390,21 @@ fn check_try_block(
                 false,
                 diags,
             ),
+            Stmt::DestructDecl { pattern, init, .. }
+            | Stmt::DestructAssign {
+                pattern,
+                value: init,
+            } => {
+                check_try_expr(init, return_channel, generator, diags);
+                visit_destruct_defaults(pattern, &mut |expr| {
+                    check_try_expr(expr, return_channel, generator, diags);
+                });
+            }
             Stmt::Return(Some(expr))
             | Stmt::Yield(Some(expr))
             | Stmt::YieldFrom(expr)
             | Stmt::Throw(expr)
-            | Stmt::Expr(expr)
-            | Stmt::DestructDecl { init: expr, .. }
-            | Stmt::DestructAssign { value: expr, .. } => {
+            | Stmt::Expr(expr) => {
                 check_try_expr(expr, return_channel, generator, diags);
             }
             Stmt::Assign { target, value } => {
@@ -680,11 +1445,19 @@ fn check_try_block(
                 }
                 check_try_block(body, return_channel, generator, diags);
             }
-            Stmt::For { items, body, .. } => {
+            Stmt::For {
+                items,
+                body,
+                else_block,
+                ..
+            } => {
                 for item in items {
                     check_try_expr(&item.iterable, return_channel, generator, diags);
                 }
                 check_try_block(body, return_channel, generator, diags);
+                if let Some(else_block) = else_block {
+                    check_try_block(else_block, return_channel, generator, diags);
+                }
             }
             Stmt::Defer(body) | Stmt::Block(body) => {
                 check_try_block(body, return_channel, generator, diags);
@@ -1061,20 +1834,32 @@ fn walk_stmt_uses(stmt: &Stmt, used: &mut HashSet<String>) {
                 walk_expr_uses(e, used);
             }
         }
-        Stmt::DestructDecl { init, .. } => walk_expr_uses(init, used),
+        Stmt::DestructDecl { pattern, init, .. } => {
+            walk_expr_uses(init, used);
+            visit_destruct_defaults(pattern, &mut |expr| walk_expr_uses(expr, used));
+        }
         Stmt::Assign { target, value } => {
             walk_lvalue_uses(target, used);
             walk_expr_uses(value, used);
         }
-        Stmt::DestructAssign { value, .. } => walk_expr_uses(value, used),
+        Stmt::DestructAssign { pattern, value } => {
+            walk_expr_uses(value, used);
+            visit_destruct_defaults(pattern, &mut |expr| walk_expr_uses(expr, used));
+        }
         Stmt::FuncDecl {
             params,
             body,
             return_type,
             return_wrapper,
             type_params,
+            descriptors,
             ..
         } => {
+            for descriptor in descriptors {
+                for arg in &descriptor.args {
+                    walk_expr_uses(arg, used);
+                }
+            }
             for (_, bound) in type_params {
                 if let Some(b) = bound {
                     walk_expr_uses(b, used);
@@ -1152,11 +1937,19 @@ fn walk_stmt_uses(stmt: &Stmt, used: &mut HashSet<String>) {
             }
             walk_block_uses(body, used);
         }
-        Stmt::For { items, body, .. } => {
+        Stmt::For {
+            items,
+            body,
+            else_block,
+            ..
+        } => {
             for it in items {
                 walk_expr_uses(&it.iterable, used);
             }
             walk_block_uses(body, used);
+            if let Some(else_block) = else_block {
+                walk_block_uses(else_block, used);
+            }
         }
         Stmt::Try {
             body,
@@ -1477,8 +2270,16 @@ fn unreachable_in_block(stmts: &Block, diags: &mut Vec<Diagnostic>) {
                     unreachable_in_block(b, diags);
                 }
             }
-            Stmt::While { body, .. } | Stmt::Loop { body, .. } | Stmt::For { body, .. } => {
+            Stmt::While { body, .. } | Stmt::Loop { body, .. } => {
                 unreachable_in_block(body, diags);
+            }
+            Stmt::For {
+                body, else_block, ..
+            } => {
+                unreachable_in_block(body, diags);
+                if let Some(else_block) = else_block {
+                    unreachable_in_block(else_block, diags);
+                }
             }
             Stmt::FuncDecl { body, .. } | Stmt::MacroDecl { body, .. } => {
                 unreachable_in_block(body, diags);
@@ -1668,8 +2469,15 @@ fn walk_stmt_extra(
                 walk_expr_extra(type_expr, scope, types, diags);
             }
         }
-        Stmt::DestructDecl { init, .. } | Stmt::DestructAssign { value: init, .. } => {
+        Stmt::DestructDecl { pattern, init, .. }
+        | Stmt::DestructAssign {
+            pattern,
+            value: init,
+        } => {
             walk_expr_extra(init, scope, types, diags);
+            visit_destruct_defaults(pattern, &mut |expr| {
+                walk_expr_extra(expr, scope, types, diags);
+            });
         }
         Stmt::Assign { target, value } => {
             walk_lvalue_extra(target, scope, types, diags);
@@ -1689,7 +2497,7 @@ fn walk_stmt_extra(
             check_type_params(type_params, types, st.line, st.column, diags);
             let mut inner = scope.clone();
             for p in params {
-                inner.insert(p.name.clone());
+                inner.extend(p.bound_names());
                 if let Some(type_expr) = &p.type_expr {
                     walk_expr_extra(type_expr, scope, types, diags);
                 }
@@ -1745,7 +2553,7 @@ fn walk_stmt_extra(
                 }
                 let mut inner = scope.clone();
                 for param in params {
-                    inner.insert(param.name.clone());
+                    inner.extend(param.bound_names());
                 }
                 unused_in_function(params, body, diags);
                 walk_block_extra(body, &inner, types, diags);
@@ -1783,13 +2591,21 @@ fn walk_stmt_extra(
             }
             walk_block_extra(body, scope, types, diags);
         }
-        Stmt::For { items, body, .. } => {
+        Stmt::For {
+            items,
+            body,
+            else_block,
+            ..
+        } => {
             let mut inner = scope.clone();
             for item in items {
                 walk_expr_extra(&item.iterable, scope, types, diags);
-                inner.insert(item.name.clone());
+                inner.extend(item.bound_names());
             }
             walk_block_extra(body, &inner, types, diags);
+            if let Some(else_block) = else_block {
+                walk_block_extra(else_block, scope, types, diags);
+            }
         }
         Stmt::Defer(body) => walk_block_extra(body, scope, types, diags),
         Stmt::Try {
@@ -1893,7 +2709,7 @@ fn walk_stmt_extra(
                 let mut inner = scope.clone();
                 inner.insert("self".into());
                 for param in &m.params {
-                    inner.insert(param.name.clone());
+                    inner.extend(param.bound_names());
                     if let Some(type_expr) = &param.type_expr {
                         walk_expr_extra(type_expr, scope, types, diags);
                     }
@@ -1938,7 +2754,7 @@ fn walk_stmt_extra(
                 let mut inner = scope.clone();
                 inner.insert("self".into());
                 for param in &method.params {
-                    inner.insert(param.name.clone());
+                    inner.extend(param.bound_names());
                     if let Some(type_expr) = &param.type_expr {
                         walk_expr_extra(type_expr, scope, types, diags);
                     }
@@ -1988,7 +2804,7 @@ fn walk_stmt_extra(
             );
             let mut inner = scope.clone();
             for param in params {
-                inner.insert(param.name.clone());
+                inner.extend(param.bound_names());
                 if let Some(type_expr) = &param.type_expr {
                     walk_expr_extra(type_expr, scope, types, diags);
                 }
@@ -2085,6 +2901,9 @@ fn walk_pattern_extra(
 ) {
     use crate::ast::{Pattern, PatternElem};
     match pattern {
+        Pattern::Destruct(pattern) => visit_destruct_defaults(pattern, &mut |expr| {
+            walk_expr_extra(expr, scope, types, diags)
+        }),
         Pattern::Value(value) => walk_expr_extra(value, scope, types, diags),
         Pattern::List(items) | Pattern::Tuple(items) => {
             for item in items {
@@ -2114,6 +2933,7 @@ fn walk_pattern_extra(
 fn pattern_binding_names(pattern: &crate::ast::Pattern) -> Vec<String> {
     use crate::ast::{Pattern, PatternElem};
     match pattern {
+        Pattern::Destruct(pattern) => pattern.bound_names(),
         Pattern::Bind(name) => vec![name.clone()],
         Pattern::List(items) | Pattern::Tuple(items) => items
             .iter()
@@ -2172,12 +2992,10 @@ fn check_parameter_list(
     let mut variadic = 0usize;
     let mut kw_variadic = 0usize;
     for param in params {
-        if !names.insert(&param.name) {
-            diags.push((
-                line,
-                column,
-                format!("duplicate parameter `{}`", param.name),
-            ));
+        for name in param.bound_names() {
+            if !names.insert(name.clone()) {
+                diags.push((line, column, format!("duplicate parameter `{name}`")));
+            }
         }
         variadic += usize::from(param.is_variadic);
         kw_variadic += usize::from(param.is_kwvariadic);
@@ -2273,10 +3091,17 @@ fn collect_local_lets(body: &Block, out: &mut Vec<(String, usize, usize, bool)>)
             }
             Stmt::While { body, .. }
             | Stmt::Loop { body, .. }
-            | Stmt::For { body, .. }
             | Stmt::With { body, .. }
             | Stmt::Block(body)
             | Stmt::Defer(body) => collect_local_lets(body, out),
+            Stmt::For {
+                body, else_block, ..
+            } => {
+                collect_local_lets(body, out);
+                if let Some(else_block) = else_block {
+                    collect_local_lets(else_block, out);
+                }
+            }
             Stmt::Try {
                 body,
                 catches,
@@ -2394,10 +3219,17 @@ fn check_hard_returns_in_block(ann: &str, body: &Block, diags: &mut Vec<Diagnost
             }
             Stmt::While { body, .. }
             | Stmt::Loop { body, .. }
-            | Stmt::For { body, .. }
             | Stmt::With { body, .. }
             | Stmt::Block(body)
             | Stmt::Defer(body) => check_hard_returns_in_block(ann, body, diags),
+            Stmt::For {
+                body, else_block, ..
+            } => {
+                check_hard_returns_in_block(ann, body, diags);
+                if let Some(else_block) = else_block {
+                    check_hard_returns_in_block(ann, else_block, diags);
+                }
+            }
             Stmt::Try {
                 body,
                 catches,
@@ -2481,10 +3313,14 @@ fn walk_expr_extra(
             return_wrapper,
             ..
         } => {
+            // A `do` expression is a function boundary just like `func`: loop
+            // labels from the surrounding expression cannot be targeted from
+            // its body, while return/yield are valid inside it.
+            check_control_flow(body, 1, &[], false, diags);
             check_parameter_list(params, expr.loc.line, expr.loc.column, diags);
             let mut inner = scope.clone();
             for p in params {
-                inner.insert(p.name.clone());
+                inner.extend(p.bound_names());
                 if let Some(type_expr) = &p.type_expr {
                     walk_expr_extra(type_expr, scope, types, diags);
                 }
@@ -2608,7 +3444,7 @@ fn walk_expr_extra(
             let mut inner = scope.clone();
             for item in items {
                 walk_expr_extra(&item.iterable, &inner, types, diags);
-                inner.insert(item.name.clone());
+                inner.extend(item.bound_names());
             }
             walk_expr_extra(elem, &inner, types, diags);
             for guard in guards {
@@ -2624,7 +3460,7 @@ fn walk_expr_extra(
             let mut inner = scope.clone();
             for item in items {
                 walk_expr_extra(&item.iterable, &inner, types, diags);
-                inner.insert(item.name.clone());
+                inner.extend(item.bound_names());
             }
             walk_expr_extra(key, &inner, types, diags);
             walk_expr_extra(value, &inner, types, diags);
@@ -2637,7 +3473,7 @@ fn walk_expr_extra(
             let mut inner = scope.clone();
             for item in items {
                 walk_expr_extra(&item.iterable, &inner, types, diags);
-                inner.insert(item.name.clone());
+                inner.extend(item.bound_names());
             }
             walk_block_extra(body, &inner, types, diags);
         }
@@ -2732,13 +3568,7 @@ fn const_number(expr: &Expr) -> Option<crate::value::Num> {
         ExprKind::Unary {
             op: crate::ast::UnaryOp::Neg,
             operand,
-        } => match const_number(operand)? {
-            crate::value::Num::Small(value) => Some(crate::value::Num::Small(-value)),
-            crate::value::Num::Int(value) => Some(crate::value::Num::from_bigint(-value.as_ref())),
-            crate::value::Num::Rat(value) => {
-                Some(crate::value::Num::from_rational(-value.as_ref()))
-            }
-        },
+        } => Some(crate::value::neg_num(&const_number(operand)?)),
         _ => None,
     }
 }
@@ -2766,7 +3596,7 @@ fn collect_go_assigns(
     match &expr.kind {
         ExprKind::DoFunc { body, params, .. } => {
             for p in params {
-                locals.insert(p.name.clone());
+                locals.extend(p.bound_names());
             }
             collect_go_assigns_block(body, locals, assigned);
         }
@@ -2824,8 +3654,16 @@ fn collect_go_assigns_block(
                     collect_go_assigns_block(b, locals, assigned);
                 }
             }
-            Stmt::While { body, .. } | Stmt::Loop { body, .. } | Stmt::For { body, .. } => {
+            Stmt::While { body, .. } | Stmt::Loop { body, .. } => {
                 collect_go_assigns_block(body, locals, assigned);
+            }
+            Stmt::For {
+                body, else_block, ..
+            } => {
+                collect_go_assigns_block(body, locals, assigned);
+                if let Some(else_block) = else_block {
+                    collect_go_assigns_block(else_block, locals, assigned);
+                }
             }
             Stmt::Expr(e) => collect_go_assigns(e, locals, assigned),
             _ => {}
@@ -2911,6 +3749,139 @@ mod tests {
     fn hard_type_mismatch() {
         let d = msgs("let x :: num = \"hi\"\n");
         assert!(d.iter().any(|m| m.contains("cannot assign")), "{d:?}");
+    }
+
+    #[test]
+    fn labeled_loop_control_resolves_active_enclosing_labels() {
+        let valid = msgs(
+            "outer for (row in [[1]]) { inner for (cell in row) { if (cell) { continue inner } else { break outer } } }\n",
+        );
+        assert!(
+            !valid.iter().any(|message| message.contains("loop label")),
+            "{valid:?}"
+        );
+
+        let typo = msgs("outer loop { break missing }\n");
+        assert!(
+            typo.iter()
+                .any(|message| message == "unknown loop label `missing`"),
+            "{typo:?}"
+        );
+
+        let function_boundary = msgs("outer loop { func stop() { break outer }\nbreak }\n");
+        assert!(
+            function_boundary
+                .iter()
+                .any(|message| message == "unknown loop label `outer`"),
+            "loop labels must not cross a function boundary: {function_boundary:?}"
+        );
+
+        let shadowed = msgs("outer loop { outer while (true) { break outer }\nbreak outer }\n");
+        assert!(
+            shadowed
+                .iter()
+                .any(|message| message == "shadowed loop label `outer`"),
+            "{shadowed:?}"
+        );
+
+        let closure_boundary = msgs("outer loop { let stop = do { break outer }\nbreak }\n");
+        assert!(
+            closure_boundary
+                .iter()
+                .any(|message| message == "unknown loop label `outer`"),
+            "do functions must not capture loop-control targets: {closure_boundary:?}"
+        );
+
+        let closure_return = msgs("let answer = do { return 42 }\nprint(answer())\n");
+        assert!(
+            !closure_return
+                .iter()
+                .any(|message| message.contains("return is only valid")),
+            "{closure_return:?}"
+        );
+    }
+
+    #[test]
+    fn variant_matches_report_missing_unknown_and_duplicate_cases() {
+        let declarations = r#"
+variant Outcome {
+    typed Ok(value: num)
+    typed Err(message: text)
+}
+"#;
+        let missing = msgs(&format!(
+            "{declarations}\nlet value = Outcome.Ok(1)\nmatch (value) {{ case Outcome.Ok(x) {{ x }} }}\n"
+        ));
+        assert!(
+            missing.iter().any(|message| message
+                .contains("non-exhaustive match for variant `Outcome`; missing: Err")),
+            "{missing:?}"
+        );
+
+        let unknown = msgs(&format!(
+            "{declarations}\nlet value: Outcome = Outcome.Ok(1)\nmatch (value) {{ case Outcome.Missing(x) {{ x }} }} else {{ 0 }}\n"
+        ));
+        assert!(
+            unknown
+                .iter()
+                .any(|message| message.contains("unknown variant case `Outcome.Missing`")),
+            "{unknown:?}"
+        );
+        assert!(
+            !unknown
+                .iter()
+                .any(|message| message.contains("non-exhaustive match")),
+            "an unknown case should not cascade into a second exhaustiveness diagnostic: {unknown:?}"
+        );
+
+        let duplicate = msgs(&format!(
+            "{declarations}\nfunc inspect(value: Outcome) {{ match (value) {{ case Outcome.Ok(x) {{ x }} case Outcome.Ok(y) {{ y }} }} else {{ 0 }} }}\n"
+        ));
+        assert!(
+            duplicate
+                .iter()
+                .any(|message| message.contains("duplicate match case `Outcome.Ok`")),
+            "{duplicate:?}"
+        );
+    }
+
+    #[test]
+    fn variant_match_exhaustiveness_accepts_complete_else_and_dynamic_matches() {
+        let declarations = r#"
+variant Outcome {
+    typed Ok(value: num)
+    typed Err(message: text)
+}
+"#;
+        let complete = msgs(&format!(
+            "{declarations}\nlet value = Outcome.Ok(1)\nlet result = match (value) {{ case Outcome.Ok(x) {{ x }} case Outcome.Err(e) {{ 0 }} }}\n"
+        ));
+        assert!(
+            !complete
+                .iter()
+                .any(|message| message.contains("non-exhaustive match")),
+            "{complete:?}"
+        );
+
+        let with_else = msgs(&format!(
+            "{declarations}\nlet value = Outcome.Ok(1)\nmatch (value) {{ case Outcome.Ok(x) {{ x }} }} else {{ 0 }}\n"
+        ));
+        assert!(
+            !with_else
+                .iter()
+                .any(|message| message.contains("non-exhaustive match")),
+            "{with_else:?}"
+        );
+
+        let dynamic = msgs(&format!(
+            "{declarations}\nlet value = Outcome.Ok(1)\nmatch (value) {{ case anything {{ anything }} }}\n"
+        ));
+        assert!(
+            !dynamic
+                .iter()
+                .any(|message| message.contains("non-exhaustive match")),
+            "{dynamic:?}"
+        );
     }
 
     #[test]
@@ -3262,6 +4233,37 @@ mod tests {
     }
 
     #[test]
+    fn function_descriptors_participate_in_scope_analysis() {
+        let valid = msgs(
+            "const LABEL = \"worker\"\nlet value = 7\nfunc outer() { if (false) { func helper() outside(1) display_as(LABEL) { return value } }\nreturn helper() }\n",
+        );
+        assert!(
+            !valid
+                .iter()
+                .any(|message| message.contains("undefined name")),
+            "{valid:?}"
+        );
+
+        let invalid = msgs(
+            "func outer() { if (true) { let inner = 2\nfunc helper() outside(1) { return inner } }\nreturn helper() }\n",
+        );
+        assert!(
+            invalid
+                .iter()
+                .any(|message| message.contains("undefined name `inner`")),
+            "{invalid:?}"
+        );
+
+        let dynamic_display = msgs("var label = \"worker\"\nfunc worker() display_as(label) {}\n");
+        assert!(
+            dynamic_display
+                .iter()
+                .any(|message| { message.contains("`display_as` requires a compile-time string") }),
+            "{dynamic_display:?}"
+        );
+    }
+
+    #[test]
     fn unused_nested_local_is_reported() {
         let diagnostics = msgs("func f(flag) { if (flag) { let nested = 1 }\nreturn 0 }\n");
         assert!(
@@ -3337,6 +4339,23 @@ mod tests {
         assert_eq!(error.severity, Severity::Error);
         assert_eq!(error.code, "E2001");
         assert!(error.help.is_some());
+
+        let match_warning =
+            diagnostic_metadata("non-exhaustive match for variant `Outcome`; missing: Err");
+        assert_eq!(match_warning.severity, Severity::Warning);
+        assert_eq!(match_warning.code, "W3001");
+
+        let variant_error = diagnostic_metadata("unknown variant case `Outcome.Missing`");
+        assert_eq!(variant_error.severity, Severity::Error);
+        assert_eq!(variant_error.code, "E5002");
+
+        let label_warning = diagnostic_metadata("shadowed loop label `outer`");
+        assert_eq!(label_warning.severity, Severity::Warning);
+        assert_eq!(label_warning.code, "W6001");
+
+        let label_error = diagnostic_metadata("unknown loop label `missing`");
+        assert_eq!(label_error.severity, Severity::Error);
+        assert_eq!(label_error.code, "E6002");
     }
 
     #[test]

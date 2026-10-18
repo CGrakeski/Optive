@@ -13,7 +13,7 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("true", "bool true"),
     ("false", "bool false"),
     ("none", "empty value"),
-    ("print", "print(...)"),
+    ("print", "print(*values, end: text = \"\\n\")"),
     ("len", "len(x)"),
     ("str", "str(x)"),
     ("repr", "repr(x)"),
@@ -42,6 +42,9 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("extern", "extern(...)"),
     ("std", "standard library"),
 ];
+
+/// Keyword-only arguments accepted by global builtins, with their required runtime type.
+pub const BUILTIN_KEYWORDS: &[(&str, &str, &str)] = &[("print", "end", "text")];
 
 pub const STD_MODULES: &[&str] = &[
     "math",
@@ -945,7 +948,7 @@ fn parse_sig_arity(sig: &str) -> Option<(usize, Option<usize>)> {
             continue;
         }
         max += 1;
-        if !p.ends_with('?') && !p.ends_with("?]") && !p.contains('[') {
+        if !p.ends_with('?') && !p.ends_with("?]") && !p.contains('[') && !p.contains('=') {
             min += 1;
         }
     }

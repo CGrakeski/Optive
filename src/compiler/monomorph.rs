@@ -3,8 +3,9 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    Block, CallArg, CatchClause, DelTarget, Expr, ExprKind, FStringPart, ForItem, FuncParam,
-    LValue, LocatedStmt, MatchCase, Pattern, PatternElem, SelectCase, Stmt,
+    Block, CallArg, CatchClause, DelTarget, DestructElem, DestructPattern, DictDestructEntry, Expr,
+    ExprKind, FStringPart, ForItem, FuncParam, LValue, LocatedStmt, MatchCase, Pattern,
+    PatternElem, SelectCase, Stmt,
 };
 use crate::types::{static_type_value_from_expr, type_value_display, type_values_equal};
 use crate::value::Value;
@@ -166,6 +167,10 @@ pub fn substitute_func_param(
 ) -> FuncParam {
     FuncParam {
         name: param.name.clone(),
+        pattern: param
+            .pattern
+            .as_ref()
+            .map(|pattern| substitute_destruct_pattern(pattern, type_names)),
         is_variadic: param.is_variadic,
         is_kwvariadic: param.is_kwvariadic,
         implicit: param.implicit,
@@ -217,11 +222,11 @@ fn substitute_stmt_body(stmt: &Stmt, type_names: &HashMap<String, String>) -> St
             visibility: *visibility,
             is_const: *is_const,
             is_var: *is_var,
-            pattern: pattern.clone(),
+            pattern: substitute_destruct_pattern(pattern, type_names),
             init: substitute_expr(init, type_names),
         },
         Stmt::DestructAssign { pattern, value } => Stmt::DestructAssign {
-            pattern: pattern.clone(),
+            pattern: substitute_destruct_pattern(pattern, type_names),
             value: substitute_expr(value, type_names),
         },
         Stmt::Expr(e) => Stmt::Expr(substitute_expr(e, type_names)),
@@ -254,16 +259,28 @@ fn substitute_stmt_body(stmt: &Stmt, type_names: &HashMap<String, String>) -> St
             count: count.as_ref().map(|c| substitute_expr(c, type_names)),
             body: substitute_block(body, type_names),
         },
-        Stmt::For { label, items, body } => Stmt::For {
+        Stmt::For {
+            label,
+            items,
+            body,
+            else_block,
+        } => Stmt::For {
             label: label.clone(),
             items: items
                 .iter()
                 .map(|it| ForItem {
                     name: it.name.clone(),
+                    pattern: it
+                        .pattern
+                        .as_ref()
+                        .map(|pattern| substitute_destruct_pattern(pattern, type_names)),
                     iterable: substitute_expr(&it.iterable, type_names),
                 })
                 .collect(),
             body: substitute_block(body, type_names),
+            else_block: else_block
+                .as_ref()
+                .map(|block| substitute_block(block, type_names)),
         },
         Stmt::Block(b) => Stmt::Block(substitute_block(b, type_names)),
         Stmt::Try {
@@ -550,6 +567,10 @@ pub fn substitute_expr(expr: &Expr, type_names: &HashMap<String, String>) -> Exp
                 .iter()
                 .map(|i| ForItem {
                     name: i.name.clone(),
+                    pattern: i
+                        .pattern
+                        .as_ref()
+                        .map(|pattern| substitute_destruct_pattern(pattern, type_names)),
                     iterable: substitute_expr(&i.iterable, type_names),
                 })
                 .collect(),
@@ -594,6 +615,10 @@ pub fn substitute_expr(expr: &Expr, type_names: &HashMap<String, String>) -> Exp
                 .iter()
                 .map(|p| FuncParam {
                     name: p.name.clone(),
+                    pattern: p
+                        .pattern
+                        .as_ref()
+                        .map(|pattern| substitute_destruct_pattern(pattern, type_names)),
                     is_variadic: p.is_variadic,
                     is_kwvariadic: p.is_kwvariadic,
                     implicit: p.implicit,
@@ -636,6 +661,9 @@ pub fn substitute_expr(expr: &Expr, type_names: &HashMap<String, String>) -> Exp
 
 fn substitute_pattern(pat: &Pattern, type_names: &HashMap<String, String>) -> Pattern {
     match pat {
+        Pattern::Destruct(pattern) => {
+            Pattern::Destruct(substitute_destruct_pattern(pattern, type_names))
+        }
         Pattern::Bind(n) => Pattern::Bind(n.clone()),
         Pattern::Value(e) => Pattern::Value(Box::new(substitute_expr(e, type_names))),
         Pattern::List(elems) => Pattern::List(
@@ -699,6 +727,55 @@ fn substitute_del_target(target: &DelTarget, type_names: &HashMap<String, String
     }
 }
 
+fn substitute_destruct_pattern(
+    pattern: &DestructPattern,
+    type_names: &HashMap<String, String>,
+) -> DestructPattern {
+    match pattern {
+        DestructPattern::Name(name) => DestructPattern::Name(name.clone()),
+        DestructPattern::Discard => DestructPattern::Discard,
+        DestructPattern::Tuple(items) => DestructPattern::Tuple(
+            items
+                .iter()
+                .map(|item| substitute_destruct_elem(item, type_names))
+                .collect(),
+        ),
+        DestructPattern::List(items) => DestructPattern::List(
+            items
+                .iter()
+                .map(|item| substitute_destruct_elem(item, type_names))
+                .collect(),
+        ),
+        DestructPattern::Dict { entries, rest } => DestructPattern::Dict {
+            entries: entries
+                .iter()
+                .map(|entry| DictDestructEntry {
+                    key: entry.key.clone(),
+                    binding: entry.binding.clone(),
+                    default: entry
+                        .default
+                        .as_ref()
+                        .map(|expr| substitute_expr(expr, type_names)),
+                })
+                .collect(),
+            rest: rest.clone(),
+        },
+    }
+}
+
+fn substitute_destruct_elem(
+    item: &DestructElem,
+    type_names: &HashMap<String, String>,
+) -> DestructElem {
+    match item {
+        DestructElem::Pat(pattern) => {
+            DestructElem::Pat(substitute_destruct_pattern(pattern, type_names))
+        }
+        DestructElem::Rest(name) => DestructElem::Rest(name.clone()),
+        DestructElem::RestDiscard => DestructElem::RestDiscard,
+    }
+}
+
 fn substitute_type_operand_expr(expr: &Expr, type_names: &HashMap<String, String>) -> Expr {
     match &expr.kind {
         ExprKind::Var(name) if type_names.contains_key(name) => {
@@ -720,6 +797,7 @@ fn substitute_for_items(items: &[ForItem], type_names: &HashMap<String, String>)
         .iter()
         .map(|it| ForItem {
             name: it.name.clone(),
+            pattern: it.pattern.clone(),
             iterable: substitute_expr(&it.iterable, type_names),
         })
         .collect()

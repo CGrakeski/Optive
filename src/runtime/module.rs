@@ -383,11 +383,17 @@ fn rebound_struct_def_methods(
     def: Arc<crate::value::StructDef>,
     module_env: &Arc<ModuleGlobalEnv>,
 ) -> Arc<crate::value::StructDef> {
-    if def.methods.is_empty() && def.overloads.is_empty() {
+    if def.methods.is_empty()
+        && def.overloads.is_empty()
+        && def.field_defaults.iter().all(Option::is_none)
+    {
         return def;
     }
     let mut d = (*def).clone();
     for f in d.methods.values_mut() {
+        *f = function_with_module_env(f, module_env);
+    }
+    for f in d.field_defaults.iter_mut().flatten() {
         *f = function_with_module_env(f, module_env);
     }
     for list in d.overloads.values_mut() {

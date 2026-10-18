@@ -385,6 +385,12 @@ pub(crate) fn specialize_with_entry(code: &mut [Instruction], entry_env: &[Optio
                 stack.push(None);
             }
             Instruction::RegisterExport(_) => {}
+            Instruction::GoCallEx => {
+                for _ in 0..3 {
+                    let _ = stack.pop();
+                }
+                stack.push(None);
+            }
             Instruction::GoCall(argc) => {
                 for _ in 0..*argc {
                     let _ = stack.pop();

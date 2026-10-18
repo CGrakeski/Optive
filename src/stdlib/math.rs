@@ -64,7 +64,7 @@ pub(super) fn math_hypot(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     Ok(Value::Num(float_from_f64(a.hypot(b))?))
 }
 
-/// `divmod(a, b)` → `[a / b, a % b]`（整数商与余数，遵循有理数取模同号语义）。
+/// `divmod(a, b)` → `[floor(a / b), a % b]`（整数商与余数，余数与除数同号）。
 pub(super) fn math_divmod(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     expect_arity("divmod", args, 2)?;
     let (Value::Num(a), Value::Num(b)) = (&args[0], &args[1]) else {
@@ -73,8 +73,11 @@ pub(super) fn math_divmod(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if b.is_zero() {
         return Err(crate::error::RuntimeError::value_err("divmod by zero"));
     }
-    let q = Value::Num(a.clone()).div(&args[1])?;
     let r = Value::Num(a.clone()).rem(&args[1])?;
+    let Value::Num(q) = Value::Num(a.clone()).div(&args[1])? else {
+        unreachable!("numeric division returns a number");
+    };
+    let q = Value::Num(q.floor_num());
     Ok(Value::List(Shared::new(vec![q, r])))
 }
 

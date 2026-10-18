@@ -43,6 +43,12 @@ pub fn format_expr(expr: &Expr) -> String {
     out.buf
 }
 
+pub fn format_destruct(pattern: &DestructPattern) -> String {
+    let mut out = Formatter::new();
+    out.emit_destruct(pattern);
+    out.buf
+}
+
 struct Formatter {
     buf: String,
 }
@@ -172,6 +178,7 @@ impl Formatter {
                 name,
                 type_params,
                 params,
+                descriptors,
                 return_type,
                 return_strong,
                 return_wrapper,
@@ -195,6 +202,26 @@ impl Formatter {
                 self.buf.push_str(name);
                 self.emit_type_params(type_params);
                 self.emit_param_list(params, depth);
+                for descriptor in descriptors {
+                    self.buf.push(' ');
+                    self.buf.push_str(&descriptor.name);
+                    self.buf.push(if descriptor.name == "cancel_flag" {
+                        '{'
+                    } else {
+                        '('
+                    });
+                    for (index, arg) in descriptor.args.iter().enumerate() {
+                        if index > 0 {
+                            self.buf.push_str(", ");
+                        }
+                        self.emit_expr(arg, depth);
+                    }
+                    self.buf.push(if descriptor.name == "cancel_flag" {
+                        '}'
+                    } else {
+                        ')'
+                    });
+                }
                 self.emit_return_sig(
                     return_type.as_ref(),
                     *return_strong,
@@ -218,15 +245,35 @@ impl Formatter {
                     for m in members {
                         self.indent(depth + 1);
                         match m {
-                            ProtocolMember::Method { name, params } => {
+                            ProtocolMember::Method {
+                                name,
+                                params,
+                                return_type,
+                                return_strong,
+                            } => {
                                 self.buf.push_str("func ");
                                 self.buf.push_str(name);
                                 self.emit_param_list(params, depth + 1);
+                                self.emit_return_sig(
+                                    return_type.as_ref(),
+                                    *return_strong,
+                                    None,
+                                    depth + 1,
+                                );
                                 self.buf.push_str(" {}");
                             }
-                            ProtocolMember::Field { name, mutable } => {
+                            ProtocolMember::Field {
+                                name,
+                                mutable,
+                                type_expr,
+                                type_strong,
+                            } => {
                                 self.buf.push_str(if *mutable { "var " } else { "let " });
                                 self.buf.push_str(name);
+                                if let Some(ty) = type_expr {
+                                    self.buf.push_str(if *type_strong { " :: " } else { " : " });
+                                    self.emit_type(ty);
+                                }
                             }
                         }
                         self.buf.push('\n');
@@ -302,7 +349,12 @@ impl Formatter {
                 self.buf.push(' ');
                 self.emit_block(body, depth);
             }
-            Stmt::For { label, items, body } => {
+            Stmt::For {
+                label,
+                items,
+                body,
+                else_block,
+            } => {
                 if let Some(label) = label {
                     self.buf.push_str(label);
                     self.buf.push(' ');
@@ -312,12 +364,20 @@ impl Formatter {
                     if i > 0 {
                         self.buf.push_str(", ");
                     }
-                    self.buf.push_str(&it.name);
+                    if let Some(pattern) = &it.pattern {
+                        self.emit_destruct(pattern);
+                    } else {
+                        self.buf.push_str(&it.name);
+                    }
                     self.buf.push_str(" in ");
                     self.emit_expr(&it.iterable, depth);
                 }
                 self.buf.push_str(") ");
                 self.emit_block(body, depth);
+                if let Some(else_block) = else_block {
+                    self.buf.push_str(" else ");
+                    self.emit_block(else_block, depth);
+                }
             }
             Stmt::Break(label) => {
                 self.buf.push_str("break");
@@ -699,7 +759,11 @@ impl Formatter {
         } else if p.is_variadic {
             self.buf.push('*');
         }
-        self.buf.push_str(&p.name);
+        if let Some(pattern) = &p.pattern {
+            self.emit_destruct(pattern);
+        } else {
+            self.buf.push_str(&p.name);
+        }
         if let Some(t) = &p.type_expr {
             self.buf.push_str(if p.type_strong { " :: " } else { ": " });
             self.emit_type(t);
@@ -806,6 +870,38 @@ impl Formatter {
                 }
                 self.buf.push(']');
             }
+            DestructPattern::Dict { entries, rest } => {
+                self.buf.push('{');
+                let mut first = true;
+                for entry in entries {
+                    if !first {
+                        self.buf.push_str(", ");
+                    }
+                    first = false;
+                    self.buf.push_str(&entry.key);
+                    self.buf.push_str(" = ");
+                    if let Some(default) = &entry.default {
+                        let needs_parens = matches!(default.kind, ExprKind::Var(_));
+                        if needs_parens {
+                            self.buf.push('(');
+                        }
+                        self.emit_expr(default, 0);
+                        if needs_parens {
+                            self.buf.push(')');
+                        }
+                    } else {
+                        self.buf.push_str(&entry.binding);
+                    }
+                }
+                if let Some(rest) = rest {
+                    if !first {
+                        self.buf.push_str(", ");
+                    }
+                    self.buf.push_str("**");
+                    self.buf.push_str(rest);
+                }
+                self.buf.push('}');
+            }
         }
     }
 
@@ -860,6 +956,7 @@ impl Formatter {
 
     fn emit_pattern(&mut self, p: &Pattern, depth: usize) {
         match p {
+            Pattern::Destruct(pattern) => self.emit_destruct(pattern),
             Pattern::Bind(n) => self.buf.push_str(n),
             Pattern::Value(e) => self.emit_expr(e, depth),
             Pattern::List(elems) => {
@@ -1171,7 +1268,11 @@ impl Formatter {
                     if i > 0 {
                         self.buf.push_str(", ");
                     }
-                    self.buf.push_str(&item.name);
+                    if let Some(pattern) = &item.pattern {
+                        self.emit_destruct(pattern);
+                    } else {
+                        self.buf.push_str(&item.name);
+                    }
                     self.buf.push_str(" in ");
                     self.emit_expr_replacing(&item.iterable, depth, replace_var, with);
                 }
@@ -1326,7 +1427,11 @@ impl Formatter {
     ) {
         for it in items {
             self.buf.push_str(" for (");
-            self.buf.push_str(&it.name);
+            if let Some(pattern) = &it.pattern {
+                self.emit_destruct(pattern);
+            } else {
+                self.buf.push_str(&it.name);
+            }
             self.buf.push_str(" in ");
             self.emit_expr_replacing(&it.iterable, depth, replace_var, with);
             self.buf.push(')');
@@ -1421,6 +1526,9 @@ impl Formatter {
                 '{' => self.buf.push_str("{{"),
                 '}' => self.buf.push_str("}}"),
                 '\n' => self.buf.push_str("\\n"),
+                '\r' => self.buf.push_str("\\r"),
+                '\t' => self.buf.push_str("\\t"),
+                c if c.is_control() => self.buf.push_str(&format!("\\u{{{:x}}}", c as u32)),
                 c => self.buf.push(c),
             }
         }

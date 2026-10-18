@@ -42,6 +42,15 @@ await t
 }
 
 #[test]
+fn mn_task_value_after_completion() {
+    assert_num_workers(
+        4,
+        "let t = go do { return 42 }\nwhile (not t.done()) ...\nt.value() + t.value()",
+        "84",
+    );
+}
+
+#[test]
 fn mn_mutex_counter_many_tasks() {
     assert_num_workers(
         4,

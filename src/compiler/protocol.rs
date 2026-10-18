@@ -18,22 +18,24 @@ pub struct ProtocolDef {
     pub name: String,
     pub methods: Vec<String>,
     pub fields: Vec<(String, bool)>,
+    pub members: Vec<ProtocolMember>,
 }
 
 #[must_use]
 pub fn protocol_from_members(name: String, members: Vec<ProtocolMember>) -> ProtocolDef {
     let mut methods = Vec::new();
     let mut fields = Vec::new();
-    for m in members {
+    for m in &members {
         match m {
-            ProtocolMember::Method { name, .. } => methods.push(name),
-            ProtocolMember::Field { name, mutable } => fields.push((name, mutable)),
+            ProtocolMember::Method { name, .. } => methods.push(name.clone()),
+            ProtocolMember::Field { name, mutable, .. } => fields.push((name.clone(), *mutable)),
         }
     }
     ProtocolDef {
         name,
         methods,
         fields,
+        members,
     }
 }
 
@@ -97,7 +99,115 @@ pub fn type_satisfies_protocol_ctx(
             return false;
         }
     }
+    for member in &def.members {
+        if !member_contract_satisfied(ctx, &type_name, member) {
+            return false;
+        }
+    }
     true
+}
+
+fn type_contract(ctx: &TypeCheckContext, actual: &Expr, expected: &Expr, input: bool) -> bool {
+    let (Some(actual), Some(expected)) = (
+        static_type_value_from_expr(actual),
+        static_type_value_from_expr(expected),
+    ) else {
+        return false;
+    };
+    if type_values_equal(&actual, &expected) {
+        return true;
+    }
+    let (actual, expected) = (
+        type_value_base_name(&actual),
+        type_value_base_name(&expected),
+    );
+    if input {
+        type_name_is_a(ctx, &expected, &actual)
+    } else {
+        type_name_is_a(ctx, &actual, &expected)
+    }
+}
+
+fn member_contract_satisfied(ctx: &TypeCheckContext, owner: &str, member: &ProtocolMember) -> bool {
+    match member {
+        ProtocolMember::Field {
+            name,
+            type_expr: Some(expected),
+            type_strong: true,
+            mutable,
+            ..
+        } => {
+            let Some(def) = ctx.struct_defs.get(owner) else {
+                return false;
+            };
+            let Some(index) = def.fields.iter().position(|field| field == name) else {
+                return false;
+            };
+            def.field_types.get(index).is_some_and(|info| {
+                info.strict
+                    && info.type_expr.as_ref().is_some_and(|actual| {
+                        type_contract(ctx, actual, expected, false)
+                            && (!*mutable || type_contract(ctx, actual, expected, true))
+                    })
+            })
+        }
+        ProtocolMember::Method {
+            name,
+            params,
+            return_type,
+            return_strong,
+        } => {
+            let strict = *return_strong || params.iter().any(|param| param.type_strong);
+            let Some(def) = ctx.struct_defs.get(owner) else {
+                // Builtin registry currently exposes names but no parameter AST.
+                return !strict;
+            };
+            let candidates: Vec<_> = def
+                .methods
+                .get(name)
+                .into_iter()
+                .chain(def.overloads.get(name).into_iter().flatten())
+                .collect();
+            candidates.iter().any(|function| {
+                let expected: Vec<_> = params.iter().filter(|p| p.name != "self").collect();
+                let actual: Vec<_> = function
+                    .params
+                    .iter()
+                    .filter(|p| p.name != "self")
+                    .collect();
+                if actual.len() < expected.len()
+                    || actual
+                        .iter()
+                        .skip(expected.len())
+                        .any(|p| p.default_expr.is_none() && !p.is_variadic && !p.is_kwvariadic)
+                {
+                    return false;
+                }
+                for (expected, actual) in expected.iter().zip(actual.iter()) {
+                    if expected.type_strong
+                        && (!actual.type_strong
+                            || !match (&actual.type_expr, &expected.type_expr) {
+                                (Some(actual), Some(expected)) => {
+                                    type_contract(ctx, actual, expected, true)
+                                }
+                                _ => false,
+                            })
+                    {
+                        return false;
+                    }
+                }
+                !*return_strong
+                    || (function.return_strong()
+                        && match (&function.return_type, return_type) {
+                            (Some(actual), Some(expected)) => {
+                                type_contract(ctx, actual, expected, false)
+                            }
+                            _ => false,
+                        })
+            })
+        }
+        _ => true,
+    }
 }
 
 pub fn check_type_bound_ctx(

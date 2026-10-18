@@ -7,18 +7,25 @@ use num_traits::Zero;
 use crate::runtime_ast;
 use crate::traceback;
 use crate::types;
-use crate::value::{DictMap, Num, Value, ValueKey};
+use crate::value::{DictMap, FrozenValue, Num, Value, ValueKey};
 use crate::vm::Vm;
 use crate::Result;
 
 use crate::shared::{Shared, SyncCell};
+fn builtin_cancel_flag(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if !args.is_empty() {
+        return Err(crate::error::RuntimeError::type_err(
+            "__cancel_flag__ takes no arguments",
+        ));
+    }
+    Ok(vm.current_cancel_flag())
+}
 pub fn install_globals(vm: &mut Vm) {
     vm.globals.insert("true".into(), Value::Bool(true));
     vm.globals.insert("false".into(), Value::Bool(false));
     vm.globals.insert("none".into(), Value::None);
     type GlobalBuiltin = fn(&mut Vm, &[Value]) -> Result<Value>;
     let builtins: Vec<(&str, GlobalBuiltin)> = vec![
-        ("print", builtin_print),
         ("len", builtin_len),
         ("str", builtin_str),
         ("repr", builtin_repr),
@@ -38,6 +45,7 @@ pub fn install_globals(vm: &mut Vm) {
         ("__ensure_dispatch__", builtin_ensure_dispatch),
         ("convert", builtin_convert),
         ("__make_closure__", builtin_make_closure),
+        ("__cancel_flag__", builtin_cancel_flag),
         ("__with_exit__", builtin_with_exit),
         ("is_a", builtin_is_a),
         ("isinstanceof", builtin_is_a),
@@ -64,6 +72,12 @@ pub fn install_globals(vm: &mut Vm) {
         ("__variant_is__", builtin_variant_is),
         ("__variant_payload__", builtin_variant_payload),
         ("__struct_slot__", builtin_struct_slot),
+        ("__struct_unpack__", builtin_struct_unpack),
+        ("__can_unpack__", builtin_can_unpack),
+        ("__unpack_view__", builtin_unpack_view),
+        ("__unpack_required__", builtin_unpack_required),
+        ("__unpack_optional__", builtin_unpack_optional),
+        ("__unpack_rest__", builtin_unpack_rest),
         ("__finalize_enum__", builtin_finalize_enum),
         ("__try_failed__", builtin_try_failed),
         ("__try_unwrap__", builtin_try_unwrap),
@@ -71,6 +85,10 @@ pub fn install_globals(vm: &mut Vm) {
     for (name, f) in builtins {
         vm.globals.insert(name.into(), Value::builtin_fn(name, f));
     }
+    vm.globals.insert(
+        "print".into(),
+        Value::builtin_with_keywords("print", builtin_print, builtin_print_keywords),
+    );
 }
 
 fn standard_try_case(value: &Value) -> Option<(&str, &Value)> {
@@ -118,8 +136,30 @@ fn builtin_try_unwrap(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
         .unwrap_or(Value::None))
 }
 fn builtin_print(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    print_with_end(vm, args, "\n")
+}
+
+fn builtin_print_keywords(vm: &mut Vm, args: &[Value], kwargs: &DictMap) -> Result<Value> {
+    let mut end = "\n";
+    for (key, value) in kwargs.iter() {
+        if !matches!(key, ValueKey::Text(name) if name == "end") {
+            return Err(crate::error::RuntimeError::type_err(
+                "print() only accepts the keyword argument `end`",
+            ));
+        }
+        let Value::Text(text) = value else {
+            return Err(crate::error::RuntimeError::type_err(
+                "print() argument `end` must be text",
+            ));
+        };
+        end = text;
+    }
+    print_with_end(vm, args, end)
+}
+
+fn print_with_end(vm: &mut Vm, args: &[Value], end: &str) -> Result<Value> {
     let out = crate::value::args_join_space(args);
-    vm.write_output(crate::vm::OutputStream::Stdout, &format!("{out}\n"));
+    vm.write_output(crate::vm::OutputStream::Stdout, &format!("{out}{end}"));
     Ok(Value::None)
 }
 
@@ -130,16 +170,36 @@ fn builtin_len(vm: &mut Vm, args: &[Value]) -> Result<Value> {
         ));
     }
     let obj = &args[0];
-    if let Some(r) = vm.try_call_magic(obj, "__len__", vec![]) {
-        return r;
+    let value = if let Some(r) = vm.try_call_magic(obj, "__len__", vec![]) {
+        r?
+    } else {
+        let method = vm.get_attr_value(obj, "__len__").map_err(|_| {
+            crate::error::RuntimeError::type_err(format!(
+                "object of type '{}' has no __len__",
+                obj.type_name()
+            ))
+        })?;
+        vm.call_value(method, vec![])?
+    };
+    if let Value::Num(number) = &value {
+        if number.to_rational().is_integer()
+            && number.cmp_num(&Num::Small(0)) != std::cmp::Ordering::Less
+        {
+            return Ok(value);
+        }
     }
-    match vm.get_attr_value(obj, "__len__") {
-        Ok(m) => vm.call_value(m, vec![]),
-        Err(_) => Err(crate::error::RuntimeError::type_err(format!(
-            "object of type '{}' has no __len__",
-            obj.type_name()
-        ))),
+    if let Value::Sized(number) = &value {
+        if matches!(
+            number,
+            crate::sized::SizedNum::U64(_) | crate::sized::SizedNum::Usize(_)
+        ) || number.to_i64().is_some_and(|length| length >= 0)
+        {
+            return Ok(value);
+        }
     }
+    Err(crate::error::RuntimeError::type_err(
+        "__len__ must return a non-negative integer",
+    ))
 }
 
 fn builtin_str(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -151,17 +211,11 @@ fn builtin_str(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let v = &args[0];
     if let Some(r) = vm.try_call_magic(v, "__str__", vec![]) {
         let s = r?;
-        return Ok(match s {
-            Value::Text(t) => Value::Text(t),
-            other => Value::Text(other.print_string()),
-        });
+        return magic_text(s, "__str__");
     }
     if let Some(r) = vm.try_call_magic(v, "__repr__", vec![]) {
         let s = r?;
-        return Ok(match s {
-            Value::Text(t) => Value::Text(t),
-            other => Value::Text(other.print_string()),
-        });
+        return magic_text(s, "__repr__");
     }
     Ok(Value::Text(v.print_string()))
 }
@@ -548,15 +602,21 @@ fn builtin_input(vm: &mut Vm, args: &[Value]) -> Result<Value> {
 }
 
 /// 带可选提示的行输入（`input` 与 `std.io.read_line` 共用）。
-pub(crate) fn read_line_with_prompt(vm: &Vm, prompt: &str) -> Result<Value> {
+pub(crate) fn read_line_with_prompt(vm: &mut Vm, prompt: &str) -> Result<Value> {
     use std::io;
-    if !prompt.is_empty() {
+    if !vm.has_native_wait() && !prompt.is_empty() {
         vm.write_output(crate::vm::OutputStream::Stdout, prompt);
     }
-    let mut line = String::new();
-    io::stdin()
-        .read_line(&mut line)
-        .map_err(|e| crate::error::RuntimeError::io_err(format!("read_line failed: {e}")))?;
+    let Some(line) = vm.run_blocking(|| {
+        let mut line = String::new();
+        io::stdin()
+            .read_line(&mut line)
+            .map_err(|e| crate::error::RuntimeError::io_err(format!("read_line failed: {e}")))?;
+        Ok(line)
+    })?
+    else {
+        return Ok(Value::None);
+    };
     Ok(Value::Text(line.trim_end().to_string()))
 }
 
@@ -729,11 +789,24 @@ fn builtin_help(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
     Ok(Value::None)
 }
 
-fn builtin_repr(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+fn magic_text(value: Value, method: &str) -> Result<Value> {
+    match value {
+        Value::Text(_) => Ok(value),
+        other => Err(crate::error::RuntimeError::type_err(format!(
+            "{method} must return text, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+fn builtin_repr(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(crate::error::RuntimeError::type_err(
             "repr requires 1 argument",
         ));
+    }
+    if let Some(result) = vm.try_call_magic(&args[0], "__repr__", vec![]) {
+        return magic_text(result?, "__repr__");
     }
     Ok(Value::Text(args[0].display_string()))
 }
@@ -915,6 +988,153 @@ fn builtin_struct_slot(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
             other.type_name()
         ))),
     }
+}
+
+/// Apply Optive's object-destructuring protocol exactly once.
+/// Dictionaries are already unpacked. Structs may override `__unpack__`; a
+/// plain struct receives the language default view in field declaration order.
+fn builtin_unpack_view(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(crate::error::RuntimeError::type_err(
+            "internal __unpack_view__ arity",
+        ));
+    }
+    if let Value::Dict(_) = &args[0] {
+        return Ok(args[0].clone());
+    }
+    if let Value::Frozen(frozen) = &args[0] {
+        if let FrozenValue::Dict(items) = frozen.as_ref() {
+            return Ok(Value::Dict(Shared::new(dict_from_pairs(items))));
+        }
+    }
+    if let Some(result) = vm.try_call_magic(&args[0], "__unpack__", vec![]) {
+        let unpacked = result?;
+        return match unpacked {
+            Value::Dict(_) => Ok(unpacked),
+            Value::Frozen(frozen) => match frozen.as_ref() {
+                FrozenValue::Dict(items) => Ok(Value::Dict(Shared::new(dict_from_pairs(items)))),
+                _ => Err(crate::error::RuntimeError::type_err(format!(
+                    "__unpack__ must return dict, got {}",
+                    Value::Frozen(frozen).type_name()
+                ))),
+            },
+            other => Err(crate::error::RuntimeError::type_err(format!(
+                "__unpack__ must return dict, got {}",
+                other.type_name()
+            ))),
+        };
+    }
+    Err(crate::error::RuntimeError::type_err(format!(
+        "object destructuring expects dict or a value implementing __unpack__, got {}",
+        args[0].type_name()
+    )))
+}
+
+fn builtin_struct_unpack(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    let [Value::Struct(instance)] = args else {
+        return Err(crate::error::RuntimeError::type_err(
+            "default __unpack__ requires one struct instance",
+        ));
+    };
+    let slots = instance.slots.borrow();
+    let mut map = DictMap::new();
+    for (name, value) in instance.def.fields.iter().zip(slots.iter()) {
+        map.insert(ValueKey::Text(name.clone()), value.clone());
+    }
+    Ok(Value::Dict(Shared::new(map)))
+}
+
+fn builtin_can_unpack(vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    let [value] = args else {
+        return Err(crate::error::RuntimeError::type_err(
+            "internal __can_unpack__ arity",
+        ));
+    };
+    Ok(Value::Bool(
+        matches!(value, Value::Dict(_))
+            || matches!(value, Value::Frozen(frozen) if matches!(frozen.as_ref(), FrozenValue::Dict(_)))
+            || vm.struct_has_method(value, "__unpack__"),
+    ))
+}
+
+fn dict_from_pairs(items: &[(ValueKey, Value)]) -> DictMap {
+    let mut map = DictMap::new();
+    for (key, value) in items {
+        map.insert(key.clone(), value.clone());
+    }
+    map
+}
+
+fn unpack_dict_and_key<'a>(
+    name: &str,
+    args: &'a [Value],
+) -> Result<(&'a Shared<DictMap>, ValueKey)> {
+    if args.len() != 2 {
+        return Err(crate::error::RuntimeError::type_err(format!(
+            "internal {name} arity"
+        )));
+    }
+    let Value::Dict(dict) = &args[0] else {
+        return Err(crate::error::RuntimeError::type_err(format!(
+            "internal {name} expects dict"
+        )));
+    };
+    let Value::Text(key) = &args[1] else {
+        return Err(crate::error::RuntimeError::type_err(format!(
+            "internal {name} expects text key"
+        )));
+    };
+    Ok((dict, ValueKey::Text(key.clone())))
+}
+
+fn builtin_unpack_required(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    let (dict, key) = unpack_dict_and_key("__unpack_required__", args)?;
+    dict.borrow().get(&key).cloned().ok_or_else(|| {
+        let ValueKey::Text(key) = key else {
+            unreachable!()
+        };
+        crate::error::RuntimeError::value_err(format!(
+            "object destructuring: missing required key `{key}`"
+        ))
+    })
+}
+
+fn builtin_unpack_optional(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    let (dict, key) = unpack_dict_and_key("__unpack_optional__", args)?;
+    let found = dict.borrow().get(&key).cloned();
+    Ok(Value::Tuple(Arc::from(
+        vec![Value::Bool(found.is_some()), found.unwrap_or(Value::None)].into_boxed_slice(),
+    )))
+}
+
+fn builtin_unpack_rest(_vm: &mut Vm, args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(crate::error::RuntimeError::type_err(
+            "internal __unpack_rest__ arity",
+        ));
+    }
+    let Value::Dict(dict) = &args[0] else {
+        return Err(crate::error::RuntimeError::type_err(
+            "internal __unpack_rest__ expects dict",
+        ));
+    };
+    let Value::List(keys) = &args[1] else {
+        return Err(crate::error::RuntimeError::type_err(
+            "internal __unpack_rest__ expects key list",
+        ));
+    };
+    let excluded: Vec<ValueKey> = keys
+        .borrow()
+        .iter()
+        .map(ValueKey::from_value)
+        .collect::<Result<_>>()?;
+    let mut rest = DictMap::new();
+    for (key, value) in dict.borrow().iter() {
+        if !excluded.contains(key) {
+            rest.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(Value::Dict(Shared::new(rest)))
 }
 
 fn builtin_finalize_enum(vm: &mut Vm, args: &[Value]) -> Result<Value> {

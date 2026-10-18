@@ -156,7 +156,9 @@ impl Num {
     #[must_use]
     pub fn abs_num(&self) -> Self {
         match self {
-            Self::Small(n) => Self::Small(n.abs()),
+            Self::Small(n) => n
+                .checked_abs()
+                .map_or_else(|| Self::from_bigint(BigInt::from(*n).abs()), Self::Small),
             Self::Int(i) => Self::from_bigint(i.abs()),
             Self::Rat(r) => Self::from_rational(r.abs()),
         }
@@ -253,12 +255,17 @@ impl fmt::Display for Num {
 }
 
 pub type BuiltinFn = Arc<dyn Fn(&mut crate::vm::Vm, &[Value]) -> Result<Value> + Send + Sync>;
+pub type BuiltinKeywordFn =
+    Arc<dyn Fn(&mut crate::vm::Vm, &[Value], &DictMap) -> Result<Value> + Send + Sync>;
 
 /// 具名内建：短名用于 repr（`<builtin alloc>`），不含模块点分路径。
 #[derive(Clone)]
 pub struct BuiltinObject {
     pub name: Arc<str>,
     pub func: BuiltinFn,
+    pub keyword_func: Option<BuiltinKeywordFn>,
+    /// Explicit language captures: Rust closures are opaque to the cycle collector.
+    pub roots: Vec<Value>,
 }
 
 impl BuiltinObject {
@@ -266,11 +273,31 @@ impl BuiltinObject {
         Arc::new(Self {
             name: name.into(),
             func,
+            keyword_func: None,
+            roots: Vec::new(),
         })
     }
 
     pub fn call(&self, vm: &mut crate::vm::Vm, args: &[Value]) -> Result<Value> {
         (self.func)(vm, args)
+    }
+
+    pub fn call_with_keywords(
+        &self,
+        vm: &mut crate::vm::Vm,
+        args: &[Value],
+        kwargs: &DictMap,
+    ) -> Result<Value> {
+        if kwargs.is_empty() {
+            return self.call(vm, args);
+        }
+        match &self.keyword_func {
+            Some(f) => f(vm, args, kwargs),
+            None => Err(RuntimeError::type_err(format!(
+                "{}() does not accept keyword arguments",
+                self.name
+            ))),
+        }
     }
 
     #[must_use]
@@ -587,6 +614,7 @@ pub enum TaskState {
     Pending {
         callable: Value,
         args: Vec<Value>,
+        kwargs: DictMap,
     },
     Running,
     /// 已挂起；纤程快照由 VM 侧 `task_fibers` 表持有。
@@ -601,17 +629,40 @@ pub struct TaskInner {
     pub task_group: Option<Shared<SyncInner>>,
     /// 协作式取消请求；在 await / sleep / 调度入口等检查点生效。
     pub cancelled: bool,
+    /// Shared with flag values; no GC-managed references.
+    pub cancel_signal: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub cooperative_cancel: bool,
+    pub cooperative_depth: usize,
     /// 调试器停在该任务上：勿入就绪队列，直至会话 `continue`。
     pub debug_paused: bool,
 }
 
 impl TaskInner {
     #[must_use]
-    pub const fn pending(callable: Value, args: Vec<Value>) -> Self {
+    pub fn pending(callable: Value, args: Vec<Value>) -> Self {
+        Self::pending_with_keywords(callable, args, DictMap::new())
+    }
+
+    #[must_use]
+    pub fn pending_with_keywords(callable: Value, args: Vec<Value>, kwargs: DictMap) -> Self {
+        let cooperative_cancel = match &callable {
+            Value::Function(f) => f.cooperative_cancel,
+            Value::GenericFunction(f) => {
+                crate::frontend::function_descriptors::has_cancel_flag(&f.body)
+            }
+            _ => false,
+        };
         Self {
-            state: TaskState::Pending { callable, args },
+            state: TaskState::Pending {
+                callable,
+                args,
+                kwargs,
+            },
             task_group: None,
             cancelled: false,
+            cancel_signal: None,
+            cooperative_cancel,
+            cooperative_depth: 0,
             debug_paused: false,
         }
     }
@@ -622,6 +673,9 @@ impl TaskInner {
             state: TaskState::Done(value),
             task_group: None,
             cancelled: false,
+            cancel_signal: None,
+            cooperative_cancel: false,
+            cooperative_depth: 0,
             debug_paused: false,
         }
     }
@@ -631,8 +685,16 @@ impl TaskInner {
         self.cancelled
     }
 
-    pub const fn request_cancel(&mut self) {
+    pub fn request_cancel(&mut self) {
         self.cancelled = true;
+        if let Some(signal) = &self.cancel_signal {
+            signal.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    #[must_use]
+    pub const fn should_abort_on_cancel(&self) -> bool {
+        self.cancelled && !self.cooperative_cancel && self.cooperative_depth == 0
     }
 }
 
@@ -772,6 +834,10 @@ pub enum OncePhase {
 /// 其余并发原语（RWMutex / `WaitGroup` / Semaphore / Once / Barrier / Cond / `TaskGroup` / TimeoutCtx）的统一载荷。
 #[derive(Clone)]
 pub enum SyncInner {
+    /// Read-only cancellation request flag for one task.
+    CancelFlag {
+        signal: Arc<std::sync::atomic::AtomicBool>,
+    },
     /// 读写锁：`readers` 为当前活跃读者数，`writer` 为是否有写者持有。
     RWMutex {
         value: Value,
@@ -1023,6 +1089,9 @@ pub struct StructDef {
     pub mutable_fields: Vec<bool>,
     pub typed: bool,
     pub field_types: Vec<FieldTypeInfo>,
+    /// Per-instance initializers, evaluated only for fields not supplied by the
+    /// field constructor. Each receives the newly allocated instance as self.
+    pub field_defaults: Vec<Option<Arc<crate::opcode::FunctionObject>>>,
     pub type_params: Vec<(String, Option<crate::ast::Expr>)>,
     /// `typed struct ... : <layout>` 计算出的本地布局；供 load / store / by-value FFI。
     pub native_layout: Option<std::sync::Arc<crate::ffi_extra::NativeStructLayout>>,
@@ -1063,6 +1132,29 @@ impl Value {
         f: fn(&mut crate::vm::Vm, &[Value]) -> Result<Value>,
     ) -> Self {
         Self::Builtin(BuiltinObject::new(name, Arc::new(f)))
+    }
+
+    pub fn builtin_with_keywords(
+        name: impl Into<Arc<str>>,
+        f: impl Fn(&mut crate::vm::Vm, &[Value]) -> Result<Value> + Send + Sync + 'static,
+        keyword_f: impl Fn(&mut crate::vm::Vm, &[Value], &DictMap) -> Result<Value>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        Self::Builtin(Arc::new(BuiltinObject {
+            name: name.into(),
+            func: Arc::new(f),
+            keyword_func: Some(Arc::new(keyword_f)),
+            roots: Vec::new(),
+        }))
+    }
+
+    pub(crate) fn with_builtin_roots(mut self, roots: Vec<Value>) -> Self {
+        if let Self::Builtin(builtin) = &mut self {
+            Arc::make_mut(builtin).roots = roots;
+        }
+        self
     }
 
     /// 索引 / 注解用的类型名操作数（`TypeRef`，以及旧式 `Text`）。
@@ -1121,6 +1213,7 @@ impl Value {
                 SyncInner::TaskGroup { .. } => "TaskGroup",
                 SyncInner::TimeoutCtx { .. } => "TimeoutCtx",
                 SyncInner::Atomic { .. } => "Atomic",
+                SyncInner::CancelFlag { .. } => "CancelFlag",
             },
             Self::SyncGuard(g) => match &*g.borrow() {
                 SyncGuardInner::Read { .. } => "RWMutexReadGuard",
@@ -1213,8 +1306,14 @@ impl Value {
                 out
             }
             Self::Iterator(_) => "<iterator>".to_string(),
-            Self::Function(f) => format!("<function {}>", f.name),
-            Self::GenericFunction(g) => format!("<generic function {}>", g.name),
+            Self::Function(f) => f
+                .display_name
+                .clone()
+                .unwrap_or_else(|| format!("<function {}>", f.name)),
+            Self::GenericFunction(g) => g
+                .display_name
+                .clone()
+                .unwrap_or_else(|| format!("<generic function {}>", g.name)),
             Self::Macro(m) => format!("<macro {}>", m.name),
             Self::Dispatch(d) => format!("<friend func {}>", d.borrow().name),
             Self::Builtin(b) => b.repr(),
@@ -1260,6 +1359,7 @@ impl Value {
                 SyncInner::TaskGroup { .. } => "<TaskGroup>".to_string(),
                 SyncInner::TimeoutCtx { .. } => "<TimeoutCtx>".to_string(),
                 SyncInner::Atomic { .. } => "<Atomic>".to_string(),
+                SyncInner::CancelFlag { .. } => "<CancelFlag>".to_string(),
             },
             Self::SyncGuard(g) => match &*g.borrow() {
                 SyncGuardInner::Read { .. } => "<RWMutexReadGuard>".to_string(),
@@ -1635,9 +1735,11 @@ fn pow_num(base: &Num, exp: &Num) -> Result<Num> {
         .ok_or_else(|| RuntimeError::value_err("non-finite floating-point result"))
 }
 
-fn neg_num(n: &Num) -> Num {
+pub(crate) fn neg_num(n: &Num) -> Num {
     match n {
-        Num::Small(i) => Num::Small(-*i),
+        Num::Small(i) => i
+            .checked_neg()
+            .map_or_else(|| Num::from_bigint(-BigInt::from(*i)), Num::Small),
         Num::Int(i) => Num::from_bigint(-i.as_ref()),
         Num::Rat(r) => Num::from_rational(-r.as_ref()),
     }
@@ -1782,7 +1884,8 @@ impl IteratorState {
                     return Ok(None);
                 }
                 let val = Value::Num(Num::Small(*current));
-                *current += *step;
+                // Overflow steps beyond every representable exclusive stop.
+                *current = current.checked_add(*step).unwrap_or(*stop);
                 Ok(Some(val))
             }
             IteratorKind::List { items, index } => {

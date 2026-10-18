@@ -189,6 +189,30 @@ fn parse_func_no_params() {
 }
 
 #[test]
+fn parse_function_descriptors_between_params_and_return() {
+    let program = optive::parse_program(
+        r#"func worker(x) outside(1) display_as("background worker") -> int { return x }"#,
+    )
+    .expect("function descriptors parse");
+    match &program.stmts[0].stmt {
+        optive::ast::Stmt::FuncDecl { descriptors, .. } => {
+            assert_eq!(descriptors.len(), 2);
+            assert_eq!(descriptors[0].name, "outside");
+            assert_eq!(descriptors[1].name, "display_as");
+        }
+        other => panic!("expected FuncDecl, got {other:?}"),
+    }
+}
+
+#[test]
+fn function_descriptors_reject_unknown_duplicate_and_bad_arity() {
+    assert!(optive::parse_program("func a() unknown(1) {}").is_err());
+    assert!(optive::parse_program("func a() outside(1) outside(2) {}").is_err());
+    assert!(optive::parse_program("func a() display_as() {}").is_err());
+    assert!(optive::parse_program("const func a() display_as(\"a\") {}").is_err());
+}
+
+#[test]
 fn decorators_only_bind_on_the_same_line() {
     let same_line = parse_program("deco2 deco1 func f() {}").expect("same-line decorators");
     assert_eq!(same_line.stmts.len(), 1);
@@ -574,6 +598,24 @@ func f(stats) {
 #[test]
 fn parse_with_destructuring_pattern() {
     parse_ok("with (resource as (head, [item, *rest])) { item }");
+}
+
+#[test]
+fn parse_object_destructuring_requires_explicit_mapping() {
+    parse_ok("let { x = left, y = top, **rest } = point");
+    parse_ok("let { retries = 3 } = options");
+    parse_err("let { name } = options");
+}
+
+#[test]
+fn parse_object_destructuring_assignment() {
+    parse_ok("var left = 0\n{ x = left } = point");
+}
+
+#[test]
+fn parse_for_else() {
+    parse_ok("for (x in xs) { print(x) } else { print(\"done\") }");
+    parse_ok("outer for (x in xs) { break outer } else { print(\"done\") }");
 }
 
 #[test]

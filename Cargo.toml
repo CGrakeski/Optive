@@ -64,6 +64,7 @@ num_cpus = "1"
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-bundle-always"] }
 cap-std = "4.0.3"
 unicode-width = "0.2"
+unicode_names2 = "4"
 ring = "0.17"
 zip = { version = "2", default-features = false, features = ["deflate-flate2", "flate2"] }
 tar = { version = "0.4", default-features = false }

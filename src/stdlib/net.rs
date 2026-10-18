@@ -155,8 +155,12 @@ fn net_connect(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let host = expect_text("connect", args, 0)?;
     let port = check_port("connect", expect_int("connect", args, 1)?)?;
     let addr = format!("{host}:{port}");
-    let stream = crate::gc::blocking_native(|| TcpStream::connect(&addr))
-        .map_err(|e| io_map(&format!("connect {addr}"), e))?;
+    let Some(stream) = vm.run_blocking(move || {
+        TcpStream::connect(&addr).map_err(|e| io_map(&format!("connect {addr}"), e))
+    })?
+    else {
+        return Ok(Value::None);
+    };
     let _ = stream.set_nodelay(true);
     Ok(wrap_conn(ConnInner::Plain(stream)))
 }
@@ -167,10 +171,15 @@ fn net_connect_tls(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let host = expect_text("connect_tls", args, 0)?;
     let port = check_port("connect_tls", expect_int("connect_tls", args, 1)?)?;
     let addr = format!("{host}:{port}");
-    let tcp = crate::gc::blocking_native(|| TcpStream::connect(&addr))
-        .map_err(|e| io_map(&format!("connect_tls {addr}"), e))?;
-    let _ = tcp.set_nodelay(true);
-    let tls = tls_wrap(tcp, &host)?;
+    let Some(tls) = vm.run_blocking(move || {
+        let tcp =
+            TcpStream::connect(&addr).map_err(|e| io_map(&format!("connect_tls {addr}"), e))?;
+        let _ = tcp.set_nodelay(true);
+        tls_wrap(tcp, &host)
+    })?
+    else {
+        return Ok(Value::None);
+    };
     Ok(wrap_conn(ConnInner::Tls(Box::new(tls))))
 }
 
@@ -217,11 +226,17 @@ fn net_ws_connect(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let port = check_port("ws_connect", expect_int("ws_connect", args, 1)?)?;
     let path = ws_path(args, "ws_connect")?;
     let addr = format!("{host}:{port}");
-    let tcp = crate::gc::blocking_native(|| TcpStream::connect(&addr))
-        .map_err(|e| io_map(&format!("ws_connect {addr}"), e))?;
-    let _ = tcp.set_nodelay(true);
     let uri = format!("ws://{host}:{port}{path}");
-    handshake_client(&uri, ConnInner::Plain(tcp))
+    let Some(ws) = vm.run_blocking(move || {
+        let tcp =
+            TcpStream::connect(&addr).map_err(|e| io_map(&format!("ws_connect {addr}"), e))?;
+        let _ = tcp.set_nodelay(true);
+        handshake_client(&uri, ConnInner::Plain(tcp))
+    })?
+    else {
+        return Ok(Value::None);
+    };
+    Ok(wrap_ws(ws))
 }
 
 fn net_ws_connect_tls(vm: &mut Vm, args: &[Value]) -> Result<Value> {
@@ -230,24 +245,36 @@ fn net_ws_connect_tls(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     let port = check_port("ws_connect_tls", expect_int("ws_connect_tls", args, 1)?)?;
     let path = ws_path(args, "ws_connect_tls")?;
     let addr = format!("{host}:{port}");
-    let tcp = crate::gc::blocking_native(|| TcpStream::connect(&addr))
-        .map_err(|e| io_map(&format!("ws_connect_tls {addr}"), e))?;
-    let _ = tcp.set_nodelay(true);
-    let tls = tls_wrap(tcp, &host)?;
     let uri = format!("wss://{host}:{port}{path}");
-    handshake_client(&uri, ConnInner::Tls(Box::new(tls)))
+    let Some(ws) = vm.run_blocking(move || {
+        let tcp =
+            TcpStream::connect(&addr).map_err(|e| io_map(&format!("ws_connect_tls {addr}"), e))?;
+        let _ = tcp.set_nodelay(true);
+        let tls = tls_wrap(tcp, &host)?;
+        handshake_client(&uri, ConnInner::Tls(Box::new(tls)))
+    })?
+    else {
+        return Ok(Value::None);
+    };
+    Ok(wrap_ws(ws))
 }
 
-fn handshake_client(uri: &str, stream: ConnInner) -> Result<Value> {
+fn handshake_client(uri: &str, stream: ConnInner) -> Result<tungstenite::WebSocket<ConnInner>> {
     let (ws, _) = tungstenite::client(uri, stream).map_err(|e| io_map("ws_connect", e))?;
-    Ok(wrap_ws(ws))
+    Ok(ws)
 }
 
 fn net_ws_accept(vm: &mut Vm, args: &[Value]) -> Result<Value> {
     vm.caps.check_network("ws_accept")?;
     expect_arity("ws_accept", args, 1)?;
-    let stream = take_conn(&args[0])?;
-    let ws = tungstenite::accept(stream).map_err(|e| io_map("ws_accept", e))?;
+    let key = conn_key(&args[0])?;
+    let Some(ws) = vm.run_blocking(move || {
+        let stream = take_conn(key)?;
+        tungstenite::accept(stream).map_err(|e| io_map("ws_accept", e))
+    })?
+    else {
+        return Ok(Value::None);
+    };
     Ok(wrap_ws(ws))
 }
 
@@ -384,17 +411,25 @@ fn wrap_listener(listener: TcpListener, tls: Option<Arc<ServerConfig>>) -> Value
                 "accept",
                 Value::builtin("accept", move |vm, _| {
                     vm.caps.check_network("accept")?;
-                    let guard = accept_h.lock();
-                    let ln = guard
-                        .as_ref()
-                        .ok_or_else(|| RuntimeError::io_err("accept: listener is closed"))?;
-                    let (stream, _) = ln.accept().map_err(|e| io_map("accept", e))?;
-                    drop(guard);
-                    let _ = stream.set_nodelay(true);
-                    let conn = if let Some(cfg) = &tls_accept {
-                        accept_tls(stream, cfg)?
-                    } else {
-                        ConnInner::Plain(stream)
+                    let handle = accept_h.clone();
+                    let tls = tls_accept.clone();
+                    let Some(conn) = vm.run_blocking(move || {
+                        let listener = handle
+                            .lock()
+                            .as_ref()
+                            .ok_or_else(|| RuntimeError::io_err("accept: listener is closed"))?
+                            .try_clone()
+                            .map_err(|e| io_map("accept", e))?;
+                        let (stream, _) = listener.accept().map_err(|e| io_map("accept", e))?;
+                        let _ = stream.set_nodelay(true);
+                        if let Some(cfg) = tls {
+                            accept_tls(stream, &cfg)
+                        } else {
+                            Ok(ConnInner::Plain(stream))
+                        }
+                    })?
+                    else {
+                        return Ok(Value::None);
                     };
                     Ok(wrap_conn(conn))
                 }),
@@ -438,7 +473,8 @@ fn wrap_conn(stream: ConnInner) -> Value {
         exports: exports(&[
             (
                 "read",
-                Value::builtin("read", move |_vm, args| {
+                Value::builtin("read", move |vm, args| {
+                    vm.caps.check_network("read")?;
                     let n = match args.len() {
                         0 => 4096i64,
                         1 => expect_int("read", args, 0)?,
@@ -454,47 +490,91 @@ fn wrap_conn(stream: ConnInner) -> Value {
                     let cap = usize::try_from(n)
                         .unwrap_or(usize::MAX)
                         .min(8 * 1024 * 1024);
-                    let mut buf = vec![0u8; cap];
-                    let mut guard = read_h.lock();
-                    let s = guard
-                        .as_mut()
-                        .ok_or_else(|| RuntimeError::io_err("read: connection is closed"))?;
-                    let got = s.read(&mut buf).map_err(|e| io_map("read", e))?;
-                    buf.truncate(got);
+                    let handle = read_h.clone();
+                    let Some(buf) = vm.run_blocking(move || {
+                        let mut buf = vec![0u8; cap];
+                        let mut guard = handle.lock();
+                        let s = guard
+                            .as_mut()
+                            .ok_or_else(|| RuntimeError::io_err("read: connection is closed"))?;
+                        let got = if let ConnInner::Plain(tcp) = s {
+                            let mut tcp = tcp.try_clone().map_err(|e| io_map("read", e))?;
+                            drop(guard);
+                            tcp.read(&mut buf).map_err(|e| io_map("read", e))?
+                        } else {
+                            s.read(&mut buf).map_err(|e| io_map("read", e))?
+                        };
+                        buf.truncate(got);
+                        Ok(buf)
+                    })?
+                    else {
+                        return Ok(Value::None);
+                    };
                     Ok(Value::Bytes(Arc::new(buf)))
                 }),
             ),
             (
                 "write",
-                Value::builtin("write", move |_vm, args| {
+                Value::builtin("write", move |vm, args| {
+                    vm.caps.check_network("write")?;
                     expect_arity("write", args, 1)?;
                     let bytes = expect_text_or_bytes("write", args, 0)?;
-                    let mut guard = write_h.lock();
-                    let s = guard
-                        .as_mut()
-                        .ok_or_else(|| RuntimeError::io_err("write: connection is closed"))?;
-                    s.write_all(&bytes).map_err(|e| io_map("write", e))?;
-                    s.flush().map_err(|e| io_map("write", e))?;
-                    Ok(Value::Num(Num::Small(bytes.len() as i64)))
+                    let handle = write_h.clone();
+                    let Some(n) = vm.run_blocking(move || {
+                        let mut guard = handle.lock();
+                        let s = guard
+                            .as_mut()
+                            .ok_or_else(|| RuntimeError::io_err("write: connection is closed"))?;
+                        if let ConnInner::Plain(tcp) = s {
+                            let mut tcp = tcp.try_clone().map_err(|e| io_map("write", e))?;
+                            drop(guard);
+                            tcp.write_all(&bytes).map_err(|e| io_map("write", e))?;
+                            tcp.flush().map_err(|e| io_map("write", e))?;
+                        } else {
+                            s.write_all(&bytes).map_err(|e| io_map("write", e))?;
+                            s.flush().map_err(|e| io_map("write", e))?;
+                        }
+                        Ok(bytes.len())
+                    })?
+                    else {
+                        return Ok(Value::None);
+                    };
+                    Ok(Value::Num(Num::Small(n as i64)))
                 }),
             ),
             (
                 "peer",
-                Value::builtin("peer", move |_vm, _| {
-                    let guard = peer_h.lock();
-                    let s = guard
-                        .as_ref()
-                        .ok_or_else(|| RuntimeError::io_err("peer: connection is closed"))?;
-                    let a = s.peer_addr().map_err(|e| io_map("peer", e))?;
-                    Ok(Value::Text(a.to_string()))
+                Value::builtin("peer", move |vm, _| {
+                    let handle = peer_h.clone();
+                    let Some(addr) = vm.run_blocking(move || {
+                        let guard = handle.lock();
+                        let s = guard
+                            .as_ref()
+                            .ok_or_else(|| RuntimeError::io_err("peer: connection is closed"))?;
+                        s.peer_addr().map_err(|e| io_map("peer", e))
+                    })?
+                    else {
+                        return Ok(Value::None);
+                    };
+                    Ok(Value::Text(addr.to_string()))
                 }),
             ),
             (
                 "close",
-                Value::builtin("close", move |_vm, _| {
-                    close_registration.remove();
-                    if let Some(mut s) = close_h.lock().take() {
-                        s.shutdown_tls();
+                Value::builtin("close", move |vm, _| {
+                    let registration = close_registration.clone();
+                    let handle = close_h.clone();
+                    if vm
+                        .run_blocking(move || {
+                            registration.remove();
+                            if let Some(mut s) = handle.lock().take() {
+                                s.shutdown_tls();
+                            }
+                            Ok(())
+                        })?
+                        .is_none()
+                    {
+                        return Ok(Value::None);
                     }
                     Ok(Value::None)
                 }),
@@ -511,14 +591,17 @@ fn wrap_conn(stream: ConnInner) -> Value {
     Value::Module(module)
 }
 
-fn take_conn(v: &Value) -> Result<ConnInner> {
+fn conn_key(v: &Value) -> Result<usize> {
     let Value::Module(m) = v else {
         return Err(RuntimeError::type_err("ws_accept: argument must be a Conn"));
     };
     if m.borrow().name != "Conn" {
         return Err(RuntimeError::type_err("ws_accept: argument must be a Conn"));
     }
-    let key = m.as_ptr() as usize;
+    Ok(m.as_ptr() as usize)
+}
+
+fn take_conn(key: usize) -> Result<ConnInner> {
     let slot = conn_slots()
         .lock()
         .remove(&key)
@@ -553,11 +636,21 @@ fn wrap_udp(sock: UdpSocket) -> Value {
                     let host = expect_text("send_to", args, 1)?;
                     let port = check_port("send_to", expect_int("send_to", args, 2)?)?;
                     let dest = format!("{host}:{port}");
-                    let guard = send_h.lock();
-                    let s = guard
-                        .as_ref()
-                        .ok_or_else(|| RuntimeError::io_err("send_to: socket is closed"))?;
-                    let n = s.send_to(&bytes, &dest).map_err(|e| io_map("send_to", e))?;
+                    let handle = send_h.clone();
+                    let Some(n) = vm.run_blocking(move || {
+                        let socket = handle
+                            .lock()
+                            .as_ref()
+                            .ok_or_else(|| RuntimeError::io_err("send_to: socket is closed"))?
+                            .try_clone()
+                            .map_err(|e| io_map("send_to", e))?;
+                        socket
+                            .send_to(&bytes, &dest)
+                            .map_err(|e| io_map("send_to", e))
+                    })?
+                    else {
+                        return Ok(Value::None);
+                    };
                     Ok(Value::Num(Num::Small(n as i64)))
                 }),
             ),
@@ -565,13 +658,24 @@ fn wrap_udp(sock: UdpSocket) -> Value {
                 "recv_from",
                 Value::builtin("recv_from", move |vm, _| {
                     vm.caps.check_network("recv_from")?;
-                    let guard = recv_h.lock();
-                    let s = guard
-                        .as_ref()
-                        .ok_or_else(|| RuntimeError::io_err("recv_from: socket is closed"))?;
-                    let mut buf = vec![0u8; 65535];
-                    let (n, from) = s.recv_from(&mut buf).map_err(|e| io_map("recv_from", e))?;
-                    buf.truncate(n);
+                    let handle = recv_h.clone();
+                    let Some((buf, from)) = vm.run_blocking(move || {
+                        let socket = handle
+                            .lock()
+                            .as_ref()
+                            .ok_or_else(|| RuntimeError::io_err("recv_from: socket is closed"))?
+                            .try_clone()
+                            .map_err(|e| io_map("recv_from", e))?;
+                        let mut buf = vec![0u8; 65535];
+                        let (n, from) = socket
+                            .recv_from(&mut buf)
+                            .map_err(|e| io_map("recv_from", e))?;
+                        buf.truncate(n);
+                        Ok((buf, from))
+                    })?
+                    else {
+                        return Ok(Value::None);
+                    };
                     let mut d = DictMap::new();
                     d.insert(ValueKey::Text("data".into()), Value::Bytes(Arc::new(buf)));
                     d.insert(
@@ -631,11 +735,19 @@ fn wrap_ws(ws: tungstenite::WebSocket<ConnInner>) -> Value {
                             return Err(RuntimeError::type_err("send: data must be text or bytes"));
                         }
                     };
-                    let mut guard = send_h.lock();
-                    let ws = guard
-                        .as_mut()
-                        .ok_or_else(|| RuntimeError::io_err("send: websocket is closed"))?;
-                    ws.send(msg).map_err(|e| io_map("send", e))?;
+                    let handle = send_h.clone();
+                    if vm
+                        .run_blocking(move || {
+                            let mut guard = handle.lock();
+                            let ws = guard
+                                .as_mut()
+                                .ok_or_else(|| RuntimeError::io_err("send: websocket is closed"))?;
+                            ws.send(msg).map_err(|e| io_map("send", e))
+                        })?
+                        .is_none()
+                    {
+                        return Ok(Value::None);
+                    }
                     Ok(Value::None)
                 }),
             ),
@@ -643,31 +755,49 @@ fn wrap_ws(ws: tungstenite::WebSocket<ConnInner>) -> Value {
                 "recv",
                 Value::builtin("recv", move |vm, _| {
                     vm.caps.check_network("ws_recv")?;
-                    let mut guard = recv_h.lock();
-                    let ws = guard
-                        .as_mut()
-                        .ok_or_else(|| RuntimeError::io_err("recv: websocket is closed"))?;
-                    loop {
-                        let msg = ws.read().map_err(|e| io_map("recv", e))?;
-                        match msg {
-                            tungstenite::Message::Text(t) => return Ok(Value::Text(t.to_string())),
-                            tungstenite::Message::Binary(b) => {
-                                return Ok(Value::Bytes(Arc::new(b.to_vec())));
+                    let handle = recv_h.clone();
+                    let Some(msg) = vm.run_blocking(move || {
+                        let mut guard = handle.lock();
+                        let ws = guard
+                            .as_mut()
+                            .ok_or_else(|| RuntimeError::io_err("recv: websocket is closed"))?;
+                        loop {
+                            let msg = ws.read().map_err(|e| io_map("recv", e))?;
+                            match msg {
+                                tungstenite::Message::Text(_)
+                                | tungstenite::Message::Binary(_)
+                                | tungstenite::Message::Close(_) => return Ok(msg),
+                                tungstenite::Message::Ping(p) => {
+                                    let _ = ws.send(tungstenite::Message::Pong(p));
+                                }
+                                tungstenite::Message::Pong(_) | tungstenite::Message::Frame(_) => {}
                             }
-                            tungstenite::Message::Close(_) => return Ok(Value::None),
-                            tungstenite::Message::Ping(p) => {
-                                let _ = ws.send(tungstenite::Message::Pong(p));
-                            }
-                            tungstenite::Message::Pong(_) | tungstenite::Message::Frame(_) => {}
                         }
-                    }
+                    })?
+                    else {
+                        return Ok(Value::None);
+                    };
+                    Ok(match msg {
+                        tungstenite::Message::Text(t) => Value::Text(t.to_string()),
+                        tungstenite::Message::Binary(b) => Value::Bytes(Arc::new(b.to_vec())),
+                        _ => Value::None,
+                    })
                 }),
             ),
             (
                 "close",
-                Value::builtin("close", move |_vm, _| {
-                    if let Some(mut ws) = close_h.lock().take() {
-                        let _ = ws.close(None);
+                Value::builtin("close", move |vm, _| {
+                    let handle = close_h.clone();
+                    if vm
+                        .run_blocking(move || {
+                            if let Some(mut ws) = handle.lock().take() {
+                                let _ = ws.close(None);
+                            }
+                            Ok(())
+                        })?
+                        .is_none()
+                    {
+                        return Ok(Value::None);
                     }
                     Ok(Value::None)
                 }),

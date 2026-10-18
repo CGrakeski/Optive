@@ -465,6 +465,76 @@ t.cancelled()
 }
 
 #[test]
+fn task_value_after_done_polling_is_repeatable() {
+    assert_num(
+        r"
+let t = go do { return 42 }
+while (not t.done()) ...
+t.value() + t.value()
+",
+        "84",
+    );
+}
+
+#[test]
+fn task_value_preserves_none_result() {
+    assert_bool(
+        r"
+let t = go do { return none }
+await t
+t.done() and t.value() == none
+",
+        true,
+    );
+}
+
+#[test]
+fn task_value_rejects_unfinished_tasks_without_running_them() {
+    let mut vm = optive::vm::Vm::with_workers(1);
+    let error = optive::run_source_in_vm(
+        &mut vm,
+        "let t = go do { return 42 }\nt.value()",
+        "<task-value>",
+    )
+    .unwrap_err();
+    assert!(error.message().contains("requires a completed task"));
+}
+
+#[test]
+fn task_value_takes_no_arguments() {
+    run_err("let t = go do { return 42 }\nawait t\nt.value(1)");
+}
+
+#[test]
+fn task_value_rethrows_original_task_failure() {
+    let mut vm = optive::vm::Vm::with_workers(1);
+    let error = optive::run_source_in_vm(
+        &mut vm,
+        r#"
+let t = go do { throw ValueError("task-value-original-error") }
+while (not t.done()) ...
+t.value()
+"#,
+        "<task-value>",
+    )
+    .unwrap_err();
+    assert!(error.message().contains("task-value-original-error"));
+    assert_eq!(error.kind(), optive::error::ExceptionKind::ValueError);
+}
+
+#[test]
+fn task_value_rethrows_finalized_cancellation() {
+    run_err(
+        r"
+let t = go do { suspend; return 42 }
+t.cancel()
+try { await t } catch (e) {}
+t.value()
+",
+    );
+}
+
+#[test]
 fn await_cancelled_task_throws() {
     run_err(
         r"

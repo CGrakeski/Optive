@@ -208,9 +208,12 @@ fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
 
 fn write_func(w: &mut Vec<u8>, name: &str, f: &FunctionObject) -> Result<()> {
     if f.captured.is_some()
+        || f.cooperative_cancel
+        || f.display_name.is_some()
         || f.return_type.is_some()
         || f.return_wrapper.is_some()
         || f.defaults.iter().any(Option::is_some)
+        || f.params.iter().any(|p| p.pattern.is_some())
     {
         return Err(crate::error::RuntimeError::msg("uncacheable function"));
     }
@@ -262,6 +265,7 @@ fn read_func(r: &mut Cursor<&[u8]>) -> Result<(String, FunctionObject)> {
     for _ in 0..nparams {
         params.push(FuncParam {
             name: read_str(r)?,
+            pattern: None,
             is_variadic: read_u8(r)? != 0,
             is_kwvariadic: read_u8(r)? != 0,
             implicit: read_u8(r)? != 0,
@@ -301,6 +305,8 @@ fn read_func(r: &mut Cursor<&[u8]>) -> Result<(String, FunctionObject)> {
             hot_call_argc,
             flags,
             name,
+            display_name: None,
+            cooperative_cancel: false,
             params,
             body: Arc::new(body),
             line_map: Arc::new(line_map),
@@ -799,6 +805,7 @@ fn encode_ins(w: &mut Vec<u8>, ins: &Instruction) -> Result<()> {
             write_u32(w, *i as u32);
         }
         GoValue => unit(w, 110),
+        GoCallEx => unit(w, 130),
         Await => unit(w, 111),
         Suspend => unit(w, 112),
         Yield => unit(w, 113),
@@ -989,6 +996,7 @@ fn decode_ins(r: &mut Cursor<&[u8]>) -> Result<Instruction> {
         108 => RegisterExport(read_str(r)?),
         109 => GoCall(read_u32(r)? as usize),
         110 => GoValue,
+        130 => GoCallEx,
         111 => Await,
         112 => Suspend,
         113 => Yield,
@@ -1144,6 +1152,22 @@ mod tests {
         vm.load_program(back).expect("load");
         let v = vm.run().expect("run");
         assert_eq!(v.display_string(), "3");
+    }
+
+    #[test]
+    fn roundtrip_named_and_expanded_go_calls() {
+        let source = r#"
+func add(x, y) { return x + y }
+let a = go add(x = 40, y = 2)
+let b = go add(*[40], **{"y": 2})
+(await a) + (await b)
+"#;
+        let program = crate::compile(source).expect("compile");
+        let bytes = encode(&program).expect("encode");
+        let program = decode(&bytes).expect("decode");
+        let mut vm = Vm::with_workers(1);
+        vm.load_program(program).expect("load");
+        assert_eq!(vm.run().expect("run").display_string(), "84");
     }
 
     #[test]

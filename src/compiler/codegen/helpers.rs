@@ -117,6 +117,10 @@ fn collect_destruct_names(pattern: &DestructPattern, out: &mut Vec<String>) {
                 }
             }
         }
+        DestructPattern::Dict { entries, rest } => {
+            out.extend(entries.iter().map(|entry| entry.binding.clone()));
+            out.extend(rest.iter().cloned());
+        }
     }
 }
 

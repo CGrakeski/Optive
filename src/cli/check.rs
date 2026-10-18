@@ -1,4 +1,4 @@
-//! `Optive check [path]`：词法/语法 + 与 LSP 共享的名字/`std.*`/arity，不启动 VM。
+//! `Optive check [path]`：词法/语法 + 与 LSP 共享的项目静态语义，不启动 VM。
 
 use std::collections::HashMap;
 use std::fs;

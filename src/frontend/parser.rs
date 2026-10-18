@@ -1,9 +1,10 @@
 use crate::ast::{
     fill_placeholders, BinaryOp, Block, CallArg, CatchClause, CatchPattern, DelTarget,
-    DestructElem, DestructPattern, EnumMemberDecl, EnumMethodDecl, Expr, ExprKind, FStringPart,
-    ForItem, FuncParam, LValue, LocatedStmt, MacroCallArg, MacroParam, MatchCase, ModuleRef,
-    Pattern, PatternElem, Program, ProtocolMember, SelectCase, SourceLoc, Stmt, StructField,
-    StructMethod, UnaryOp, UseItem, VariantCaseDecl, Visibility, RET_WRAPPER_VAL,
+    DestructElem, DestructPattern, DictDestructEntry, EnumMemberDecl, EnumMethodDecl, Expr,
+    ExprKind, FStringPart, ForItem, FuncParam, LValue, LocatedStmt, MacroCallArg, MacroParam,
+    MatchCase, ModuleRef, Pattern, PatternElem, Program, ProtocolMember, SelectCase, SourceLoc,
+    Stmt, StructField, StructMethod, UnaryOp, UseItem, VariantCaseDecl, Visibility,
+    RET_WRAPPER_VAL,
 };
 use crate::error::ParseError;
 use crate::lexer::Lexer;
@@ -566,6 +567,19 @@ impl Parser {
         if self.match_kind(TokenKind::KwProtocol) {
             return self.parse_protocol_decl(vis);
         }
+        // A leading `{` is otherwise ambiguous with a dictionary literal or
+        // statement block. Give an explicit object pattern followed by `=`
+        // priority, then roll back and use the normal brace classifier.
+        if self.check(TokenKind::LBrace) {
+            let saved = self.pos;
+            if let Ok(pattern) = self.parse_destruct_pattern() {
+                if self.match_kind(TokenKind::Assign) {
+                    let value = self.parse_expr()?;
+                    return Ok(Stmt::DestructAssign { pattern, value });
+                }
+            }
+            self.pos = saved;
+        }
         if self.check(TokenKind::LBrace) && self.brace_starts_dict() {
             let expr = self.parse_expr()?;
             return Ok(Stmt::Expr(expr));
@@ -632,6 +646,7 @@ impl Parser {
     ) -> Result<Stmt, ParseError> {
         if self.check(TokenKind::LParen)
             || self.check(TokenKind::LBracket)
+            || self.check(TokenKind::LBrace)
             || self.check(TokenKind::Placeholder)
         {
             let pattern = self.parse_destruct_pattern()?;
@@ -687,10 +702,84 @@ impl Parser {
             let elems = self.parse_destruct_elem_list(TokenKind::RBracket, "']'")?;
             return Ok(DestructPattern::List(elems));
         }
+        if self.match_kind(TokenKind::LBrace) {
+            return self.parse_dict_destruct_pattern();
+        }
         if self.check(TokenKind::Identifier) {
             return Ok(DestructPattern::Name(self.advance().value));
         }
         Err(self.error("expected destructuring pattern"))
+    }
+
+    fn parse_dict_destruct_pattern(&mut self) -> Result<DestructPattern, ParseError> {
+        let mut entries = Vec::new();
+        let mut rest = None;
+        let mut keys = std::collections::HashSet::new();
+        let mut bindings = std::collections::HashSet::new();
+        self.skip_newlines();
+        while !self.check(TokenKind::RBrace) {
+            if self.match_kind(TokenKind::StarStar) {
+                if rest.is_some() {
+                    return Err(self.error("multiple **rest bindings in object destructuring"));
+                }
+                let name = self
+                    .expect(
+                        TokenKind::Identifier,
+                        "expected name after '**' in object destructuring",
+                    )?
+                    .value;
+                if !bindings.insert(name.clone()) {
+                    return Err(self.error("duplicate binding in object destructuring"));
+                }
+                rest = Some(name);
+            } else {
+                let key = self
+                    .expect(
+                        TokenKind::Identifier,
+                        "expected key name in object destructuring",
+                    )?
+                    .value;
+                if !keys.insert(key.clone()) {
+                    return Err(self.error("duplicate key in object destructuring"));
+                }
+                self.expect(
+                    TokenKind::Assign,
+                    "expected '=' after object destructuring key",
+                )?;
+
+                // A lone identifier is an explicit destination binding:
+                // `x = left`. Any other expression is a default for the same
+                // name: `retries = 3`. Bare `{ name }` is deliberately invalid.
+                let (binding, default) = if self.check(TokenKind::Identifier)
+                    && matches!(
+                        self.tokens.get(self.pos + 1).map(|token| token.kind),
+                        Some(TokenKind::Comma | TokenKind::RBrace | TokenKind::Newline)
+                    ) {
+                    (self.advance().value, None)
+                } else {
+                    (key.clone(), Some(self.parse_expr()?))
+                };
+                if !bindings.insert(binding.clone()) {
+                    return Err(self.error("duplicate binding in object destructuring"));
+                }
+                entries.push(DictDestructEntry {
+                    key,
+                    binding,
+                    default,
+                });
+            }
+            self.skip_newlines();
+            if self.match_kind(TokenKind::Comma) {
+                self.skip_newlines();
+                continue;
+            }
+            break;
+        }
+        self.expect(
+            TokenKind::RBrace,
+            "expected '}' in object destructuring pattern",
+        )?;
+        Ok(DestructPattern::Dict { entries, rest })
     }
 
     fn parse_destruct_elem_list(
@@ -932,6 +1021,10 @@ impl Parser {
         let params = self.parse_param_list()?;
         self.skip_newlines();
         self.expect(TokenKind::RParen, "expected ')'")?;
+        let descriptors = self.parse_function_descriptors()?;
+        if is_const && !descriptors.is_empty() {
+            return Err(self.error("const func does not support runtime function descriptors"));
+        }
         let (return_type, return_strong, return_wrapper) = self.parse_optional_return()?;
         let body = self.parse_block()?;
         Ok(Stmt::FuncDecl {
@@ -941,12 +1034,84 @@ impl Parser {
             name,
             type_params,
             params,
+            descriptors,
             return_type,
             return_strong,
             return_wrapper,
             body,
             is_generator,
         })
+    }
+
+    fn parse_function_descriptors(
+        &mut self,
+    ) -> Result<Vec<crate::ast::FunctionDescriptor>, ParseError> {
+        let mut descriptors = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            self.skip_newlines();
+            if !matches!(
+                self.tokens.get(self.pos).map(|token| token.kind),
+                Some(TokenKind::Identifier | TokenKind::KwOutside)
+            ) || !matches!(
+                self.tokens.get(self.pos + 1).map(|token| token.kind),
+                Some(TokenKind::LParen | TokenKind::LBrace)
+            ) {
+                break;
+            }
+            let name = self.advance().value;
+            if !matches!(name.as_str(), "outside" | "display_as" | "cancel_flag") {
+                let message = format!("unknown function descriptor `{name}`");
+                return Err(self.error(&message));
+            }
+            if !seen.insert(name.clone()) {
+                let message = format!("duplicate function descriptor `{name}`");
+                return Err(self.error(&message));
+            }
+            if name == "cancel_flag" {
+                self.expect(
+                    TokenKind::LBrace,
+                    "cancel_flag requires macro syntax: cancel_flag{name}",
+                )?;
+                self.skip_newlines();
+                let token = self.expect(
+                    TokenKind::Identifier,
+                    "cancel_flag requires one binding name",
+                )?;
+                let binding = Expr::at(token.line, token.column, ExprKind::Var(token.value));
+                self.skip_newlines();
+                self.expect(
+                    TokenKind::RBrace,
+                    "expected '}' after cancel_flag binding name",
+                )?;
+                descriptors.push(crate::ast::FunctionDescriptor {
+                    name,
+                    args: vec![binding],
+                });
+                continue;
+            }
+            self.expect(TokenKind::LParen, "expected '(' after function descriptor")?;
+            self.skip_newlines();
+            let mut args = Vec::new();
+            if !self.check(TokenKind::RParen) {
+                args.push(self.parse_expr()?);
+                while self.match_kind(TokenKind::Comma) {
+                    self.skip_newlines();
+                    if self.check(TokenKind::RParen) {
+                        break;
+                    }
+                    args.push(self.parse_expr()?);
+                }
+            }
+            self.skip_newlines();
+            self.expect(TokenKind::RParen, "expected ')' after function descriptor")?;
+            if args.len() != 1 {
+                let message = format!("function descriptor `{name}` expects 1 argument");
+                return Err(self.error(&message));
+            }
+            descriptors.push(crate::ast::FunctionDescriptor { name, args });
+        }
+        Ok(descriptors)
     }
 
     fn parse_protocol_decl(&mut self, visibility: Visibility) -> Result<Stmt, ParseError> {
@@ -977,6 +1142,10 @@ impl Parser {
             let params = self.parse_param_list()?;
             self.skip_newlines();
             self.expect(TokenKind::RParen, "expected ')'")?;
+            let (return_type, return_strong, return_wrapper) = self.parse_optional_return()?;
+            if return_wrapper.is_some() {
+                return Err(self.error("protocol signatures cannot transform return values"));
+            }
             let body = self.parse_block()?;
             if !Self::is_empty_protocol_body(&body) {
                 return Err(self.error("protocol method body must be empty"));
@@ -984,6 +1153,8 @@ impl Parser {
             return Ok(ProtocolMember::Method {
                 name: method_name,
                 params,
+                return_type,
+                return_strong,
             });
         }
         let mutable = if self.match_kind(TokenKind::KwVar) {
@@ -998,10 +1169,12 @@ impl Parser {
         let field_name = self
             .expect(TokenKind::Identifier, "expected field name")?
             .value;
-        let _ = self.parse_optional_type()?;
+        let (type_expr, type_strong) = self.parse_optional_type()?;
         Ok(ProtocolMember::Field {
             name: field_name,
             mutable,
+            type_expr,
+            type_strong,
         })
     }
 
@@ -1237,9 +1410,20 @@ impl Parser {
         } else {
             false
         };
-        let name = self
-            .expect(TokenKind::Identifier, "expected parameter name")?
-            .value;
+        let pattern = if matches!(
+            self.current().kind,
+            TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace | TokenKind::Placeholder
+        ) {
+            Some(self.parse_destruct_pattern()?)
+        } else {
+            None
+        };
+        let name = if pattern.is_some() {
+            format!("__pattern_param_{}", self.pos)
+        } else {
+            self.expect(TokenKind::Identifier, "expected parameter name")?
+                .value
+        };
         let (type_expr, type_strong) = self.parse_optional_type()?;
         let default_expr = if !is_variadic && !is_kwvariadic && self.match_kind(TokenKind::Assign) {
             Some(self.parse_expr()?)
@@ -1254,6 +1438,7 @@ impl Parser {
         }
         Ok(FuncParam {
             name,
+            pattern,
             is_variadic,
             is_kwvariadic,
             implicit,
@@ -1334,15 +1519,19 @@ impl Parser {
         self.expect(TokenKind::LParen, "expected '(' after for")?;
         let mut items = Vec::new();
         loop {
-            let name = if self.match_kind(TokenKind::Placeholder) {
-                "_".into()
-            } else {
-                self.expect(TokenKind::Identifier, "expected loop variable")?
-                    .value
+            let pattern = self.parse_destruct_pattern()?;
+            let (name, pattern) = match pattern {
+                DestructPattern::Name(name) => (name, None),
+                DestructPattern::Discard => ("_".into(), None),
+                pattern => (format!("__pattern_for_{}", self.pos), Some(pattern)),
             };
             self.expect(TokenKind::KwIn, "expected 'in'")?;
             let iterable = self.parse_expr()?;
-            items.push(ForItem { name, iterable });
+            items.push(ForItem {
+                name,
+                pattern,
+                iterable,
+            });
             if !self.match_kind(TokenKind::Comma) {
                 break;
             }
@@ -1354,7 +1543,17 @@ impl Parser {
     fn parse_for(&mut self, label: Option<String>) -> Result<Stmt, ParseError> {
         let items = self.parse_for_items_in_parens()?;
         let body = self.parse_block()?;
-        Ok(Stmt::For { label, items, body })
+        let else_block = if self.match_kind(TokenKind::KwElse) {
+            Some(self.parse_block()?)
+        } else {
+            None
+        };
+        Ok(Stmt::For {
+            label,
+            items,
+            body,
+            else_block,
+        })
     }
 
     /// `par { expr; expr; ... }`：块内仅允许表达式语句。
@@ -1482,6 +1681,25 @@ impl Parser {
     }
 
     fn parse_pattern_unit(&mut self) -> Result<Pattern, ParseError> {
+        if self.check(TokenKind::LBrace) {
+            return Ok(Pattern::Destruct(self.parse_destruct_pattern()?));
+        }
+        if self.check(TokenKind::LBracket) || self.check(TokenKind::LParen) {
+            let start = self.pos;
+            if let Ok(pattern) = self.parse_destruct_pattern() {
+                let is_list = matches!(pattern, DestructPattern::List(_));
+                let has_rest = match &pattern {
+                    DestructPattern::Tuple(items) => items.iter().any(|item| {
+                        matches!(item, DestructElem::Rest(_) | DestructElem::RestDiscard)
+                    }),
+                    _ => false,
+                };
+                if is_list || has_rest {
+                    return Ok(Pattern::Destruct(pattern));
+                }
+            }
+            self.pos = start;
+        }
         if self.match_kind(TokenKind::LBracket) {
             let mut elems = Vec::new();
             self.skip_newlines();
@@ -1498,6 +1716,40 @@ impl Parser {
         }
         if self.check(TokenKind::Identifier) {
             let name = self.current().value.clone();
+            // Constructor arguments are patterns, not ordinary call expressions:
+            // e.g. Box([head, *tail]) and Some({ x = value }).
+            let start = self.pos;
+            let mut constructor = self.advance().value;
+            while self.check(TokenKind::Dot)
+                && self.tokens.get(self.pos + 1).map(|token| token.kind)
+                    == Some(TokenKind::Identifier)
+            {
+                self.advance();
+                constructor.push('.');
+                constructor.push_str(&self.advance().value);
+            }
+            if self.match_kind(TokenKind::LParen) {
+                let mut args = Vec::new();
+                self.skip_newlines();
+                while !self.check(TokenKind::RParen) && !self.is_at_end() {
+                    args.push(match self.parse_pattern_elem()? {
+                        PatternElem::Bind(name) => Pattern::Bind(name),
+                        PatternElem::Nested(pattern) => pattern,
+                        PatternElem::Value(value) => Pattern::Value(value),
+                    });
+                    self.skip_newlines();
+                    if !self.match_kind(TokenKind::Comma) {
+                        break;
+                    }
+                    self.skip_newlines();
+                }
+                self.expect(TokenKind::RParen, "expected ')' in constructor pattern")?;
+                return Ok(Pattern::Call {
+                    type_name: constructor,
+                    args,
+                });
+            }
+            self.pos = start;
             if self.tokens.get(self.pos + 1).map(|t| t.kind) == Some(TokenKind::LBrace) {
                 self.advance();
                 self.advance();
@@ -1575,6 +1827,7 @@ impl Parser {
 
     fn parse_pattern_elem(&mut self) -> Result<PatternElem, ParseError> {
         if self.check(TokenKind::LBracket)
+            || self.check(TokenKind::LBrace)
             || (self.check(TokenKind::Identifier)
                 && self.tokens.get(self.pos + 1).map(|t| t.kind) == Some(TokenKind::LBrace))
             || self.check(TokenKind::LParen)
@@ -1588,8 +1841,7 @@ impl Parser {
                 Some(TokenKind::Dot | TokenKind::LParen)
             )
         {
-            let expr = self.parse_postfix_no_macro()?;
-            return match expr_to_pattern(expr)? {
+            return match self.parse_pattern_unit()? {
                 Pattern::Value(e) => Ok(PatternElem::Value(e)),
                 p => Ok(PatternElem::Nested(p)),
             };
@@ -1959,59 +2211,40 @@ impl Parser {
     }
 
     fn parse_fstring(loc: SourceLoc, raw: &str) -> Result<Expr, ParseError> {
-        let mut parts: Vec<FStringPart> = Vec::new();
-        let mut lit = String::new();
-        let chars: Vec<char> = raw.chars().collect();
+        let mut parts = Vec::new();
+        let mut literal = String::new();
         let mut i = 0;
-        while i < chars.len() {
-            let ch = chars[i];
-            if ch == '{' {
-                if i + 1 < chars.len() && chars[i + 1] == '{' {
-                    lit.push('{');
-                    i += 2;
-                    continue;
-                }
-                if !lit.is_empty() {
-                    parts.push(FStringPart::Text(std::mem::take(&mut lit)));
-                }
-                i += 1;
-                let start = i;
-                let mut depth = 1usize;
-                while i < chars.len() && depth > 0 {
-                    let c = chars[i];
-                    if c == '{' {
-                        depth += 1;
-                    } else if c == '}' {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    i += 1;
-                }
-                if depth != 0 {
-                    return Err(ParseError::Message {
-                        line: 0,
-                        column: 0,
-                        message: "unclosed '{' in f-string".into(),
-                    });
-                }
-                let expr_src: String = chars[start..i].iter().collect();
-                let expr = Self::parse_expr_from_source(expr_src.trim())?;
-                parts.push(FStringPart::Expr(Box::new(expr)));
-                i += 1;
-                continue;
-            }
-            if ch == '}' && i + 1 < chars.len() && chars[i + 1] == '}' {
-                lit.push('}');
+        while i < raw.len() {
+            let ch = raw[i..].chars().next().unwrap_or('\0');
+            if raw[i..].starts_with("{{") {
+                literal.push('{');
                 i += 2;
-                continue;
+            } else if ch == '{' {
+                if !literal.is_empty() {
+                    parts.push(FStringPart::Text(std::mem::take(&mut literal)));
+                }
+                let start = i + 1;
+                let end =
+                    super::string_literals::interpolation_end(raw, start).map_err(|message| {
+                        ParseError::Message {
+                            line: loc.line,
+                            column: loc.column,
+                            message,
+                        }
+                    })?;
+                let expr = Self::parse_expr_from_source(raw[start..end].trim())?;
+                parts.push(FStringPart::Expr(Box::new(expr)));
+                i = end + 1;
+            } else if raw[i..].starts_with("}}") {
+                literal.push('}');
+                i += 2;
+            } else {
+                literal.push(ch);
+                i += ch.len_utf8();
             }
-            lit.push(ch);
-            i += 1;
         }
-        if !lit.is_empty() {
-            parts.push(FStringPart::Text(lit));
+        if !literal.is_empty() {
+            parts.push(FStringPart::Text(literal));
         }
         if parts.is_empty() {
             parts.push(FStringPart::Text(String::new()));

@@ -11,6 +11,7 @@ pub enum Visibility {
 #[derive(Debug, Clone)]
 pub struct FuncParam {
     pub name: String,
+    pub pattern: Option<DestructPattern>,
     /// `*args` 可变位置参数。
     pub is_variadic: bool,
     /// `**kwargs` 可变关键字参数。
@@ -48,8 +49,15 @@ pub struct MacroParam {
     pub type_strong: bool,
 }
 
+impl MacroParam {
+    pub fn bound_names(&self) -> Vec<String> {
+        vec![self.name.clone()]
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Pattern {
+    Destruct(DestructPattern),
     /// 字段 / payload 绑定名（如 `Point(a, b)` 中的 `a`）。
     Bind(String),
     Value(Box<Expr>),
@@ -84,6 +92,19 @@ pub enum DestructPattern {
     Tuple(Vec<DestructElem>),
     /// `[...]` 列表形解构（接受 list 或 tuple）
     List(Vec<DestructElem>),
+    /// `{ key = binding, key = default, **rest }` 对象/字典解构。
+    Dict {
+        entries: Vec<DictDestructEntry>,
+        rest: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct DictDestructEntry {
+    pub key: String,
+    pub binding: String,
+    /// `key = <非名字表达式>` 将值作为缺失键的默认值，并绑定到同名变量。
+    pub default: Option<Expr>,
 }
 
 #[derive(Debug, Clone)]
@@ -126,7 +147,56 @@ pub struct SelectCase {
 #[derive(Debug, Clone)]
 pub struct ForItem {
     pub name: String,
+    pub pattern: Option<DestructPattern>,
     pub iterable: Expr,
+}
+
+impl DestructPattern {
+    pub fn bound_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        match self {
+            Self::Name(name) => names.push(name.clone()),
+            Self::Discard => {}
+            Self::Tuple(items) | Self::List(items) => {
+                for item in items {
+                    match item {
+                        DestructElem::Pat(pattern) => names.extend(pattern.bound_names()),
+                        DestructElem::Rest(name) => names.push(name.clone()),
+                        DestructElem::RestDiscard => {}
+                    }
+                }
+            }
+            Self::Dict { entries, rest } => {
+                names.extend(entries.iter().map(|entry| entry.binding.clone()));
+                names.extend(rest.iter().cloned());
+            }
+        }
+        names
+    }
+}
+
+impl FuncParam {
+    pub fn bound_names(&self) -> Vec<String> {
+        self.pattern
+            .as_ref()
+            .map_or_else(|| vec![self.name.clone()], DestructPattern::bound_names)
+    }
+}
+
+impl ForItem {
+    pub fn bound_names(&self) -> Vec<String> {
+        self.pattern
+            .as_ref()
+            .map_or_else(|| vec![self.name.clone()], DestructPattern::bound_names)
+    }
+}
+
+/// A declaration-time function descriptor written after the parameter list:
+/// `func f() outside(1) display_as("worker") -> T { ... }`.
+#[derive(Debug, Clone)]
+pub struct FunctionDescriptor {
+    pub name: String,
+    pub args: Vec<Expr>,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +253,7 @@ pub enum Stmt {
         name: String,
         type_params: Vec<(String, Option<Expr>)>,
         params: Vec<FuncParam>,
+        descriptors: Vec<FunctionDescriptor>,
         return_type: Option<Expr>,
         return_strong: bool,
         return_wrapper: Option<Expr>,
@@ -220,6 +291,7 @@ pub enum Stmt {
         label: Option<String>,
         items: Vec<ForItem>,
         body: Block,
+        else_block: Option<Block>,
     },
     Break(Option<String>),
     Continue(Option<String>),
@@ -303,10 +375,14 @@ pub enum ProtocolMember {
     Method {
         name: String,
         params: Vec<FuncParam>,
+        return_type: Option<Expr>,
+        return_strong: bool,
     },
     Field {
         name: String,
         mutable: bool,
+        type_expr: Option<Expr>,
+        type_strong: bool,
     },
 }
 
@@ -398,9 +474,11 @@ pub fn block_has_yield(body: &Block) -> bool {
             }
             Stmt::While { body, .. }
             | Stmt::Loop { body, .. }
-            | Stmt::For { body, .. }
             | Stmt::With { body, .. }
             | Stmt::Block(body) => block_has_yield(body),
+            Stmt::For {
+                body, else_block, ..
+            } => block_has_yield(body) || else_block.as_ref().is_some_and(block_has_yield),
             Stmt::Try {
                 body,
                 catches,
@@ -951,6 +1029,7 @@ fn fill_placeholder_for_items(items: &[ForItem], repl: &Expr) -> Vec<ForItem> {
         .iter()
         .map(|it| ForItem {
             name: it.name.clone(),
+            pattern: it.pattern.clone(),
             iterable: fill_placeholders(&it.iterable, repl),
         })
         .collect()

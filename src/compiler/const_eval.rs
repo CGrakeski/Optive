@@ -55,6 +55,8 @@ pub struct ConstContext {
 #[derive(Clone)]
 struct ConstFunction {
     params: Vec<FuncParam>,
+    return_type: Option<Expr>,
+    return_strong: bool,
     body: Block,
     loc: SourceLoc,
 }
@@ -95,6 +97,17 @@ enum Flow {
     LoopContinue(Option<String>),
 }
 
+#[derive(Clone, Copy)]
+struct BindMode {
+    mutable: bool,
+    declaring: bool,
+}
+
+struct ForBlocks<'a> {
+    body: &'a Block,
+    else_block: Option<&'a Block>,
+}
+
 enum ConstValue {
     Value(Value),
     Module(CompileTimeModule),
@@ -130,6 +143,8 @@ impl ConstContext {
                 decorators,
                 is_generator,
                 type_params,
+                return_type,
+                return_strong,
                 ..
             } = &located.stmt
             {
@@ -138,20 +153,17 @@ impl ConstContext {
                         "const func `{name}` cannot be a generator, decorated, or generic"
                     )));
                 }
-                if params.iter().any(|param| {
-                    param.default_expr.is_some()
-                        || param.is_variadic
-                        || param.is_kwvariadic
-                        || param.implicit
-                }) {
+                if params.iter().any(|param| param.implicit) {
                     return Err(RuntimeError::msg(format!(
-                        "const func `{name}` requires plain parameters without defaults"
+                        "const func `{name}` does not support implicit runtime conversions"
                     )));
                 }
                 cx.functions.insert(
                     name.clone(),
                     ConstFunction {
                         params: params.clone(),
+                        return_type: return_type.clone(),
+                        return_strong: *return_strong,
                         body: body.clone(),
                         loc: SourceLoc::new(located.line, located.column),
                     },
@@ -159,6 +171,11 @@ impl ConstContext {
             }
         }
         for (name, function) in &cx.functions {
+            for param in &function.params {
+                if let Some(default) = &param.default_expr {
+                    cx.validate_expr(default)?;
+                }
+            }
             cx.validate_block(&function.body).map_err(|error| {
                 RuntimeError::msg(format!(
                     "const func `{name}` has forbidden effect: {}",
@@ -452,23 +469,43 @@ impl ConstContext {
         let ExprKind::Var(name) = &callee.kind else {
             return Ok(None);
         };
-        if args
-            .iter()
-            .any(|arg| arg.name.is_some() || arg.is_splat || arg.is_kwsplat)
-        {
-            return Err(state.error(
-                loc,
-                format!("compile-time call `{name}` expects plain positional arguments"),
-            ));
-        }
         let mut values = Vec::with_capacity(args.len());
+        let mut named = crate::value::DictMap::new();
         for arg in args {
             let Some(ConstValue::Value(value)) = self.eval(&arg.value, locals, state)? else {
                 return Ok(None);
             };
-            values.push(value);
+            if arg.is_splat {
+                values.extend(sequence_items(&value, loc, state)?);
+            } else if arg.is_kwsplat {
+                let Value::Frozen(frozen) = &value else {
+                    return Err(state.error(loc, "** argument must be a dict"));
+                };
+                let FrozenValue::Dict(entries) = frozen.as_ref() else {
+                    return Err(state.error(loc, "** argument must be a dict"));
+                };
+                for (key, value) in entries.iter() {
+                    let ValueKey::Text(key) = key else {
+                        return Err(state.error(loc, "keyword keys must be text"));
+                    };
+                    if named.contains_key(&ValueKey::Text(key.clone())) {
+                        return Err(state.error(loc, format!("duplicate keyword `{key}`")));
+                    }
+                    named.insert(ValueKey::Text(key.clone()), value.clone());
+                }
+            } else if let Some(key) = &arg.name {
+                if named.contains_key(&ValueKey::Text(key.clone())) {
+                    return Err(state.error(loc, format!("duplicate keyword `{key}`")));
+                }
+                named.insert(ValueKey::Text(key.clone()), value);
+            } else {
+                values.push(value);
+            }
         }
         if const_effect::is_pure_builtin(name) {
+            if !named.is_empty() {
+                return Err(state.error(loc, "builtin does not accept keyword arguments"));
+            }
             return Ok(Some(ConstValue::Value(
                 const_effect::eval_pure_builtin(name, &values)
                     .map_err(|error| state.error(loc, error.message()))?,
@@ -477,16 +514,41 @@ impl ConstContext {
         let Some(function) = self.functions.get(name).cloned() else {
             return Ok(None);
         };
-        if values.len() != function.params.len() {
-            return Err(state.error(
-                loc,
-                format!(
-                    "const func `{name}` expects {} positional arguments",
-                    function.params.len()
-                ),
-            ));
+        let mut positional = values.into_iter();
+        let mut bound = Vec::with_capacity(function.params.len());
+        for param in &function.params {
+            let value = if param.is_variadic {
+                Value::Frozen(Arc::new(FrozenValue::List(
+                    positional.by_ref().collect::<Vec<_>>().into(),
+                )))
+            } else if param.is_kwvariadic {
+                let entries = named
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<Vec<_>>();
+                named.clear();
+                Value::Frozen(Arc::new(FrozenValue::Dict(entries.into())))
+            } else if let Some(value) = positional.next() {
+                if named.contains_key(&ValueKey::Text(param.name.clone())) {
+                    return Err(state.error(
+                        loc,
+                        format!("multiple values for argument `{}`", param.name),
+                    ));
+                }
+                value
+            } else if let Some(value) = named.remove(&ValueKey::Text(param.name.clone())) {
+                value
+            } else if let Some(default) = &param.default_expr {
+                self.eval_required(default, &EvalLocals::default(), state)?
+            } else {
+                return Err(state.error(loc, format!("missing argument `{}`", param.name)));
+            };
+            bound.push(value);
         }
-        let value = self.call_function(name, &function, values, loc, state)?;
+        if positional.next().is_some() || !named.is_empty() {
+            return Err(state.error(loc, format!("unexpected arguments for `{name}`")));
+        }
+        let value = self.call_function(name, &function, bound, loc, state)?;
         Ok(Some(ConstValue::Value(value)))
     }
 
@@ -502,6 +564,19 @@ impl ConstContext {
             name: name.to_string(),
             args: fingerprint_args(&args)?,
         };
+        for (param, value) in function.params.iter().zip(&args) {
+            if param.type_strong {
+                if let Some(annotation) = &param.type_expr {
+                    check_const_contract(
+                        value,
+                        annotation,
+                        &format!("parameter '{}'", param.name),
+                        loc,
+                        state,
+                    )?;
+                }
+            }
+        }
         if let Some(value) = state.memo.get(&key) {
             return Ok(value.clone());
         }
@@ -514,9 +589,24 @@ impl ConstContext {
         state.enter(name, loc)?;
         let mut call_locals = EvalLocals::default();
         for (param, value) in function.params.iter().zip(args) {
-            call_locals.values.insert(param.name.clone(), value);
+            if let Some(pattern) = &param.pattern {
+                bind_pattern(
+                    self,
+                    pattern,
+                    &value,
+                    &mut call_locals,
+                    BindMode {
+                        mutable: false,
+                        declaring: true,
+                    },
+                    loc,
+                    state,
+                )?;
+            } else {
+                call_locals.values.insert(param.name.clone(), value);
+            }
         }
-        let result = match self.exec_block(&function.body, &mut call_locals, state) {
+        let result = match self.exec_block_value(&function.body, &mut call_locals, state, true) {
             Ok(Flow::Return(value)) => Ok(value),
             Ok(Flow::Normal) => Ok(Value::None),
             Ok(Flow::Break(_) | Flow::LoopContinue(_)) => {
@@ -527,6 +617,11 @@ impl ConstContext {
         state.leave();
         state.active.remove(&key);
         let value = result?;
+        if function.return_strong {
+            if let Some(annotation) = &function.return_type {
+                check_const_contract(&value, annotation, "return", loc, state)?;
+            }
+        }
         state.memo.insert(key, value.clone());
         Ok(value)
     }
@@ -537,7 +632,21 @@ impl ConstContext {
         locals: &mut EvalLocals,
         state: &mut EvalState,
     ) -> Result<Flow> {
-        for located in block {
+        self.exec_block_value(block, locals, state, false)
+    }
+
+    fn exec_block_value(
+        &self,
+        block: &Block,
+        locals: &mut EvalLocals,
+        state: &mut EvalState,
+        as_value: bool,
+    ) -> Result<Flow> {
+        let last_value_index = block
+            .iter()
+            .rposition(|stmt| !matches!(stmt.stmt, Stmt::Comment { .. }));
+        for (index, located) in block.iter().enumerate() {
+            let tail = as_value && Some(index) == last_value_index;
             state.tick(SourceLoc::new(located.line, located.column), "statement")?;
             let loc = SourceLoc::new(located.line, located.column);
             match &located.stmt {
@@ -568,7 +677,18 @@ impl ConstContext {
                     ..
                 } => {
                     let value = self.eval_required(init, locals, state)?;
-                    bind_pattern(pattern, &value, locals, *is_var, true, loc, state)?;
+                    bind_pattern(
+                        self,
+                        pattern,
+                        &value,
+                        locals,
+                        BindMode {
+                            mutable: *is_var,
+                            declaring: true,
+                        },
+                        loc,
+                        state,
+                    )?;
                 }
                 Stmt::Assign {
                     target: LValue::Name(name),
@@ -585,7 +705,18 @@ impl ConstContext {
                 }
                 Stmt::DestructAssign { pattern, value } => {
                     let value = self.eval_required(value, locals, state)?;
-                    bind_pattern(pattern, &value, locals, true, false, loc, state)?;
+                    bind_pattern(
+                        self,
+                        pattern,
+                        &value,
+                        locals,
+                        BindMode {
+                            mutable: true,
+                            declaring: false,
+                        },
+                        loc,
+                        state,
+                    )?;
                 }
                 Stmt::If {
                     cond,
@@ -606,7 +737,7 @@ impl ConstContext {
                         selected.or(else_block.as_ref())
                     };
                     if let Some(selected) = selected {
-                        match self.exec_block(selected, locals, state)? {
+                        match self.exec_block_value(selected, locals, state, tail)? {
                             Flow::Normal => {}
                             flow => return Ok(flow),
                         }
@@ -646,8 +777,23 @@ impl ConstContext {
                         }
                     }
                 }
-                Stmt::For { label, items, body } => {
-                    match self.exec_for(label.as_deref(), items, body, locals, state, loc)? {
+                Stmt::For {
+                    label,
+                    items,
+                    body,
+                    else_block,
+                } => {
+                    match self.exec_for(
+                        label.as_deref(),
+                        items,
+                        ForBlocks {
+                            body,
+                            else_block: else_block.as_ref(),
+                        },
+                        locals,
+                        state,
+                        loc,
+                    )? {
                         Flow::Normal => {}
                         flow => return Ok(flow),
                     }
@@ -655,8 +801,16 @@ impl ConstContext {
                 Stmt::Break(label) => return Ok(Flow::Break(label.clone())),
                 Stmt::Continue(label) => return Ok(Flow::LoopContinue(label.clone())),
                 Stmt::Expr(expr) => {
-                    self.eval_required(expr, locals, state)?;
+                    let value = self.eval_required(expr, locals, state)?;
+                    if tail {
+                        return Ok(Flow::Return(value));
+                    }
                 }
+                Stmt::Block(body) => match self.exec_block_value(body, locals, state, tail)? {
+                    Flow::Normal => {}
+                    flow => return Ok(flow),
+                },
+                Stmt::Comment { .. } => {}
                 _ => {
                     return Err(state.error(loc, "statement is not allowed in a const func"));
                 }
@@ -669,7 +823,7 @@ impl ConstContext {
         &self,
         label: Option<&str>,
         items: &[ForItem],
-        body: &Block,
+        blocks: ForBlocks<'_>,
         locals: &mut EvalLocals,
         state: &mut EvalState,
         loc: SourceLoc,
@@ -686,27 +840,47 @@ impl ConstContext {
             )?);
         }
         let count = streams.iter().map(Vec::len).min().unwrap_or(0);
+        let mut broken = false;
         for index in 0..count {
             state.tick(loc, "for iteration")?;
             for (item, stream) in items.iter().zip(&streams) {
-                if item.name != "_" {
+                if let Some(pattern) = &item.pattern {
+                    bind_pattern(
+                        self,
+                        pattern,
+                        &stream[index],
+                        locals,
+                        BindMode {
+                            mutable: false,
+                            declaring: true,
+                        },
+                        loc,
+                        state,
+                    )?;
+                } else if item.name != "_" {
                     locals
                         .values
                         .insert(item.name.clone(), stream[index].clone());
                     locals.mutable.remove(&item.name);
                 }
             }
-            match self.exec_block(body, locals, state)? {
+            match self.exec_block(blocks.body, locals, state)? {
                 flow @ Flow::Return(_) => return Ok(flow),
                 Flow::Break(target)
                     if target.as_deref().is_none() || target.as_deref() == label =>
                 {
-                    break
+                    broken = true;
+                    break;
                 }
                 Flow::LoopContinue(target)
                     if target.as_deref().is_none() || target.as_deref() == label => {}
                 flow @ (Flow::Break(_) | Flow::LoopContinue(_)) => return Ok(flow),
                 Flow::Normal => {}
+            }
+        }
+        if !broken {
+            if let Some(else_block) = blocks.else_block {
+                return self.exec_block(else_block, locals, state);
             }
         }
         Ok(Flow::Normal)
@@ -756,13 +930,22 @@ impl ConstContext {
                     }
                     self.validate_block(body)?;
                 }
-                Stmt::For { items, body, .. } => {
+                Stmt::For {
+                    items,
+                    body,
+                    else_block,
+                    ..
+                } => {
                     for item in items {
                         self.validate_expr(&item.iterable)?;
                     }
                     self.validate_block(body)?;
+                    if let Some(else_block) = else_block {
+                        self.validate_block(else_block)?;
+                    }
                 }
-                Stmt::Break(_) | Stmt::Continue(_) => {}
+                Stmt::Break(_) | Stmt::Continue(_) | Stmt::Comment { .. } => {}
+                Stmt::Block(body) => self.validate_block(body)?,
                 _ => return Err(RuntimeError::msg("statement is not compile-time pure")),
             }
         }
@@ -987,34 +1170,114 @@ fn iterate(value: &Value, loc: SourceLoc, state: &EvalState) -> Result<Vec<Value
 }
 
 fn bind_pattern(
+    cx: &ConstContext,
     pattern: &DestructPattern,
     value: &Value,
     locals: &mut EvalLocals,
-    mutable: bool,
-    declaring: bool,
+    mode: BindMode,
     loc: SourceLoc,
-    state: &EvalState,
+    state: &mut EvalState,
 ) -> Result<()> {
     match pattern {
-        DestructPattern::Name(name) => {
-            bind_name(name, value.clone(), locals, mutable, declaring, loc, state)
-        }
+        DestructPattern::Name(name) => bind_name(
+            name,
+            value.clone(),
+            locals,
+            mode.mutable,
+            mode.declaring,
+            loc,
+            state,
+        ),
         DestructPattern::Discard => Ok(()),
         DestructPattern::Tuple(elems) | DestructPattern::List(elems) => {
             let items = sequence_items(value, loc, state)?;
-            bind_elems(elems, &items, locals, mutable, declaring, loc, state)
+            bind_elems(cx, elems, &items, locals, mode, loc, state)
+        }
+        DestructPattern::Dict { entries, rest } => {
+            let owned: Vec<(ValueKey, Value)> = match value {
+                Value::Dict(dict) => dict
+                    .borrow()
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+                Value::Frozen(frozen) => match frozen.as_ref() {
+                    FrozenValue::Dict(items) => items.to_vec(),
+                    _ => {
+                        return Err(state.error(
+                            loc,
+                            format!(
+                                "compile-time object destructuring expects dict, got {}",
+                                value.type_name()
+                            ),
+                        ));
+                    }
+                },
+                other => {
+                    return Err(state.error(
+                        loc,
+                        format!(
+                            "compile-time object destructuring expects dict, got {}",
+                            other.type_name()
+                        ),
+                    ));
+                }
+            };
+            let mut used = HashSet::new();
+            for entry in entries {
+                let key = ValueKey::Text(entry.key.clone());
+                let value = if let Some((_, value)) =
+                    owned.iter().find(|(candidate, _)| candidate == &key)
+                {
+                    value.clone()
+                } else if let Some(default) = &entry.default {
+                    cx.eval_required(default, locals, state)?
+                } else {
+                    return Err(state.error(
+                        loc,
+                        format!("object destructuring: missing required key `{}`", entry.key),
+                    ));
+                };
+                used.insert(key);
+                bind_name(
+                    &entry.binding,
+                    value,
+                    locals,
+                    mode.mutable,
+                    mode.declaring,
+                    loc,
+                    state,
+                )?;
+            }
+            if let Some(rest) = rest {
+                let remaining: Vec<_> = owned
+                    .into_iter()
+                    .filter(|(key, _)| !used.contains(key))
+                    .collect();
+                bind_name(
+                    rest,
+                    Value::Frozen(Arc::new(FrozenValue::Dict(Arc::from(
+                        remaining.into_boxed_slice(),
+                    )))),
+                    locals,
+                    mode.mutable,
+                    mode.declaring,
+                    loc,
+                    state,
+                )?;
+            }
+            Ok(())
         }
     }
 }
 
 fn bind_elems(
+    cx: &ConstContext,
     elems: &[DestructElem],
     items: &[Value],
     locals: &mut EvalLocals,
-    mutable: bool,
-    declaring: bool,
+    mode: BindMode,
     loc: SourceLoc,
-    state: &EvalState,
+    state: &mut EvalState,
 ) -> Result<()> {
     let rest = elems
         .iter()
@@ -1025,7 +1288,7 @@ fn bind_elems(
             return Err(state.error(loc, "compile-time destructuring length mismatch"));
         }
         for (elem, value) in elems[..rest_at].iter().zip(items) {
-            bind_elem(elem, value, locals, mutable, declaring, loc, state)?;
+            bind_elem(cx, elem, value, locals, mode, loc, state)?;
         }
         let rest_values = items[rest_at..items.len() - after].to_vec();
         match &elems[rest_at] {
@@ -1033,8 +1296,8 @@ fn bind_elems(
                 name,
                 Value::Frozen(Arc::new(FrozenValue::List(rest_values.into()))),
                 locals,
-                mutable,
-                declaring,
+                mode.mutable,
+                mode.declaring,
                 loc,
                 state,
             )?,
@@ -1045,7 +1308,7 @@ fn bind_elems(
             .iter()
             .zip(&items[items.len() - after..])
         {
-            bind_elem(elem, value, locals, mutable, declaring, loc, state)?;
+            bind_elem(cx, elem, value, locals, mode, loc, state)?;
         }
         return Ok(());
     }
@@ -1053,27 +1316,31 @@ fn bind_elems(
         return Err(state.error(loc, "compile-time destructuring length mismatch"));
     }
     for (elem, value) in elems.iter().zip(items) {
-        bind_elem(elem, value, locals, mutable, declaring, loc, state)?;
+        bind_elem(cx, elem, value, locals, mode, loc, state)?;
     }
     Ok(())
 }
 
 fn bind_elem(
+    cx: &ConstContext,
     elem: &DestructElem,
     value: &Value,
     locals: &mut EvalLocals,
-    mutable: bool,
-    declaring: bool,
+    mode: BindMode,
     loc: SourceLoc,
-    state: &EvalState,
+    state: &mut EvalState,
 ) -> Result<()> {
     match elem {
-        DestructElem::Pat(pattern) => {
-            bind_pattern(pattern, value, locals, mutable, declaring, loc, state)
-        }
-        DestructElem::Rest(name) => {
-            bind_name(name, value.clone(), locals, mutable, declaring, loc, state)
-        }
+        DestructElem::Pat(pattern) => bind_pattern(cx, pattern, value, locals, mode, loc, state),
+        DestructElem::Rest(name) => bind_name(
+            name,
+            value.clone(),
+            locals,
+            mode.mutable,
+            mode.declaring,
+            loc,
+            state,
+        ),
         DestructElem::RestDiscard => Ok(()),
     }
 }
@@ -1106,6 +1373,26 @@ fn bind_name(
         locals.mutable.insert(name.to_string());
     } else {
         locals.mutable.remove(name);
+    }
+    Ok(())
+}
+
+fn check_const_contract(
+    value: &Value,
+    annotation: &Expr,
+    label: &str,
+    loc: SourceLoc,
+    state: &EvalState,
+) -> Result<()> {
+    let ty = crate::types::static_type_value_from_expr(annotation).ok_or_else(|| {
+        state.error(
+            loc,
+            format!("{label}: type annotation is not compile-time static"),
+        )
+    })?;
+    let vm = crate::vm::Vm::new();
+    if let Some(detail) = crate::types::type_check_error(&vm, value, &ty) {
+        return Err(state.error(loc, format!("{label}: {detail}")));
     }
     Ok(())
 }

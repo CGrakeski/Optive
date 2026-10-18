@@ -1,0 +1,31 @@
+// A descriptor macro binds a cancellation request flag, not a string name.
+func work() cancel_flag{a} -> num {
+    if (a.requested()) {
+        return 0
+    }
+    return 42
+}
+
+func monitor(ready) cancel_flag{stop} {
+    ready.send(true)
+    while (not stop.requested()) {
+        suspend
+    }
+    return "monitor stopped normally"
+}
+
+func main() {
+    // Even a request before the first instruction can be handled by the task.
+    let task = go work()
+    task.cancel()
+    print("work result:", await task)
+
+    // A handshake ensures the monitor is running before cancellation is sent.
+    let ready = Channel()
+    let watcher = go monitor(ready)
+    ready.recv()
+    watcher.cancel()
+    print(await watcher)
+}
+
+main()

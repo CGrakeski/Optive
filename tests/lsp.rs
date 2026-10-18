@@ -168,6 +168,21 @@ fn signature_help_highlights_second_param() {
 }
 
 #[test]
+fn outside_descriptor_extends_lsp_symbol_scope() {
+    let src = concat!(
+        "func outer() {\n",
+        "  if (false) { func helper() outside(1) { return 7 } }\n",
+        "  helper()\n",
+        "}\n",
+    );
+    let hv = hover(src, 2, 3);
+    assert_eq!(hv["contents"]["value"], "func helper()");
+    assert!(diagnostics(src, "t.tive")
+        .iter()
+        .all(|(_, _, message)| !message.contains("undefined name `helper`")));
+}
+
+#[test]
 fn signature_help_shows_types_return_type_and_tracks_nested_commas() {
     let src = concat!(
         "func calculate(values: list, scale :: int = 2) -> int { return scale }\n",

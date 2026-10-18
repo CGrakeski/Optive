@@ -1,0 +1,12 @@
+var seed = 4
+
+export struct Default {
+    let number:: num = seed
+}
+
+export struct Counter {
+    var value = seed
+    func __init__(self, label: text, payload: num = 7) {
+        self.value = payload + seed
+    }
+}

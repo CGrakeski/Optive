@@ -34,15 +34,17 @@ pub enum OutputStream {
 type OutputCallback = dyn Fn(OutputStream, &str) + Send + Sync;
 
 #[derive(Clone)]
-pub struct OutputSink(Arc<OutputCallback>);
+pub struct OutputSink(Arc<SyncCell<Arc<OutputCallback>>>);
 
 impl OutputSink {
     pub fn new(f: impl Fn(OutputStream, &str) + Send + Sync + 'static) -> Self {
-        Self(Arc::new(f))
+        Self(Arc::new(SyncCell::new(Arc::new(f))))
     }
 
     fn write(&self, stream: OutputStream, text: &str) {
-        (self.0)(stream, text);
+        // Release the configuration lock before invoking user code (which may reenter).
+        let callback = self.0.borrow().clone();
+        callback(stream, text);
     }
 }
 
@@ -143,6 +145,8 @@ struct TaskRunCtx {
 
 /// 挂起任务的纤程快照。
 pub(crate) struct TaskFiber {
+    /// Exception state belongs to this fiber, including a catch that suspends.
+    active_exception: Option<Value>,
     code: Arc<Vec<Instruction>>,
     hot_ops: Arc<[u8]>,
     hot_args: Arc<[i64]>,
@@ -168,8 +172,9 @@ pub(crate) struct TaskFiber {
     lw_frame_slots: usize,
     /// 卸荷 FFI pending（随纤程迁移，不能只挂在 Vm 上）。
     ffi_wait: Option<std::sync::Arc<crate::ffi_pool::FfiPending>>,
+    native_wait: Option<Arc<crate::runtime::io_pool::Pending>>,
     /// `go builtin(...)` 卸荷后：恢复时再 poll 同一 Builtin，勿跑宿主字节码。
-    retry_poll: Option<(Value, Vec<Value>)>,
+    retry_poll: Option<(Value, Vec<Value>, DictMap)>,
     /// Barrier/Cond 挂起后重试：已登记等待，勿再次 +1。
     sync_wait_resume: Option<SyncWaitResume>,
 }
@@ -237,7 +242,7 @@ const LW_SLOTS_INIT_CAP: usize = 1024;
 const LW_BASES_INIT_CAP: usize = 128;
 /// M:N 死锁检测：连续「全局静默」轮次阈值（每轮 ≈ `wait_brief` 2ms）。
 const MN_DEADLOCK_IDLE_ROUNDS: u32 = 50;
-/// 任务内协作 sleep 的单次切片上限。
+/// Idle waits are bounded so host cancellation and GC safepoints remain responsive.
 const COOP_SLEEP_SLICE: std::time::Duration = std::time::Duration::from_millis(10);
 /// select 空转时单次睡到最近截止时间的上限。
 const SELECT_IDLE_CAP_MS: u64 = 10;
@@ -689,12 +694,17 @@ pub struct Vm {
     pub active_line_map: Arc<Vec<usize>>,
     pub active_column_map: Arc<Vec<usize>>,
     pub struct_defs: SharedTable<Arc<crate::value::StructDef>>,
+    struct_constructions: Vec<(Arc<crate::value::StructInstance>, Vec<bool>)>,
     pub enum_defs: SharedTable<Arc<crate::value::EnumDef>>,
     pub variant_defs: SharedTable<Arc<crate::value::VariantDef>>,
     pub functions: SharedTable<Arc<FunctionObject>>,
     pub macros: SharedTable<Arc<MacroObject>>,
     pub(crate) try_stack: Vec<TryFrame>,
+    /// Synchronous host-to-language calls must not execute their caller's catch.
+    sync_call_floors: Vec<(usize, usize, usize, usize)>,
     pub(crate) active_exception: Option<Value>,
+    /// Host exceptions temporarily hidden while a scheduler invocation runs a task.
+    scheduler_exception_roots: Vec<Value>,
     pub(crate) iterators: Vec<ActiveIter>,
     pub(crate) const_names: FxHashSet<String>,
     /// 已声明但尚未执行到对应 store 的 const 名（允许先引用后赋值）。
@@ -814,10 +824,13 @@ pub struct Vm {
     ffi_cfg: std::sync::Arc<crate::ffi::FfiRuntimeConfig>,
     /// 卸荷中的 pending（任务重试 Builtin 时取回）。
     ffi_wait: Option<std::sync::Arc<crate::ffi_pool::FfiPending>>,
+    native_wait: Option<Arc<crate::runtime::io_pool::Pending>>,
     /// `call_value_poll` 里 Builtin 卸荷后，随 `capture_fiber` 写入 `retry_poll`。
-    pending_poll_retry: Option<(Value, Vec<Value>)>,
+    pending_poll_retry: Option<(Value, Vec<Value>, DictMap)>,
     /// Barrier/Cond 挂起重试令牌（亦随 `TaskFiber` 迁移）。
     sync_wait_resume: Option<SyncWaitResume>,
+    /// Main-context timed wait; running tasks must return at its deadline even in M:N.
+    native_wait_deadline: Option<std::time::Instant>,
     /// 当前调度任务上下文；`None` 表示主纤程。
     task_ctx: Option<TaskRunCtx>,
     /// 每片最多执行的字节码条数。
@@ -1066,6 +1079,7 @@ enum StepAction {
     GoCall {
         argc: usize,
     },
+    GoCallEx,
     GoValue,
     Await,
     Suspend,
@@ -1136,7 +1150,9 @@ impl Vm {
     }
 
     pub fn set_output_sink(&mut self, sink: OutputSink) {
-        self.output_sink = sink;
+        // Workers share this cell, not a stale snapshot of the previous callback.
+        let callback = sink.0.borrow().clone();
+        *self.output_sink.0.borrow_mut() = callback;
     }
 
     pub fn set_host_cancel(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
@@ -1195,12 +1211,15 @@ impl Vm {
             active_line_map: Arc::new(Vec::new()),
             active_column_map: Arc::new(Vec::new()),
             struct_defs: SharedTable::new(),
+            struct_constructions: Vec::new(),
             enum_defs: SharedTable::new(),
             variant_defs: SharedTable::new(),
             functions: SharedTable::new(),
             macros: SharedTable::new(),
             try_stack: Vec::new(),
+            sync_call_floors: Vec::new(),
             active_exception: None,
+            scheduler_exception_roots: Vec::new(),
             iterators: Vec::new(),
             const_names: FxHashSet::default(),
             pending_const: FxHashSet::default(),
@@ -1272,8 +1291,10 @@ impl Vm {
             call_retry_armed: false,
             ffi_cfg: crate::ffi::FfiRuntimeConfig::from_env(),
             ffi_wait: None,
+            native_wait: None,
             pending_poll_retry: None,
             sync_wait_resume: None,
+            native_wait_deadline: None,
             task_ctx: None,
             suspend_budget: clamp_suspend_budget(suspend_budget_default()),
             budget_left: clamp_suspend_budget(suspend_budget_default()),
@@ -1586,9 +1607,19 @@ impl Vm {
         for f in &self.func_stack {
             push_func(worklist, f);
         }
+        for def in self.struct_defs.values() {
+            for f in def.field_defaults.iter().flatten() {
+                push_func(worklist, f);
+            }
+        }
+        for (instance, _) in &self.struct_constructions {
+            worklist.push(Value::Struct(instance.clone()));
+        }
         if let Some(exc) = &self.active_exception {
             worklist.push(exc.clone());
         }
+        worklist.extend(self.scheduler_exception_roots.iter().cloned());
+        worklist.extend(self.mn.sleeping_task_values());
         for it in &self.iterators {
             worklist.push(Value::Iterator(it.state.clone()));
         }
@@ -1647,6 +1678,14 @@ impl Vm {
     }
 
     fn gc_push_fiber_roots(fiber: &TaskFiber, worklist: &mut Vec<Value>) {
+        if let Some((callable, args, kwargs)) = &fiber.retry_poll {
+            worklist.push(callable.clone());
+            worklist.extend(args.iter().cloned());
+            worklist.extend(kwargs.values().cloned());
+        }
+        if let Some(exc) = &fiber.active_exception {
+            worklist.push(exc.clone());
+        }
         for v in &fiber.stack {
             worklist.push(v.to_value());
         }
@@ -3563,6 +3602,10 @@ impl Vm {
                 HotFlow::Cold
             }
             H_GOTO_IF_NOT => {
+                if matches!(self.stack.get(self.stack_sp.wrapping_sub(1)), Some(StackVal::Heap(value)) if matches!(value.as_ref(), Value::Struct(_)))
+                {
+                    return HotFlow::Cold;
+                }
                 // 常见：比较结果 Bool 在 TOS
                 self.pc = pc + 1;
                 let sp = self.stack_sp;
@@ -3606,6 +3649,10 @@ impl Vm {
                 HotFlow::Cont
             }
             H_GOTO_IF => {
+                if matches!(self.stack.get(self.stack_sp.wrapping_sub(1)), Some(StackVal::Heap(value)) if matches!(value.as_ref(), Value::Struct(_)))
+                {
+                    return HotFlow::Cold;
+                }
                 self.pc = pc + 1;
                 let sp = self.stack_sp;
                 if sp > 0 {
@@ -4361,7 +4408,11 @@ impl Vm {
 
     fn dispatch_to_handler(&mut self) -> Result<bool> {
         // 任务纤程内不得跳到宿主 try（否则 leave_scope 会卸掉 stop_* 以下的帧）。
-        let stop_try = self.task_ctx.as_ref().map_or(0, |c| c.stop_try);
+        let stop_try = self
+            .task_ctx
+            .as_ref()
+            .map_or(0, |c| c.stop_try)
+            .max(self.sync_call_floors.last().map_or(0, |f| f.0));
         if self.try_stack.len() <= stop_try {
             return Ok(false);
         }
@@ -4585,6 +4636,7 @@ impl Vm {
             I::FindModFile(path) => StepAction::FindModFile(path.clone()),
             I::RegisterExport(name) => StepAction::RegisterExport(name.clone()),
             I::GoCall(argc) => StepAction::GoCall { argc: *argc },
+            I::GoCallEx => StepAction::GoCallEx,
             I::GoValue => StepAction::GoValue,
             I::Await => StepAction::Await,
             I::Suspend => StepAction::Suspend,
@@ -4805,7 +4857,7 @@ impl Vm {
             }
             StepAction::TruthyNot => {
                 let a = self.pop()?;
-                let t = self.value_is_truthy(&a);
+                let t = self.value_is_truthy(&a)?;
                 self.push_bool(!t);
             }
             StepAction::And | StepAction::Or => {
@@ -5114,13 +5166,13 @@ impl Vm {
             }
             StepAction::GotoIf(target) => {
                 let cond = self.pop()?;
-                if self.value_is_truthy_fast(&cond) {
+                if self.value_is_truthy_fast(&cond)? {
                     self.jump_or_halt(target)?;
                 }
             }
             StepAction::GotoIfNot(target) => {
                 let cond = self.pop()?;
-                if !self.value_is_truthy_fast(&cond) {
+                if !self.value_is_truthy_fast(&cond)? {
                     self.jump_or_halt(target)?;
                 }
             }
@@ -5355,7 +5407,7 @@ impl Vm {
                     args.push(self.pop()?);
                 }
                 args.reverse();
-                let val = make_struct(self, &name, args, None)?;
+                let val = make_struct(self, &name, args, None, DictMap::new())?;
                 self.push_value(val);
             }
             StepAction::VariantNew { name } => {
@@ -5620,6 +5672,19 @@ impl Vm {
             StepAction::GoValue => {
                 let v = self.pop()?;
                 let task = Self::task_from_value(v);
+                self.push_value(task);
+            }
+            StepAction::GoCallEx => {
+                let callee = self.pop()?;
+                let kwargs = match self.pop()? {
+                    Value::Dict(d) => d.borrow().clone(),
+                    _ => return Err(RuntimeError::type_err("GoCallEx requires kwargs dict")),
+                };
+                let args = match self.pop()? {
+                    Value::List(l) => l.borrow().clone(),
+                    _ => return Err(RuntimeError::type_err("GoCallEx requires arg list")),
+                };
+                let task = self.spawn_task_with_keywords(callee, args, kwargs);
                 self.push_value(task);
             }
             StepAction::Await => {
@@ -6130,18 +6195,28 @@ impl Vm {
     }
 
     fn call_struct_method(&mut self, obj: &Value, method: &str, args: Vec<Value>) -> Result<Value> {
+        self.call_struct_method_with_keywords(obj, method, args, DictMap::new())
+    }
+
+    fn call_struct_method_with_keywords(
+        &mut self,
+        obj: &Value,
+        method: &str,
+        args: Vec<Value>,
+        kwargs: DictMap,
+    ) -> Result<Value> {
         let Value::Struct(s) = obj else {
             return Err(RuntimeError::msg("expected struct instance"));
         };
         if let Some(func) = s.def.methods.get(method).cloned() {
             let mut full_args = vec![obj.clone()];
             full_args.extend(args);
-            return self.call_user_function(func, full_args);
+            return self.call_user_function_with_keywords(func, full_args, kwargs);
         }
         if let Some(overloads) = s.def.overloads.get(method).cloned() {
             let mut full_args = vec![obj.clone()];
             full_args.extend(args);
-            return self.dispatch_overload(&overloads, &full_args);
+            return self.dispatch_overload_with_keywords(&overloads, &full_args, kwargs);
         }
         Err(RuntimeError::attr_err(format!(
             "{} has no method {method}",
@@ -6164,21 +6239,28 @@ impl Vm {
         kwargs: DictMap,
     ) -> Result<Value> {
         self.user_call_deferred = false;
-        if !kwargs.is_empty() && !matches!(callee, Value::Function(_) | Value::GenericFunction(_)) {
+        let supports_keywords = matches!(&callee, Value::Function(_) | Value::GenericFunction(_))
+            || matches!(&callee, Value::Builtin(b) if b.keyword_func.is_some())
+            || matches!(&callee, Value::TypeRef(name) if self.struct_defs.contains_key(name))
+            || matches!(&callee, Value::TypeSpec(spec) if self.struct_defs.contains_key(&spec.name));
+        let supports_keywords = supports_keywords
+            || matches!(&callee, Value::Dispatch(_))
+            || (matches!(&callee, Value::Struct(_)) && self.struct_has_method(&callee, "__call__"));
+        if !kwargs.is_empty() && !supports_keywords {
             return Err(RuntimeError::type_err(
-                "keyword arguments only supported for user functions",
+                "this callable does not support keyword arguments",
             ));
         }
         let args = positional;
         match callee {
             Value::Struct(ref _s) if self.struct_has_method(&callee, "__call__") => {
-                self.call_struct_method(&callee, "__call__", args)
+                self.call_struct_method_with_keywords(&callee, "__call__", args, kwargs)
             }
             Value::Builtin(b) => {
-                let out = b.call(self, &args)?;
+                let out = b.call_with_keywords(self, &args, &kwargs)?;
                 if self.block_suspend {
                     self.block_suspend = false;
-                    self.arm_call_retry(Value::Builtin(b), args);
+                    self.arm_call_retry_with_keywords(Value::Builtin(b), args, kwargs);
                     return Ok(Value::None);
                 }
                 Ok(out)
@@ -6201,7 +6283,8 @@ impl Vm {
                 Ok(Value::None)
             }
             Value::GenericFunction(template) => {
-                let type_args = infer_generic_type_args_from_values(self, &template, &args)?;
+                let type_args =
+                    infer_generic_type_args_from_values(self, &template, &args, &kwargs)?;
                 let func = specialize_generic_runtime(self, &template, type_args)?;
                 let bound = self.bind_call_arguments(&func, args, kwargs)?;
                 if func.is_generator() {
@@ -6214,9 +6297,9 @@ impl Vm {
             Value::Macro(_) => Err(RuntimeError::msg(
                 "macro cannot be called with (); use {} syntax",
             )),
-            Value::Dispatch(table) => self.call_dispatch(&table, args),
+            Value::Dispatch(table) => self.call_dispatch_with_keywords(&table, args, kwargs),
             Value::TypeRef(ref type_name) if self.struct_defs.contains_key(type_name) => {
-                make_struct(self, type_name, args, None)
+                make_struct(self, type_name, args, None, kwargs)
             }
             Value::TypeRef(ref type_name) if self.variant_defs.contains_key(type_name) => {
                 if args.len() != 1 {
@@ -6260,7 +6343,9 @@ impl Vm {
                         .expect("variant arg count checked above (theoretically unreachable)"),
                 )
             }
-            Value::TypeSpec(spec) => make_struct(self, &spec.name, args, Some(spec.args.clone())),
+            Value::TypeSpec(spec) => {
+                make_struct(self, &spec.name, args, Some(spec.args.clone()), kwargs)
+            }
             other => Err(RuntimeError::type_err(format!(
                 "value is not callable: {}",
                 other.type_name()
@@ -6516,11 +6601,17 @@ impl Vm {
         Ok(result)
     }
 
-    pub(crate) fn value_is_truthy(&mut self, val: &Value) -> bool {
+    pub(crate) fn value_is_truthy(&mut self, val: &Value) -> Result<bool> {
         if let Some(r) = self.try_call_magic(val, "__bool__", vec![]) {
-            return r.is_ok_and(|v| v.is_truthy());
+            return match r? {
+                Value::Bool(value) => Ok(value),
+                value => Err(RuntimeError::type_err(format!(
+                    "__bool__ must return bool, got {}",
+                    value.type_name()
+                ))),
+            };
         }
-        val.is_truthy()
+        Ok(val.is_truthy())
     }
 
     pub(crate) fn value_contains(&mut self, container: &Value, item: &Value) -> Result<bool> {
@@ -6669,6 +6760,15 @@ impl Vm {
     }
 
     fn call_dispatch(&mut self, table: &Shared<DispatchTable>, args: Vec<Value>) -> Result<Value> {
+        self.call_dispatch_with_keywords(table, args, DictMap::new())
+    }
+
+    fn call_dispatch_with_keywords(
+        &mut self,
+        table: &Shared<DispatchTable>,
+        args: Vec<Value>,
+        kwargs: DictMap,
+    ) -> Result<Value> {
         enum DispatchTarget {
             Function(Arc<FunctionObject>),
             Builtin(Arc<crate::value::BuiltinObject>),
@@ -6685,12 +6785,19 @@ impl Vm {
                 let (score, target) = match handler_val {
                     Value::Function(func) => {
                         let func = self.ensure_func_types_resolved(func.clone())?;
-                        let Some(score) = types::dispatch_match_score(self, &func, &args) else {
+                        let Ok(bound) =
+                            self.bind_call_arguments(&func, args.clone(), kwargs.clone())
+                        else {
+                            continue;
+                        };
+                        let Some(score) = types::dispatch_match_score(self, &func, &bound) else {
                             continue;
                         };
                         (score, DispatchTarget::Function(func))
                     }
-                    Value::Builtin(b) => (usize::MAX, DispatchTarget::Builtin(b.clone())),
+                    Value::Builtin(b) if kwargs.is_empty() || b.keyword_func.is_some() => {
+                        (usize::MAX, DispatchTarget::Builtin(b.clone()))
+                    }
                     _ => continue,
                 };
                 match &best {
@@ -6706,7 +6813,7 @@ impl Vm {
         if let Some((_, _, target)) = best {
             return match target {
                 DispatchTarget::Function(func) => {
-                    let bound = self.bind_call_arguments(&func, args, DictMap::new())?;
+                    let bound = self.bind_call_arguments(&func, args, kwargs)?;
                     if func.is_generator() {
                         return self.make_generator_iterator(func, bound);
                     }
@@ -6715,10 +6822,10 @@ impl Vm {
                     Ok(Value::None)
                 }
                 DispatchTarget::Builtin(b) => {
-                    let out = b.call(self, &args)?;
+                    let out = b.call_with_keywords(self, &args, &kwargs)?;
                     if self.block_suspend {
                         self.block_suspend = false;
-                        self.arm_call_retry(Value::Builtin(b), args);
+                        self.arm_call_retry_with_keywords(Value::Builtin(b), args, kwargs);
                         return Ok(Value::None);
                     }
                     Ok(out)
@@ -6890,8 +6997,8 @@ impl Vm {
         Ok(())
     }
 
-    fn value_is_truthy_fast(&mut self, val: &Value) -> bool {
-        match val {
+    fn value_is_truthy_fast(&mut self, val: &Value) -> Result<bool> {
+        Ok(match val {
             Value::None => false,
             Value::Bool(b) => *b,
             Value::Num(n) => !n.is_zero(),
@@ -6901,8 +7008,8 @@ impl Vm {
             Value::Set(s) => !s.borrow().is_empty(),
             Value::Tuple(t) => !t.is_empty(),
             Value::Bytes(b) => !b.is_empty(),
-            _ => self.value_is_truthy(val),
-        }
+            _ => return self.value_is_truthy(val),
+        })
     }
 
     pub(crate) fn current_line(&self) -> usize {
@@ -7065,7 +7172,16 @@ impl Vm {
         func: Arc<FunctionObject>,
         args: Vec<Value>,
     ) -> Result<Value> {
-        match self.call_user_function_poll(func, args)? {
+        self.call_user_function_with_keywords(func, args, DictMap::new())
+    }
+
+    fn call_user_function_with_keywords(
+        &mut self,
+        func: Arc<FunctionObject>,
+        args: Vec<Value>,
+        kwargs: DictMap,
+    ) -> Result<Value> {
+        match self.call_user_function_poll(func, args, kwargs)? {
             InterpreterResult::Value(v) => Ok(v.unwrap_or(Value::None)),
             InterpreterResult::Suspended => {
                 self.nested_user_call_suspended = true;
@@ -7114,8 +7230,9 @@ impl Vm {
         &mut self,
         func: Arc<FunctionObject>,
         args: Vec<Value>,
+        kwargs: DictMap,
     ) -> Result<InterpreterResult> {
-        let bound = self.bind_call_arguments(&func, args, DictMap::new())?;
+        let bound = self.bind_call_arguments(&func, args, kwargs)?;
         if func.is_generator() {
             return Ok(InterpreterResult::Value(Some(
                 self.make_generator_iterator(func, bound)?,
@@ -7123,8 +7240,18 @@ impl Vm {
         }
         let stack_base = self.stack_sp;
         let stop_depth = self.user_call_frames.len();
-        self.setup_user_call(func, bound, false)?;
-        match self.run_interpreter(Some(stop_depth))? {
+        self.sync_call_floors.push((
+            self.try_stack.len(),
+            stop_depth,
+            self.fast_ret_sp,
+            self.iterators.len(),
+        ));
+        let result = (|| {
+            self.setup_user_call(func, bound, false)?;
+            self.run_interpreter(Some(stop_depth))
+        })();
+        self.sync_call_floors.pop();
+        match result? {
             InterpreterResult::Value(v) => {
                 self.op_truncate(stack_base);
                 Ok(InterpreterResult::Value(Some(v.unwrap_or(Value::None))))
@@ -7256,6 +7383,11 @@ impl Vm {
             saved_lw_depth,
             saved_lw_base,
         });
+        if func.cooperative_cancel {
+            if let Some(ctx) = &self.task_ctx {
+                ctx.task.borrow_mut().cooperative_depth += 1;
+            }
+        }
         self.code = func.body.clone();
         validate_function_hot(&func, self.script_global_names.len())?;
         self.hot_ops = func.hot.ops.clone();
@@ -7345,6 +7477,12 @@ impl Vm {
     }
 
     fn restore_user_call_frame(&mut self, frame: UserCallFrame) {
+        if frame.func.cooperative_cancel {
+            if let Some(ctx) = &self.task_ctx {
+                let mut task = ctx.task.borrow_mut();
+                task.cooperative_depth = task.cooperative_depth.saturating_sub(1);
+            }
+        }
         let was_lightweight = !frame.pushed_name_frame;
         if !was_lightweight {
             self.code = frame.saved_code.expect("heavy frame saves code");
@@ -7438,11 +7576,20 @@ impl Vm {
         if self.task_ctx.is_some() {
             return Ok(());
         }
-        while self.fast_ret_sp > 0 {
+        let (stop_try, stop_depth, stop_fast, stop_iters) = self
+            .sync_call_floors
+            .last()
+            .copied()
+            .unwrap_or((0, 0, 0, 0));
+        while self.fast_ret_sp > stop_fast {
             self.fast_ret_sp -= 1;
             self.pop_lightweight_frame();
         }
-        while let Some(frame) = self.user_call_frames.pop() {
+        while self.user_call_frames.len() > stop_depth {
+            let frame = self
+                .user_call_frames
+                .pop()
+                .expect("frame above synchronous call floor");
             if frame.pushed_name_frame {
                 self.leave_scope();
             } else if self.lw_depth > frame.saved_lw_depth {
@@ -7457,8 +7604,8 @@ impl Vm {
             self.restore_user_call_frame(frame);
         }
         if self.generator_run.is_empty() {
-            self.try_stack.clear();
-            self.iterators.clear();
+            self.try_stack.truncate(stop_try);
+            self.iterators.truncate(stop_iters);
         }
         Ok(())
     }
@@ -7932,19 +8079,45 @@ impl Vm {
         overloads: &[Arc<FunctionObject>],
         args: &[Value],
     ) -> Result<Value> {
+        self.dispatch_overload_with_keywords(overloads, args, DictMap::new())
+    }
+
+    fn dispatch_overload_with_keywords(
+        &mut self,
+        overloads: &[Arc<FunctionObject>],
+        args: &[Value],
+        kwargs: DictMap,
+    ) -> Result<Value> {
         let mut best: Option<(usize, Arc<FunctionObject>)> = None;
+        let mut binding_error = None;
+        let mut any_bound = false;
         for func in overloads {
             let func = self.ensure_func_types_resolved(func.clone())?;
-            if let Some(score) = types::dispatch_match_score(self, &func, args) {
+            let bound = match self.bind_call_arguments(&func, args.to_vec(), kwargs.clone()) {
+                Ok(bound) => {
+                    any_bound = true;
+                    bound
+                }
+                Err(error) => {
+                    binding_error.get_or_insert(error);
+                    continue;
+                }
+            };
+            if let Some(score) = types::dispatch_match_score(self, &func, &bound) {
                 if best.as_ref().is_none_or(|(s, _)| score < *s) {
                     best = Some((score, func));
                 }
             }
         }
         if let Some((_, func)) = best {
-            return self.call_user_function(func, args.to_vec());
+            return self.call_user_function_with_keywords(func, args.to_vec(), kwargs);
         }
-        Err(RuntimeError::msg("no matching overload"))
+        if !any_bound {
+            if let Some(error) = binding_error {
+                return Err(error);
+            }
+        }
+        Err(RuntimeError::type_err("no matching overload"))
     }
 
     pub(crate) fn advance_iterator(
@@ -7965,7 +8138,8 @@ impl Vm {
                         return Ok(None);
                     }
                     let val = Value::Num(Num::Small(*current));
-                    *current += *step;
+                    // Overflow steps beyond every representable exclusive stop.
+                    *current = current.checked_add(*step).unwrap_or(*stop);
                     return Ok(Some(val));
                 }
                 IteratorKind::List { items, index } => {
@@ -8534,10 +8708,19 @@ impl Vm {
     }
 
     pub(crate) fn spawn_task(&mut self, callable: Value, args: Vec<Value>) -> Value {
+        self.spawn_task_with_keywords(callable, args, DictMap::new())
+    }
+
+    fn spawn_task_with_keywords(
+        &mut self,
+        callable: Value,
+        args: Vec<Value>,
+        kwargs: DictMap,
+    ) -> Value {
         // go 任务可能经 SharedMap / module_env 读顶层绑定；刷平行槽。
         self.flush_script_globals_to_map();
         self.publish_script_globals();
-        let task = Shared::new(TaskInner::pending(callable, args));
+        let task = Shared::new(TaskInner::pending_with_keywords(callable, args, kwargs));
         self.enqueue_new_task(task.clone());
         Value::Task(task)
     }
@@ -8565,15 +8748,24 @@ impl Vm {
     }
 
     fn take_ready_task(&mut self) -> Option<Shared<TaskInner>> {
-        if self.mn_parallel {
-            let task = self.mn.steal_task(&self.local_worker);
-            if task.is_some() {
+        for task in self.mn.take_due_sleepers() {
+            self.enqueue_task(task);
+        }
+        loop {
+            let task = if self.mn_parallel {
+                self.mn.steal_task(&self.local_worker)
+            } else {
+                self.ready_tasks.pop_front()
+            }?;
+            // await / synchronization may have queued a duplicate before the task parked.
+            if self.mn.is_sleeping(&task) {
+                continue;
+            }
+            if self.mn_parallel {
                 // 与 scheduler_run_task 末尾的 note_task_done 配对（死锁检测）。
                 self.mn.note_task_taken();
             }
-            task
-        } else {
-            self.ready_tasks.pop_front()
+            return Some(task);
         }
     }
 
@@ -8614,12 +8806,15 @@ impl Vm {
             active_line_map: Arc::new(Vec::new()),
             active_column_map: Arc::new(Vec::new()),
             struct_defs: self.struct_defs.clone(),
+            struct_constructions: Vec::new(),
             enum_defs: self.enum_defs.clone(),
             variant_defs: self.variant_defs.clone(),
             functions: self.functions.clone(),
             macros: self.macros.clone(),
             try_stack: Vec::new(),
+            sync_call_floors: Vec::new(),
             active_exception: None,
+            scheduler_exception_roots: Vec::new(),
             iterators: Vec::new(),
             const_names: self.const_names.clone(),
             pending_const: FxHashSet::default(),
@@ -8688,8 +8883,10 @@ impl Vm {
             call_retry_armed: false,
             ffi_cfg: self.ffi_cfg.clone(),
             ffi_wait: None,
+            native_wait: None,
             pending_poll_retry: None,
             sync_wait_resume: None,
+            native_wait_deadline: None,
             task_ctx: None,
             suspend_budget: clamp_suspend_budget(self.suspend_budget),
             budget_left: clamp_suspend_budget(self.suspend_budget),
@@ -8773,11 +8970,23 @@ impl Vm {
         if self.scheduler_run_one()? || self.debug_break_requested {
             return Ok(());
         }
+        // A parked timer is future work, not deadlock. Do not repeatedly run sleeping fibers.
+        if let Some(until) = self.mn.next_sleep_deadline() {
+            self.fail_if_host_cancelled()?;
+            self.poll_gc_safepoint();
+            self.mn.wait_for(
+                until
+                    .saturating_duration_since(std::time::Instant::now())
+                    .min(COOP_SLEEP_SLICE),
+            );
+            self.mn_idle_rounds = 0;
+            return Ok(());
+        }
         if self.mn_parallel {
             // 其它 OS worker 可能正在跑 CPU 任务；不能仅凭「本线程无就绪」判死锁。
             // 静默判据：无任何线程在执行任务（busy==0）且各级队列均为空。
-            // sleep / FFI / 定时等待的任务会持续在就绪队列自旋或处于执行中，
-            // 故不会造成全局静默；连续静默若干轮（覆盖取任务瞬间的竞态窗口）
+            // Sleeping tasks were handled above through their timers; FFI / other waits
+            // still have runnable polling fibers or a busy worker. 连续静默若干轮（覆盖取任务瞬间的竞态窗口）
             // 后才报死锁。
             let quiescent = !self.mn.is_shutdown() && self.mn.busy() == 0 && self.mn.queues_empty();
             if quiescent {
@@ -8801,14 +9010,96 @@ impl Vm {
         Err(RuntimeError::deadlock(msg))
     }
 
-    /// 将 callee/args 压回栈并把 PC 拨回 Call，供挂起恢复后重试。
-    fn arm_call_retry(&mut self, callee: Value, args: Vec<Value>) {
-        for a in args {
-            self.push_value(a);
+    pub(crate) fn has_native_wait(&self) -> bool {
+        self.native_wait.is_some()
+    }
+
+    /// Resume an already prepared native operation without rebuilding its resources.
+    pub(crate) fn resume_blocking<T: Send + 'static>(&mut self) -> Result<Option<T>> {
+        let pending = self
+            .native_wait
+            .take()
+            .ok_or_else(|| RuntimeError::msg("internal error: native wait missing on resume"))?;
+        self.poll_native_wait(pending)
+    }
+
+    fn poll_native_wait<T: Send + 'static>(
+        &mut self,
+        pending: Arc<crate::runtime::io_pool::Pending>,
+    ) -> Result<Option<T>> {
+        if let Some(result) = pending.take::<T>() {
+            self.sync_wait_resume = None;
+            return result.map(Some);
         }
+        self.native_wait = Some(pending);
+        // Timer parking avoids an always-runnable polling fiber / busy spin.
+        self.sync_wait_resume = Some(SyncWaitResume::Sleep {
+            until: std::time::Instant::now() + std::time::Duration::from_millis(2),
+        });
+        self.block_suspend = true;
+        Ok(None)
+    }
+
+    /// `None` means that the builtin must return without doing any more work;
+    /// its call is retried with the original arguments after fiber resumption.
+    /// The job must own native data only, never VM state or GC-managed Values.
+    pub(crate) fn run_blocking<T: Send + 'static>(
+        &mut self,
+        job: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> Result<Option<T>> {
+        let in_task = self.sched_depth > 0 && self.task_ctx.is_some();
+        let pending = if in_task {
+            self.native_wait.take()
+        } else {
+            None
+        };
+        let pending = match pending {
+            Some(pending) => pending,
+            None => {
+                let scheduler = Arc::downgrade(&self.mn);
+                crate::runtime::io_pool::submit(job, move || {
+                    if let Some(scheduler) = scheduler.upgrade() {
+                        scheduler.notify_all();
+                    }
+                })?
+            }
+        };
+        if in_task {
+            return self.poll_native_wait(pending);
+        }
+        let previous_deadline = self.native_wait_deadline;
+        let result = (|| loop {
+            if let Some(result) = pending.take::<T>() {
+                return result.map(Some);
+            }
+            self.fail_if_host_cancelled()?;
+            self.native_wait_deadline = Some(std::time::Instant::now() + COOP_SLEEP_SLICE);
+            self.poll_gc_safepoint();
+            if !self.scheduler_run_one()? {
+                self.mn.wait_for(std::time::Duration::from_millis(2));
+            }
+        })();
+        self.native_wait_deadline = previous_deadline;
+        result
+    }
+
+    /// 将 callee/args 压回栈并把 PC 拨回 Call，供挂起恢复后重试。
+    fn arm_call_retry_with_keywords(&mut self, callee: Value, args: Vec<Value>, kwargs: DictMap) {
         // `Call` / `CallList` / `CallEx` 从栈取 callee；`CallGlobal` / `CallSelf` 自取目标。
         // 若误压 callee，重入 `CallGlobal` 时会把函数当成第一个实参（如 convert function to u32）。
         let call_pc = self.pc.saturating_sub(1);
+        match self.code.get(call_pc) {
+            Some(Instruction::CallEx) => {
+                self.push_value(Value::List(Shared::new(args)));
+                self.push_value(Value::Dict(Shared::new(kwargs)));
+            }
+            Some(Instruction::CallList) => self.push_value(Value::List(Shared::new(args))),
+            _ => {
+                for arg in args {
+                    self.push_value(arg);
+                }
+            }
+        }
         let push_callee = !matches!(
             self.code.get(call_pc),
             Some(Instruction::CallGlobal { .. } | Instruction::CallSelf { .. })
@@ -8867,6 +9158,15 @@ impl Vm {
     fn should_timeslice_preempt(&self) -> bool {
         if !self.mn_parallel {
             return true;
+        }
+        let timer = self.mn.next_sleep_deadline();
+        if self.native_wait_deadline.is_some() || timer.is_some() {
+            let now = std::time::Instant::now();
+            if self.native_wait_deadline.is_some_and(|until| now >= until)
+                || timer.is_some_and(|until| now >= until)
+            {
+                return true;
+            }
         }
         !self.local_worker.is_empty()
     }
@@ -8973,6 +9273,7 @@ impl Vm {
         };
 
         let fiber = TaskFiber {
+            active_exception: self.active_exception.take(),
             code: self.code.clone(),
             hot_ops: self.hot_ops.clone(),
             hot_args: self.hot_args.clone(),
@@ -8996,6 +9297,7 @@ impl Vm {
             lw_entry_pc: self.lw_entry_pc,
             lw_frame_slots: self.lw_frame_slots,
             ffi_wait: self.ffi_wait.take(),
+            native_wait: self.native_wait.take(),
             retry_poll: self.pending_poll_retry.take(),
             sync_wait_resume: self.sync_wait_resume.take(),
         };
@@ -9100,7 +9402,9 @@ impl Vm {
         self.lw_entry_pc = fiber.lw_entry_pc;
         self.lw_frame_slots = fiber.lw_frame_slots;
         self.ffi_wait = fiber.ffi_wait.take();
+        self.native_wait = fiber.native_wait.take();
         self.sync_wait_resume = fiber.sync_wait_resume.take();
+        self.active_exception = fiber.active_exception.take();
 
         self.task_ctx = Some(ctx);
         self.budget_left = self.suspend_budget;
@@ -9116,18 +9420,38 @@ impl Vm {
         };
         let key = Self::task_ptr_key(&ctx.task);
         let fiber = self.capture_fiber(&ctx);
+        let mut sleep_until = match fiber.sync_wait_resume {
+            Some(SyncWaitResume::Sleep { until }) => Some(until),
+            _ => None,
+        };
         self.fiber_insert(key, fiber);
-        ctx.task.borrow_mut().state = TaskState::Suspended;
-        self.enqueue_task(ctx.task);
+        {
+            let mut inner = ctx.task.borrow_mut();
+            // Cancellation can arrive while the task is still Running, before park publication.
+            if inner.should_abort_on_cancel() {
+                sleep_until = None;
+            }
+            // Publish the timer and state while holding the task lock: a worker waking an
+            // immediately-expiring timer cannot claim the task before it is Suspended.
+            if let Some(until) = sleep_until {
+                self.mn.park_sleep(ctx.task.clone(), until);
+            }
+            inner.state = TaskState::Suspended;
+        }
+        if sleep_until.is_none() {
+            self.enqueue_task(ctx.task);
+        }
         Ok(InterpreterResult::Suspended)
     }
 
     pub(crate) fn scheduler_run_one(&mut self) -> Result<bool> {
         self.flush_script_globals_to_map();
-        let Some(task) = self.take_ready_task() else {
-            return Ok(false);
-        };
-        self.scheduler_run_task(task)
+        while let Some(task) = self.take_ready_task() {
+            if self.scheduler_run_task(task)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn scheduler_run_task(&mut self, task: Shared<TaskInner>) -> Result<bool> {
@@ -9159,6 +9483,11 @@ impl Vm {
         // 认领：仅 Pending/Suspended 可进入 Running。重复入队的副本直接跳过。
         let state = {
             let mut inner = task.borrow_mut();
+            // Recheck under the claim lock: a duplicate may have been taken just before
+            // another worker parked this task for its next sleep.
+            if self.mn.is_sleeping(&task) {
+                return Ok(false);
+            }
             match &inner.state {
                 TaskState::Pending { .. } | TaskState::Suspended => {
                     std::mem::replace(&mut inner.state, TaskState::Running)
@@ -9170,7 +9499,7 @@ impl Vm {
         };
 
         // 认领后若已取消：直接 Failed(Cancelled)，不跑用户代码。
-        if task.borrow().is_cancelled() {
+        if task.borrow().should_abort_on_cancel() {
             let exc = match exceptions::make_exception(self, "Cancelled", "task cancelled") {
                 Ok(v) => v,
                 Err(_) => Value::Text("task cancelled".into()),
@@ -9186,6 +9515,10 @@ impl Vm {
         }
 
         let saved_ctx = self.task_ctx.take();
+        let saved_exception = self.active_exception.take();
+        if let Some(exc) = &saved_exception {
+            self.scheduler_exception_roots.push(exc.clone());
+        }
         let saved_budget = self.budget_left;
         let saved_pending = self.pending_suspend;
         let saved_block_suspend = self.block_suspend;
@@ -9206,10 +9539,14 @@ impl Vm {
 
         let run_result = (|| -> Result<Option<Value>> {
             match state {
-                TaskState::Pending { callable, args } => {
+                TaskState::Pending {
+                    callable,
+                    args,
+                    kwargs,
+                } => {
                     self.task_ctx = Some(Self::snapshot_task_ctx(task.clone(), self));
                     self.budget_left = self.suspend_budget;
-                    match self.call_value_poll(callable, args)? {
+                    match self.call_value_poll(callable, args, kwargs)? {
                         InterpreterResult::Value(v) => {
                             // 丢弃任务帧，保证不污染调用方（主 fiber / 外层任务）栈。
                             if let Some(ctx) = self.task_ctx.take() {
@@ -9236,9 +9573,9 @@ impl Vm {
                             "internal error: suspended task missing fiber",
                         ));
                     };
-                    if let Some((callable, args)) = fiber.retry_poll.take() {
+                    if let Some((callable, args, kwargs)) = fiber.retry_poll.take() {
                         self.install_fiber(task.clone(), fiber);
-                        match self.call_value_poll(callable, args)? {
+                        match self.call_value_poll(callable, args, kwargs)? {
                             InterpreterResult::Value(v) => {
                                 if let Some(ctx) = self.task_ctx.take() {
                                     let _ = self.capture_fiber(&ctx);
@@ -9296,15 +9633,18 @@ impl Vm {
             }
             Ok(None) => {}
             Err(e) => {
+                let task_exception = self.active_exception.take();
                 // 任务失败时同样回滚到 stop_*，避免残留栈槽破坏调用方的下一条指令。
                 if let Some(ctx) = self.task_ctx.take() {
                     let _ = self.capture_fiber(&ctx);
                 }
                 let msg = e.message();
-                let exc = match exceptions::make_exception_kind(self, e.kind(), msg) {
-                    Ok(v) => v,
-                    Err(_) => Value::Text(e.message().to_string()),
-                };
+                let exc = task_exception.unwrap_or_else(|| {
+                    match exceptions::make_exception_kind(self, e.kind(), msg) {
+                        Ok(v) => v,
+                        Err(_) => Value::Text(e.message().to_string()),
+                    }
+                });
                 task.borrow_mut().state = TaskState::Failed(exc.clone());
                 self.taskgroup_notify_finished(&task, Some(exc));
             }
@@ -9312,6 +9652,10 @@ impl Vm {
 
         self.sched_depth = self.sched_depth.saturating_sub(1);
         self.task_ctx = saved_ctx;
+        if saved_exception.is_some() {
+            self.scheduler_exception_roots.pop();
+        }
+        self.active_exception = saved_exception;
         self.budget_left = saved_budget;
         self.pending_suspend = saved_pending;
         self.block_suspend = saved_block_suspend;
@@ -9324,6 +9668,11 @@ impl Vm {
 
     pub(crate) fn scheduler_yield(&mut self) -> Result<()> {
         self.flush_script_globals_to_map();
+        // A timer may be the only source of ready work. M:1's queue-length bound must
+        // include expired timers, otherwise `while (not task.done()) { suspend }` stalls.
+        for task in self.mn.take_due_sleepers() {
+            self.enqueue_task(task);
+        }
         if self.mn_parallel {
             // 并行：与 M:1 一致，以「进入时本地队列长度」为上界跑一轮就绪任务。
             // 固定 64 次会让单个 sleep/IO 切片任务重入队后被反复抽干，
@@ -9357,8 +9706,7 @@ impl Vm {
         }
     }
 
-    /// 任务纤程内的协作式 sleep：每次最多睡一小片并 `block_suspend`，让 select/其它任务推进。
-    /// 主纤程仍用整段 `thread::sleep`（无调度对象可让出）。
+    /// Sleep parks a task on a timer; the main context drives runnable tasks while waiting.
     pub(crate) fn coop_sleep_secs(&mut self, secs: f64) -> Result<Value> {
         let secs = sanitize_coop_sleep_secs(secs);
         self.coop_sleep_duration(std::time::Duration::from_secs_f64(secs))
@@ -9375,31 +9723,14 @@ impl Vm {
         self.fail_if_current_task_cancelled()?;
         let in_task = self.task_ctx.is_some() || self.sched_depth > 0;
         if !in_task {
-            std::thread::sleep(total);
-            return Ok(Value::None);
+            return self.sleep_as_worker(total);
         }
+        let now = std::time::Instant::now();
         let until = match self.sync_wait_resume {
             Some(SyncWaitResume::Sleep { until }) => until,
-            _ => {
-                if let Some(t) = std::time::Instant::now().checked_add(total) {
-                    t
-                } else {
-                    // 溢出：睡完本切片后视为到期，避免 Instant 加法 panic。
-                    std::thread::sleep(total.min(COOP_SLEEP_SLICE));
-                    self.sync_wait_resume = None;
-                    return Ok(Value::None);
-                }
-            }
+            _ => now.checked_add(total).unwrap_or(now + COOP_SLEEP_SLICE),
         };
-        let now = std::time::Instant::now();
         if now >= until {
-            self.sync_wait_resume = None;
-            return Ok(Value::None);
-        }
-        let slice = (until - now).min(COOP_SLEEP_SLICE);
-        std::thread::sleep(slice);
-        self.fail_if_current_task_cancelled()?;
-        if std::time::Instant::now() >= until {
             self.sync_wait_resume = None;
             return Ok(Value::None);
         }
@@ -9408,12 +9739,42 @@ impl Vm {
         Ok(Value::None)
     }
 
+    fn sleep_as_worker(&mut self, total: std::time::Duration) -> Result<Value> {
+        let now = std::time::Instant::now();
+        let until = now.checked_add(total).unwrap_or(now + COOP_SLEEP_SLICE);
+        let saved_deadline = self.native_wait_deadline;
+        self.native_wait_deadline = Some(saved_deadline.map_or(until, |outer| outer.min(until)));
+        let result = (|| {
+            while std::time::Instant::now() < until {
+                self.fail_if_host_cancelled()?;
+                self.poll_gc_safepoint();
+                if self.debug_break_requested {
+                    break;
+                }
+                if self.scheduler_run_one()? {
+                    continue;
+                }
+                let wake = self
+                    .mn
+                    .next_sleep_deadline()
+                    .map_or(until, |timer| timer.min(until));
+                self.mn.wait_for(
+                    wake.saturating_duration_since(std::time::Instant::now())
+                        .min(COOP_SLEEP_SLICE),
+                );
+            }
+            Ok(Value::None)
+        })();
+        self.native_wait_deadline = saved_deadline;
+        result
+    }
+
     pub(crate) fn await_value(&mut self, value: Value) -> Result<Value> {
         let Value::Task(task) = value else {
             return Ok(value);
         };
         loop {
-            if task.borrow().is_cancelled()
+            if task.borrow().should_abort_on_cancel()
                 && !matches!(
                     task.borrow().state,
                     TaskState::Done(_) | TaskState::Failed(_)
@@ -9450,7 +9811,7 @@ impl Vm {
 
     /// 确保任务在就绪队列中（不阻塞等待完成）。
     pub(crate) fn ensure_task_runnable(&mut self, task: &Shared<TaskInner>) {
-        if task.borrow().debug_paused {
+        if task.borrow().debug_paused || self.mn.is_sleeping(task) {
             return;
         }
         let state = task.borrow().state.clone();
@@ -9463,14 +9824,19 @@ impl Vm {
         }
     }
 
-    fn call_value_poll(&mut self, callee: Value, args: Vec<Value>) -> Result<InterpreterResult> {
+    fn call_value_poll(
+        &mut self,
+        callee: Value,
+        args: Vec<Value>,
+        kwargs: DictMap,
+    ) -> Result<InterpreterResult> {
         match callee {
-            Value::Function(f) => self.call_user_function_poll(f, args),
+            Value::Function(f) => self.call_user_function_poll(f, args, kwargs),
             Value::Builtin(b) => {
-                let out = b.call(self, &args)?;
+                let out = b.call_with_keywords(self, &args, &kwargs)?;
                 if self.block_suspend {
                     self.block_suspend = false;
-                    self.pending_poll_retry = Some((Value::Builtin(b), args));
+                    self.pending_poll_retry = Some((Value::Builtin(b), args, kwargs));
                     return self.complete_task_suspend();
                 }
                 if self.nested_user_call_suspended {
@@ -9480,7 +9846,7 @@ impl Vm {
             }
             other => {
                 let stop = self.user_call_frames.len();
-                let result = self.call_value(other, args)?;
+                let result = self.call_value_ex(other, args, kwargs)?;
                 if self.user_call_deferred {
                     match self.run_interpreter(Some(stop))? {
                         InterpreterResult::Value(v) => {
@@ -9782,28 +10148,48 @@ impl Vm {
 
     /// 请求协作式取消；已结束的任务不变。挂起/待运行任务会入队以便尽快以 `Cancelled` 收尾。
     pub(crate) fn cancel_task(&mut self, task: &Shared<TaskInner>) {
-        let should_enqueue = {
+        let (should_enqueue, abort_sleep) = {
             let mut inner = task.borrow_mut();
             if matches!(inner.state, TaskState::Done(_) | TaskState::Failed(_)) {
                 return;
             }
             inner.request_cancel();
-            matches!(
-                inner.state,
-                TaskState::Pending { .. } | TaskState::Suspended
+            (
+                matches!(
+                    inner.state,
+                    TaskState::Pending { .. } | TaskState::Suspended
+                ),
+                inner.should_abort_on_cancel(),
             )
         };
+        if abort_sleep {
+            self.mn.remove_sleep(task);
+        }
         if should_enqueue {
             self.ensure_task_runnable(task);
         }
         self.mn.notify_all();
     }
 
+    pub(crate) fn current_cancel_flag(&self) -> Value {
+        let signal = self.task_ctx.as_ref().map_or_else(
+            || Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            |ctx| {
+                let mut task = ctx.task.borrow_mut();
+                let requested = task.cancelled;
+                task.cancel_signal
+                    .get_or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(requested)))
+                    .clone()
+            },
+        );
+        Value::Sync(Shared::new(crate::value::SyncInner::CancelFlag { signal }))
+    }
+
     /// 若当前任务已取消，返回 `Cancelled` 宿主错误。
     pub(crate) fn fail_if_current_task_cancelled(&self) -> Result<()> {
         self.fail_if_host_cancelled()?;
         if let Some(ctx) = &self.task_ctx {
-            if ctx.task.borrow().is_cancelled() {
+            if ctx.task.borrow().should_abort_on_cancel() {
                 return Err(RuntimeError::cancelled("task cancelled"));
             }
         }
@@ -9840,11 +10226,17 @@ impl Vm {
             None => {}
         }
         let exc = exceptions::make_exception(self, "Cancelled", "task cancelled")?;
-        {
+        self.mn.remove_sleep(task);
+        let discard_fiber = {
             let mut inner = task.borrow_mut();
+            let suspended = matches!(inner.state, TaskState::Suspended);
             if !matches!(inner.state, TaskState::Done(_) | TaskState::Failed(_)) {
                 inner.state = TaskState::Failed(exc.clone());
             }
+            suspended
+        };
+        if discard_fiber {
+            let _ = self.fiber_take(Self::task_ptr_key(task));
         }
         self.taskgroup_notify_finished(task, Some(exc.clone()));
         self.mn.notify_all();
@@ -9921,7 +10313,7 @@ impl Vm {
                 }
             }
         }
-        let result = match self.call_value_poll(callable, vec![]) {
+        let result = match self.call_value_poll(callable, vec![], DictMap::new()) {
             Ok(InterpreterResult::Value(v)) => v.unwrap_or(Value::None),
             Ok(InterpreterResult::Suspended) => {
                 if let SyncInner::Once { phase, value } = &mut *s.borrow_mut() {
@@ -10644,7 +11036,7 @@ fn variant_type_attr(vm: &mut Vm, variant_name: &str, field: &str) -> Result<Val
     if let Some(case) = vdef.cases.iter().find(|c| c.name == field) {
         let struct_name = case.struct_name.clone();
         return Ok(Value::builtin(field, move |vm, args| {
-            make_struct(vm, &struct_name, args.to_vec(), None)
+            make_struct(vm, &struct_name, args.to_vec(), None, DictMap::new())
         }));
     }
     Err(RuntimeError::attr_err(format!(
@@ -10686,7 +11078,13 @@ fn type_spec_attr(vm: &mut Vm, name: &str, type_args: &[Value], field: &str) -> 
             let struct_name = crate::enum_variant::case_struct_name(name, field);
             let generic_args = type_args.to_vec();
             return Ok(Value::builtin(field, move |vm, args| {
-                make_struct(vm, &struct_name, args.to_vec(), Some(generic_args.clone()))
+                make_struct(
+                    vm,
+                    &struct_name,
+                    args.to_vec(),
+                    Some(generic_args.clone()),
+                    DictMap::new(),
+                )
             }));
         }
     }
@@ -10755,20 +11153,53 @@ fn get_attr(vm: &mut Vm, obj: &Value, field: &str) -> Result<Value> {
             if let Some(func) = s.def.methods.get(field) {
                 let self_val = obj.clone();
                 let func = func.clone();
-                return Ok(Value::builtin(field, move |vm, args| {
-                    let mut full_args = vec![self_val.clone()];
-                    full_args.extend_from_slice(args);
-                    vm.call_user_function(func.clone(), full_args)
-                }));
+                let kw_self = self_val.clone();
+                let kw_func = func.clone();
+                let roots = vec![obj.clone(), Value::Function(func.clone())];
+                return Ok(Value::builtin_with_keywords(
+                    field,
+                    move |vm, args| {
+                        let mut full_args = vec![self_val.clone()];
+                        full_args.extend_from_slice(args);
+                        vm.call_user_function(func.clone(), full_args)
+                    },
+                    move |vm, args, kwargs| {
+                        let mut full_args = vec![kw_self.clone()];
+                        full_args.extend_from_slice(args);
+                        vm.call_user_function_with_keywords(
+                            kw_func.clone(),
+                            full_args,
+                            kwargs.clone(),
+                        )
+                    },
+                )
+                .with_builtin_roots(roots));
             }
             if let Some(overloads) = s.def.overloads.get(field) {
                 let self_val = obj.clone();
                 let overloads = overloads.clone();
-                return Ok(Value::builtin(field, move |vm, args| {
-                    let mut full_args = vec![self_val.clone()];
-                    full_args.extend_from_slice(args);
-                    vm.dispatch_overload(&overloads, &full_args)
-                }));
+                let kw_self = self_val.clone();
+                let kw_overloads = overloads.clone();
+                let mut roots = vec![obj.clone()];
+                roots.extend(overloads.iter().cloned().map(Value::Function));
+                return Ok(Value::builtin_with_keywords(
+                    field,
+                    move |vm, args| {
+                        let mut full_args = vec![self_val.clone()];
+                        full_args.extend_from_slice(args);
+                        vm.dispatch_overload(&overloads, &full_args)
+                    },
+                    move |vm, args, kwargs| {
+                        let mut full_args = vec![kw_self.clone()];
+                        full_args.extend_from_slice(args);
+                        vm.dispatch_overload_with_keywords(
+                            &kw_overloads,
+                            &full_args,
+                            kwargs.clone(),
+                        )
+                    },
+                )
+                .with_builtin_roots(roots));
             }
             Err(RuntimeError::attr_err(format!("no field {field}")))
         }
@@ -10789,7 +11220,13 @@ fn set_field(vm: &mut Vm, obj: &Value, field: &str, val: Value) -> Result<()> {
             .iter()
             .position(|f| f == field)
             .ok_or_else(|| RuntimeError::attr_err(format!("no field {field}")))?;
-        if !s.def.mutable_fields[idx] {
+        let constructing = vm
+            .struct_constructions
+            .iter()
+            .rposition(|(instance, _)| Arc::ptr_eq(instance, s));
+        let first_initialization =
+            constructing.is_some_and(|state| !vm.struct_constructions[state].1[idx]);
+        if !s.def.mutable_fields[idx] && !first_initialization {
             return Err(RuntimeError::attr_err(format!(
                 "field {field} is not mutable"
             )));
@@ -10817,6 +11254,9 @@ fn set_field(vm: &mut Vm, obj: &Value, field: &str, val: Value) -> Result<()> {
             }
         }
         s.slots.borrow_mut()[idx] = val;
+        if let Some(state) = constructing {
+            vm.struct_constructions[state].1[idx] = true;
+        }
         Ok(())
     } else {
         Err(RuntimeError::msg("set_field on non-struct"))
@@ -10828,30 +11268,72 @@ fn make_struct(
     name: &str,
     args: Vec<Value>,
     explicit_generics: Option<Vec<Value>>,
+    mut kwargs: DictMap,
 ) -> Result<Value> {
     let def = vm
         .struct_defs
         .get(name)
         .ok_or_else(|| RuntimeError::msg(format!("unknown struct: {name}")))?;
-    let allow_partial = def.fields.len() == 2
-        && def.fields.get(1).map(std::string::String::as_str) == Some("traceback")
+    let has_init = def.methods.contains_key("__init__") || def.overloads.contains_key("__init__");
+    let allow_partial = !has_init
+        && def.fields.len() == 2
+        && def.fields.get(1).map(String::as_str) == Some("traceback")
         && args.len() == 1;
-    if args.len() > def.fields.len() {
-        return Err(RuntimeError::type_err(format!(
-            "struct {name} expects at most {} args, got {}",
-            def.fields.len(),
-            args.len()
-        )));
-    }
-    if args.len() != def.fields.len() && !allow_partial {
-        return Err(RuntimeError::type_err(format!(
-            "struct {name} expects {} args, got {}",
-            def.fields.len(),
-            args.len()
-        )));
+    let mut slots = vec![Value::None; def.fields.len()];
+    let mut initialized = vec![false; def.fields.len()];
+    if !has_init {
+        if args.len() > def.fields.len() {
+            return Err(RuntimeError::type_err(format!(
+                "struct {name} expects at most {} args, got {}",
+                def.fields.len(),
+                args.len()
+            )));
+        }
+        for (index, value) in args.iter().enumerate() {
+            slots[index] = value.clone();
+            initialized[index] = true;
+        }
+        for index in 0..def.fields.len() {
+            if let Some(value) = kwargs.remove(&ValueKey::Text(def.fields[index].clone())) {
+                if initialized[index] {
+                    return Err(RuntimeError::type_err(format!(
+                        "struct {name} got multiple values for field '{}'",
+                        def.fields[index]
+                    )));
+                }
+                slots[index] = value;
+                initialized[index] = true;
+            }
+        }
+        if !kwargs.is_empty() {
+            return Err(RuntimeError::type_err(format!(
+                "struct {name} got unknown field argument(s): {}",
+                kwargs
+                    .keys()
+                    .map(value_key_to_display)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        if allow_partial {
+            initialized[1] = true;
+        }
+        for (index, field) in def.fields.iter().enumerate() {
+            if !initialized[index]
+                && def
+                    .field_defaults
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .is_none()
+            {
+                return Err(RuntimeError::type_err(format!(
+                    "struct {name} missing required field '{field}'"
+                )));
+            }
+        }
     }
 
-    let generic_args: Vec<Value> = if let Some(explicit) = explicit_generics {
+    let generic_args = if let Some(explicit) = explicit_generics {
         if explicit.len() != def.type_params.len() {
             return Err(RuntimeError::type_err(format!(
                 "struct {name} expects {} type argument(s), got {}",
@@ -10861,88 +11343,164 @@ fn make_struct(
         }
         explicit
     } else if !def.type_params.is_empty() {
-        let inferred = types::infer_generic_args(vm, &def, &args);
-        if inferred.len() < def.type_params.len() {
-            return Err(RuntimeError::msg(format!(
-                "cannot infer type parameter(s) for struct {name}"
-            )));
+        let mut inferred = HashMap::new();
+        if has_init {
+            if let Some(func) = def.methods.get("__init__") {
+                for (index, param) in func.params.iter().skip(1).enumerate() {
+                    let value = args
+                        .get(index)
+                        .or_else(|| kwargs.get(&ValueKey::Text(param.name.clone())));
+                    if let (Some(value), Some(annotation)) = (value, &param.type_expr) {
+                        if let Some(ty) = types::static_type_value_from_expr(annotation) {
+                            let actual = types::value_to_type_value(vm, value);
+                            types::infer_from_field_type_inner(&ty, &actual, &mut inferred);
+                        }
+                    }
+                }
+            }
+        } else {
+            for (index, value) in slots.iter().enumerate() {
+                if !initialized[index] {
+                    continue;
+                }
+                if let Some(annotation) = def
+                    .field_types
+                    .get(index)
+                    .and_then(|info| info.type_expr.as_ref())
+                {
+                    if let Some(ty) = types::static_type_value_from_expr(annotation) {
+                        let actual = types::value_to_type_value(vm, value);
+                        types::infer_from_field_type_inner(&ty, &actual, &mut inferred);
+                    }
+                }
+            }
         }
         def.type_params
             .iter()
-            .map(|(p, _)| {
-                inferred
-                    .get(p)
-                    .cloned()
-                    .unwrap_or_else(|| Value::type_ref(p.clone()))
+            .map(|(param, _)| {
+                inferred.get(param).cloned().ok_or_else(|| {
+                    RuntimeError::type_err(format!(
+                        "cannot infer type parameter '{param}' for struct {name}"
+                    ))
+                })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?
     } else {
         Vec::new()
     };
 
-    if !def.type_params.is_empty()
-        && !types::check_type_param_bounds(vm, &def.type_params, &generic_args)
-    {
-        let exc = exceptions::make_exception(
-            vm,
-            "TypeError",
-            format!("type argument out of bounds for {name}"),
-        )?;
-        vm.throw_value(exc)?;
-        return Ok(Value::None);
+    if !types::check_type_param_bounds(vm, &def.type_params, &generic_args) {
+        return Err(RuntimeError::type_err(format!(
+            "type argument out of bounds for {name}"
+        )));
     }
-
-    let subs: std::collections::HashMap<String, Value> = def
+    let subs: HashMap<String, Value> = def
         .type_params
         .iter()
-        .zip(generic_args.iter())
-        .map(|((p, _), ty)| (p.clone(), ty.clone()))
+        .zip(&generic_args)
+        .map(|((param, _), value)| (param.clone(), value.clone()))
         .collect();
-
-    let mut slots = args;
-    while slots.len() < def.fields.len() {
-        slots.push(Value::None);
-    }
-    for (i, val) in slots.iter().enumerate() {
-        if let Some(info) = def.field_types.get(i) {
-            if info.strict {
-                if let Some(ref ty_expr) = info.type_expr {
-                    let subbed = types::substitute_type_annotation(ty_expr, &subs);
-                    let resolved = types::eval_type_annotation(vm, &subbed)?;
-                    if let Some(detail) = types::type_check_error(vm, val, &resolved) {
-                        let msg = format!("field '{}': {detail}", def.fields[i]);
-                        let exc = exceptions::make_exception(vm, "TypeError", msg)?;
-                        vm.throw_value(exc)?;
-                        return Ok(Value::None);
-                    }
-                    types::seal_container_contract(vm, val, &resolved);
+    let instance = Arc::new(crate::value::StructInstance {
+        def: def.clone(),
+        slots: SyncCell::new(slots),
+        generic_args,
+    });
+    let value = Value::Struct(instance.clone());
+    vm.track_value(&value);
+    // This roots the instance during default expressions and grants an
+    // immutable field exactly one initialization write within construction.
+    vm.struct_constructions
+        .push((instance.clone(), initialized));
+    let result = (|| {
+        for (index, initializer) in def.field_defaults.iter().enumerate() {
+            if vm
+                .struct_constructions
+                .last()
+                .is_some_and(|state| state.1[index])
+            {
+                continue;
+            }
+            if let Some(initializer) = initializer {
+                let default = vm.call_user_function(initializer.clone(), vec![value.clone()])?;
+                if vm.active_exception.is_some() {
+                    return Ok(Value::None);
+                }
+                set_field(vm, &value, &def.fields[index], default)?;
+                if vm.active_exception.is_some() {
+                    return Ok(Value::None);
                 }
             }
         }
-    }
-    let val = Value::Struct(Arc::new(crate::value::StructInstance {
-        def,
-        slots: SyncCell::new(slots),
-        generic_args,
-    }));
-    vm.track_value(&val);
-    if let Value::Struct(s) = &val {
-        if vm.struct_has_method(&val, "__init__") {
-            let init_args = if let Some(func) = s.def.methods.get("__init__") {
-                let n_bind = func
-                    .params
+        if has_init {
+            let mut full_args = vec![value.clone()];
+            full_args.extend(args);
+            if let Some(func) = def.methods.get("__init__") {
+                let func = constructor_function_types(func, &subs);
+                vm.call_user_function_with_keywords(func, full_args, kwargs)?;
+            } else if let Some(overloads) = def.overloads.get("__init__") {
+                let overloads: Vec<_> = overloads
                     .iter()
-                    .filter(|p| !p.is_variadic && !p.is_kwvariadic)
-                    .count()
-                    .saturating_sub(1);
-                s.slots.borrow().iter().take(n_bind).cloned().collect()
-            } else {
-                s.slots.borrow().clone()
-            };
-            vm.call_struct_method(&val, "__init__", init_args)?;
+                    .map(|func| constructor_function_types(func, &subs))
+                    .collect();
+                vm.dispatch_overload_with_keywords(&overloads, &full_args, kwargs)?;
+            }
+            if vm.active_exception.is_some() {
+                return Ok(Value::None);
+            }
+        }
+        if let Some((_, initialized)) = vm.struct_constructions.last() {
+            if let Some(index) = initialized.iter().position(|ready| !ready) {
+                return Err(RuntimeError::type_err(format!(
+                    "struct {name} constructor did not initialize field '{}'",
+                    def.fields[index]
+                )));
+            }
+        }
+        // Strong contracts apply to the finished instance, not its temporary
+        // empty slots before __init__ has assigned them.
+        let finished_slots = instance.slots.borrow().clone();
+        for (index, item) in finished_slots.iter().enumerate() {
+            if let Some(info) = def.field_types.get(index).filter(|info| info.strict) {
+                if let Some(annotation) = &info.type_expr {
+                    let annotation = types::substitute_type_annotation(annotation, &subs);
+                    let ty = types::eval_type_annotation(vm, &annotation)?;
+                    if let Some(detail) = types::type_check_error(vm, item, &ty) {
+                        return Err(RuntimeError::type_err(format!(
+                            "field '{}': {detail}",
+                            def.fields[index]
+                        )));
+                    }
+                    types::seal_container_contract(vm, item, &ty);
+                }
+            }
+        }
+        Ok(value)
+    })();
+    // Also revoke initialization writes when a default or __init__ throws.
+    vm.struct_constructions.pop();
+    result
+}
+
+fn constructor_function_types(
+    func: &Arc<FunctionObject>,
+    subs: &HashMap<String, Value>,
+) -> Arc<FunctionObject> {
+    if subs.is_empty() {
+        return func.clone();
+    }
+    let mut function = (**func).clone();
+    for param in &mut function.params {
+        if let Some(annotation) = &param.type_expr {
+            param.type_expr = Some(types::substitute_type_annotation(annotation, subs));
         }
     }
-    Ok(val)
+    if let Some(annotation) = &function.return_type {
+        function.return_type = Some(types::substitute_type_annotation(annotation, subs));
+    }
+    function.param_types.clear();
+    function.return_type_value = None;
+    function.set_types_resolved(false);
+    Arc::new(function)
 }
 
 fn seq_items_for_unpack(v: &Value) -> Result<Vec<Value>> {
@@ -11085,10 +11643,17 @@ fn infer_generic_type_args_from_values(
     vm: &Vm,
     template: &crate::opcode::GenericFunctionTemplate,
     args: &[Value],
+    kwargs: &DictMap,
 ) -> Result<Vec<Value>> {
     use crate::ast::ExprKind;
     let mut inferred: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
-    for (param, arg) in template.params.iter().zip(args.iter()) {
+    for (index, param) in template.params.iter().enumerate() {
+        let Some(arg) = args
+            .get(index)
+            .or_else(|| kwargs.get(&ValueKey::Text(param.name.clone())))
+        else {
+            continue;
+        };
         let Some(ty_expr) = &param.type_expr else {
             continue;
         };

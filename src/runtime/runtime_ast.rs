@@ -431,12 +431,27 @@ pub fn ast_from_stmt(stmt: &Stmt) -> RuntimeAstNode {
             slot_b: Some(Box::new(ast_from_block(body))),
             ..default_node()
         },
-        Stmt::For { label, items, body } => RuntimeAstNode {
+        Stmt::For {
+            label,
+            items,
+            body,
+            else_block,
+        } => RuntimeAstNode {
             kind: AstNodeKind::ForStmt,
             slot_a: items.first().map(|i| Box::new(ast_from_expr(&i.iterable))),
             text: items.first().map(|i| i.name.clone()).unwrap_or_default(),
-            binding_names: label.iter().cloned().collect(),
+            binding_names: vec![
+                label.clone().unwrap_or_default(),
+                items
+                    .first()
+                    .and_then(|item| item.pattern.as_ref())
+                    .map(crate::fmt::format_destruct)
+                    .unwrap_or_default(),
+            ],
             slot_b: Some(Box::new(ast_from_block(body))),
+            slot_c: else_block
+                .as_ref()
+                .map(|block| Box::new(ast_from_block(block))),
             ..default_node()
         },
         Stmt::Loop { label, count, body } => RuntimeAstNode {
@@ -570,6 +585,12 @@ fn lvalue_to_ast(lv: &LValue) -> RuntimeAstNode {
 
 fn pattern_to_ast(pat: &Pattern) -> RuntimeAstNode {
     match pat {
+        Pattern::Destruct(pattern) => RuntimeAstNode {
+            kind: AstNodeKind::MatchPattern,
+            text: "Destruct".into(),
+            binding_names: vec![crate::fmt::format_destruct(pattern)],
+            ..default_node()
+        },
         Pattern::Bind(n) => RuntimeAstNode {
             kind: AstNodeKind::MatchPattern,
             text: "Bind".into(),
@@ -1168,9 +1189,26 @@ fn ast_to_stmt(node: &RuntimeAstNode) -> Result<Stmt> {
             )?,
         }),
         AstNodeKind::ForStmt => Ok(Stmt::For {
-            label: node.binding_names.first().cloned(),
+            label: node
+                .binding_names
+                .first()
+                .filter(|name| !name.is_empty())
+                .cloned(),
             items: vec![ForItem {
                 name: node.text.clone(),
+                pattern: node
+                    .binding_names
+                    .get(1)
+                    .filter(|source| !source.is_empty())
+                    .map(|source| {
+                        let program = Parser::parse(&format!("let {source} = none"))
+                            .map_err(|error| RuntimeError::msg(error.to_string()))?;
+                        match &program.stmts[0].stmt {
+                            Stmt::DestructDecl { pattern, .. } => Ok(pattern.clone()),
+                            _ => Err(RuntimeError::msg("invalid for destructuring AST")),
+                        }
+                    })
+                    .transpose()?,
                 iterable: ast_to_expr(
                     node.slot_a
                         .as_deref()
@@ -1182,6 +1220,7 @@ fn ast_to_stmt(node: &RuntimeAstNode) -> Result<Stmt> {
                     .as_deref()
                     .ok_or_else(|| RuntimeError::msg("for missing body"))?,
             )?,
+            else_block: node.slot_c.as_ref().map(|b| ast_to_block(b)).transpose()?,
         }),
         AstNodeKind::LoopStmt => Ok(Stmt::Loop {
             label: (!node.text.is_empty()).then(|| node.text.clone()),
@@ -1274,6 +1313,18 @@ fn ast_to_stmt(node: &RuntimeAstNode) -> Result<Stmt> {
 
 fn ast_to_pattern(node: &RuntimeAstNode) -> Result<Pattern> {
     match node.text.as_str() {
+        "Destruct" => {
+            let source = node
+                .binding_names
+                .first()
+                .ok_or_else(|| RuntimeError::msg("missing destructuring pattern AST"))?;
+            let program = Parser::parse(&format!("let {source} = none"))
+                .map_err(|error| RuntimeError::msg(error.to_string()))?;
+            match &program.stmts[0].stmt {
+                Stmt::DestructDecl { pattern, .. } => Ok(Pattern::Destruct(pattern.clone())),
+                _ => Err(RuntimeError::msg("invalid destructuring pattern AST")),
+            }
+        }
         "Expr" => Ok(Pattern::Value(Box::new(ast_to_expr(
             node.slot_a
                 .as_deref()
@@ -1892,6 +1943,7 @@ pub fn register_ast_struct_types(vm: &mut Vm) {
                 mutable_fields: fields.iter().map(|_| false).collect(),
                 typed: false,
                 field_types: fields.iter().map(|_| FieldTypeInfo::default()).collect(),
+                field_defaults: Vec::new(),
                 type_params: Vec::new(),
                 native_layout: None,
                 methods: std::collections::HashMap::new(),

@@ -1677,6 +1677,76 @@ fn check_json_reports_codes_and_warning_policy() {
 }
 
 #[test]
+fn check_reports_variant_match_diagnostics() {
+    let root = tempfile_project("check_variant_match");
+    fs::write(
+        root.join("Optive.toml"),
+        "[package]\nname = \"check_variant_match\"\nentry = \"src/main.tive\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/main.tive"),
+        r#"
+variant Outcome {
+    typed Ok(value: num)
+    typed Err(message: text)
+}
+let value = Outcome.Ok(1)
+match (value) {
+    case Outcome.Ok(number) { print(number) }
+}
+"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["check", "--json"], &root);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON diagnostics");
+    assert!(json
+        .as_array()
+        .is_some_and(
+            |diagnostics| diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == "W3001"
+                    && diagnostic["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("missing: Err")))
+        ));
+
+    let (code, stdout, stderr) = run_optive(&["check", "--deny-warnings"], &root);
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        format!("{stdout}{stderr}").contains("W3001"),
+        "stdout={stdout}\nstderr={stderr}"
+    );
+}
+
+#[test]
+fn check_rejects_unknown_loop_labels_before_codegen() {
+    let root = tempfile_project("check_loop_label");
+    fs::write(
+        root.join("Optive.toml"),
+        "[package]\nname = \"check_loop_label\"\nentry = \"src/main.tive\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/main.tive"),
+        "outer loop { if (true) { break misspelled } }\n",
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_optive(&["check", "--json"], &root);
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON diagnostics");
+    assert!(json.as_array().is_some_and(|diagnostics| diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic["code"] == "E6002"
+            && diagnostic["message"] == "unknown loop label `misspelled`")));
+}
+
+#[test]
 fn check_fails_for_missing_modules() {
     let root = tempfile_project("check_missing_module");
     fs::write(

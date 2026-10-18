@@ -129,7 +129,9 @@ impl FileIndex {
 pub fn index_source(source: &str) -> FileIndex {
     let hi = source.lines().count().max(1).saturating_add(1);
     if let Some(program) = parse_for_lsp(source) {
-        index_program(&program, hi)
+        let lowered =
+            crate::frontend::function_descriptors::lower_program(&program).unwrap_or(program);
+        index_program(&lowered, hi)
     } else {
         token_index(source, hi)
     }
@@ -398,7 +400,12 @@ fn format_params(params: &[crate::ast::FuncParam]) -> String {
             } else if p.is_variadic {
                 s.push('*');
             }
-            s.push_str(&p.name);
+            s.push_str(
+                &p.pattern
+                    .as_ref()
+                    .map(crate::fmt::format_destruct)
+                    .unwrap_or_else(|| p.name.clone()),
+            );
             if let Some(ty) = &p.type_expr {
                 s.push_str(if p.type_strong { " :: " } else { ": " });
                 s.push_str(&crate::fmt::format_expr(ty));
@@ -483,7 +490,10 @@ fn walk_stmt(st: &LocatedStmt, lo: usize, hi: usize, idx: &mut FileIndex) {
             walk_lvalue(target, idx);
             walk_expr(value, idx);
         }
-        Stmt::DestructAssign { value, .. } => walk_expr(value, idx),
+        Stmt::DestructAssign { pattern, value } => {
+            walk_expr(value, idx);
+            walk_destruct_defaults(pattern, idx);
+        }
         Stmt::Del(t) => walk_del(t, idx),
         Stmt::Block(b) | Stmt::Defer(b) => walk_block(b, st.line, block_hi(b, hi), idx),
         Stmt::Break(_) | Stmt::Continue(_) | Stmt::Comment { .. } => {}
@@ -559,6 +569,7 @@ fn walk_destruct_decl(st: &LocatedStmt, hi: usize, idx: &mut FileIndex) {
         );
     }
     walk_expr(init, idx);
+    walk_destruct_defaults(pattern, idx);
 }
 
 fn walk_func(st: &LocatedStmt, lo: usize, hi: usize, idx: &mut FileIndex) {
@@ -568,6 +579,7 @@ fn walk_func(st: &LocatedStmt, lo: usize, hi: usize, idx: &mut FileIndex) {
         params,
         body,
         decorators,
+        descriptors,
         return_type,
         return_strong,
         return_wrapper,
@@ -601,32 +613,37 @@ fn walk_func(st: &LocatedStmt, lo: usize, hi: usize, idx: &mut FileIndex) {
     mark_export(idx, *visibility);
     let inner_hi = body_hi(body, st.line, hi);
     for p in params {
-        let ty = p
-            .type_expr
-            .as_ref()
-            .and_then(ty_from_ann)
-            .unwrap_or(Ty::Unknown);
-        let mut detail = format!("param {}", p.name);
-        if ty != Ty::Unknown {
-            detail.push_str(&format!(": {}", ty.label()));
+        if let Some(pattern) = &p.pattern {
+            walk_destruct_defaults(pattern, idx);
         }
-        push_sym(
-            idx,
-            p.name.clone(),
-            KIND_VAR,
-            detail,
-            st.line,
-            st.column,
-            st.line,
-            inner_hi,
-            None,
-        );
-        if let Some(s) = last_sym(idx) {
-            s.ty = ty;
+        for name in p.bound_names() {
+            let ty = p
+                .type_expr
+                .as_ref()
+                .and_then(ty_from_ann)
+                .unwrap_or(Ty::Unknown);
+            let mut detail = format!("param {name}");
+            if ty != Ty::Unknown {
+                detail.push_str(&format!(": {}", ty.label()));
+            }
+            push_sym(
+                idx, name, KIND_VAR, detail, st.line, st.column, st.line, inner_hi, None,
+            );
+            if let Some(s) = last_sym(idx) {
+                s.ty = ty;
+            }
         }
     }
     for d in decorators {
         walk_expr(d, idx);
+    }
+    for descriptor in descriptors {
+        if descriptor.name == "cancel_flag" {
+            continue;
+        }
+        for arg in &descriptor.args {
+            walk_expr(arg, idx);
+        }
     }
     walk_block(body, st.line, inner_hi, idx);
 }
@@ -698,11 +715,33 @@ fn walk_struct(st: &LocatedStmt, lo: usize, hi: usize, idx: &mut FileIndex) {
         return;
     };
 
+    let constructor_params =
+        if let Some(initializer) = methods.iter().find(|method| method.name == "__init__") {
+            let params: Vec<_> = initializer
+                .params
+                .iter()
+                .filter(|param| param.name != "self")
+                .cloned()
+                .collect();
+            format_params(&params)
+        } else {
+            fields
+                .iter()
+                .map(|field| {
+                    let mut parameter = field.name.clone();
+                    if let Some(default) = &field.default_expr {
+                        parameter.push_str(&format!(" = {}", crate::fmt::format_expr(default)));
+                    }
+                    parameter
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
     push_sym(
         idx,
         name.clone(),
         KIND_CLASS,
-        format!("struct {name}"),
+        format!("struct {name}({constructor_params})"),
         st.line,
         st.column,
         lo,
@@ -886,12 +925,17 @@ fn walk_protocol(st: &LocatedStmt, lo: usize, hi: usize, idx: &mut FileIndex) {
     mark_export(idx, *visibility);
     for m in members {
         match m {
-            crate::ast::ProtocolMember::Method { name: mn, params } => {
+            crate::ast::ProtocolMember::Method {
+                name: mn,
+                params,
+                return_type,
+                return_strong,
+            } => {
                 push_sym(
                     idx,
                     mn.clone(),
                     KIND_METHOD,
-                    format!("func {mn}({})", format_params(params)),
+                    format_func_signature(mn, params, return_type.as_ref(), *return_strong, None),
                     st.line,
                     st.column,
                     lo,
@@ -1032,26 +1076,40 @@ fn walk_if(st: &LocatedStmt, hi: usize, idx: &mut FileIndex) {
 }
 
 fn walk_for(st: &LocatedStmt, hi: usize, idx: &mut FileIndex) {
-    let Stmt::For { items, body, .. } = &st.stmt else {
+    let Stmt::For {
+        items,
+        body,
+        else_block,
+        ..
+    } = &st.stmt
+    else {
         return;
     };
 
     let inner_hi = block_hi(body, hi);
     for it in items {
         walk_expr(&it.iterable, idx);
-        push_sym(
-            idx,
-            it.name.clone(),
-            KIND_VAR,
-            format!("for {}", it.name),
-            st.line,
-            st.column,
-            st.line,
-            inner_hi,
-            None,
-        );
+        if let Some(pattern) = &it.pattern {
+            walk_destruct_defaults(pattern, idx);
+        }
+        for name in it.bound_names() {
+            push_sym(
+                idx,
+                name.clone(),
+                KIND_VAR,
+                format!("for {name}"),
+                st.line,
+                st.column,
+                st.line,
+                inner_hi,
+                None,
+            );
+        }
     }
     walk_block(body, st.line, inner_hi, idx);
+    if let Some(else_block) = else_block {
+        walk_block(else_block, st.line, block_hi(else_block, hi), idx);
+    }
 }
 
 fn walk_try(st: &LocatedStmt, hi: usize, idx: &mut FileIndex) {
@@ -1242,17 +1300,22 @@ fn walk_expr(expr: &Expr, idx: &mut FileIndex) {
         ExprKind::DoFunc { params, body, .. } => {
             let hi = block_hi(body, expr.loc.line);
             for p in params {
-                push_sym(
-                    idx,
-                    p.name.clone(),
-                    KIND_VAR,
-                    format!("param {}", p.name),
-                    expr.loc.line,
-                    expr.loc.column,
-                    expr.loc.line,
-                    hi,
-                    None,
-                );
+                if let Some(pattern) = &p.pattern {
+                    walk_destruct_defaults(pattern, idx);
+                }
+                for name in p.bound_names() {
+                    push_sym(
+                        idx,
+                        name.clone(),
+                        KIND_VAR,
+                        format!("param {name}"),
+                        expr.loc.line,
+                        expr.loc.column,
+                        expr.loc.line,
+                        hi,
+                        None,
+                    );
+                }
             }
             walk_block(body, expr.loc.line, hi, idx);
         }
@@ -1397,6 +1460,31 @@ fn destruct_names(p: &DestructPattern) -> Vec<String> {
         DestructPattern::Tuple(xs) | DestructPattern::List(xs) => {
             xs.iter().flat_map(destruct_elem_names).collect()
         }
+        DestructPattern::Dict { entries, rest } => entries
+            .iter()
+            .map(|entry| entry.binding.clone())
+            .chain(rest.iter().cloned())
+            .collect(),
+    }
+}
+
+fn walk_destruct_defaults(pattern: &DestructPattern, idx: &mut FileIndex) {
+    match pattern {
+        DestructPattern::Dict { entries, .. } => {
+            for entry in entries {
+                if let Some(default) = &entry.default {
+                    walk_expr(default, idx);
+                }
+            }
+        }
+        DestructPattern::Tuple(items) | DestructPattern::List(items) => {
+            for item in items {
+                if let DestructElem::Pat(pattern) = item {
+                    walk_destruct_defaults(pattern, idx);
+                }
+            }
+        }
+        DestructPattern::Name(_) | DestructPattern::Discard => {}
     }
 }
 
@@ -1410,6 +1498,7 @@ fn destruct_elem_names(e: &DestructElem) -> Vec<String> {
 
 fn pattern_names(p: &Pattern) -> Vec<String> {
     match p {
+        Pattern::Destruct(pattern) => pattern.bound_names(),
         Pattern::Bind(n) => vec![n.clone()],
         Pattern::List(xs) | Pattern::Tuple(xs) => xs
             .iter()

@@ -153,6 +153,130 @@ seen
 }
 
 #[test]
+fn outside_descriptor_lifts_function_to_enclosing_lexical_scope() {
+    assert_num(
+        r#"
+let value = 7
+func outer() {
+    let value = 100
+    if (false) {
+        let value = 99
+        func helper() outside(1) { return value }
+    }
+    return helper()
+}
+outer()
+"#,
+        "7",
+    );
+}
+
+#[test]
+fn outside_descriptor_can_lift_to_module_scope() {
+    assert_num(
+        r#"
+func outer() {
+    func available() outside(1) { return 13 }
+}
+available()
+"#,
+        "13",
+    );
+}
+
+#[test]
+fn outside_zero_keeps_the_declaration_in_its_current_scope() {
+    assert_num(
+        r#"
+func outer() {
+    func local() outside(0) { return 17 }
+    return local()
+}
+outer()
+"#,
+        "17",
+    );
+    assert!(optive::run_source("func outer() { func local() outside(0) {} } local()").is_err());
+}
+
+#[test]
+fn outside_requires_a_compile_time_non_negative_integer() {
+    for source in [
+        "func bad() outside(-1) {}",
+        "func bad() outside(1.5) {}",
+        "let depth = 1\nfunc bad() outside(depth) {}",
+    ] {
+        let error = optive::run_source(source).expect_err("invalid outside depth");
+        assert!(
+            error
+                .to_string()
+                .contains("requires a compile-time non-negative integer"),
+            "unexpected error for {source:?}: {error}"
+        );
+    }
+}
+
+#[test]
+fn outside_descriptor_counts_function_boundaries_not_blocks() {
+    assert_num(
+        r#"
+func outer() {
+    func middle() {
+    if (true) {
+        if (true) {
+            func helper() outside(2) { return 11 }
+        }
+    }
+    }
+    return helper()
+}
+outer()
+"#,
+        "11",
+    );
+    assert!(optive::run_source("func outer() { func bad() outside(2) {} }").is_err());
+}
+
+#[test]
+fn display_as_changes_only_function_representation() {
+    assert_eq!(
+        optive::eval_text(
+            r#"
+const LABEL = "worker"
+func actual_name() display_as(LABEL) { return 5 }
+repr(actual_name)
+"#,
+        )
+        .expect("display_as"),
+        "worker"
+    );
+    assert_num(
+        r#"
+func actual_name() display_as("worker") { return 5 }
+actual_name()
+"#,
+        "5",
+    );
+    assert!(optive::run_source("func bad() display_as(123) {}").is_err());
+}
+
+#[test]
+fn display_as_is_preserved_by_generic_specialization() {
+    assert_eq!(
+        optive::eval_text(
+            r#"
+func identity[T](value) display_as("identity function") { return value }
+let before = repr(identity)
+identity[int](3)
+before + ":" + repr(identity)
+"#,
+        )
+        .expect("generic display_as"),
+        "identity function:identity function"
+    );
+}
+
+#[test]
 fn labeled_continue_advances_outer_for() {
     assert_num(
         r"
@@ -166,6 +290,57 @@ outer for (row in [[1, 2], [3, 4]]) {
 total
 ",
         "0",
+    );
+}
+
+#[test]
+fn for_else_runs_after_normal_exhaustion_including_empty_input() {
+    assert_num(
+        r"
+var result = 0
+for (x in [1, 2, 3]) { result = result + x } else { result = result + 10 }
+for (x in []) { result = 999 } else { result = result + 20 }
+result
+",
+        "36",
+    );
+}
+
+#[test]
+fn for_else_is_skipped_by_break() {
+    assert_num(
+        r"
+var result = 0
+for (x in [1, 2, 3]) {
+    result = result + x
+    if (x == 2) { break }
+} else {
+    result = 999
+}
+result
+",
+        "3",
+    );
+}
+
+#[test]
+fn labeled_break_skips_target_for_else() {
+    assert_num(
+        r"
+var result = 0
+outer for (row in [[1, 2], [3, 4]]) {
+    for (cell in row) {
+        result = result + cell
+        if (cell == 2) { break outer }
+    } else {
+        result = result + 100
+    }
+} else {
+    result = 999
+}
+result
+",
+        "3",
     );
 }
 

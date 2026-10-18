@@ -15,21 +15,17 @@ use std::sync::Arc;
 
 pub fn default_enum_values(members: &[EnumMemberDecl]) -> Result<Vec<EnumMemberInfo>> {
     let mut out = Vec::new();
-    let mut next: i64 = 0;
+    let mut next = num_bigint::BigInt::from(0);
     for m in members {
         let value = if let Some(expr) = &m.value {
             eval_const_num(expr)?
         } else {
-            let v = Num::from_i64(next);
-            next += 1;
-            v
+            Num::from_bigint(next.clone())
         };
-        if m.value.is_some() {
-            next = value
-                .to_i64()
-                .ok_or_else(|| RuntimeError::type_err("enum value must be integer"))?
-                + 1;
-        }
+        next = value
+            .to_bigint()
+            .map_err(|_| RuntimeError::type_err("enum value must be integer"))?
+            + 1;
         out.push(EnumMemberInfo {
             name: m.name.clone(),
             value,
@@ -46,11 +42,7 @@ pub fn eval_const_num(expr: &Expr) -> Result<Num> {
             operand,
         } => {
             let inner = eval_const_num(operand)?;
-            match inner {
-                Num::Small(n) => Ok(Num::Small(-n)),
-                Num::Int(n) => Ok(Num::from_bigint(-n.as_ref())),
-                Num::Rat(r) => Ok(Num::from_rational(-r.as_ref())),
-            }
+            Ok(crate::value::neg_num(&inner))
         }
         _ => Err(RuntimeError::type_err(
             "enum member value must be integer literal",
@@ -124,6 +116,7 @@ pub fn build_variant_def(
                 mutable_fields,
                 typed: true,
                 field_types,
+                field_defaults: Vec::new(),
                 type_params: type_params.clone(),
                 native_layout: None,
                 methods: HashMap::new(),
@@ -269,6 +262,7 @@ pub fn builtin_enum_method_entries(
             format!("{enum_name}.members"),
             vec![crate::ast::FuncParam {
                 name: "cls".into(),
+                pattern: None,
                 is_variadic: false,
                 is_kwvariadic: false,
                 implicit: false,

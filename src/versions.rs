@@ -1,20 +1,25 @@
-//! 语言、字节码与 embedding API 版本契约。
+//! 语言与内部格式标识。
 //!
-//! 解释器 Cargo 包版本可以独立演进；缓存键与兼容检查使用这里的常量，
-//! 而不是 `CARGO_PKG_VERSION`。
+//! 1.x 之前无需向后兼容，内部格式和 API 编号统一固定为 1；
+//! 破坏性修改不递增编号，旧缓存和构建产物需要时直接重新生成。
+//! 解释器 Cargo 包发布版本独立管理。
 
 /// 当前语言语义版本（主.次）。
 pub const LANGUAGE_VERSION: &str = "0.2";
-/// `.tivc` 磁盘格式号。布局变了就丢缓存；0.x 不读旧格式。
-pub const BYTECODE_FORMAT_VERSION: u16 = 4;
-/// `.tivb` 容器格式号。不读旧格式。
+/// `.tivc` 磁盘格式标识；1.x 之前固定为 1。
+pub const BYTECODE_FORMAT_VERSION: u16 = 1;
+/// 编译缓存标识；1.x 之前固定为 1，不随语义或布局修改递增。
+pub const COMPILER_CACHE_REVISION: u16 = 1;
+/// `.tivb` 容器格式标识；1.x 之前固定为 1。
 pub const BUNDLE_FORMAT_VERSION: u32 = 1;
-/// 稳定 embedding facade 版本。
+/// embedding facade 标识；1.x 之前固定为 1。
 pub const EMBED_API_VERSION: u16 = 1;
 
 #[must_use]
 pub fn bytecode_cache_version() -> String {
-    format!("lang={LANGUAGE_VERSION};bc={BYTECODE_FORMAT_VERSION}")
+    format!(
+        "lang={LANGUAGE_VERSION};bc={BYTECODE_FORMAT_VERSION};compiler={COMPILER_CACHE_REVISION}"
+    )
 }
 
 /// `requires_optive` 约束：`1.2.3` 或 `>=1.2.3`。
@@ -52,6 +57,14 @@ pub fn language_compatible(declared: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_identity_includes_semantic_revision() {
+        let current = bytecode_cache_version();
+        let legacy = format!("lang={LANGUAGE_VERSION};bc={BYTECODE_FORMAT_VERSION}");
+        assert_ne!(current, legacy);
+        assert!(current.ends_with(&format!("compiler={COMPILER_CACHE_REVISION}")));
+    }
 
     #[test]
     fn requires_optive_exact_and_ge() {
